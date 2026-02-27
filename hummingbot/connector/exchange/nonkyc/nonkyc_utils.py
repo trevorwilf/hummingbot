@@ -26,9 +26,12 @@ def is_market_active(exchange_info: Dict[str, Any]) -> bool:
     return exchange_info.get("active", False) or exchange_info.get("isActive", False)
 
 
-def convert_fromiso_to_unix_timestamp(date_str):
-    date_object = datetime.datetime.fromisoformat(date_str.rstrip('Z'))
-    return int(date_object.timestamp() * 1000)
+def convert_fromiso_to_unix_timestamp(date_str: str) -> float:
+    # Handle both "Z" suffix and "+00:00" suffix
+    if date_str.endswith("Z"):
+        date_str = date_str[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(date_str)
+    return dt.timestamp() * 1e3  # return milliseconds
 
 
 class NonkycConfigMap(BaseConnectorConfigMap):

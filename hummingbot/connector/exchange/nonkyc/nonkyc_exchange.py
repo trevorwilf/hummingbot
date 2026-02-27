@@ -17,7 +17,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import TradeFillOrderDetails, combine_to_hb_trading_pair, split_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -51,7 +51,7 @@ class NonkycExchange(ExchangePyBase):
 
     @staticmethod
     def Nonkyc_order_type(order_type: OrderType) -> str:
-        return order_type.name.upper()
+        return order_type.name.lower()
 
     @staticmethod
     def to_hb_order_type(Nonkyc_type: str) -> OrderType:
@@ -116,10 +116,14 @@ class NonkycExchange(ExchangePyBase):
         return pairs_prices
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
-        error_description = str(request_exception)
-        is_time_synchronizer_related = ("-1021" in error_description
-                                        and "Timestamp for this request" in error_description)
-        return is_time_synchronizer_related
+        error_description = str(request_exception).lower()
+        is_time_related = any(phrase in error_description for phrase in [
+            "nonce",
+            "timestamp",
+            "signature",
+            "unauthorized",
+        ])
+        return is_time_related
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
@@ -208,13 +212,13 @@ class NonkycExchange(ExchangePyBase):
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         api_params = {
-            "id": order_id,
+            "id": tracked_order.exchange_order_id,
         }
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
             data=api_params,
             is_auth_required=True)
-        if cancel_result.get("success"):
+        if cancel_result.get("id") is not None:
             return True
         return False
 
@@ -280,9 +284,9 @@ class NonkycExchange(ExchangePyBase):
                                 exchange_order_id=str(message_params["id"]),
                                 trading_pair=tracked_order.trading_pair,
                                 fee=fee,
-                                fill_base_amount=Decimal(message_params["executedQuantity"]),
-                                fill_quote_amount=Decimal(message_params["executedQuantity"]) * Decimal(message_params["price"]),
-                                fill_price=Decimal(message_params["price"]),
+                                fill_base_amount=Decimal(message_params["tradeQuantity"]),
+                                fill_quote_amount=Decimal(message_params["tradeQuantity"]) * Decimal(message_params["tradePrice"]),
+                                fill_price=Decimal(message_params["tradePrice"]),
                                 fill_timestamp=message_params["updatedAt"] * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
@@ -292,9 +296,9 @@ class NonkycExchange(ExchangePyBase):
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=message_params["updatedAt"] * 1e-3,
-                            new_state=CONSTANTS.ORDER_STATE[message_params["status"]],
+                            new_state=CONSTANTS.ORDER_STATE.get(message_params["status"], OrderState.OPEN),
                             client_order_id=client_order_id,
-                            exchange_order_id=str(message_params["userProvidedId"]),
+                            exchange_order_id=str(message_params["id"]),
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
 
@@ -434,7 +438,7 @@ class NonkycExchange(ExchangePyBase):
                     flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=quote_asset)]
                 )
                 trade_update = TradeUpdate(
-                    trade_id=str(trade["orderid"]),
+                    trade_id=str(trade["id"]),
                     client_order_id=order.client_order_id,
                     exchange_order_id=exchange_order_id,
                     trading_pair=trading_pair,
@@ -454,7 +458,11 @@ class NonkycExchange(ExchangePyBase):
             is_auth_required=True,
             limit_id = CONSTANTS.ORDER_INFO_PATH_URL)
 
-        new_state = CONSTANTS.ORDER_STATE[updated_order_data["status"]]
+        raw_status = updated_order_data["status"]
+        new_state = CONSTANTS.ORDER_STATE.get(raw_status)
+        if new_state is None:
+            self.logger().warning(f"Unknown order state from NonKYC: {raw_status}")
+            new_state = OrderState.OPEN
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -490,7 +498,7 @@ class NonkycExchange(ExchangePyBase):
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        print("initializing nonkyc pairs")
+        self.logger().info("Initializing NonKYC trading pairs")
 
         for symbol_data in filter(nonkyc_utils.is_market_active, exchange_info):
             symbol = symbol_data["symbol"]

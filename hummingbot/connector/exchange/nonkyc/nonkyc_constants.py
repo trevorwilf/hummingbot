@@ -15,7 +15,7 @@ HBOT_ORDER_ID_PREFIX = "HBOT-"
 MAX_ORDER_ID_LEN = 32
 
 # Public Nonkyc API endpoints
-SERVER_TIME_API_URL = "https://nonkyc.io/api/v2/getservertime"
+SERVER_TIME_API_URL = "https://api.nonkyc.io/api/v2/time"
 TICKER_INFO_PATH_URL = "/ticker"
 TICKER_BOOK_PATH_URL = "/tickers"
 MARKETS_INFO_PATH_URL = "/market/getlist"
@@ -43,6 +43,7 @@ WS_METHOD_SUBSCRIBE_USER_BALANCE = "subscribeBalances"
 
 # Websocket event types
 DIFF_EVENT_TYPE = "updateOrderbook"
+SNAPSHOT_EVENT_TYPE = "snapshotOrderbook"
 TRADE_EVENT_TYPE = "updateTrades"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
@@ -58,10 +59,22 @@ SIDE_SELL = "sell"
 
 ORDER_STATE = {
     "New": OrderState.OPEN,
+    "new": OrderState.OPEN,
     "Active": OrderState.OPEN,
-    "Filled": OrderState.FILLED,
+    "active": OrderState.OPEN,
     "Partly Filled": OrderState.PARTIALLY_FILLED,
+    "partly filled": OrderState.PARTIALLY_FILLED,
+    "partlyFilled": OrderState.PARTIALLY_FILLED,
+    "Filled": OrderState.FILLED,
+    "filled": OrderState.FILLED,
     "Cancelled": OrderState.CANCELED,
+    "cancelled": OrderState.CANCELED,
+    "Canceled": OrderState.CANCELED,
+    "canceled": OrderState.CANCELED,
+    "Expired": OrderState.CANCELED,
+    "expired": OrderState.CANCELED,
+    "Suspended": OrderState.CANCELED,
+    "suspended": OrderState.CANCELED,
 }
 
 # Rate Limit Type

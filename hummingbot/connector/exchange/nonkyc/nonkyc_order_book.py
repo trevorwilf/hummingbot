@@ -23,11 +23,19 @@ class NonkycOrderBook(OrderBook):
         if metadata:
             msg.update(metadata)
 
+        bids = msg["bids"]
+        asks = msg["asks"]
+        # Convert dict-format entries to list format if needed
+        if bids and isinstance(bids[0], dict):
+            bids = [[b["price"], str(b["quantity"])] for b in bids]
+        if asks and isinstance(asks[0], dict):
+            asks = [[a["price"], str(a["quantity"])] for a in asks]
+
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
             "update_id": timestamp,
-            "bids": msg["bids"],
-            "asks": msg["asks"]
+            "bids": bids,
+            "asks": asks
         }, timestamp=timestamp)
 
     @classmethod
@@ -68,7 +76,11 @@ class NonkycOrderBook(OrderBook):
             msg.update(metadata)
 
         tradedata = msg["params"]["data"][0]
-        ts = tradedata["timestampms"]
+        if "timestampms" in tradedata:
+            ts = float(tradedata["timestampms"])
+        else:
+            from hummingbot.connector.exchange.nonkyc.nonkyc_utils import convert_fromiso_to_unix_timestamp
+            ts = convert_fromiso_to_unix_timestamp(tradedata["timestamp"])
         return OrderBookMessage(OrderBookMessageType.TRADE, {
             "trading_pair": msg["trading_pair"],
             "trade_type": float(TradeType.SELL.value) if tradedata["side"] == "sell" else float(TradeType.BUY.value),

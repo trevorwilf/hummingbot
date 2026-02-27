@@ -32,6 +32,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._connector = connector
         self._trade_messages_queue_key = CONSTANTS.TRADE_EVENT_TYPE
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
+        self._snapshot_messages_queue_key = CONSTANTS.SNAPSHOT_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
 
@@ -129,6 +130,15 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             message_queue.put_nowait(order_book_message)
 
+    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        if "result" not in raw_message:
+            params = raw_message.get("params", {})
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
+                symbol=params.get("symbol"))
+            snapshot_msg: OrderBookMessage = NonkycOrderBook.snapshot_message_from_exchange(
+                params, time.time(), metadata={"trading_pair": trading_pair})
+            message_queue.put_nowait(snapshot_msg)
+
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""
         if "result" not in event_message:
@@ -137,6 +147,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 channel = self._trade_messages_queue_key
             elif event_type == CONSTANTS.DIFF_EVENT_TYPE:
                 channel = self._diff_messages_queue_key
+            elif event_type == CONSTANTS.SNAPSHOT_EVENT_TYPE:
+                channel = self._snapshot_messages_queue_key
         return channel
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:

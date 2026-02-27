@@ -48,7 +48,7 @@ class NonkycAuth(AuthBase):
         return request  # pass-through
 
     def generate_ws_authentication_message(self, request: WSRequest = None, ) -> Dict[str, any]:
-        random_str = str(random.choices(string.ascii_letters + string.digits, k=14))
+        random_str = "".join(random.choices(string.ascii_letters + string.digits, k=14))
         payload = {
             "method": "login",
             "params": {
@@ -61,7 +61,7 @@ class NonkycAuth(AuthBase):
         return payload
 
     def header_for_authentication(self, data: str) -> Dict[str, str]:
-        timestamp = int(self.time_provider.time() * 1e4)
+        timestamp = int(self.time_provider.time() * 1e3)
         message_to_sign = f"{self.api_key}{data}{timestamp}"
         signature = self._generate_signature(message_to_sign)
         return {"X-API-KEY": self.api_key,

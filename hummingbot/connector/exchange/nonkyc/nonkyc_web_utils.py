@@ -71,5 +71,5 @@ async def get_current_server_time(
         method=RESTMethod.GET,
         throttler_limit_id=CONSTANTS.SERVER_TIME_API_URL,
     )
-    server_time = response["unix_microsec"]
+    server_time = response["serverTime"]
     return server_time
