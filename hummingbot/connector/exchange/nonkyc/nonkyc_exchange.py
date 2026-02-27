@@ -534,7 +534,7 @@ class NonkycExchange(ExchangePyBase):
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        self.logger().info("Initializing NonKYC trading pairs")
+        self.logger().debug(f"Initializing {len(exchange_info)} NonKYC trading pairs")
 
         for symbol_data in filter(nonkyc_utils.is_market_active, exchange_info):
             symbol = symbol_data["symbol"]
@@ -543,12 +543,23 @@ class NonkycExchange(ExchangePyBase):
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-
-        resp_json = await self._api_request(
-            method=RESTMethod.GET,
-            path_url=f"{CONSTANTS.TICKER_INFO_PATH_URL}/{symbol}",
-            limit_id=CONSTANTS.TICKER_INFO_PATH_URL
-        )
-        return float(resp_json["last_price"])
+        try:
+            resp_json = await self._api_request(
+                method=RESTMethod.GET,
+                path_url=f"{CONSTANTS.TICKER_INFO_PATH_URL}/{symbol}",
+                limit_id=CONSTANTS.TICKER_INFO_PATH_URL
+            )
+            return float(resp_json["last_price"])
+        except Exception:
+            # Fallback: filter from tickers list
+            all_tickers = await self._api_request(
+                method=RESTMethod.GET,
+                path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
+                limit_id=CONSTANTS.TICKER_BOOK_PATH_URL
+            )
+            ticker_id = symbol.replace("/", "_")
+            for ticker in all_tickers:
+                if ticker.get("ticker_id") == ticker_id:
+                    return float(ticker["last_price"])
+            raise ValueError(f"Ticker not found for {trading_pair}")

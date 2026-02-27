@@ -14,24 +14,29 @@ BROKER_ID = "hummingbot"
 HBOT_ORDER_ID_PREFIX = "HBOT-"
 MAX_ORDER_ID_LEN = 32
 
-# Public Nonkyc API endpoints
-SERVER_TIME_API_URL = "https://api.nonkyc.io/api/v2/time"
+# Public Nonkyc API endpoints — current
+SERVER_TIME_PATH_URL = "/time"
 TICKER_INFO_PATH_URL = "/ticker"
 TICKER_BOOK_PATH_URL = "/tickers"
 MARKETS_INFO_PATH_URL = "/market/getlist"
+MARKET_ORDERBOOK_PATH_URL = "/market/orderbook"
 PING_PATH_URL = "/info"
 SUPPORTED_SYMBOL_PATH_URL = "/asset/getlist"
-ORDERBOOK_SNAPSHOT_PATH_URL = "/orderbook"
 
-# Private Nonkyc API endpoints
+# Deprecated public endpoints (old API, still functional but superseded)
+SERVER_TIME_API_URL = "https://nonkyc.io/api/v2/getservertime"  # Deprecated: use SERVER_TIME_PATH_URL (/time)
+ORDERBOOK_SNAPSHOT_PATH_URL = "/orderbook"  # Deprecated: use MARKET_ORDERBOOK_PATH_URL (/market/orderbook)
+
+# Private Nonkyc API endpoints — current
 USER_BALANCES_PATH_URL = "/balances"
-USER_TRADES_PATH_URL = "/gettrades"  # deprecated
-USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL = "/gettradessince"  # deprecated
 ACCOUNT_TRADES_PATH_URL = "/account/trades"
-
 CREATE_ORDER_PATH_URL = "/createorder"
 CANCEL_ORDER_PATH_URL = "/cancelorder"
 ORDER_INFO_PATH_URL = "/getorder"
+
+# Deprecated private endpoints
+USER_TRADES_PATH_URL = "/gettrades"  # Deprecated: use ACCOUNT_TRADES_PATH_URL
+USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL = "/gettradessince"  # Deprecated: use ACCOUNT_TRADES_PATH_URL with since param
 
 # Ws public methods
 WS_METHOD_SUBSCRIBE_ORDERBOOK = "subscribeOrderbook"
@@ -41,11 +46,11 @@ WS_METHOD_SUBSCRIBE_TRADES = "subscribeTrades"
 WS_METHOD_SUBSCRIBE_USER_ORDERS = "subscribeReports"
 WS_METHOD_SUBSCRIBE_USER_BALANCE = "subscribeBalances"
 
-
 # Websocket event types
 DIFF_EVENT_TYPE = "updateOrderbook"
 SNAPSHOT_EVENT_TYPE = "snapshotOrderbook"
 TRADE_EVENT_TYPE = "updateTrades"
+SNAPSHOT_TRADES_EVENT_TYPE = "snapshotTrades"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
@@ -74,8 +79,8 @@ ORDER_STATE = {
     "canceled": OrderState.CANCELED,
     "Expired": OrderState.CANCELED,
     "expired": OrderState.CANCELED,
-    "Suspended": OrderState.CANCELED,
-    "suspended": OrderState.CANCELED,
+    "Suspended": OrderState.PENDING_CREATE,
+    "suspended": OrderState.PENDING_CREATE,
 }
 
 # Rate Limit Type
@@ -84,14 +89,15 @@ ORDERS = "ORDERS"
 ORDERS_24HR = "ORDERS_24HR"
 RAW_REQUESTS = "RAW_REQUESTS"
 
+# Estimated — NonKYC doesn't publish rate limit docs
 MAX_REQUEST = 5000
 
 RATE_LIMITS = [
-    # Pools
+    # Pools (estimated values — NonKYC does not publish rate limit documentation)
     RateLimit(limit_id=REQUEST_WEIGHT, limit=6000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ORDERS, limit=50, time_interval=10 * ONE_SECOND),
     RateLimit(limit_id=ORDERS_24HR, limit=160000, time_interval=ONE_DAY),
-    RateLimit(limit_id=RAW_REQUESTS, limit=61000, time_interval= 5 * ONE_MINUTE),
+    RateLimit(limit_id=RAW_REQUESTS, limit=61000, time_interval=5 * ONE_MINUTE),
     # Weighted Limits
     RateLimit(limit_id=TICKER_INFO_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 2),
@@ -102,8 +108,14 @@ RATE_LIMITS = [
     RateLimit(limit_id=MARKETS_INFO_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 20),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=MARKET_ORDERBOOK_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 100),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
     RateLimit(limit_id=ORDERBOOK_SNAPSHOT_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 100),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
     RateLimit(limit_id=USER_BALANCES_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 20),

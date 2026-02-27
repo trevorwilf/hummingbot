@@ -50,17 +50,18 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         :return: the response from the exchange (JSON dictionary)
         """
+        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         params = {
-            "ticker_id": await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "depth": "1000"
+            "symbol": symbol,
+            "limit": "1000"
         }
 
         rest_assistant = await self._api_factory.get_rest_assistant()
         data = await rest_assistant.execute_request(
-            url=web_utils.public_rest_url(path_url=CONSTANTS.ORDERBOOK_SNAPSHOT_PATH_URL),
+            url=web_utils.public_rest_url(path_url=CONSTANTS.MARKET_ORDERBOOK_PATH_URL),
             params=params,
             method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.ORDERBOOK_SNAPSHOT_PATH_URL,
+            throttler_limit_id=CONSTANTS.MARKET_ORDERBOOK_PATH_URL,
         )
 
         return data
@@ -166,7 +167,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         channel = ""
         if "result" not in event_message:
             event_type = event_message.get("method")
-            if event_type == CONSTANTS.TRADE_EVENT_TYPE or event_type == "snapshotTrades":
+            if event_type == CONSTANTS.TRADE_EVENT_TYPE or event_type == CONSTANTS.SNAPSHOT_TRADES_EVENT_TYPE:
                 channel = self._trade_messages_queue_key
             elif event_type == CONSTANTS.DIFF_EVENT_TYPE:
                 channel = self._diff_messages_queue_key

@@ -63,7 +63,7 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
     @aioresponses()
     async def test_get_new_order_book_successful(self, mock_api):
-        url = web_utils.public_rest_url(path_url=CONSTANTS.ORDERBOOK_SNAPSHOT_PATH_URL)
+        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKET_ORDERBOOK_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = {
             "marketid": "643bfeeb5e07bba23a98a981",
@@ -183,7 +183,7 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._last_sequence[self.trading_pair] = 100
 
         # Mock the REST snapshot for resync
-        url = web_utils.public_rest_url(path_url=CONSTANTS.ORDERBOOK_SNAPSHOT_PATH_URL)
+        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKET_ORDERBOOK_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         snapshot_response = {
             "marketid": "643bfeeb5e07bba23a98a981",
