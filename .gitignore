@@ -94,6 +94,7 @@ coverage.xml
 /**/.injective_cookie
 
 .env
-nonkyc_phase*
 
+# Local Claude code prompts
+*_claude_code_prompt.md
 **/.claude/settings.local.json
