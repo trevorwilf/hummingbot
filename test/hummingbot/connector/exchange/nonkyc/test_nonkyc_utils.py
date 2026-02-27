@@ -35,3 +35,10 @@ class NonkycUtilsTests(TestCase):
         self.assertFalse(is_market_active({"isActive": False}))
         self.assertFalse(is_market_active({"active": False}))
         self.assertFalse(is_market_active({}))
+
+    def test_example_pair_is_valid(self):
+        """EXAMPLE_PAIR must be a real pair on the exchange, not the old ZRX-ETH."""
+        from hummingbot.connector.exchange.nonkyc.nonkyc_utils import EXAMPLE_PAIR
+        self.assertEqual("BTC-USDT", EXAMPLE_PAIR)
+        self.assertIn("-", EXAMPLE_PAIR)
+        self.assertNotIn("/", EXAMPLE_PAIR)
