@@ -94,5 +94,6 @@ coverage.xml
 /**/.injective_cookie
 
 .env
+nonkyc_phase1_claude*
 
 **/.claude/settings.local.json
