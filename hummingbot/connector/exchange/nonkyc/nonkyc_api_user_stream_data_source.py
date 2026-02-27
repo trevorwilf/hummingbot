@@ -64,8 +64,24 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _authenticate_ws_connection(self, ws: WSAssistant):
         """
-        Sends the authentication message.
+        Sends the authentication message and validates the response.
         :param ws: the websocket assistant used to connect to the exchange
         """
         auth_message: WSJSONRequest = WSJSONRequest(payload=self._auth.generate_ws_authentication_message())
         await ws.send(auth_message)
+
+        # Wait for auth response
+        async for ws_response in ws.iter_messages():
+            data = ws_response.data
+            if isinstance(data, dict):
+                if data.get("result") is True:
+                    self.logger().info("WebSocket authentication successful")
+                    return
+                elif "error" in data:
+                    error_msg = data.get("error", {}).get("message", "Unknown error")
+                    raise IOError(f"WebSocket authentication failed: {error_msg}")
+            break  # unexpected message format, continue anyway
+
+    async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+        websocket_assistant and await websocket_assistant.disconnect()
+        self._ws_assistant = None

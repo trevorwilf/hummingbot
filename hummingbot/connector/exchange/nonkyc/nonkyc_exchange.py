@@ -101,6 +101,10 @@ class NonkycExchange(ExchangePyBase):
         return self._trading_pairs
 
     @property
+    def real_time_balance_update(self) -> bool:
+        return True
+
+    @property
     def is_cancel_request_in_exchange_synchronous(self) -> bool:
         return True
 
@@ -235,12 +239,15 @@ class NonkycExchange(ExchangePyBase):
                 min_base_amount_increment = Decimal(1 / (10 ** quantity_decimals))
 
                 retval.append(
-                    TradingRule(trading_pair,
-                                min_order_size=min_base_amount_increment,
-                                min_price_increment=min_price_increment,
-                                min_base_amount_increment=min_base_amount_increment))
+                    TradingRule(
+                        trading_pair,
+                        min_order_size=Decimal(str(rule.get("minimumQuantity", min_base_amount_increment))),
+                        min_price_increment=min_price_increment,
+                        min_base_amount_increment=min_base_amount_increment,
+                        min_notional_size=Decimal(str(rule.get("minQuote", 0))) if rule.get("isMinQuoteActive") else Decimal("0"),
+                    ))
 
-            except Exception:
+            except Exception as e:
                 self.logger().exception(f"Error parsing the trading pair rule {rule}. Skipping.")
         return retval
 
@@ -261,12 +268,13 @@ class NonkycExchange(ExchangePyBase):
         The events received are balance updates, order updates and trade events.
         """
         async for event_message in self._iter_user_event_queue():
+            event_type = None
             try:
                 event_type = event_message.get("method")
                 if event_type == "report":
                     message_params = event_message.get('params', {})
                     reportType = message_params.get('reportType')
-                    client_order_id = event_message.get("userProvidedId")
+                    client_order_id = message_params.get("userProvidedId")
 
                     if reportType == "trade":
                         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
@@ -302,6 +310,15 @@ class NonkycExchange(ExchangePyBase):
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
 
+                elif event_type == "currentBalances":
+                    balance_entries = event_message.get("result", [])
+                    for balance_entry in balance_entries:
+                        asset_name = balance_entry["ticker"]
+                        free_balance = Decimal(balance_entry["available"])
+                        total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
+                        self._account_available_balances[asset_name] = free_balance
+                        self._account_balances[asset_name] = total_balance
+
                 elif event_type == "balanceUpdate":
                     balance_entry = event_message.get("params")
                     asset_name = balance_entry["ticker"]
@@ -309,10 +326,30 @@ class NonkycExchange(ExchangePyBase):
                     total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
                     self._account_available_balances[asset_name] = free_balance
                     self._account_balances[asset_name] = total_balance
+
+                elif event_type == "activeOrders":
+                    active_orders = event_message.get("result", [])
+                    for order_data in active_orders:
+                        client_order_id = str(order_data.get("userProvidedId", ""))
+                        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                        if tracked_order is not None:
+                            new_state = CONSTANTS.ORDER_STATE.get(order_data.get("status", ""), OrderState.OPEN)
+                            order_update = OrderUpdate(
+                                trading_pair=tracked_order.trading_pair,
+                                update_timestamp=order_data.get("updatedAt", 0) * 1e-3,
+                                new_state=new_state,
+                                client_order_id=client_order_id,
+                                exchange_order_id=str(order_data.get("id", "")),
+                            )
+                            self._order_tracker.process_order_update(order_update)
+
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
+            except Exception as e:
+                self.logger().error(
+                    "Unexpected error in user stream listener loop.",
+                    exc_info=True
+                )
                 await self._sleep(5.0)
 
     async def _update_order_fills_from_trades(self):
@@ -339,16 +376,15 @@ class NonkycExchange(ExchangePyBase):
             tasks = []
             trading_pairs = self.trading_pairs
             for trading_pair in trading_pairs:
+                symbol = str(await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair))
                 params = {
-                    "symbol": str(await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)).replace("/", "_")
+                    "symbol": symbol
                 }
 
-                url_path = CONSTANTS.USER_TRADES_PATH_URL
                 if self._last_poll_timestamp > 0:
                     params["since"] = query_time
-                    url_path = CONSTANTS.USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL
                 tasks.append(self._api_get(
-                    path_url=url_path,
+                    path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
                     params=params,
                     is_auth_required=True))
 
@@ -360,7 +396,7 @@ class NonkycExchange(ExchangePyBase):
 
                 if isinstance(trades, Exception):
                     self.logger().network(
-                        f"Error fetching trades update for the order {trading_pair}: {trades}.",
+                        f"Error fetching trades update for {trading_pair}: {trades}.",
                         app_warning_msg=f"Failed to fetch trade update for {trading_pair}."
                     )
                     continue
@@ -384,7 +420,7 @@ class NonkycExchange(ExchangePyBase):
                             fill_base_amount=Decimal(trade["quantity"]),
                             fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
                             fill_price=Decimal(trade["price"]),
-                            fill_timestamp=trade["updatedAt"] * 1e-3,
+                            fill_timestamp=trade["timestamp"] * 1e-3,
                         )
                         self._order_tracker.process_trade_update(trade_update)
                     elif self.is_confirmed_new_order_filled_event(str(trade["id"]), exchange_order_id, trading_pair):
@@ -396,11 +432,11 @@ class NonkycExchange(ExchangePyBase):
                         self.trigger_event(
                             MarketEvent.OrderFilled,
                             OrderFilledEvent(
-                                timestamp=float(trade["createdAt"]) * 1e-3,
+                                timestamp=float(trade["timestamp"]) * 1e-3,
                                 order_id=self._exchange_order_ids.get(str(trade["orderid"]), None),
                                 trading_pair=trading_pair,
-                                trade_type=TradeType.BUY if trade["side"] == "buy" else TradeType.SELL,
-                                order_type=OrderType.LIMIT_MAKER if trade["side"] != trade['triggeredBy'] else OrderType.LIMIT,
+                                trade_type=TradeType.BUY if trade["side"].lower() == "buy" else TradeType.SELL,
+                                order_type=OrderType.LIMIT_MAKER if trade["side"].lower() != trade['triggeredBy'].lower() else OrderType.LIMIT,
                                 price=Decimal(trade["price"]),
                                 amount=Decimal(trade["quantity"]),
                                 trade_fee=DeductedFromReturnsTradeFee(
@@ -420,17 +456,17 @@ class NonkycExchange(ExchangePyBase):
 
         if order.exchange_order_id is not None:
             exchange_order_id = str(order.exchange_order_id)
-            trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
             base_asset, quote_asset = split_hb_trading_pair(trading_pair=order.trading_pair)
 
             all_fills_response = await self._api_get(
-                path_url=CONSTANTS.USER_TRADES_PATH_URL,
+                path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
+                params={"symbol": symbol},
                 is_auth_required=True,)
 
             filtered_trades = [trade for trade in all_fills_response if trade["orderid"] == exchange_order_id]
 
             for trade in filtered_trades:
-                exchange_order_id = str(trade["orderid"])
                 fee = TradeFeeBase.new_spot_fee(
                     fee_schema=self.trade_fee_schema(),
                     trade_type=order.trade_type,
@@ -441,12 +477,12 @@ class NonkycExchange(ExchangePyBase):
                     trade_id=str(trade["id"]),
                     client_order_id=order.client_order_id,
                     exchange_order_id=exchange_order_id,
-                    trading_pair=trading_pair,
+                    trading_pair=order.trading_pair,
                     fee=fee,
                     fill_base_amount=Decimal(trade["quantity"]),
                     fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
                     fill_price=Decimal(trade["price"]),
-                    fill_timestamp=trade["updatedAt"] * 1e-3,
+                    fill_timestamp=trade["timestamp"] * 1e-3,
                 )
                 trade_updates.append(trade_update)
 

@@ -35,6 +35,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._snapshot_messages_queue_key = CONSTANTS.SNAPSHOT_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        self._last_sequence: Dict[str, int] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -123,11 +124,31 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if "result" not in raw_message:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
-                symbol=raw_message.get("params", {}).get("symbol"))
+            params = raw_message.get("params", {})
+            symbol = params.get("symbol")
+            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            sequence = int(params.get("sequence", 0))
+            last_seq = self._last_sequence.get(trading_pair, 0)
+
+            if sequence <= last_seq:
+                # Duplicate or stale message, skip
+                return
+
+            if last_seq > 0 and sequence > last_seq + 1:
+                # Gap detected — trigger REST snapshot resync
+                self.logger().warning(
+                    f"Orderbook sequence gap for {trading_pair}: expected {last_seq + 1}, got {sequence}. "
+                    f"Requesting REST snapshot resync."
+                )
+                snapshot_msg = await self._order_book_snapshot(trading_pair)
+                snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
+                snapshot_queue.put_nowait(snapshot_msg)
+                self._last_sequence[trading_pair] = int(snapshot_msg.update_id)
+                return
+
+            self._last_sequence[trading_pair] = sequence
             order_book_message: OrderBookMessage = NonkycOrderBook.diff_message_from_exchange(
                 raw_message, time.time(), {"trading_pair": trading_pair})
-
             message_queue.put_nowait(order_book_message)
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
@@ -135,6 +156,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             params = raw_message.get("params", {})
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=params.get("symbol"))
+            sequence = int(params.get("sequence", 0))
+            self._last_sequence[trading_pair] = sequence
             snapshot_msg: OrderBookMessage = NonkycOrderBook.snapshot_message_from_exchange(
                 params, time.time(), metadata={"trading_pair": trading_pair})
             message_queue.put_nowait(snapshot_msg)
@@ -143,7 +166,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         channel = ""
         if "result" not in event_message:
             event_type = event_message.get("method")
-            if event_type == CONSTANTS.TRADE_EVENT_TYPE:
+            if event_type == CONSTANTS.TRADE_EVENT_TYPE or event_type == "snapshotTrades":
                 channel = self._trade_messages_queue_key
             elif event_type == CONSTANTS.DIFF_EVENT_TYPE:
                 channel = self._diff_messages_queue_key

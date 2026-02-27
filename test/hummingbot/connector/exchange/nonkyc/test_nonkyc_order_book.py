@@ -22,7 +22,7 @@ class NonkycOrderBookTests(TestCase):
 
         self.assertEqual(OrderBookMessageType.SNAPSHOT, snapshot.type)
         self.assertEqual("BTC-USDT", snapshot.trading_pair)
-        self.assertEqual(timestamp, snapshot.update_id)
+        self.assertEqual(1000, snapshot.update_id)
         self.assertEqual(1, len(snapshot.bids))
         self.assertEqual(1, len(snapshot.asks))
 

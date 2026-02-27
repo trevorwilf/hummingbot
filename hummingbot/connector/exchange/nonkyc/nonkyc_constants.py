@@ -25,8 +25,9 @@ ORDERBOOK_SNAPSHOT_PATH_URL = "/orderbook"
 
 # Private Nonkyc API endpoints
 USER_BALANCES_PATH_URL = "/balances"
-USER_TRADES_PATH_URL = "/gettrades"
-USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL = "/gettradessince"
+USER_TRADES_PATH_URL = "/gettrades"  # deprecated
+USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL = "/gettradessince"  # deprecated
+ACCOUNT_TRADES_PATH_URL = "/account/trades"
 
 CREATE_ORDER_PATH_URL = "/createorder"
 CANCEL_ORDER_PATH_URL = "/cancelorder"
@@ -117,6 +118,9 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 20),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
     RateLimit(limit_id=USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 20),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=ACCOUNT_TRADES_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 20),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
 

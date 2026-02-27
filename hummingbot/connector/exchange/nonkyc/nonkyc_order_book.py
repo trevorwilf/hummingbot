@@ -33,7 +33,7 @@ class NonkycOrderBook(OrderBook):
 
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
-            "update_id": timestamp,
+            "update_id": int(msg.get("sequence", 0)),
             "bids": bids,
             "asks": asks
         }, timestamp=timestamp)
@@ -59,7 +59,7 @@ class NonkycOrderBook(OrderBook):
 
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
-            "update_id": convert_fromiso_to_unix_timestamp(orderbookdata["timestamp"]),
+            "update_id": int(orderbookdata.get("sequence", 0)),
             "bids": formatted_bids,
             "asks": formatted_asks
         }, timestamp=timestamp)

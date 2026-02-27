@@ -123,10 +123,8 @@ def test_server_time():
                 drift < 30000,
                 f"Server: {st}, Local: {now_ms}, Drift: {drift}ms"
             )
-        return data
     except Exception as e:
         result("GET /time — reachable", False, str(e))
-        return None
 
 
 def test_also_try_old_time_endpoint():
@@ -200,14 +198,11 @@ def test_market_getlist():
         )
 
         # Print a full sample for manual inspection
-        print(f"  📋 Full sample market object (first in list):")
+        print(f"  Full sample market object (first in list):")
         print(f"       {json.dumps(sample, indent=2)[:2000]}")
         print()
-
-        return data
     except Exception as e:
         result("GET /market/getlist — reachable", False, str(e))
-        return None
 
 
 def test_orderbook(symbol="BTC/USDT"):
@@ -257,14 +252,11 @@ def test_orderbook(symbol="BTC/USDT"):
                     f"Sample: {ask}"
                 )
 
-            print(f"  📋 Full orderbook response:")
+            print(f"  Full orderbook response:")
             print(f"       {json.dumps(data, indent=2)[:1500]}")
             print()
-
-        return data
     except Exception as e:
         result("GET /market/orderbook — reachable", False, str(e))
-        return None
 
 
 def test_also_try_old_orderbook(symbol="BTC_USDT"):
@@ -311,17 +303,14 @@ def test_tickers():
                 f"Sample: {json.dumps(sample, indent=2)[:500]}"
             )
         elif isinstance(data, dict):
-            print(f"  📋 Ticker response (dict, first 3 entries):")
+            print(f"  Ticker response (dict, first 3 entries):")
             for i, (k, v) in enumerate(data.items()):
                 if i >= 3:
                     break
                 print(f"       {k}: {json.dumps(v, indent=2)[:300]}")
             print()
-
-        return data
     except Exception as e:
         result("GET /tickers — reachable", False, str(e))
-        return None
 
 
 def test_account_trades_unauthed():
@@ -360,8 +349,19 @@ def make_auth_headers(api_key, api_secret, method, url, body=""):
     }
 
 
-def test_auth_balance(api_key, api_secret):
+def _require_keys(api_key=None, api_secret=None):
+    """Return (api_key, api_secret) or pytest.skip if unavailable."""
+    key = api_key or os.environ.get("NONKYC_API_KEY", "")
+    secret = api_secret or os.environ.get("NONKYC_API_SECRET", "")
+    if not key or not secret:
+        import pytest
+        pytest.skip("NONKYC_API_KEY / NONKYC_API_SECRET not set")
+    return key, secret
+
+
+def test_auth_balance(api_key=None, api_secret=None):
     """Test authenticated GET /balances."""
+    api_key, api_secret = _require_keys(api_key, api_secret)
     url = f"{BASE_URL}/balances"
     try:
         headers = make_auth_headers(api_key, api_secret, "GET", url)
@@ -373,14 +373,13 @@ def test_auth_balance(api_key, api_secret):
             f"Status: {r.status_code}\n"
             f"Response preview: {r.text[:500]}"
         )
-        return r.status_code == 200
     except Exception as e:
         result("GET /balances — reachable", False, str(e))
-        return False
 
 
-def test_auth_open_orders(api_key, api_secret):
+def test_auth_open_orders(api_key=None, api_secret=None):
     """Test authenticated GET /account/orders."""
+    api_key, api_secret = _require_keys(api_key, api_secret)
     url = f"{BASE_URL}/account/orders"
     try:
         headers = make_auth_headers(api_key, api_secret, "GET", url)
@@ -398,8 +397,9 @@ def test_auth_open_orders(api_key, api_secret):
         result("GET /account/orders — reachable", False, str(e))
 
 
-def test_auth_trades(api_key, api_secret):
+def test_auth_trades(api_key=None, api_secret=None):
     """Test authenticated GET /account/trades."""
+    api_key, api_secret = _require_keys(api_key, api_secret)
     url = f"{BASE_URL}/account/trades"
     try:
         headers = make_auth_headers(api_key, api_secret, "GET", url)
@@ -438,11 +438,15 @@ def test_auth_trades(api_key, api_secret):
 # TIER 1B: Public WebSocket
 # ========================================================================
 
-async def test_ws_public():
+def test_ws_public():
     """Connect to WS, subscribe to orderbook and trades, capture messages."""
     if websockets is None:
-        result("WebSocket tests", False, "websockets package not installed", warn=True)
-        return
+        import pytest
+        pytest.skip("websockets package not installed")
+    asyncio.run(_ws_public_impl())
+
+
+async def _ws_public_impl():
 
     section("TIER 1B: Public WebSocket")
 
@@ -562,10 +566,16 @@ async def test_ws_public():
 # TIER 2B: Authenticated WebSocket
 # ========================================================================
 
-async def test_ws_auth(api_key, api_secret):
+def test_ws_auth(api_key=None, api_secret=None):
     """Test WS login with corrected nonce generation."""
+    api_key, api_secret = _require_keys(api_key, api_secret)
     if websockets is None:
-        return
+        import pytest
+        pytest.skip("websockets package not installed")
+    asyncio.run(_ws_auth_impl(api_key, api_secret))
+
+
+async def _ws_auth_impl(api_key, api_secret):
 
     section("TIER 2B: Authenticated WebSocket")
 
@@ -719,7 +729,7 @@ def main():
 
     # --- TIER 1B: Public WS ---
     if websockets:
-        asyncio.run(test_ws_public())
+        asyncio.run(_ws_public_impl())
 
     # --- TIER 2: Authenticated ---
     api_key = os.environ.get("NONKYC_API_KEY", "")
@@ -727,18 +737,13 @@ def main():
 
     if api_key and api_secret:
         section("TIER 2: Authenticated REST")
-        auth_ok = test_auth_balance(api_key, api_secret)
-        if auth_ok:
-            test_auth_open_orders(api_key, api_secret)
-            test_auth_trades(api_key, api_secret)
-        else:
-            print("  ⚠ Auth failed — signature format may differ from assumption.")
-            print("  ⚠ Check the response body above for error details.")
-            print("  ⚠ The connector's nonkyc_auth.py may need further adjustment.\n")
+        test_auth_balance(api_key, api_secret)
+        test_auth_open_orders(api_key, api_secret)
+        test_auth_trades(api_key, api_secret)
 
         # TIER 2B: Authenticated WS
         if websockets:
-            asyncio.run(test_ws_auth(api_key, api_secret))
+            asyncio.run(_ws_auth_impl(api_key, api_secret))
     else:
         section("TIER 2: Authenticated (SKIPPED)")
         print("  No API keys found. Add to your .env file at the repo root:")
