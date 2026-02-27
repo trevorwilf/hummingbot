@@ -25,6 +25,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 # ---------------------------------------------------------------------------
 # Find repo root and load .env
@@ -330,12 +331,14 @@ def test_account_trades_unauthed():
 # TIER 2: Authenticated REST (needs API key)
 # ========================================================================
 
-def make_auth_headers(api_key, api_secret, method, url, body=""):
-    """Generate NonKYC auth headers based on our Phase 1 fix understanding."""
-    nonce = str(int(time.time() * 1e3))
+def make_auth_headers(api_key, api_secret, full_url):
+    """Generate NonKYC auth headers.
 
-    # REST signature: HMAC-SHA256 of (apikey + url + body + nonce)
-    message = api_key + url + body + nonce
+    Signature = HMAC-SHA256(api_key + full_url_with_query_params + nonce)
+    Headers: X-API-KEY, X-API-NONCE, X-API-SIGN
+    """
+    nonce = str(int(time.time() * 1e3))
+    message = f"{api_key}{full_url}{nonce}"
     signature = hmac.new(
         api_secret.encode("utf-8"),
         message.encode("utf-8"),
@@ -343,9 +346,9 @@ def make_auth_headers(api_key, api_secret, method, url, body=""):
     ).hexdigest()
 
     return {
-        "apikey": api_key,
-        "signature": signature,
-        "nonce": nonce,
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": signature,
     }
 
 
@@ -364,7 +367,7 @@ def test_auth_balance(api_key=None, api_secret=None):
     api_key, api_secret = _require_keys(api_key, api_secret)
     url = f"{BASE_URL}/balances"
     try:
-        headers = make_auth_headers(api_key, api_secret, "GET", url)
+        headers = make_auth_headers(api_key, api_secret, url)
         r = requests.get(url, headers=headers, timeout=10)
 
         result(
@@ -380,12 +383,11 @@ def test_auth_balance(api_key=None, api_secret=None):
 def test_auth_open_orders(api_key=None, api_secret=None):
     """Test authenticated GET /account/orders."""
     api_key, api_secret = _require_keys(api_key, api_secret)
-    url = f"{BASE_URL}/account/orders"
+    params = {"status": "active"}
+    full_url = f"{BASE_URL}/account/orders?{urlencode(params)}"
     try:
-        headers = make_auth_headers(api_key, api_secret, "GET", url)
-        r = requests.get(
-            url, headers=headers, params={"status": "active"}, timeout=10
-        )
+        headers = make_auth_headers(api_key, api_secret, full_url)
+        r = requests.get(full_url, headers=headers, timeout=10)
 
         result(
             "GET /account/orders?status=active — authenticated",
@@ -402,7 +404,7 @@ def test_auth_trades(api_key=None, api_secret=None):
     api_key, api_secret = _require_keys(api_key, api_secret)
     url = f"{BASE_URL}/account/trades"
     try:
-        headers = make_auth_headers(api_key, api_secret, "GET", url)
+        headers = make_auth_headers(api_key, api_secret, url)
         r = requests.get(url, headers=headers, timeout=10)
 
         result(
