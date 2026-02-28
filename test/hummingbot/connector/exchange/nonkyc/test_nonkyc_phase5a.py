@@ -13,15 +13,15 @@ class TestPhase5AOrderTypes(unittest.TestCase):
 
     def test_limit_maker_maps_to_limit(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
-        self.assertEqual(NonkycExchange.Nonkyc_order_type(OrderType.LIMIT_MAKER), "limit")
+        self.assertEqual(NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER), "limit")
 
     def test_limit_maps_to_limit(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
-        self.assertEqual(NonkycExchange.Nonkyc_order_type(OrderType.LIMIT), "limit")
+        self.assertEqual(NonkycExchange.nonkyc_order_type(OrderType.LIMIT), "limit")
 
     def test_market_maps_to_market(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
-        self.assertEqual(NonkycExchange.Nonkyc_order_type(OrderType.MARKET), "market")
+        self.assertEqual(NonkycExchange.nonkyc_order_type(OrderType.MARKET), "market")
 
     def test_supported_types_includes_limit_maker(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange

@@ -36,6 +36,12 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._domain = domain
         self._api_factory = api_factory
         self._last_sequence: Dict[str, int] = {}
+        self._ws_request_id: int = 0  # JSON-RPC 2.0 request id counter
+
+    def _next_ws_id(self) -> int:
+        """Returns the next JSON-RPC 2.0 request id."""
+        self._ws_request_id += 1
+        return self._ws_request_id
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -77,14 +83,16 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 trade_payload = {
                     "method": CONSTANTS.WS_METHOD_SUBSCRIBE_TRADES,
-                    "params": {"symbol": symbol}
+                    "params": {"symbol": symbol},
+                    "id": self._next_ws_id()
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trade_payload)
                 await ws.send(subscribe_trade_request)
 
                 ob_payload = {
                     "method": CONSTANTS.WS_METHOD_SUBSCRIBE_ORDERBOOK,
-                    "params": {"symbol": symbol, "limit": 100}
+                    "params": {"symbol": symbol, "limit": 100},
+                    "id": self._next_ws_id()
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=ob_payload)
                 await ws.send(subscribe_orderbook_request)
@@ -195,13 +203,15 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             trade_payload = {
                 "method": CONSTANTS.WS_METHOD_SUBSCRIBE_TRADES,
-                "params": {"symbol": symbol}
+                "params": {"symbol": symbol},
+                "id": self._next_ws_id()
             }
             await self._ws_assistant.send(WSJSONRequest(payload=trade_payload))
 
             ob_payload = {
                 "method": CONSTANTS.WS_METHOD_SUBSCRIBE_ORDERBOOK,
-                "params": {"symbol": symbol, "limit": 100}
+                "params": {"symbol": symbol, "limit": 100},
+                "id": self._next_ws_id()
             }
             await self._ws_assistant.send(WSJSONRequest(payload=ob_payload))
 
@@ -236,14 +246,16 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Send unsubscribe for trades
             unsub_trades_payload = {
                 "method": CONSTANTS.WS_METHOD_UNSUBSCRIBE_TRADES,
-                "params": {"symbol": symbol}
+                "params": {"symbol": symbol},
+                "id": self._next_ws_id()
             }
             await self._ws_assistant.send(WSJSONRequest(payload=unsub_trades_payload))
 
             # Send unsubscribe for orderbook
             unsub_ob_payload = {
                 "method": CONSTANTS.WS_METHOD_UNSUBSCRIBE_ORDERBOOK,
-                "params": {"symbol": symbol}
+                "params": {"symbol": symbol},
+                "id": self._next_ws_id()
             }
             await self._ws_assistant.send(WSJSONRequest(payload=unsub_ob_payload))
 

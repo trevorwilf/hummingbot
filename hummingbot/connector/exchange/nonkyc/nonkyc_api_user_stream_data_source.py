@@ -29,6 +29,12 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._auth: NonkycAuth = auth
         self._domain = domain
         self._api_factory = api_factory
+        self._ws_request_id: int = 100  # Start at 100 to distinguish from order book ids in logs
+
+    def _next_ws_id(self) -> int:
+        """Returns the next JSON-RPC 2.0 request id."""
+        self._ws_request_id += 1
+        return self._ws_request_id
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -46,14 +52,16 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         subscribe_user_orders_request: WSJSONRequest = WSJSONRequest(payload={
             "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_ORDERS,
-            "params": {}
+            "params": {},
+            "id": self._next_ws_id()
         })
         await websocket_assistant.send(subscribe_user_orders_request)
         self.logger().info("Subscribed to user orders")
 
         subscribe_user_balance_request: WSJSONRequest = WSJSONRequest(payload={
             "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_BALANCE,
-            "params": {}
+            "params": {},
+            "id": self._next_ws_id()
         })
         await websocket_assistant.send(subscribe_user_balance_request)
         self.logger().info("Subscribed to user balance")

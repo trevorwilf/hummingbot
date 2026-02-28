@@ -48,12 +48,21 @@ class NonkycExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        self._last_trades_poll_Nonkyc_timestamp = 1.0
+        self._last_trades_poll_nonkyc_timestamp = 1.0
         self._trading_fees: Dict[str, Decimal] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
-    def Nonkyc_order_type(order_type: OrderType) -> str:
+    def nonkyc_order_type(order_type: OrderType) -> str:
+        """
+        Map Hummingbot OrderType to NonKYC API type string.
+
+        NOTE: LIMIT_MAKER is mapped to 'limit' because NonKYC does not support
+        a native post-only/maker-only order type. Unlike Binance's LIMIT_MAKER
+        (which rejects if it would take), this limit order CAN cross the spread.
+        The dynamic fee system (Phase 5C) correctly classifies maker/taker fills
+        using the 'triggeredBy' field from trade history.
+        """
         if order_type == OrderType.LIMIT_MAKER:
             return "limit"
         return order_type.name.lower()
@@ -204,7 +213,12 @@ class NonkycExchange(ExchangePyBase):
                            **kwargs) -> Tuple[str, float]:
         order_result = None
         amount_str = f"{amount:f}"
-        type_str = NonkycExchange.Nonkyc_order_type(order_type)
+        type_str = NonkycExchange.nonkyc_order_type(order_type)
+        if order_type is OrderType.LIMIT_MAKER:
+            self.logger().debug(
+                f"LIMIT_MAKER mapped to 'limit' for NonKYC (no native post-only). "
+                f"Order may take liquidity if price crosses spread."
+            )
         side_str = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
@@ -617,6 +631,7 @@ class NonkycExchange(ExchangePyBase):
                     balance_entries = event_message.get("result", [])
                     for balance_entry in balance_entries:
                         asset_name = balance_entry["ticker"]
+                        # WS uses 'ticker' not 'asset'; same fields: available + held (pending excluded)
                         free_balance = Decimal(balance_entry["available"])
                         total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
                         self._account_available_balances[asset_name] = free_balance
@@ -625,6 +640,7 @@ class NonkycExchange(ExchangePyBase):
                 elif event_type == "balanceUpdate":
                     balance_entry = event_message.get("params")
                     asset_name = balance_entry["ticker"]
+                    # Incremental balance update -- same formula: available + held (pending excluded)
                     free_balance = Decimal(balance_entry["available"])
                     total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
                     self._account_available_balances[asset_name] = free_balance
@@ -673,8 +689,8 @@ class NonkycExchange(ExchangePyBase):
 
         if (long_interval_current_tick > long_interval_last_tick
                 or (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick)):
-            query_time = int(self._last_trades_poll_Nonkyc_timestamp * 1e3)
-            self._last_trades_poll_Nonkyc_timestamp = self._time_synchronizer.time()
+            query_time = int(self._last_trades_poll_nonkyc_timestamp * 1e3)
+            self._last_trades_poll_nonkyc_timestamp = self._time_synchronizer.time()
             order_by_exchange_id_map = {}
             for order in self._order_tracker.all_fillable_orders.values():
                 order_by_exchange_id_map[order.exchange_order_id] = order
@@ -824,6 +840,11 @@ class NonkycExchange(ExchangePyBase):
 
         for balance_entry in balances:
             asset_name = balance_entry["asset"]
+            # NonKYC balance fields:
+            #   'available' = funds free for new orders
+            #   'held'      = funds locked in open orders
+            #   'pending'   = unconfirmed deposits/withdrawals (NOT usable for trading)
+            # Total trading balance = available + held (pending excluded intentionally)
             available_balance = Decimal(balance_entry["available"])
             total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
             self._account_available_balances[asset_name] = available_balance

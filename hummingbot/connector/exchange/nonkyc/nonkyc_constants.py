@@ -1,7 +1,9 @@
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
-DEFAULT_DOMAIN = "com"
+# NonKYC has a single domain. This constant is retained for compatibility with
+# the ExchangePyBase domain parameter interface but is not used in URL construction.
+DEFAULT_DOMAIN = "nonkyc"
 EXCHANGE_NAME = "nonkyc"
 
 # Base urls
@@ -93,7 +95,24 @@ ORDERS = "ORDERS"
 ORDERS_24HR = "ORDERS_24HR"
 RAW_REQUESTS = "RAW_REQUESTS"
 
-# Estimated — NonKYC doesn't publish rate limit docs
+# ============================================================================
+# RATE LIMITS -- ESTIMATED VALUES
+# ============================================================================
+# NonKYC does not publish rate limit documentation. These values are
+# conservative estimates based on observed behavior during development.
+#
+# If you encounter HTTP 429 ("Too Many Requests") errors in hummingbot logs:
+#   1. Reduce MAX_REQUEST (e.g., from 5000 to 2000)
+#   2. Increase REQUEST_WEIGHT time_interval (e.g., from 60s to 120s)
+#
+# If bot performance feels sluggish (slow order placement, delayed updates):
+#   1. Increase MAX_REQUEST cautiously
+#   2. Reduce weight values on frequently-used endpoints
+#
+# Monitor logs for "Rate limit" warnings from the AsyncThrottler.
+# ============================================================================
+
+# Estimated -- NonKYC doesn't publish rate limit docs
 MAX_REQUEST = 5000
 
 RATE_LIMITS = [

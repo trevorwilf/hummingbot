@@ -49,7 +49,7 @@ class NonkycAuth(AuthBase):
         """
         return request  # pass-through
 
-    def generate_ws_authentication_message(self, request: WSRequest = None, ) -> Dict[str, any]:
+    def generate_ws_authentication_message(self, request: WSRequest = None) -> Dict[str, any]:
         random_str = "".join(random.choices(string.ascii_letters + string.digits, k=14))
         payload = {
             "method": "login",
@@ -58,7 +58,8 @@ class NonkycAuth(AuthBase):
                 "pKey": self.api_key,
                 "nonce": random_str,
                 "signature": self._generate_signature(random_str)
-            }
+            },
+            "id": 99  # Fixed id for auth; response correlation handled by result check
         }
         return payload
 
