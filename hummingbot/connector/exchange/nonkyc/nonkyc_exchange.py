@@ -639,6 +639,9 @@ class NonkycExchange(ExchangePyBase):
 
                 elif event_type == "balanceUpdate":
                     balance_entry = event_message.get("params")
+                    if not balance_entry:
+                        self.logger().warning("Received balanceUpdate with empty params, skipping.")
+                        continue
                     asset_name = balance_entry["ticker"]
                     # Incremental balance update -- same formula: available + held (pending excluded)
                     free_balance = Decimal(balance_entry["available"])
@@ -808,10 +811,13 @@ class NonkycExchange(ExchangePyBase):
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        # Prefer exchange_order_id (NonKYC internal id) when available;
+        # fall back to client_order_id (userProvidedId) for orders not yet confirmed
+        order_id_for_query = tracked_order.exchange_order_id or tracked_order.client_order_id
         updated_order_data = await self._api_get(
-            path_url=f"{CONSTANTS.ORDER_INFO_PATH_URL}/{tracked_order.client_order_id}",
+            path_url=f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order_id_for_query}",
             is_auth_required=True,
-            limit_id = CONSTANTS.ORDER_INFO_PATH_URL)
+            limit_id=CONSTANTS.ORDER_INFO_PATH_URL)
 
         raw_status = updated_order_data["status"]
         new_state = CONSTANTS.ORDER_STATE.get(raw_status)
@@ -862,8 +868,12 @@ class NonkycExchange(ExchangePyBase):
 
         for symbol_data in filter(nonkyc_utils.is_market_active, exchange_info):
             symbol = symbol_data["symbol"]
+            parts = symbol.split('/')
+            if len(parts) != 2:
+                self.logger().warning(f"Skipping market with unexpected symbol format: {symbol}")
+                continue
             mapping[symbol] = combine_to_hb_trading_pair(base=symbol_data["primaryTicker"],
-                                                         quote=symbol.split('/')[1])
+                                                         quote=parts[1])
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:

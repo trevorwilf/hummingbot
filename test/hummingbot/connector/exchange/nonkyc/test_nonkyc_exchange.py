@@ -344,7 +344,7 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}")
+        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.exchange_order_id or order.client_order_id}")
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_status_request_completely_filled_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
@@ -356,7 +356,7 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}")
+        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.exchange_order_id or order.client_order_id}")
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_status_request_canceled_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
@@ -368,7 +368,7 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}")
+        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.exchange_order_id or order.client_order_id}")
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_status_request_open_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
@@ -380,7 +380,7 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}")
+        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.exchange_order_id or order.client_order_id}")
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         mock_api.get(regex_url, status=401, callback=callback)
         return url
@@ -391,7 +391,7 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}")
+        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.exchange_order_id or order.client_order_id}")
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_status_request_partially_filled_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
@@ -403,7 +403,7 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> List[str]:
-        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}")
+        url = web_utils.private_rest_url(f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.exchange_order_id or order.client_order_id}")
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = {"code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE, "msg": CONSTANTS.ORDER_NOT_EXIST_MESSAGE}
         mock_api.get(regex_url, body=json.dumps(response), status=400, callback=callback)

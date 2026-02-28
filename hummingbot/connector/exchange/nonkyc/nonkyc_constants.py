@@ -85,6 +85,8 @@ ORDER_STATE = {
     "canceled": OrderState.CANCELED,
     "Expired": OrderState.CANCELED,
     "expired": OrderState.CANCELED,
+    "Rejected": OrderState.FAILED,
+    "rejected": OrderState.FAILED,
     "Suspended": OrderState.PENDING_CREATE,
     "suspended": OrderState.PENDING_CREATE,
 }

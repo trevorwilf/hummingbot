@@ -55,7 +55,7 @@ class NonkycOrderBook(OrderBook):
         orderbookdata = msg["params"]
 
         formatted_asks = [[ask['price'], str(ask['quantity'])] for ask in orderbookdata["asks"]]
-        formatted_bids = [[ask['price'], str(ask['quantity'])] for ask in orderbookdata["bids"]]
+        formatted_bids = [[bid['price'], str(bid['quantity'])] for bid in orderbookdata["bids"]]
 
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],

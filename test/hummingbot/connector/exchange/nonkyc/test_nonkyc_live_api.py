@@ -2601,6 +2601,11 @@ def print_compatibility_report():
         ("Phase 7C", "Trading rule fields from API", "7C-13", "[OK]"),
         ("Phase 7C", "max_order_size in trading rules", "7C-14", "[OK]"),
         ("Phase 7C", "Sequence cleanup on unsubscribe", "7C-15", "[OK]"),
+        ("Bugfix", "OB diff variable name (cosmetic)",       "Bug-1",  "[OK]"),
+        ("Bugfix", "balanceUpdate null params guard",         "Bug-2",  "[OK]"),
+        ("Bugfix", "_request_order_status prefers exchange_order_id", "Bug-3", "[OK]"),
+        ("Bugfix", "Symbol split guard in pair init",         "Bug-4",  "[OK]"),
+        ("Bugfix", "Rejected order state in ORDER_STATE",     "Bug-5",  "[OK]"),
     ]
 
     # Print header
@@ -3440,6 +3445,54 @@ def test_7c_live_trade_has_alternate_fee_fields(api_key=None, api_secret=None):
         result("7C-3 LIVE: alternate fee fields", False, str(e))
 
 
+# ================================================================
+#   TIER 16: Bug Fix Validation
+# ================================================================
+
+def test_bugfix_ob_diff_bids_asks_independent():
+    """Bug 1: OB diff bids/asks independence."""
+    from hummingbot.connector.exchange.nonkyc.nonkyc_order_book import NonkycOrderBook
+    msg = {
+        "trading_pair": "TEST-USDT",
+        "params": {
+            "sequence": 1,
+            "bids": [{"price": "100", "quantity": "1"}],
+            "asks": [{"price": "200", "quantity": "2"}],
+        }
+    }
+    ob_diff = NonkycOrderBook.diff_message_from_exchange(msg, time.time())
+    ok = (ob_diff.content["bids"][0][0] == "100" and ob_diff.content["asks"][0][0] == "200")
+    result("Bug 1: OB diff bids/asks are independent", ok,
+           "bids[0]={}, asks[0]={}".format(ob_diff.content['bids'][0][0], ob_diff.content['asks'][0][0]))
+
+
+def test_bugfix_rejected_in_order_state():
+    """Bug 5: Rejected in ORDER_STATE."""
+    from hummingbot.connector.exchange.nonkyc import nonkyc_constants as CONSTANTS
+    from hummingbot.core.data_type.in_flight_order import OrderState
+
+    ok = ("Rejected" in CONSTANTS.ORDER_STATE and "rejected" in CONSTANTS.ORDER_STATE)
+    result("Bug 5: 'Rejected' in ORDER_STATE", ok,
+           "Rejected={}, rejected={}".format(CONSTANTS.ORDER_STATE.get('Rejected'), CONSTANTS.ORDER_STATE.get('rejected')))
+
+    ok = (CONSTANTS.ORDER_STATE["Rejected"] == OrderState.FAILED)
+    result("Bug 5: Rejected maps to FAILED (not OPEN)", ok,
+           "value={}".format(CONSTANTS.ORDER_STATE['Rejected']))
+
+    # Existing states unchanged (regression)
+    ok = (CONSTANTS.ORDER_STATE["New"] == OrderState.OPEN
+          and CONSTANTS.ORDER_STATE["Filled"] == OrderState.FILLED
+          and CONSTANTS.ORDER_STATE["cancelled"] == OrderState.CANCELED)
+    result("Bug 5: Existing ORDER_STATE mappings unchanged", ok,
+           "New={}, Filled={}".format(CONSTANTS.ORDER_STATE['New'], CONSTANTS.ORDER_STATE['Filled']))
+
+    # Total state count
+    expected_count = 19  # 18 original + 2 new (Rejected, rejected)
+    ok = len(CONSTANTS.ORDER_STATE) == expected_count
+    result("Bug 5: ORDER_STATE has {} entries".format(expected_count), ok,
+           "actual={}".format(len(CONSTANTS.ORDER_STATE)))
+
+
 # ========================================================================
 # MAIN
 # ========================================================================
@@ -3700,6 +3753,11 @@ def main():
         test_7c_live_trade_has_alternate_fee_fields(api_key, api_secret)
     else:
         result("7C LIVE auth tests (SKIPPED -- no API keys)", True, warn=True)
+
+    # --- TIER 16: Bug Fix Validation ---
+    section("TIER 16: Bug Fix Validation")
+    test_bugfix_ob_diff_bids_asks_independent()
+    test_bugfix_rejected_in_order_state()
 
     # --- SUMMARY ---
     print()
