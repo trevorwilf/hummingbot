@@ -20,6 +20,7 @@ from hummingbot.core.rate_oracle.sources.hyperliquid_perpetual_rate_source impor
 from hummingbot.core.rate_oracle.sources.hyperliquid_rate_source import HyperliquidRateSource
 from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSource
 from hummingbot.core.rate_oracle.sources.mexc_rate_source import MexcRateSource
+from hummingbot.core.rate_oracle.sources.nonkyc_rate_source import NonkycRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -39,6 +40,7 @@ RATE_ORACLE_SOURCES = {
     "hyperliquid_perpetual": HyperliquidPerpetualRateSource,
     "derive": DeriveRateSource,
     "mexc": MexcRateSource,
+    "nonkyc": NonkycRateSource,
 }
 
 

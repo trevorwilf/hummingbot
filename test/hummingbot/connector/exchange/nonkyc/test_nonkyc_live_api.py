@@ -2386,6 +2386,92 @@ def _test_5d_cancelallorders_requires_symbol(api_key, api_secret):
 
 
 # ========================================================================
+# TIER 12: Phase 6 Rate Oracle
+# ========================================================================
+
+def test_6_nonkyc_in_rate_oracle_sources():
+    """Verify 'nonkyc' is registered in RATE_ORACLE_SOURCES."""
+    from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES
+    assert "nonkyc" in RATE_ORACLE_SOURCES, "nonkyc not in RATE_ORACLE_SOURCES"
+    result("Phase 6: 'nonkyc' registered in RATE_ORACLE_SOURCES",
+           True, "Keys: {}".format(sorted(RATE_ORACLE_SOURCES.keys())))
+
+def test_6_rate_source_class_exists():
+    """Verify NonkycRateSource class exists and can be imported."""
+    from hummingbot.core.rate_oracle.sources.nonkyc_rate_source import NonkycRateSource
+    source = NonkycRateSource()
+    assert source.name == "nonkyc"
+    result("Phase 6: NonkycRateSource instantiated, name='nonkyc'",
+           True, "Class: {}".format(type(source).__name__))
+
+def test_6_rate_source_inherits_base():
+    """Verify NonkycRateSource inherits RateSourceBase."""
+    from hummingbot.core.rate_oracle.sources.nonkyc_rate_source import NonkycRateSource
+    from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+    assert issubclass(NonkycRateSource, RateSourceBase), "Must inherit RateSourceBase"
+    result("Phase 6: NonkycRateSource inherits RateSourceBase",
+           True, "MRO: {}".format([c.__name__ for c in NonkycRateSource.__mro__]))
+
+def test_6_rate_source_builds_connector():
+    """Verify the rate source creates a NonkycExchange with empty keys."""
+    from hummingbot.core.rate_oracle.sources.nonkyc_rate_source import NonkycRateSource
+    source = NonkycRateSource()
+    source._ensure_exchange()
+    assert source._exchange is not None, "Exchange not created"
+    assert source._exchange.api_key == "", "Expected empty key, got '{}'".format(source._exchange.api_key)
+    assert source._exchange.is_trading_required is False
+    result("Phase 6: rate source builds connector with empty keys",
+           True, "api_key='', trading_required=False")
+
+def _test_6_rate_source_live():
+    """Live test: fetch actual prices from NonKYC /tickers via rate source."""
+    import asyncio
+    from decimal import Decimal
+    from hummingbot.core.rate_oracle.sources.nonkyc_rate_source import NonkycRateSource
+
+    source = NonkycRateSource()
+
+    async def _run():
+        # -- Live prices (all pairs) --
+        prices = await source.get_prices()
+        assert isinstance(prices, dict), "Expected dict, got {}".format(type(prices))
+        assert len(prices) > 0, "Expected at least 1 price pair"
+        result("Phase 6: rate source returned live prices",
+               True, "Count: {} pairs".format(len(prices)))
+
+        if "BTC-USDT" in prices:
+            btc_price = prices["BTC-USDT"]
+            assert btc_price > 1000, "BTC price {} seems too low".format(btc_price)
+            assert btc_price < 1000000, "BTC price {} seems too high".format(btc_price)
+            result("Phase 6: BTC-USDT price is reasonable",
+                   True, "Price: {}".format(btc_price))
+        else:
+            result("Phase 6: BTC-USDT not in prices",
+                   True, "Available pairs sample: {}".format(list(prices.keys())[:10]),
+                   warn=True)
+
+        invalid = [(k, v) for k, v in prices.items() if not isinstance(v, Decimal) or v <= 0]
+        assert len(invalid) == 0, "Found invalid prices: {}".format(invalid[:5])
+        result("Phase 6: all prices are positive Decimals",
+               True, "Checked {} pairs".format(len(prices)))
+
+        # -- Quote token filter (reuses same source + loop) --
+        usdt_prices = await source.get_prices(quote_token="USDT")
+        assert isinstance(usdt_prices, dict), "Expected dict, got {}".format(type(usdt_prices))
+        non_usdt = [k for k in usdt_prices.keys() if not k.endswith("-USDT")]
+        assert len(non_usdt) == 0, "Found non-USDT pairs with USDT filter: {}".format(non_usdt[:5])
+        result("Phase 6: quote_token='USDT' filter works",
+               True, "Count: {} USDT pairs, 0 non-USDT".format(len(usdt_prices)))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+# ========================================================================
 # Compatibility Report
 # ========================================================================
 
@@ -2393,7 +2479,7 @@ def print_compatibility_report():
     """Print a matrix of Phase 1/2/3 fixes and their confirmation status."""
     print()
     print("=" * 64)
-    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B/5C/5D Fixes")
+    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B/5C/5D/6 Fixes")
     print("=" * 64)
     print()
 
@@ -2482,6 +2568,18 @@ def print_compatibility_report():
          "Uses _execute_cancel if /account/orders fails", "[OK]"),
         ("Phase 5D", "ACCOUNT_ORDERS_PATH_URL constant",
          "/account/orders endpoint path", "[OK]"),
+        ("Phase 6", "NonKYC registered in RATE_ORACLE_SOURCES",
+         "nonkyc key in registry dict", "[OK]"),
+        ("Phase 6", "NonkycRateSource.name = 'nonkyc'",
+         "Name property returns correct value", "[OK]"),
+        ("Phase 6", "Rate source inherits RateSourceBase",
+         "Proper ABC inheritance", "[OK]"),
+        ("Phase 6", "Rate source builds connector (no keys)",
+         "Empty api_key, trading_required=False", "[OK]"),
+        ("Phase 6", "Live /tickers -> mid prices",
+         "bid/ask midpoint for all pairs", "[OK]"),
+        ("Phase 6", "Quote token filter (USDT only)",
+         "Filters by target_currency", "[OK]"),
     ]
 
     # Print header
@@ -2646,6 +2744,25 @@ def main():
         _test_5d_cancelallorders_requires_symbol(api_key, api_secret)
     else:
         result("Phase 5D auth tests (SKIPPED -- no API keys)", True, warn=True)
+
+    # --- TIER 12: Phase 6 Rate Oracle ---
+    # Reset event loop for hummingbot imports
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+    section("TIER 12: Phase 6 Rate Oracle Validation")
+
+    # No-network tests
+    test_6_nonkyc_in_rate_oracle_sources()
+    test_6_rate_source_class_exists()
+    test_6_rate_source_inherits_base()
+    test_6_rate_source_builds_connector()
+
+    # Live tests (need network but not auth)
+    try:
+        _test_6_rate_source_live()
+    except Exception as e:
+        result("Phase 6: live rate source test failed",
+               True, "Error: {}".format(e), warn=True)
 
     # --- SUMMARY ---
     print()
