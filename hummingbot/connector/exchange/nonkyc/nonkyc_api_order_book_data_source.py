@@ -119,9 +119,10 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if "result" not in raw_message:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=raw_message.get("params", {}).get("symbol"))
-            trade_message = NonkycOrderBook.trade_message_from_exchange(
+            trade_messages = NonkycOrderBook.trade_messages_from_exchange(
                 raw_message, {"trading_pair": trading_pair})
-            message_queue.put_nowait(trade_message)
+            for trade_message in trade_messages:
+                message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if "result" not in raw_message:
@@ -217,11 +218,10 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
         """
         Unsubscribes from order book and trade channels for a single trading pair.
-        NonKYC API does not have an explicit unsubscribe method, so we just remove the pair
-        from the internal tracking list.
+        Sends explicit unsubscribe messages to the NonKYC WebSocket API.
 
         :param trading_pair: the trading pair to unsubscribe from
-        :return: True if successfully removed, False otherwise
+        :return: True if successfully unsubscribed, False otherwise
         """
         if self._ws_assistant is None:
             self.logger().warning(
@@ -230,9 +230,34 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return False
 
         try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(
+                trading_pair=trading_pair)
+
+            # Send unsubscribe for trades
+            unsub_trades_payload = {
+                "method": CONSTANTS.WS_METHOD_UNSUBSCRIBE_TRADES,
+                "params": {"symbol": symbol}
+            }
+            await self._ws_assistant.send(WSJSONRequest(payload=unsub_trades_payload))
+
+            # Send unsubscribe for orderbook
+            unsub_ob_payload = {
+                "method": CONSTANTS.WS_METHOD_UNSUBSCRIBE_ORDERBOOK,
+                "params": {"symbol": symbol}
+            }
+            await self._ws_assistant.send(WSJSONRequest(payload=unsub_ob_payload))
+
+            # Remove from internal tracking
             self.remove_trading_pair(trading_pair)
-            self.logger().info(f"Unsubscribed from {trading_pair} channels")
+            # Clean up sequence tracking
+            self._last_sequence.pop(trading_pair, None)
+
+            self.logger().info(f"Unsubscribed from {trading_pair} order book and trade channels")
             return True
+
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            self.logger().exception(f"Unexpected error unsubscribing from {trading_pair} channels")
+            self.logger().exception(
+                f"Unexpected error unsubscribing from {trading_pair} channels")
             return False

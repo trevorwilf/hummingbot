@@ -12,6 +12,7 @@ from hummingbot.connector.exchange.nonkyc import nonkyc_constants as CONSTANTS, 
 from hummingbot.connector.exchange.nonkyc.nonkyc_api_order_book_data_source import NonkycAPIOrderBookDataSource
 from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 
 
 class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
@@ -242,3 +243,72 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         # Should be skipped (duplicate)
         self.assertTrue(msg_queue.empty())
+
+    async def test_unsubscribe_sends_ws_messages(self):
+        """Phase 5B: Unsubscribe should send proper WS unsubscribe messages."""
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        sent_messages = []
+        async def capture_send(request):
+            sent_messages.append(request.payload)
+        mock_ws.send.side_effect = capture_send
+
+        # Add the trading pair first so remove works
+        self.data_source._trading_pairs = [self.trading_pair]
+
+        success = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
+
+        self.assertTrue(success)
+        self.assertEqual(2, len(sent_messages))
+        # Check both unsubscribe messages were sent
+        methods = [m["method"] for m in sent_messages]
+        self.assertIn(CONSTANTS.WS_METHOD_UNSUBSCRIBE_TRADES, methods)
+        self.assertIn(CONSTANTS.WS_METHOD_UNSUBSCRIBE_ORDERBOOK, methods)
+        # Check symbol was included
+        for msg in sent_messages:
+            self.assertEqual(self.ex_trading_pair, msg["params"]["symbol"])
+
+    async def test_parse_trade_message_processes_all_trades(self):
+        """Phase 5B: Multiple trades in data array should all be queued."""
+        msg_queue = asyncio.Queue()
+        raw_message = {
+            "jsonrpc": "2.0",
+            "method": "snapshotTrades",
+            "params": {
+                "symbol": self.ex_trading_pair,
+                "data": [
+                    {
+                        "id": "trade1",
+                        "price": "67799.74",
+                        "quantity": "0.020323",
+                        "side": "sell",
+                        "timestampms": 1772169881018,
+                    },
+                    {
+                        "id": "trade2",
+                        "price": "67800.00",
+                        "quantity": "0.010000",
+                        "side": "buy",
+                        "timestampms": 1772169880000,
+                    },
+                    {
+                        "id": "trade3",
+                        "price": "67801.50",
+                        "quantity": "0.005000",
+                        "side": "sell",
+                        "timestampms": 1772169879000,
+                    },
+                ],
+            },
+        }
+
+        await self.data_source._parse_trade_message(raw_message, msg_queue)
+
+        # All 3 trades should be in the queue, not just the first one
+        self.assertEqual(3, msg_queue.qsize())
+        trade_ids = []
+        while not msg_queue.empty():
+            msg = msg_queue.get_nowait()
+            trade_ids.append(msg.content["trade_id"])
+        self.assertEqual(["trade1", "trade2", "trade3"], trade_ids)

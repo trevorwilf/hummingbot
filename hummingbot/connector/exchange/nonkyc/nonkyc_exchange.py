@@ -352,7 +352,9 @@ class NonkycExchange(ExchangePyBase):
                     self._account_balances[asset_name] = total_balance
 
                 elif event_type == "activeOrders":
-                    active_orders = event_message.get("result", [])
+                    active_orders = event_message.get("result") or event_message.get("params") or []
+                    if not isinstance(active_orders, list):
+                        active_orders = []
                     for order_data in active_orders:
                         client_order_id = str(order_data.get("userProvidedId", ""))
                         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)

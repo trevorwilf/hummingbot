@@ -1,3 +1,4 @@
+import asyncio
 from typing import TYPE_CHECKING, List, Optional
 
 from hummingbot.connector.exchange.nonkyc import nonkyc_constants as CONSTANTS
@@ -65,22 +66,57 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _authenticate_ws_connection(self, ws: WSAssistant):
         """
         Sends the authentication message and validates the response.
+        Includes timeout and retry with exponential backoff.
         :param ws: the websocket assistant used to connect to the exchange
         """
-        auth_message: WSJSONRequest = WSJSONRequest(payload=self._auth.generate_ws_authentication_message())
-        await ws.send(auth_message)
+        max_retries = 3
+        base_timeout = 10.0
 
-        # Wait for auth response
-        async for ws_response in ws.iter_messages():
-            data = ws_response.data
-            if isinstance(data, dict):
-                if data.get("result") is True:
-                    self.logger().info("WebSocket authentication successful")
-                    return
-                elif "error" in data:
-                    error_msg = data.get("error", {}).get("message", "Unknown error")
-                    raise IOError(f"WebSocket authentication failed: {error_msg}")
-            break  # unexpected message format, continue anyway
+        for attempt in range(1, max_retries + 1):
+            try:
+                auth_message: WSJSONRequest = WSJSONRequest(
+                    payload=self._auth.generate_ws_authentication_message())
+                await ws.send(auth_message)
+
+                # Wait for auth response with timeout, skipping non-auth messages
+                deadline = asyncio.get_event_loop().time() + base_timeout * attempt
+                async for ws_response in ws.iter_messages():
+                    if asyncio.get_event_loop().time() > deadline:
+                        raise asyncio.TimeoutError(
+                            f"WS auth response not received within {base_timeout * attempt}s")
+
+                    data = ws_response.data
+                    if not isinstance(data, dict):
+                        continue  # skip non-dict messages
+
+                    if data.get("result") is True:
+                        self.logger().info("WebSocket authentication successful")
+                        return
+                    elif "error" in data:
+                        error_msg = data.get("error", {}).get("message", "Unknown error")
+                        raise IOError(f"WebSocket authentication failed: {error_msg}")
+
+                    # Not an auth response (e.g., ticker update) — keep waiting
+                    continue
+
+                # iter_messages exhausted without auth response
+                raise IOError("WebSocket closed before authentication completed")
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Auth explicitly failed (wrong credentials) — don't retry
+                if isinstance(e, IOError) and "authentication failed" in str(e).lower():
+                    raise
+                if attempt < max_retries:
+                    backoff = 2 ** (attempt - 1)
+                    self.logger().warning(
+                        f"WS auth attempt {attempt}/{max_retries} failed: {repr(e)}. "
+                        f"Retrying in {backoff}s...")
+                    await self._sleep(backoff)
+                else:
+                    raise IOError(
+                        f"WebSocket authentication failed after {max_retries} attempts: {repr(e)}")
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         websocket_assistant and await websocket_assistant.disconnect()

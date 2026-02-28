@@ -42,6 +42,8 @@ USER_TRADES_SINCE_A_TIMESTAMP_PATH_URL = "/gettradessince"  # Deprecated: use AC
 # Ws public methods
 WS_METHOD_SUBSCRIBE_ORDERBOOK = "subscribeOrderbook"
 WS_METHOD_SUBSCRIBE_TRADES = "subscribeTrades"
+WS_METHOD_UNSUBSCRIBE_ORDERBOOK = "unsubscribeOrderbook"
+WS_METHOD_UNSUBSCRIBE_TRADES = "unsubscribeTrades"
 
 # Ws private methods
 WS_METHOD_SUBSCRIBE_USER_ORDERS = "subscribeReports"

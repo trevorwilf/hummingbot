@@ -65,21 +65,25 @@ class NonkycOrderBook(OrderBook):
         }, timestamp=timestamp)
 
     @classmethod
-    def trade_message_from_exchange(cls, msg: Dict[str, any], metadata: Optional[Dict] = None):
+    def trade_message_from_exchange(cls, msg: Dict[str, any], metadata: Optional[Dict] = None,
+                                     trade_index: int = 0):
         """
-        Creates a trade message with the information from the trade event sent by the exchange
+        Creates a trade message from a single trade entry in the exchange data.
         :param msg: the trade event details sent by the exchange
         :param metadata: a dictionary with extra information to add to trade message
+        :param trade_index: index into the data array (default 0 for backward compatibility)
         :return: a trade message with the details of the trade as provided by the exchange
         """
         if metadata:
             msg.update(metadata)
 
-        tradedata = msg["params"]["data"][0]
+        data_list = msg["params"]["data"]
+        if trade_index >= len(data_list):
+            trade_index = 0  # fallback to first if index out of bounds
+        tradedata = data_list[trade_index]
         if "timestampms" in tradedata:
             ts = float(tradedata["timestampms"])
         else:
-            from hummingbot.connector.exchange.nonkyc.nonkyc_utils import convert_fromiso_to_unix_timestamp
             ts = convert_fromiso_to_unix_timestamp(tradedata["timestamp"])
         return OrderBookMessage(OrderBookMessageType.TRADE, {
             "trading_pair": msg["trading_pair"],
@@ -89,3 +93,20 @@ class NonkycOrderBook(OrderBook):
             "price": tradedata["price"],
             "amount": tradedata["quantity"]
         }, timestamp=ts * 1e-3)
+
+    @classmethod
+    def trade_messages_from_exchange(cls, msg: Dict[str, any], metadata: Optional[Dict] = None):
+        """
+        Creates trade messages for ALL trade entries in the exchange data.
+        Used for snapshotTrades (up to 50 entries) and batched updateTrades.
+        :param msg: the trade event details sent by the exchange
+        :param metadata: a dictionary with extra information to add to trade messages
+        :return: list of trade messages
+        """
+        if metadata:
+            msg.update(metadata)
+        data_list = msg.get("params", {}).get("data", [])
+        messages = []
+        for i in range(len(data_list)):
+            messages.append(cls.trade_message_from_exchange(msg, trade_index=i))
+        return messages

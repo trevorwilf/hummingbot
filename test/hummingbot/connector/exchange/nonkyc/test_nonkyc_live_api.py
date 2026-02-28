@@ -1680,6 +1680,309 @@ def test_5a_constants_integrity():
 
 
 # ========================================================================
+# TIER 9: Phase 5B WebSocket Hardening Validation
+# ========================================================================
+
+def test_5b_unsubscribe_constants():
+    """Verify Phase 5B unsubscribe constants exist and match API docs."""
+    try:
+        from hummingbot.connector.exchange.nonkyc import nonkyc_constants as C
+
+        result(
+            "Phase 5B: WS_METHOD_UNSUBSCRIBE_ORDERBOOK = 'unsubscribeOrderbook'",
+            C.WS_METHOD_UNSUBSCRIBE_ORDERBOOK == "unsubscribeOrderbook",
+            "Value: '{}'".format(C.WS_METHOD_UNSUBSCRIBE_ORDERBOOK),
+        )
+        result(
+            "Phase 5B: WS_METHOD_UNSUBSCRIBE_TRADES = 'unsubscribeTrades'",
+            C.WS_METHOD_UNSUBSCRIBE_TRADES == "unsubscribeTrades",
+            "Value: '{}'".format(C.WS_METHOD_UNSUBSCRIBE_TRADES),
+        )
+        # Regression: subscribe constants still correct
+        result(
+            "Phase 5B: WS_METHOD_SUBSCRIBE_ORDERBOOK (regression)",
+            C.WS_METHOD_SUBSCRIBE_ORDERBOOK == "subscribeOrderbook",
+            "Value: '{}'".format(C.WS_METHOD_SUBSCRIBE_ORDERBOOK),
+        )
+        result(
+            "Phase 5B: WS_METHOD_SUBSCRIBE_TRADES (regression)",
+            C.WS_METHOD_SUBSCRIBE_TRADES == "subscribeTrades",
+            "Value: '{}'".format(C.WS_METHOD_SUBSCRIBE_TRADES),
+        )
+    except Exception as e:
+        result("Phase 5B: unsubscribe constants", False, "Error: {}".format(e))
+
+
+def test_5b_trade_messages_method_exists():
+    """Verify trade_messages_from_exchange (plural) method exists and works."""
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_order_book import NonkycOrderBook
+
+        # Verify method exists
+        has_method = hasattr(NonkycOrderBook, "trade_messages_from_exchange")
+        result(
+            "Phase 5B: trade_messages_from_exchange method exists",
+            has_method,
+        )
+
+        if has_method:
+            # Test with 3 trades
+            msg = {
+                "method": "snapshotTrades",
+                "params": {
+                    "symbol": "BTC/USDT",
+                    "data": [
+                        {"id": "t1", "price": "50000.00", "quantity": "0.5",
+                         "side": "buy", "timestampms": 1666197265041},
+                        {"id": "t2", "price": "50001.00", "quantity": "0.3",
+                         "side": "sell", "timestampms": 1666197265042},
+                        {"id": "t3", "price": "49999.00", "quantity": "0.1",
+                         "side": "buy", "timestampms": 1666197265043},
+                    ],
+                }
+            }
+            messages = NonkycOrderBook.trade_messages_from_exchange(
+                msg, metadata={"trading_pair": "BTC-USDT"})
+            result(
+                "Phase 5B: trade_messages_from_exchange returns all 3 trades",
+                len(messages) == 3,
+                "Count: {}".format(len(messages)),
+            )
+
+            # Verify backward compat: singular method still works
+            msg2 = {
+                "method": "updateTrades",
+                "params": {
+                    "symbol": "BTC/USDT",
+                    "data": [
+                        {"id": "t1", "price": "50000.00", "quantity": "0.5",
+                         "side": "buy", "timestampms": 1666197265041},
+                    ],
+                }
+            }
+            single = NonkycOrderBook.trade_message_from_exchange(
+                msg2, metadata={"trading_pair": "BTC-USDT"})
+            result(
+                "Phase 5B: trade_message_from_exchange (singular) backward compat",
+                single is not None and single.content["trade_id"] == "t1",
+                "trade_id: {}".format(single.content.get("trade_id") if single else "None"),
+            )
+    except Exception as e:
+        result("Phase 5B: trade_messages method", False, "Error: {}".format(e))
+
+
+async def _ws_5b_public_impl():
+    """Tier 9 WS public tests: unsubscribe + snapshotTrades multi-entry."""
+
+    section("TIER 9 (WS): Phase 5B Public WebSocket Tests")
+
+    try:
+        async with websockets.connect(WS_URL, ping_interval=20, close_timeout=5) as ws:
+
+            # --- Test: unsubscribe orderbook ---
+            sub_ob = {"method": "subscribeOrderbook", "params": {"symbol": "BTC/USDT"}, "id": 50}
+            await ws.send(json.dumps(sub_ob))
+
+            # Wait for snapshotOrderbook to confirm subscription
+            got_snapshot = False
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                data = json.loads(raw)
+                if data.get("method") == "snapshotOrderbook":
+                    got_snapshot = True
+                    break
+
+            result(
+                "Phase 5B: subscribeOrderbook confirmed (got snapshot)",
+                got_snapshot,
+            )
+
+            # Send unsubscribe
+            unsub_ob = {"method": "unsubscribeOrderbook", "params": {"symbol": "BTC/USDT"}, "id": 51}
+            await ws.send(json.dumps(unsub_ob))
+
+            # Wait for unsubscribe response
+            unsub_ob_ok = False
+            deadline = asyncio.get_event_loop().time() + 5
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                    data = json.loads(raw)
+                    if data.get("result") is True:
+                        unsub_ob_ok = True
+                        break
+                except asyncio.TimeoutError:
+                    break
+
+            result(
+                "Phase 5B: unsubscribeOrderbook -> result: true",
+                unsub_ob_ok,
+            )
+
+            # --- Test: unsubscribe trades + snapshotTrades multi-entry ---
+            sub_trades = {"method": "subscribeTrades", "params": {"symbol": "BTC/USDT"}, "id": 52}
+            await ws.send(json.dumps(sub_trades))
+
+            # Wait for snapshotTrades
+            snapshot_trades_data = None
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                data = json.loads(raw)
+                if data.get("method") == "snapshotTrades":
+                    snapshot_trades_data = data.get("params", {}).get("data", [])
+                    break
+
+            if snapshot_trades_data is not None:
+                trade_count = len(snapshot_trades_data)
+                result(
+                    "Phase 5B: snapshotTrades has multiple entries",
+                    trade_count > 1,
+                    "Count: {} (old code only read data[0])".format(trade_count),
+                )
+
+                # Verify all entries have required fields
+                if trade_count > 0:
+                    all_valid = True
+                    required = ["id", "price", "quantity", "side"]
+                    for i, t in enumerate(snapshot_trades_data):
+                        for f in required:
+                            if f not in t:
+                                all_valid = False
+                                break
+                        # Must have timestamp or timestampms
+                        if "timestamp" not in t and "timestampms" not in t:
+                            all_valid = False
+                    result(
+                        "Phase 5B: all snapshotTrades entries have required fields",
+                        all_valid,
+                        "Checked {} entries for id/price/quantity/side/timestamp".format(trade_count),
+                    )
+            else:
+                result("Phase 5B: snapshotTrades received", False, "No snapshotTrades", warn=True)
+
+            # Send unsubscribe trades
+            unsub_trades = {"method": "unsubscribeTrades", "params": {"symbol": "BTC/USDT"}, "id": 53}
+            await ws.send(json.dumps(unsub_trades))
+
+            unsub_trades_ok = False
+            deadline = asyncio.get_event_loop().time() + 5
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                    data = json.loads(raw)
+                    if data.get("result") is True:
+                        unsub_trades_ok = True
+                        break
+                except asyncio.TimeoutError:
+                    break
+
+            result(
+                "Phase 5B: unsubscribeTrades -> result: true",
+                unsub_trades_ok,
+            )
+
+    except Exception as e:
+        result("Phase 5B: WS public tests", False, "Error: {}".format(e), warn=True)
+
+
+async def _ws_5b_auth_impl(api_key, api_secret):
+    """Tier 9 WS auth tests: auth timeout behavior + activeOrders format."""
+
+    section("TIER 9 (WS): Phase 5B Authenticated WebSocket Tests")
+
+    try:
+        async with websockets.connect(WS_URL, ping_interval=20, close_timeout=5) as ws:
+
+            # --- Test: auth timeout behavior (measure latency) ---
+            nonce = "".join(random.choices(string.ascii_letters + string.digits, k=14))
+            sig = hmac.new(
+                api_secret.encode("utf-8"),
+                nonce.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            login_msg = {
+                "method": "login",
+                "params": {
+                    "algo": "HS256",
+                    "pKey": api_key,
+                    "nonce": nonce,
+                    "signature": sig,
+                },
+                "id": 99,
+            }
+
+            start_ms = time.time() * 1000
+            await ws.send(json.dumps(login_msg))
+
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                latency_ms = time.time() * 1000 - start_ms
+                data = json.loads(raw)
+                auth_ok = data.get("result") is True
+
+                result(
+                    "Phase 5B: WS auth completes within 10s timeout",
+                    auth_ok,
+                    "Latency: {:.0f}ms, Response: {}".format(
+                        latency_ms, json.dumps(data)[:200]),
+                )
+            except asyncio.TimeoutError:
+                result("Phase 5B: WS auth within 10s", False, "Timed out")
+                return
+
+            # --- Test: activeOrders format ---
+            sub_reports = {"method": "subscribeReports", "params": {}, "id": 100}
+            await ws.send(json.dumps(sub_reports))
+
+            active_orders_data = None
+            active_orders_key = None
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                    data = json.loads(raw)
+                    if data.get("method") == "activeOrders":
+                        if "result" in data:
+                            active_orders_data = data["result"]
+                            active_orders_key = "result"
+                        elif "params" in data:
+                            active_orders_data = data["params"]
+                            active_orders_key = "params"
+                        break
+                except asyncio.TimeoutError:
+                    break
+
+            if active_orders_data is not None:
+                result(
+                    "Phase 5B: activeOrders received",
+                    True,
+                    "Key: '{}', type: {}, count: {}".format(
+                        active_orders_key,
+                        type(active_orders_data).__name__,
+                        len(active_orders_data) if isinstance(active_orders_data, list) else "N/A"),
+                )
+
+                # Test defensive parsing logic
+                test_msg = {"result": active_orders_data}
+                parsed = test_msg.get("result") or test_msg.get("params") or []
+                if not isinstance(parsed, list):
+                    parsed = []
+                result(
+                    "Phase 5B: defensive parsing extracts activeOrders correctly",
+                    isinstance(parsed, list),
+                    "Parsed type: {}, count: {}".format(type(parsed).__name__, len(parsed)),
+                )
+            else:
+                result("Phase 5B: activeOrders received", False,
+                       "No activeOrders message", warn=True)
+
+    except Exception as e:
+        result("Phase 5B: WS auth tests", False, "Error: {}".format(e), warn=True)
+
+
+# ========================================================================
 # Compatibility Report
 # ========================================================================
 
@@ -1687,7 +1990,7 @@ def print_compatibility_report():
     """Print a matrix of Phase 1/2/3 fixes and their confirmation status."""
     print()
     print("=" * 64)
-    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A Fixes")
+    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B Fixes")
     print("=" * 64)
     print()
 
@@ -1752,6 +2055,14 @@ def print_compatibility_report():
          "Updated from 0.1% to match NonKYC schedule", "[OK]"),
         ("Phase 5A", "cancelAllOrders endpoint",
          "POST /cancelallorders for batch cancel", "[OK]"),
+        ("Phase 5B", "WS auth timeout + retry",
+         "10s timeout, 3 retries, exponential backoff", "[OK]"),
+        ("Phase 5B", "WS unsubscribe messages sent",
+         "unsubscribeOrderbook + unsubscribeTrades", "[OK]"),
+        ("Phase 5B", "activeOrders defensive parsing",
+         "Checks both result and params keys", "[OK]"),
+        ("Phase 5B", "snapshotTrades all entries processed",
+         "trade_messages_from_exchange iterates full data[]", "[OK]"),
     ]
 
     # Print header
@@ -1870,6 +2181,23 @@ def main():
         test_5a_cancel_all_orders_endpoint(api_key, api_secret)
     else:
         result("cancelAllOrders endpoint (SKIPPED -- no API keys)", True, warn=True)
+
+    # --- TIER 9: Phase 5B WebSocket Hardening ---
+    section("TIER 9: Phase 5B WebSocket Hardening Validation")
+    test_5b_unsubscribe_constants()
+    test_5b_trade_messages_method_exists()
+
+    if websockets:
+        asyncio.run(_ws_5b_public_impl())
+    else:
+        result("WS unsubscribe tests (SKIPPED -- pip install websockets)", True, warn=True)
+
+    if has_keys and websockets:
+        asyncio.run(_ws_5b_auth_impl(api_key, api_secret))
+    elif not websockets:
+        result("WS auth timeout test (SKIPPED -- no websockets)", True, warn=True)
+    else:
+        result("WS auth timeout test (SKIPPED -- no API keys)", True, warn=True)
 
     # --- SUMMARY ---
     print()

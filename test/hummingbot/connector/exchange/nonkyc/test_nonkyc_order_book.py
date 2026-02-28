@@ -113,3 +113,38 @@ class NonkycOrderBookTests(TestCase):
 
         self.assertEqual("BTC-USDT", trade.trading_pair)
         self.assertEqual(1666197265041.0, trade.content["update_id"])
+
+    def test_trade_messages_from_exchange_multiple(self):
+        """Phase 5B: trade_messages_from_exchange returns all trades."""
+        msg = {
+            "method": "snapshotTrades",
+            "params": {
+                "symbol": "BTC/USDT",
+                "data": [
+                    {"id": "t1", "price": "50000.00", "quantity": "0.5", "side": "buy", "timestampms": 1666197265041},
+                    {"id": "t2", "price": "50001.00", "quantity": "0.3", "side": "sell", "timestampms": 1666197265042},
+                    {"id": "t3", "price": "49999.00", "quantity": "0.1", "side": "buy", "timestampms": 1666197265043},
+                ],
+            }
+        }
+        messages = NonkycOrderBook.trade_messages_from_exchange(
+            msg, metadata={"trading_pair": "BTC-USDT"})
+
+        self.assertEqual(3, len(messages))
+        self.assertEqual("t1", messages[0].content["trade_id"])
+        self.assertEqual("t2", messages[1].content["trade_id"])
+        self.assertEqual("t3", messages[2].content["trade_id"])
+
+    def test_trade_messages_from_exchange_empty_data(self):
+        """Phase 5B: Empty data array should return empty list."""
+        msg = {
+            "method": "snapshotTrades",
+            "params": {
+                "symbol": "BTC/USDT",
+                "data": [],
+            }
+        }
+        messages = NonkycOrderBook.trade_messages_from_exchange(
+            msg, metadata={"trading_pair": "BTC-USDT"})
+
+        self.assertEqual(0, len(messages))
