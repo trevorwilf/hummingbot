@@ -1,5 +1,5 @@
 import asyncio
-from decimal import Decimal
+from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
@@ -47,6 +47,7 @@ class NonkycExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_trades_poll_Nonkyc_timestamp = 1.0
+        self._trading_fees: Dict[str, Decimal] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -172,7 +173,13 @@ class NonkycExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
-        is_maker = order_type is OrderType.LIMIT_MAKER
+        is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
+        if self._trading_fees:
+            fee_key = "maker_fee" if is_maker else "taker_fee"
+            fee_pct = self._trading_fees.get(fee_key)
+            if fee_pct is not None:
+                return DeductedFromReturnsTradeFee(percent=fee_pct)
+        # Fall back to static defaults from DEFAULT_FEES / fee overrides
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _place_order(self,
@@ -281,9 +288,82 @@ class NonkycExchange(ExchangePyBase):
 
     async def _update_trading_fees(self):
         """
-        Update fees information from the exchange
+        Computes actual maker/taker fee rates from the user's recent trade history.
+
+        NonKYC does not have a dedicated fee-tier API endpoint. Instead, we calculate
+        fee percentages from actual trades using:
+            fee_rate = fee / (quantity * price)
+
+        Maker vs taker is determined by comparing the 'side' and 'triggeredBy' fields:
+            - side != triggeredBy -> maker (your resting order was matched)
+            - side == triggeredBy -> taker (you matched a resting order)
         """
-        pass
+        try:
+            all_trades = await self._api_get(
+                path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
+                is_auth_required=True)
+
+            if not all_trades:
+                self.logger().debug("No trade history found for dynamic fee calculation. Using defaults.")
+                return
+
+            maker_rates = []
+            taker_rates = []
+
+            for trade in all_trades:
+                try:
+                    fee = Decimal(str(trade.get("fee", "0")))
+                    quantity = Decimal(str(trade.get("quantity", "0")))
+                    price = Decimal(str(trade.get("price", "0")))
+                    notional = quantity * price
+
+                    if notional <= 0 or fee <= 0:
+                        continue  # Skip zero-value or zero-fee trades
+
+                    fee_rate = fee / notional
+                    side = str(trade.get("side", "")).lower()
+                    triggered_by = str(trade.get("triggeredBy", "")).lower()
+
+                    if not side or not triggered_by:
+                        continue  # Skip trades with missing classification data
+
+                    if side != triggered_by:
+                        maker_rates.append(fee_rate)
+                    else:
+                        taker_rates.append(fee_rate)
+
+                except (InvalidOperation, DivisionByZero, TypeError, KeyError):
+                    continue  # Skip malformed trade entries
+
+            if maker_rates:
+                avg_maker = sum(maker_rates) / len(maker_rates)
+                self._trading_fees["maker_fee"] = avg_maker
+            if taker_rates:
+                avg_taker = sum(taker_rates) / len(taker_rates)
+                self._trading_fees["taker_fee"] = avg_taker
+
+            # Log if computed rates differ from defaults
+            if self._trading_fees:
+                default_schema = self.trade_fee_schema()
+                computed_maker = self._trading_fees.get("maker_fee")
+                computed_taker = self._trading_fees.get("taker_fee")
+                default_maker = default_schema.maker_percent_fee_decimal
+                default_taker = default_schema.taker_percent_fee_decimal
+
+                parts = []
+                if computed_maker is not None:
+                    parts.append(f"maker={computed_maker:.6f} (default={default_maker:.6f}, {len(maker_rates)} trades)")
+                if computed_taker is not None:
+                    parts.append(f"taker={computed_taker:.6f} (default={default_taker:.6f}, {len(taker_rates)} trades)")
+                self.logger().info(f"Dynamic fee rates computed from trade history: {', '.join(parts)}")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().network(
+                "Error computing dynamic fee rates from trade history.",
+                exc_info=True,
+                app_warning_msg=f"Could not compute trading fees for {self.name}. Using defaults.")
 
     async def _user_stream_event_listener(self):
         """

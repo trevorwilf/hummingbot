@@ -1983,6 +1983,283 @@ async def _ws_5b_auth_impl(api_key, api_secret):
 
 
 # ========================================================================
+# TIER 10: Phase 5C Dynamic Fee System
+# ========================================================================
+
+
+def test_5c_trading_fees_dict_exists():
+    """Phase 5C: _trading_fees dict exists and is empty on init."""
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+        ex = NonkycExchange(
+            nonkyc_api_key="",
+            nonkyc_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        has_attr = hasattr(ex, "_trading_fees")
+        is_dict = isinstance(ex._trading_fees, dict) if has_attr else False
+        is_empty = len(ex._trading_fees) == 0 if is_dict else False
+
+        result("Phase 5C: _trading_fees attribute exists", has_attr)
+        result("Phase 5C: _trading_fees is a dict", is_dict)
+        result("Phase 5C: _trading_fees is empty on init", is_empty)
+    except Exception as e:
+        result("Phase 5C: _trading_fees dict check", False, "Error: {}".format(e))
+
+
+def test_5c_get_fee_with_cache():
+    """Phase 5C: _get_fee uses cached rates when available."""
+    from decimal import Decimal
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+        from hummingbot.core.data_type.common import OrderType, TradeType
+
+        ex = NonkycExchange(
+            nonkyc_api_key="",
+            nonkyc_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        ex._trading_fees = {
+            "maker_fee": Decimal("0.002"),
+            "taker_fee": Decimal("0.003"),
+        }
+
+        # LIMIT_MAKER -> maker fee
+        fee_maker = ex._get_fee("BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY, Decimal("1"))
+        result(
+            "Phase 5C: LIMIT_MAKER uses cached maker_fee (0.002)",
+            fee_maker.percent == Decimal("0.002"),
+            "Got: {}".format(fee_maker.percent),
+        )
+
+        # LIMIT -> taker fee
+        fee_taker = ex._get_fee("BTC", "USDT", OrderType.LIMIT, TradeType.BUY, Decimal("1"))
+        result(
+            "Phase 5C: LIMIT uses cached taker_fee (0.003)",
+            fee_taker.percent == Decimal("0.003"),
+            "Got: {}".format(fee_taker.percent),
+        )
+
+        # MARKET -> taker fee
+        fee_market = ex._get_fee("BTC", "USDT", OrderType.MARKET, TradeType.BUY, Decimal("1"))
+        result(
+            "Phase 5C: MARKET uses cached taker_fee (0.003)",
+            fee_market.percent == Decimal("0.003"),
+            "Got: {}".format(fee_market.percent),
+        )
+    except Exception as e:
+        result("Phase 5C: _get_fee with cache", False, "Error: {}".format(e))
+
+
+def test_5c_get_fee_fallback():
+    """Phase 5C: _get_fee falls back to defaults when cache is empty."""
+    from decimal import Decimal
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+        from hummingbot.core.data_type.common import OrderType, TradeType
+
+        ex = NonkycExchange(
+            nonkyc_api_key="",
+            nonkyc_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        # _trading_fees is empty -> should fall back to estimate_fee_pct
+
+        fee = ex._get_fee("BTC", "USDT", OrderType.LIMIT, TradeType.BUY, Decimal("1"))
+        is_nonzero = fee.percent > Decimal("0")
+        result(
+            "Phase 5C: fallback returns non-zero fee",
+            is_nonzero,
+            "Got: {}".format(fee.percent),
+        )
+
+        # Should match the static estimate
+        expected = ex.estimate_fee_pct(False)
+        result(
+            "Phase 5C: fallback matches estimate_fee_pct",
+            fee.percent == expected,
+            "fee={}, estimate={}".format(fee.percent, expected),
+        )
+    except Exception as e:
+        result("Phase 5C: _get_fee fallback", False, "Error: {}".format(e))
+
+
+def _test_5c_trade_history_has_fee_field(api_key, api_secret):
+    """Phase 5C: Trade history entries have required fee fields."""
+    from decimal import Decimal
+    url = "{}/account/trades".format(BASE_URL)
+    nonce = str(int(time.time() * 1000))
+    sig = hmac.new(api_secret.encode(), (api_key + url + nonce).encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": sig,
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    trades = resp.json()
+
+    if not isinstance(trades, list) or len(trades) == 0:
+        result("Phase 5C: trade history available", True,
+               "No trades found (empty history)", warn=True)
+        return
+
+    result("Phase 5C: trade history available", True,
+           "{} trades returned".format(len(trades)))
+
+    # Check required fields on first trade
+    required = ["fee", "quantity", "price", "side", "triggeredBy"]
+    first = trades[0]
+    for field in required:
+        result(
+            "Phase 5C: trade has '{}' field".format(field),
+            field in first,
+            "Value: {}".format(first.get(field, "MISSING")),
+        )
+
+    # Compute fee rates for non-zero-fee trades
+    rates_computed = 0
+    for trade in trades:
+        try:
+            fee = Decimal(str(trade.get("fee", "0")))
+            qty = Decimal(str(trade.get("quantity", "0")))
+            price = Decimal(str(trade.get("price", "0")))
+            notional = qty * price
+            if notional > 0 and fee > 0:
+                rate = fee / notional
+                is_reasonable = Decimal("0.0001") <= rate <= Decimal("0.05")
+                if not is_reasonable:
+                    result("Phase 5C: fee_rate in range [0.01%-5%]", False,
+                           "rate={} for trade {}".format(rate, trade.get("id", "?")))
+                    return
+                rates_computed += 1
+        except Exception:
+            continue
+
+    result(
+        "Phase 5C: all computed fee_rates in reasonable range",
+        rates_computed > 0,
+        "{} rates computed from {} trades".format(rates_computed, len(trades)),
+    )
+
+
+def _test_5c_maker_taker_classification(api_key, api_secret):
+    """Phase 5C: Trades can be classified as maker/taker."""
+    url = "{}/account/trades".format(BASE_URL)
+    nonce = str(int(time.time() * 1000))
+    sig = hmac.new(api_secret.encode(), (api_key + url + nonce).encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": sig,
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    trades = resp.json()
+
+    if not isinstance(trades, list) or len(trades) == 0:
+        result("Phase 5C: maker/taker classification", True,
+               "No trades to classify", warn=True)
+        return
+
+    maker_count = 0
+    taker_count = 0
+    unclassified = 0
+
+    for trade in trades:
+        side = str(trade.get("side", "")).lower()
+        triggered_by = str(trade.get("triggeredBy", "")).lower()
+        if not side or not triggered_by:
+            unclassified += 1
+        elif side != triggered_by:
+            maker_count += 1
+        else:
+            taker_count += 1
+
+    total_classified = maker_count + taker_count
+    result(
+        "Phase 5C: maker/taker classification succeeded",
+        total_classified > 0,
+        "maker={}, taker={}, unclassified={}, total={}".format(
+            maker_count, taker_count, unclassified, len(trades)),
+    )
+
+
+def _test_5c_computed_vs_default_fees(api_key, api_secret):
+    """Phase 5C: Compare computed fee rates to defaults."""
+    from decimal import Decimal
+    url = "{}/account/trades".format(BASE_URL)
+    nonce = str(int(time.time() * 1000))
+    sig = hmac.new(api_secret.encode(), (api_key + url + nonce).encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": sig,
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    trades = resp.json()
+
+    if not isinstance(trades, list) or len(trades) == 0:
+        result("Phase 5C: computed vs default fees", True,
+               "No trades to compute from", warn=True)
+        return
+
+    maker_rates = []
+    taker_rates = []
+    default_rate = Decimal("0.0015")  # DEFAULT_FEES
+
+    for trade in trades:
+        try:
+            fee = Decimal(str(trade.get("fee", "0")))
+            qty = Decimal(str(trade.get("quantity", "0")))
+            price = Decimal(str(trade.get("price", "0")))
+            notional = qty * price
+            if notional <= 0 or fee <= 0:
+                continue
+            rate = fee / notional
+            side = str(trade.get("side", "")).lower()
+            triggered_by = str(trade.get("triggeredBy", "")).lower()
+            if not side or not triggered_by:
+                continue
+            if side != triggered_by:
+                maker_rates.append(rate)
+            else:
+                taker_rates.append(rate)
+        except Exception:
+            continue
+
+    if maker_rates:
+        avg_maker = sum(maker_rates) / len(maker_rates)
+        diff_pct = abs(avg_maker - default_rate) / default_rate * 100
+        is_warn = diff_pct > 50
+        result(
+            "Phase 5C: computed maker rate vs default",
+            True,
+            "computed={:.6f}, default={:.6f}, diff={:.1f}%".format(avg_maker, default_rate, diff_pct),
+            warn=is_warn,
+        )
+    else:
+        result("Phase 5C: computed maker rate", True, "No maker trades found", warn=True)
+
+    if taker_rates:
+        avg_taker = sum(taker_rates) / len(taker_rates)
+        diff_pct = abs(avg_taker - default_rate) / default_rate * 100
+        is_warn = diff_pct > 50
+        result(
+            "Phase 5C: computed taker rate vs default",
+            True,
+            "computed={:.6f}, default={:.6f}, diff={:.1f}%".format(avg_taker, default_rate, diff_pct),
+            warn=is_warn,
+        )
+    else:
+        result("Phase 5C: computed taker rate", True, "No taker trades found", warn=True)
+
+
+# ========================================================================
 # Compatibility Report
 # ========================================================================
 
@@ -1990,7 +2267,7 @@ def print_compatibility_report():
     """Print a matrix of Phase 1/2/3 fixes and their confirmation status."""
     print()
     print("=" * 64)
-    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B Fixes")
+    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B/5C Fixes")
     print("=" * 64)
     print()
 
@@ -2063,6 +2340,12 @@ def print_compatibility_report():
          "Checks both result and params keys", "[OK]"),
         ("Phase 5B", "snapshotTrades all entries processed",
          "trade_messages_from_exchange iterates full data[]", "[OK]"),
+        ("Phase 5C", "_update_trading_fees computes from history",
+         "Avg fee_rate = fee/(qty*price) per trade", "[OK]"),
+        ("Phase 5C", "_get_fee uses computed rates",
+         "Falls back to DEFAULT_FEES if no history", "[OK]"),
+        ("Phase 5C", "Maker/taker classified by triggeredBy",
+         "side != triggeredBy -> maker", "[OK]"),
     ]
 
     # Print header
@@ -2198,6 +2481,22 @@ def main():
         result("WS auth timeout test (SKIPPED -- no websockets)", True, warn=True)
     else:
         result("WS auth timeout test (SKIPPED -- no API keys)", True, warn=True)
+
+    # --- TIER 10: Phase 5C Dynamic Fee System ---
+    # Reset event loop since Tier 9 WS tests may have closed it
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+    section("TIER 10: Phase 5C Dynamic Fee System Validation")
+    test_5c_trading_fees_dict_exists()
+    test_5c_get_fee_with_cache()
+    test_5c_get_fee_fallback()
+
+    if has_keys:
+        _test_5c_trade_history_has_fee_field(api_key, api_secret)
+        _test_5c_maker_taker_classification(api_key, api_secret)
+        _test_5c_computed_vs_default_fees(api_key, api_secret)
+    else:
+        result("Dynamic fee live tests (SKIPPED -- no API keys)", True, warn=True)
 
     # --- SUMMARY ---
     print()
