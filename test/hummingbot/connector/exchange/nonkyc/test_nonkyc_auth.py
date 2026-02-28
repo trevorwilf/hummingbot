@@ -40,7 +40,8 @@ class NonkycAuthTests(TestCase):
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
         expected_nonce = int(now * 1e3)  # 1234567890000
-        full_url = f"{url}?{urlencode(params)}"
+        sorted_params = sorted(params.items())
+        full_url = f"{url}?{urlencode(sorted_params)}"
         expected_message = f"{self._api_key}{full_url}{expected_nonce}"
         expected_signature = self._generate_signature(expected_message)
 

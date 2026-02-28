@@ -29,13 +29,15 @@ class NonkycAuth(AuthBase):
             headers.update(request.headers)
 
         if request.method == RESTMethod.GET:
-            url = f"{request.url}?{urlencode(request.params)}" if request.params else request.url
+            sorted_params = sorted(request.params.items()) if request.params else []
+            url = f"{request.url}?{urlencode(sorted_params)}" if sorted_params else request.url
             headers.update(self.header_for_authentication(data=(url)))
 
         elif request.method == RESTMethod.POST:
             json_str = (json.dumps(json.loads(request.data))).replace(" ", "")
             to_sign = f"{request.url}{json_str}"
             headers.update(self.header_for_authentication(to_sign))
+            request.data = json_str  # Body must match what was signed (per NonKYC API spec)
 
         request.headers = headers
         return request

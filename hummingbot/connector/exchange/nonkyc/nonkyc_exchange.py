@@ -59,8 +59,8 @@ class NonkycExchange(ExchangePyBase):
         return order_type.name.lower()
 
     @staticmethod
-    def to_hb_order_type(Nonkyc_type: str) -> OrderType:
-        return OrderType[Nonkyc_type]
+    def to_hb_order_type(nonkyc_type: str) -> OrderType:
+        return OrderType[nonkyc_type.upper()]
 
     @property
     def authenticator(self):
@@ -184,6 +184,16 @@ class NonkycExchange(ExchangePyBase):
         # Fall back to static defaults from DEFAULT_FEES / fee overrides
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
+    @staticmethod
+    def _extract_fee_token_and_amount(trade_data: Dict[str, Any], quote_asset: str) -> Tuple[str, Decimal]:
+        """Extract fee token and amount, respecting alternateFeeAsset if present."""
+        alt_asset = trade_data.get("alternateFeeAsset")
+        if alt_asset:
+            return alt_asset, Decimal(str(trade_data.get("alternateFee", "0")))
+        # WS reports use 'tradeFee', REST uses 'fee'
+        fee_amount = trade_data.get("fee") or trade_data.get("tradeFee", "0")
+        return quote_asset, Decimal(str(fee_amount))
+
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -226,8 +236,16 @@ class NonkycExchange(ExchangePyBase):
         return o_id, transact_time
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+        cancel_id = tracked_order.exchange_order_id
+        if not cancel_id or cancel_id == "UNKNOWN":
+            # Fallback: NonKYC API accepts cancel by userProvidedId
+            cancel_id = tracked_order.client_order_id
+            self.logger().info(
+                f"cancel: exchange_order_id unavailable for {order_id}, "
+                f"falling back to client_order_id: {cancel_id}"
+            )
         api_params = {
-            "id": tracked_order.exchange_order_id,
+            "id": cancel_id,
         }
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
@@ -313,15 +331,18 @@ class NonkycExchange(ExchangePyBase):
                     except Exception:
                         pass  # Symbol mapping not available, skip
 
+                # Convert to stable list for deterministic zip alignment
+                symbols_list = sorted(symbols_with_orders)
+
                 # Step 4: Batch cancel per symbol
                 cancel_tasks = []
-                for symbol in symbols_with_orders:
+                for symbol in symbols_list:
                     cancel_tasks.append(self._cancel_all_for_symbol(symbol))
 
                 cancel_results = await safe_gather(*cancel_tasks, return_exceptions=True)
 
                 # Log results per symbol
-                for symbol, cr in zip(symbols_with_orders, cancel_results):
+                for symbol, cr in zip(symbols_list, cancel_results):
                     if isinstance(cr, Exception):
                         self.logger().warning(f"Failed to cancel orders for {symbol}: {cr}")
                     else:
@@ -331,7 +352,7 @@ class NonkycExchange(ExchangePyBase):
                 # After batch cancel, mark all tracked orders as successfully cancelled
                 # (if the batch call succeeded for their symbol)
                 cancelled_symbols = set()
-                for symbol, cr in zip(symbols_with_orders, cancel_results):
+                for symbol, cr in zip(symbols_list, cancel_results):
                     if not isinstance(cr, Exception):
                         cancelled_symbols.add(symbol)
 
@@ -430,7 +451,7 @@ class NonkycExchange(ExchangePyBase):
             is_auth_required=True,
             limit_id=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL)
 
-        return result if isinstance(result, list) else []
+        return result if isinstance(result, list) else [result] if isinstance(result, dict) else []
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         trading_pair_rules = exchange_info_dict
@@ -448,9 +469,11 @@ class NonkycExchange(ExchangePyBase):
                     TradingRule(
                         trading_pair,
                         min_order_size=Decimal(str(rule.get("minimumQuantity", min_base_amount_increment))),
+                        max_order_size=Decimal(str(rule.get("maximumQuantity"))) if rule.get("maximumQuantity") else Decimal("Inf"),
                         min_price_increment=min_price_increment,
                         min_base_amount_increment=min_base_amount_increment,
                         min_notional_size=Decimal(str(rule.get("minQuote", 0))) if rule.get("isMinQuoteActive") else Decimal("0"),
+                        supports_market_orders=bool(rule.get("allowMarketOrders", True)),
                     ))
 
             except Exception as e:
@@ -559,11 +582,12 @@ class NonkycExchange(ExchangePyBase):
                         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
                         quote_asset = (message_params.get('symbol').split('/'))[1]
                         if tracked_order is not None:
+                            fee_token, fee_amount = self._extract_fee_token_and_amount(message_params, quote_asset)
                             fee = TradeFeeBase.new_spot_fee(
                                 fee_schema=self.trade_fee_schema(),
                                 trade_type=tracked_order.trade_type,
-                                percent_token=quote_asset,
-                                flat_fees=[TokenAmount(amount=Decimal(message_params.get('tradeFee')), token=quote_asset)]
+                                percent_token=fee_token,
+                                flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
                             )
                             trade_update = TradeUpdate(
                                 trade_id=str(message_params["tradeId"]),
@@ -686,11 +710,12 @@ class NonkycExchange(ExchangePyBase):
                     if exchange_order_id in order_by_exchange_id_map:
                         # This is a fill for a tracked order
                         tracked_order = order_by_exchange_id_map[exchange_order_id]
+                        fee_token, fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=tracked_order.trade_type,
-                            percent_token=quote_asset,
-                            flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=quote_asset)]
+                            percent_token=fee_token,
+                            flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
                         )
                         trade_update = TradeUpdate(
                             trade_id=str(trade["id"]),
@@ -710,6 +735,7 @@ class NonkycExchange(ExchangePyBase):
                             market=self.display_name,
                             exchange_trade_id=str(trade["id"]),
                             symbol=trading_pair))
+                        _fee_token, _fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
                         self.trigger_event(
                             MarketEvent.OrderFilled,
                             OrderFilledEvent(
@@ -721,12 +747,7 @@ class NonkycExchange(ExchangePyBase):
                                 price=Decimal(trade["price"]),
                                 amount=Decimal(trade["quantity"]),
                                 trade_fee=DeductedFromReturnsTradeFee(
-                                    flat_fees=[
-                                        TokenAmount(
-                                            quote_asset,
-                                            Decimal(trade["fee"])
-                                        )
-                                    ]
+                                    flat_fees=[TokenAmount(_fee_token, _fee_amount)]
                                 ),
                                 exchange_trade_id=str(trade["id"])
                             ))
@@ -748,11 +769,12 @@ class NonkycExchange(ExchangePyBase):
             filtered_trades = [trade for trade in all_fills_response if trade["orderid"] == exchange_order_id]
 
             for trade in filtered_trades:
+                fee_token, fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
                 fee = TradeFeeBase.new_spot_fee(
                     fee_schema=self.trade_fee_schema(),
                     trade_type=order.trade_type,
-                    percent_token=quote_asset,
-                    flat_fees=[TokenAmount(amount=Decimal(trade["fee"]), token=quote_asset)]
+                    percent_token=fee_token,
+                    flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
                 )
                 trade_update = TradeUpdate(
                     trade_id=str(trade["id"]),

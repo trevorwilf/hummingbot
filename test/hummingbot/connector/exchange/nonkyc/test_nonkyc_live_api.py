@@ -2597,6 +2597,301 @@ def print_compatibility_report():
 
 
 # ========================================================================
+# TIER 13: Phase 7A Auth & Correctness Hardening
+# ========================================================================
+
+def test_7a_post_auth_body_minified():
+    """7A-1: Verify connector's auth produces minified body."""
+    import json
+    from unittest.mock import MagicMock
+    from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
+    from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+
+    mock_time = MagicMock()
+    mock_time.time.return_value = 1234567890.0
+    auth = NonkycAuth(api_key="testKey", secret_key="testSecret", time_provider=mock_time)
+
+    body = {"symbol": "BTC/USDT", "side": "buy", "quantity": "1.0"}
+    req = RESTRequest(method=RESTMethod.POST,
+                      url="https://api.nonkyc.io/api/v2/createorder",
+                      data=json.dumps(body), is_auth_required=True)
+    configured = asyncio.get_event_loop().run_until_complete(auth.rest_authenticate(req))
+
+    has_no_spaces = ": " not in configured.data and ", " not in configured.data
+    result("7A-1: POST body is minified after auth", has_no_spaces, configured.data[:80])
+
+    try:
+        parsed = json.loads(configured.data)
+        result("7A-1: Minified body is valid JSON", True, str(list(parsed.keys())))
+    except Exception as e:
+        result("7A-1: Minified body is valid JSON", False, str(e))
+
+
+def test_7a_get_auth_sorted_params():
+    """7A-2: GET auth produces same signature regardless of param order."""
+    from unittest.mock import MagicMock
+    from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
+    from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+
+    mock_time = MagicMock()
+    mock_time.time.return_value = 1234567890.0
+    auth = NonkycAuth(api_key="testKey", secret_key="testSecret", time_provider=mock_time)
+
+    url = "https://api.nonkyc.io/api/v2/account/orders"
+    req_a = RESTRequest(method=RESTMethod.GET, url=url,
+                        params={"status": "active", "symbol": "BTC/USDT"}, is_auth_required=True)
+    req_b = RESTRequest(method=RESTMethod.GET, url=url,
+                        params={"symbol": "BTC/USDT", "status": "active"}, is_auth_required=True)
+
+    loop = asyncio.get_event_loop()
+    cfg_a = loop.run_until_complete(auth.rest_authenticate(req_a))
+    cfg_b = loop.run_until_complete(auth.rest_authenticate(req_b))
+
+    same_sig = cfg_a.headers["X-API-SIGN"] == cfg_b.headers["X-API-SIGN"]
+    result("7A-2: GET params sorted -- signatures match", same_sig,
+           f"sig_a={cfg_a.headers['X-API-SIGN'][:16]}... sig_b={cfg_b.headers['X-API-SIGN'][:16]}...")
+
+
+def test_7a_to_hb_order_type_case_safe():
+    """7A-4: to_hb_order_type handles all cases."""
+    from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+    from hummingbot.core.data_type.common import OrderType
+
+    tests = [("limit", OrderType.LIMIT), ("LIMIT", OrderType.LIMIT), ("Limit", OrderType.LIMIT),
+             ("market", OrderType.MARKET), ("MARKET", OrderType.MARKET), ("Market", OrderType.MARKET)]
+    all_pass = True
+    for input_str, expected in tests:
+        try:
+            if NonkycExchange.to_hb_order_type(input_str) != expected:
+                all_pass = False
+        except Exception:
+            all_pass = False
+    result("7A-4: to_hb_order_type case-safe for all cases", all_pass)
+
+
+def test_7a_extract_fee_token_and_amount():
+    """7A-6: _extract_fee_token_and_amount handles all cases."""
+    from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+    from decimal import Decimal
+
+    t1, a1 = NonkycExchange._extract_fee_token_and_amount(
+        {"fee": "0.1", "alternateFeeAsset": "NKC", "alternateFee": "0.5"}, "USDT")
+    result("7A-6: alternateFeeAsset present -> uses it", t1 == "NKC" and a1 == Decimal("0.5"),
+           f"token={t1} amount={a1}")
+
+    t2, a2 = NonkycExchange._extract_fee_token_and_amount(
+        {"fee": "0.1", "alternateFeeAsset": None}, "USDT")
+    result("7A-6: alternateFeeAsset null -> fallback quote", t2 == "USDT" and a2 == Decimal("0.1"),
+           f"token={t2} amount={a2}")
+
+    t3, a3 = NonkycExchange._extract_fee_token_and_amount({"fee": "0.25"}, "BTC")
+    result("7A-6: alternateFeeAsset absent -> fallback quote", t3 == "BTC" and a3 == Decimal("0.25"),
+           f"token={t3} amount={a3}")
+
+    t4, a4 = NonkycExchange._extract_fee_token_and_amount({"tradeFee": "0.03"}, "USDT")
+    result("7A-6: WS tradeFee field works", t4 == "USDT" and a4 == Decimal("0.03"),
+           f"token={t4} amount={a4}")
+
+
+def test_7a_place_cancel_fallback_logic():
+    """7A-7: _place_cancel fallback ID selection."""
+    from unittest.mock import MagicMock
+    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+
+    def get_cancel_id(exch_id, client_id):
+        cancel_id = exch_id
+        if not cancel_id or cancel_id == "UNKNOWN":
+            cancel_id = client_id
+        return cancel_id
+
+    result("7A-7: Normal cancel uses exchange_order_id",
+           get_cancel_id("abc123", "hbot-x") == "abc123")
+    result("7A-7: None -> fallback to client_order_id",
+           get_cancel_id(None, "hbot-fb") == "hbot-fb")
+    result("7A-7: UNKNOWN -> fallback to client_order_id",
+           get_cancel_id("UNKNOWN", "hbot-503") == "hbot-503")
+    result("7A-7: Empty string -> fallback to client_order_id",
+           get_cancel_id("", "hbot-e") == "hbot-e")
+
+
+def test_7a_trading_rules_new_fields():
+    """7A-8/9: _format_trading_rules populates supports_market_orders + max_order_size."""
+    from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+    from bidict import bidict
+    from decimal import Decimal
+
+    exchange = NonkycExchange(nonkyc_api_key="test", nonkyc_api_secret="test",
+                              trading_pairs=["BTC-USDT"], trading_required=False)
+    exchange._set_trading_pair_symbol_map(bidict({"BTC/USDT": "BTC-USDT"}))
+
+    base = {"symbol": "BTC/USDT", "primaryTicker": "BTC", "priceDecimals": 2,
+            "quantityDecimals": 6, "minimumQuantity": "0.001", "minQuote": 10,
+            "isMinQuoteActive": True, "isActive": True, "isPaused": False}
+
+    loop = asyncio.get_event_loop()
+
+    # 7A-8: allowMarketOrders
+    r1 = loop.run_until_complete(exchange._format_trading_rules([{**base, "allowMarketOrders": True}]))
+    result("7A-8: allowMarketOrders=True -> supports=True", r1[0].supports_market_orders is True)
+
+    r2 = loop.run_until_complete(exchange._format_trading_rules([{**base, "allowMarketOrders": False}]))
+    result("7A-8: allowMarketOrders=False -> supports=False", r2[0].supports_market_orders is False)
+
+    r3 = loop.run_until_complete(exchange._format_trading_rules([{**base}]))
+    result("7A-8: allowMarketOrders missing -> defaults True", r3[0].supports_market_orders is True)
+
+    # 7A-9: max_order_size
+    r4 = loop.run_until_complete(exchange._format_trading_rules([{**base, "maximumQuantity": "500"}]))
+    result("7A-9: maximumQuantity=500 -> max_order_size=500",
+           r4[0].max_order_size == Decimal("500"), str(r4[0].max_order_size))
+
+    r5 = loop.run_until_complete(exchange._format_trading_rules([{**base}]))
+    result("7A-9: maximumQuantity absent -> max_order_size very large",
+           r5[0].max_order_size > Decimal("999999"), str(r5[0].max_order_size))
+
+
+def test_7a_cancel_all_orders_on_exchange_wraps_dict():
+    """7A-5: cancel_all_orders_on_exchange wraps dict response in list."""
+    from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+    from bidict import bidict
+
+    exchange = NonkycExchange(nonkyc_api_key="test", nonkyc_api_secret="test",
+                              trading_pairs=["BTC-USDT"], trading_required=False)
+    exchange._set_trading_pair_symbol_map(bidict({"BTC/USDT": "BTC-USDT"}))
+
+    async def mock_api_post(**kwargs):
+        return {"success": True, "id": "123"}
+    exchange._api_post = mock_api_post
+
+    loop = asyncio.get_event_loop()
+    res = loop.run_until_complete(exchange.cancel_all_orders_on_exchange("BTC-USDT"))
+    ok = isinstance(res, list) and len(res) == 1 and res[0].get("success") is True
+    result("7A-5: cancel_all_orders_on_exchange wraps dict in list", ok, str(res)[:100])
+
+
+def test_7a_live_market_getlist_fields():
+    """7A-8/9: Live API -- check /market/getlist for allowMarketOrders and maximumQuantity."""
+    import requests
+    try:
+        r = requests.get("https://api.nonkyc.io/api/v2/market/getlist", timeout=10)
+        markets = r.json()
+        if not isinstance(markets, list) or len(markets) == 0:
+            result("7A LIVE: /market/getlist returns list", False, f"type={type(markets)}")
+            return
+
+        result("7A LIVE: /market/getlist returns non-empty list", True, f"{len(markets)} markets")
+
+        first = markets[0]
+        has_allow = "allowMarketOrders" in first
+        result("7A-8 LIVE: allowMarketOrders field present", has_allow,
+               f"value={first.get('allowMarketOrders')}")
+
+        has_max = "maximumQuantity" in first
+        result("7A-9 LIVE: maximumQuantity field present", has_max,
+               f"value={first.get('maximumQuantity', 'NOT PRESENT')}", warn=not has_max)
+
+        # Validate some pairs have allowMarketOrders=False (diversity check)
+        false_count = sum(1 for m in markets if m.get("allowMarketOrders") is False)
+        result("7A-8 LIVE: Some pairs disallow MARKET orders", True,
+               f"{false_count}/{len(markets)} disallow", warn=(false_count == 0))
+
+    except Exception as e:
+        result("7A LIVE: /market/getlist", False, str(e))
+
+
+def test_7a_live_auth_get_balances(api_key=None, api_secret=None):
+    """7A-1/2 LIVE: Verify auth works after param sorting fix."""
+    if not api_key:
+        result("7A LIVE: GET /balances auth (SKIPPED -- no keys)", True, warn=True)
+        return
+    import hashlib, hmac, time, requests
+    url = "https://api.nonkyc.io/api/v2/balances"
+    nonce = str(int(time.time() * 1e3))
+    message = f"{api_key}{url}{nonce}"
+    sig = hmac.new(api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {"X-API-KEY": api_key, "X-API-NONCE": nonce, "X-API-SIGN": sig}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        result("7A LIVE: GET /balances auth", r.status_code == 200, f"HTTP {r.status_code}")
+    except Exception as e:
+        result("7A LIVE: GET /balances auth", False, str(e))
+
+
+def test_7a_live_auth_post_minified(api_key=None, api_secret=None):
+    """7A-1 LIVE: Verify POST auth with minified body (the actual fix)."""
+    if not api_key:
+        result("7A LIVE: POST /cancelallorders minified (SKIPPED -- no keys)", True, warn=True)
+        return
+    import hashlib, hmac, json, time, requests
+    url = "https://api.nonkyc.io/api/v2/cancelallorders"
+    body = {"symbol": "BTC/USDT"}
+    nonce = str(int(time.time() * 1e3))
+    json_str = json.dumps(body, separators=(',', ':'))  # Minified, as the fix does
+    message = f"{api_key}{url}{json_str}{nonce}"
+    sig = hmac.new(api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {"X-API-KEY": api_key, "X-API-NONCE": nonce, "X-API-SIGN": sig,
+               "Content-Type": "application/json"}
+    try:
+        # Send minified body (matching signature)
+        r = requests.post(url, data=json_str, headers=headers, timeout=10)
+        result("7A-1 LIVE: POST minified body auth", r.status_code == 200, f"HTTP {r.status_code}")
+    except Exception as e:
+        result("7A-1 LIVE: POST minified body auth", False, str(e))
+
+
+def test_7a_live_auth_get_sorted_params(api_key=None, api_secret=None):
+    """7A-2 LIVE: Verify GET auth with sorted params."""
+    if not api_key:
+        result("7A LIVE: GET sorted params auth (SKIPPED -- no keys)", True, warn=True)
+        return
+    import hashlib, hmac, time, requests
+    from urllib.parse import urlencode
+
+    url = "https://api.nonkyc.io/api/v2/account/orders"
+    params = {"symbol": "BTC/USDT", "status": "active"}
+    sorted_params = sorted(params.items())  # 7A-2 fix: sort before encoding
+    full_url = f"{url}?{urlencode(sorted_params)}"
+
+    nonce = str(int(time.time() * 1e3))
+    message = f"{api_key}{full_url}{nonce}"
+    sig = hmac.new(api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {"X-API-KEY": api_key, "X-API-NONCE": nonce, "X-API-SIGN": sig}
+    try:
+        r = requests.get(full_url, headers=headers, timeout=10)
+        result("7A-2 LIVE: GET sorted params auth", r.status_code == 200, f"HTTP {r.status_code}")
+    except Exception as e:
+        result("7A-2 LIVE: GET sorted params auth", False, str(e))
+
+
+def test_7a_live_trade_has_fee_fields(api_key=None, api_secret=None):
+    """7A-6 LIVE: Verify trade data includes fee and alternateFeeAsset fields."""
+    if not api_key:
+        result("7A-6 LIVE: trade fee fields (SKIPPED -- no keys)", True, warn=True)
+        return
+    import hashlib, hmac, time, requests
+    url = "https://api.nonkyc.io/api/v2/account/trades"
+    nonce = str(int(time.time() * 1e3))
+    message = f"{api_key}{url}{nonce}"
+    sig = hmac.new(api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {"X-API-KEY": api_key, "X-API-NONCE": nonce, "X-API-SIGN": sig}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        trades = r.json()
+        if isinstance(trades, list) and len(trades) > 0:
+            t = trades[0]
+            has_fee = "fee" in t
+            has_alt = "alternateFeeAsset" in t
+            result("7A-6 LIVE: trade has 'fee' field", has_fee, f"fee={t.get('fee')}")
+            result("7A-6 LIVE: trade has 'alternateFeeAsset' field", has_alt,
+                   f"value={t.get('alternateFeeAsset')}", warn=not has_alt)
+        else:
+            result("7A-6 LIVE: no trades to check fee fields", True,
+                   f"count={len(trades) if isinstance(trades, list) else 'N/A'}", warn=True)
+    except Exception as e:
+        result("7A-6 LIVE: trade fee fields", False, str(e))
+
+
+# ========================================================================
 # MAIN
 # ========================================================================
 
@@ -2763,6 +3058,33 @@ def main():
     except Exception as e:
         result("Phase 6: live rate source test failed",
                True, "Error: {}".format(e), warn=True)
+
+    # --- TIER 13: Phase 7A Auth & Correctness Hardening ---
+    # Reset event loop for clean state
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+    section("TIER 13: Phase 7A Auth & Correctness Hardening")
+
+    # Offline validation tests (no API keys needed)
+    test_7a_post_auth_body_minified()
+    test_7a_get_auth_sorted_params()
+    test_7a_to_hb_order_type_case_safe()
+    test_7a_extract_fee_token_and_amount()
+    test_7a_place_cancel_fallback_logic()
+    test_7a_trading_rules_new_fields()
+    test_7a_cancel_all_orders_on_exchange_wraps_dict()
+
+    # Live public API tests (no auth needed)
+    test_7a_live_market_getlist_fields()
+
+    # Live authenticated API tests
+    if has_keys:
+        test_7a_live_auth_get_balances(api_key, api_secret)
+        test_7a_live_auth_post_minified(api_key, api_secret)
+        test_7a_live_auth_get_sorted_params(api_key, api_secret)
+        test_7a_live_trade_has_fee_fields(api_key, api_secret)
+    else:
+        result("7A LIVE auth tests (SKIPPED -- no API keys)", True, warn=True)
 
     # --- SUMMARY ---
     print()

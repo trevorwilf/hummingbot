@@ -207,9 +207,11 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         return TradingRule(
             trading_pair=self.trading_pair,
             min_order_size=Decimal("2"),
+            max_order_size=Decimal("Inf"),
             min_price_increment=Decimal("0.0001"),
             min_base_amount_increment=Decimal("0.01"),
             min_notional_size=Decimal("1"),
+            supports_market_orders=True,
         )
 
     @property
