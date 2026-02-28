@@ -2,6 +2,7 @@ import asyncio
 from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
+from async_timeout import timeout
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
@@ -16,6 +17,7 @@ from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import TradeFillOrderDetails, combine_to_hb_trading_pair, split_hb_trading_pair
+from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -234,6 +236,179 @@ class NonkycExchange(ExchangePyBase):
         if cancel_result.get("id") is not None:
             return True
         return False
+
+    async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
+        """
+        Cancel all open orders on the exchange using batch /cancelallorders per symbol.
+
+        This overrides the base class implementation to:
+        1. Query the exchange for ALL active orders (catches orphans after crash)
+        2. Use batch /cancelallorders per symbol (efficient: 1 call per pair, not 1 per order)
+        3. Log orphan detection (orders on exchange but not in local tracker)
+
+        :param timeout_seconds: maximum time to wait for cancel operations
+        :return: list of CancellationResult for each tracked order
+        """
+        # Collect locally tracked incomplete orders for result reporting
+        tracked_orders = {o.client_order_id: o for o in self.in_flight_orders.values() if not o.is_done}
+        tracked_exchange_ids = {o.exchange_order_id for o in tracked_orders.values() if o.exchange_order_id}
+
+        results = []
+        try:
+            async with timeout(timeout_seconds):
+                # Step 1: Query ALL active orders from the exchange
+                try:
+                    exchange_orders = await self._api_get(
+                        path_url=CONSTANTS.ACCOUNT_ORDERS_PATH_URL,
+                        params={"status": "active"},
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.ACCOUNT_ORDERS_PATH_URL,
+                    )
+                except Exception as e:
+                    self.logger().warning(
+                        f"Failed to query active orders from exchange: {e}. "
+                        f"Falling back to individual cancel."
+                    )
+                    # Fall back to base class behavior (cancel tracked orders individually)
+                    return await self._cancel_all_fallback(timeout_seconds, tracked_orders)
+
+                if not isinstance(exchange_orders, list):
+                    self.logger().warning(
+                        f"Unexpected /account/orders response type: {type(exchange_orders)}. "
+                        f"Falling back to individual cancel."
+                    )
+                    return await self._cancel_all_fallback(timeout_seconds, tracked_orders)
+
+                # Step 2: Detect orphans — orders on exchange but not in local tracker
+                for ex_order in exchange_orders:
+                    ex_id = str(ex_order.get("id", ""))
+                    if ex_id and ex_id not in tracked_exchange_ids:
+                        # Defensive symbol extraction (top-level or nested under market)
+                        symbol = ex_order.get("symbol") or ex_order.get("market", {}).get("symbol", "unknown")
+                        self.logger().warning(
+                            f"Orphaned order detected on exchange: id={ex_id}, "
+                            f"symbol={symbol}, side={ex_order.get('side', '?')}, "
+                            f"price={ex_order.get('price', '?')}, "
+                            f"qty={ex_order.get('quantity', '?')}. Will be cancelled."
+                        )
+
+                # Step 3: Extract unique symbols that have active orders
+                symbols_with_orders = set()
+                for ex_order in exchange_orders:
+                    symbol = ex_order.get("symbol") or ex_order.get("market", {}).get("symbol")
+                    if symbol:
+                        symbols_with_orders.add(symbol)
+
+                if not symbols_with_orders and not tracked_orders:
+                    self.logger().info("cancel_all: No active orders on exchange and no tracked orders.")
+                    return []
+
+                # Also include symbols from tracked orders that might not be on exchange yet
+                for order in tracked_orders.values():
+                    try:
+                        exchange_symbol = await self.exchange_symbol_associated_to_pair(
+                            trading_pair=order.trading_pair
+                        )
+                        symbols_with_orders.add(exchange_symbol)
+                    except Exception:
+                        pass  # Symbol mapping not available, skip
+
+                # Step 4: Batch cancel per symbol
+                cancel_tasks = []
+                for symbol in symbols_with_orders:
+                    cancel_tasks.append(self._cancel_all_for_symbol(symbol))
+
+                cancel_results = await safe_gather(*cancel_tasks, return_exceptions=True)
+
+                # Log results per symbol
+                for symbol, cr in zip(symbols_with_orders, cancel_results):
+                    if isinstance(cr, Exception):
+                        self.logger().warning(f"Failed to cancel orders for {symbol}: {cr}")
+                    else:
+                        self.logger().info(f"cancel_all for {symbol}: {cr}")
+
+                # Step 5: Build CancellationResult list from tracked orders
+                # After batch cancel, mark all tracked orders as successfully cancelled
+                # (if the batch call succeeded for their symbol)
+                cancelled_symbols = set()
+                for symbol, cr in zip(symbols_with_orders, cancel_results):
+                    if not isinstance(cr, Exception):
+                        cancelled_symbols.add(symbol)
+
+                for client_oid, order in tracked_orders.items():
+                    try:
+                        exchange_symbol = await self.exchange_symbol_associated_to_pair(
+                            trading_pair=order.trading_pair
+                        )
+                        success = exchange_symbol in cancelled_symbols
+                    except Exception:
+                        success = False
+                    results.append(CancellationResult(client_oid, success))
+
+        except asyncio.TimeoutError:
+            self.logger().warning(f"cancel_all timed out after {timeout_seconds}s")
+            # Mark any un-reported tracked orders as failed
+            reported_ids = {r.order_id for r in results}
+            for client_oid in tracked_orders:
+                if client_oid not in reported_ids:
+                    results.append(CancellationResult(client_oid, False))
+        except Exception:
+            self.logger().network(
+                "Unexpected error cancelling orders.",
+                exc_info=True,
+                app_warning_msg="Failed to cancel orders. Check API key and network connection."
+            )
+            for client_oid in tracked_orders:
+                if not any(r.order_id == client_oid for r in results):
+                    results.append(CancellationResult(client_oid, False))
+
+        return results
+
+    async def _cancel_all_for_symbol(self, symbol: str) -> dict:
+        """
+        Call POST /cancelallorders for a single symbol.
+
+        :param symbol: Exchange symbol in slash format (e.g., "BTC/USDT")
+        :return: API response dict
+        :raises: Exception on API error
+        """
+        response = await self._api_post(
+            path_url=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL,
+            data={"symbol": symbol},
+            is_auth_required=True,
+            limit_id=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL,
+        )
+        # The endpoint returns HTTP 200 even for errors — check response body
+        if isinstance(response, dict) and "error" in response:
+            error_msg = response["error"].get("description", response["error"].get("message", "Unknown"))
+            raise IOError(f"cancelallorders failed for {symbol}: {error_msg}")
+        return response
+
+    async def _cancel_all_fallback(
+        self,
+        timeout_seconds: float,
+        tracked_orders: dict,
+    ) -> List[CancellationResult]:
+        """
+        Fallback: cancel tracked orders individually (base class behavior).
+        Used when /account/orders query fails.
+        """
+        tasks = [self._execute_cancel(o.trading_pair, o.client_order_id) for o in tracked_orders.values()]
+        order_id_set = set(tracked_orders.keys())
+        successful = []
+        try:
+            async with timeout(timeout_seconds):
+                cancellation_results = await safe_gather(*tasks, return_exceptions=True)
+                for cr in cancellation_results:
+                    if isinstance(cr, Exception):
+                        continue
+                    if cr is not None:
+                        order_id_set.discard(cr)
+                        successful.append(CancellationResult(cr, True))
+        except Exception:
+            self.logger().network("Unexpected error in cancel fallback.", exc_info=True)
+        failed = [CancellationResult(oid, False) for oid in order_id_set]
+        return successful + failed
 
     async def cancel_all_orders_on_exchange(self, trading_pair: Optional[str] = None) -> List[Dict[str, Any]]:
         """

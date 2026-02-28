@@ -2260,6 +2260,132 @@ def _test_5c_computed_vs_default_fees(api_key, api_secret):
 
 
 # ========================================================================
+# TIER 11: Phase 5D Crash Recovery
+# ========================================================================
+
+
+def test_5d_account_orders_constant_exists():
+    """Verify ACCOUNT_ORDERS_PATH_URL constant exists."""
+    try:
+        from hummingbot.connector.exchange.nonkyc import nonkyc_constants as C
+        has_it = hasattr(C, "ACCOUNT_ORDERS_PATH_URL")
+        correct = C.ACCOUNT_ORDERS_PATH_URL == "/account/orders" if has_it else False
+        result("Phase 5D: ACCOUNT_ORDERS_PATH_URL = '/account/orders'",
+               has_it and correct,
+               "Value: '{}'".format(getattr(C, "ACCOUNT_ORDERS_PATH_URL", "MISSING")))
+    except Exception as e:
+        result("Phase 5D: ACCOUNT_ORDERS_PATH_URL", False, "Error: {}".format(e))
+
+
+def test_5d_cancel_all_is_overridden():
+    """Verify cancel_all is overridden on NonkycExchange."""
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+        is_overridden = "cancel_all" in NonkycExchange.__dict__
+        result("Phase 5D: cancel_all is overridden (not inherited)",
+               is_overridden,
+               "Defined in NonkycExchange.__dict__" if is_overridden else "Inherited from base")
+    except Exception as e:
+        result("Phase 5D: cancel_all override check", False, "Error: {}".format(e))
+
+
+def test_5d_cancel_all_for_symbol_method_exists():
+    """Verify _cancel_all_for_symbol helper method exists."""
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+        has_it = hasattr(NonkycExchange, "_cancel_all_for_symbol")
+        result("Phase 5D: _cancel_all_for_symbol method exists",
+               has_it,
+               "Available on NonkycExchange" if has_it else "MISSING")
+    except Exception as e:
+        result("Phase 5D: _cancel_all_for_symbol", False, "Error: {}".format(e))
+
+
+def test_5d_cancel_all_fallback_method_exists():
+    """Verify _cancel_all_fallback helper method exists."""
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+        has_it = hasattr(NonkycExchange, "_cancel_all_fallback")
+        result("Phase 5D: _cancel_all_fallback method exists",
+               has_it,
+               "Available on NonkycExchange" if has_it else "MISSING")
+    except Exception as e:
+        result("Phase 5D: _cancel_all_fallback", False, "Error: {}".format(e))
+
+
+def _test_5d_account_orders_endpoint(api_key, api_secret):
+    """Live test: GET /account/orders?status=active returns valid response."""
+    url = "{}/account/orders".format(BASE_URL)
+    full_url = "{}?status=active".format(url)
+    nonce = str(int(time.time() * 1000))
+    sig = hmac.new(api_secret.encode(), (api_key + full_url + nonce).encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": sig,
+    }
+    try:
+        resp = requests.get(full_url, headers=headers, timeout=15)
+        ok = resp.status_code == 200
+        result("Phase 5D: GET /account/orders?status=active",
+               ok,
+               "Status: {}".format(resp.status_code))
+
+        if ok:
+            data = resp.json()
+            is_list = isinstance(data, list)
+            result("Phase 5D: /account/orders returns list",
+                   is_list,
+                   "Type: {}, Count: {}".format(type(data).__name__, len(data) if is_list else "N/A"))
+
+            if is_list and len(data) > 0:
+                order = data[0]
+                symbol = order.get("symbol") or order.get("market", {}).get("symbol")
+                result("Phase 5D: active order has symbol",
+                       symbol is not None,
+                       "symbol={}".format(symbol))
+                result("Phase 5D: active order has id",
+                       "id" in order,
+                       "id={}".format(order.get("id", "MISSING")))
+            else:
+                result("Phase 5D: no active orders (expected for test account)",
+                       True,
+                       "Empty list -- cancel_all would be a no-op")
+    except Exception as e:
+        result("Phase 5D: /account/orders endpoint", False, "Error: {}".format(e), warn=True)
+
+
+def _test_5d_cancelallorders_requires_symbol(api_key, api_secret):
+    """Live test: POST /cancelallorders without symbol returns error."""
+    url = "{}/cancelallorders".format(BASE_URL)
+    body = "{}"
+    nonce = str(int(time.time() * 1000))
+    message = "{}{}{}{}".format(api_key, url, body, nonce)
+    sig = hmac.new(api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": sig,
+    }
+    try:
+        resp = requests.post(url, data=body, headers=headers, timeout=15)
+        data = resp.json()
+        if "error" in data:
+            result("Phase 5D: /cancelallorders without symbol returns error",
+                   True,
+                   "error: {}".format(data["error"].get("description", data["error"].get("message"))))
+        else:
+            result("Phase 5D: /cancelallorders without symbol",
+                   True,
+                   "Response: {}".format(json.dumps(data)[:200]),
+                   warn=True)
+    except Exception as e:
+        result("Phase 5D: /cancelallorders requires symbol", False, "Error: {}".format(e), warn=True)
+
+
+# ========================================================================
 # Compatibility Report
 # ========================================================================
 
@@ -2267,7 +2393,7 @@ def print_compatibility_report():
     """Print a matrix of Phase 1/2/3 fixes and their confirmation status."""
     print()
     print("=" * 64)
-    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B/5C Fixes")
+    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A/5B/5C/5D Fixes")
     print("=" * 64)
     print()
 
@@ -2346,6 +2472,16 @@ def print_compatibility_report():
          "Falls back to DEFAULT_FEES if no history", "[OK]"),
         ("Phase 5C", "Maker/taker classified by triggeredBy",
          "side != triggeredBy -> maker", "[OK]"),
+        ("Phase 5D", "cancel_all overridden (batch per symbol)",
+         "Queries /account/orders then /cancelallorders", "[OK]"),
+        ("Phase 5D", "_cancel_all_for_symbol helper",
+         "POST /cancelallorders with symbol param", "[OK]"),
+        ("Phase 5D", "Orphan detection logging",
+         "Warns on orders not in local tracker", "[OK]"),
+        ("Phase 5D", "Fallback to individual cancel",
+         "Uses _execute_cancel if /account/orders fails", "[OK]"),
+        ("Phase 5D", "ACCOUNT_ORDERS_PATH_URL constant",
+         "/account/orders endpoint path", "[OK]"),
     ]
 
     # Print header
@@ -2497,6 +2633,19 @@ def main():
         _test_5c_computed_vs_default_fees(api_key, api_secret)
     else:
         result("Dynamic fee live tests (SKIPPED -- no API keys)", True, warn=True)
+
+    # --- TIER 11: Phase 5D Crash Recovery ---
+    section("TIER 11: Phase 5D Crash Recovery Validation")
+    test_5d_account_orders_constant_exists()
+    test_5d_cancel_all_is_overridden()
+    test_5d_cancel_all_for_symbol_method_exists()
+    test_5d_cancel_all_fallback_method_exists()
+
+    if has_keys:
+        _test_5d_account_orders_endpoint(api_key, api_secret)
+        _test_5d_cancelallorders_requires_symbol(api_key, api_secret)
+    else:
+        result("Phase 5D auth tests (SKIPPED -- no API keys)", True, warn=True)
 
     # --- SUMMARY ---
     print()

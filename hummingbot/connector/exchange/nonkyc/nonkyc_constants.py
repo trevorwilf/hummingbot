@@ -32,6 +32,7 @@ USER_BALANCES_PATH_URL = "/balances"
 ACCOUNT_TRADES_PATH_URL = "/account/trades"
 CREATE_ORDER_PATH_URL = "/createorder"
 CANCEL_ORDER_PATH_URL = "/cancelorder"
+ACCOUNT_ORDERS_PATH_URL = "/account/orders"
 ORDER_INFO_PATH_URL = "/getorder"
 CANCEL_ALL_ORDERS_PATH_URL = "/cancelallorders"
 
@@ -149,6 +150,10 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 4),
                              LinkedLimitWeightPair(ORDERS, 1),
                              LinkedLimitWeightPair(ORDERS_24HR, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+
+    RateLimit(limit_id=ACCOUNT_ORDERS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 20),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
 
     RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
