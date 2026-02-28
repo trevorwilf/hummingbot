@@ -42,3 +42,11 @@ class NonkycUtilsTests(TestCase):
         self.assertEqual("BTC-USDT", EXAMPLE_PAIR)
         self.assertIn("-", EXAMPLE_PAIR)
         self.assertNotIn("/", EXAMPLE_PAIR)
+
+    def test_default_fees_are_0_0015(self):
+        """Phase 5A: Verify fee defaults updated from 0.001 to 0.0015."""
+        from decimal import Decimal
+        from hummingbot.connector.exchange.nonkyc.nonkyc_utils import DEFAULT_FEES
+        self.assertEqual(DEFAULT_FEES.maker_percent_fee_decimal, Decimal("0.0015"))
+        self.assertEqual(DEFAULT_FEES.taker_percent_fee_decimal, Decimal("0.0015"))
+        self.assertTrue(DEFAULT_FEES.buy_percent_fee_deducted_from_returns)

@@ -51,6 +51,8 @@ class NonkycExchange(ExchangePyBase):
 
     @staticmethod
     def Nonkyc_order_type(order_type: OrderType) -> str:
+        if order_type == OrderType.LIMIT_MAKER:
+            return "limit"
         return order_type.name.lower()
 
     @staticmethod
@@ -113,7 +115,7 @@ class NonkycExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.MARKET]
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
@@ -226,6 +228,28 @@ class NonkycExchange(ExchangePyBase):
             return True
         return False
 
+    async def cancel_all_orders_on_exchange(self, trading_pair: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Cancels all open orders on the exchange, optionally filtered by trading pair.
+        Uses the NonKYC /cancelallorders REST endpoint for atomic batch cancellation.
+
+        :param trading_pair: if provided (Hummingbot format, e.g. 'BTC-USDT'),
+                             only cancel orders for this pair. If None, cancel ALL.
+        :return: list of cancelled order data dicts from the exchange
+        """
+        api_params = {}
+        if trading_pair is not None:
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            api_params["symbol"] = symbol
+
+        result = await self._api_post(
+            path_url=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL,
+            data=api_params,
+            is_auth_required=True,
+            limit_id=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL)
+
+        return result if isinstance(result, list) else []
+
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         trading_pair_rules = exchange_info_dict
         retval = []
@@ -235,8 +259,8 @@ class NonkycExchange(ExchangePyBase):
                 price_decimals = Decimal(rule.get("priceDecimals"))
                 quantity_decimals = Decimal(rule.get("quantityDecimals"))
 
-                min_price_increment = Decimal(1 / (10 ** price_decimals))
-                min_base_amount_increment = Decimal(1 / (10 ** quantity_decimals))
+                min_price_increment = Decimal(10) ** (-int(price_decimals))
+                min_base_amount_increment = Decimal(10) ** (-int(quantity_decimals))
 
                 retval.append(
                     TradingRule(

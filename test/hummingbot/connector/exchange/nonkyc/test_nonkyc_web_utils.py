@@ -24,7 +24,7 @@ class NonkycWebUtilsTests(IsolatedAsyncioWrapperTestCase):
 
     @aioresponses()
     async def test_get_current_server_time(self, mock_api):
-        url = CONSTANTS.SERVER_TIME_API_URL
+        url = web_utils.public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH_URL)
         response = {"serverTime": 1772170404982}
         mock_api.get(url, body=json.dumps(response))
 

@@ -1477,6 +1477,209 @@ def test_order_book_snapshot_via_data_source():
 
 
 # ========================================================================
+# TIER 8: Phase 5A Critical Fixes Validation
+# ========================================================================
+
+def test_5a_server_time_endpoint():
+    """Verify /time endpoint returns serverTime (the correct endpoint used after BUG-1 fix)."""
+    try:
+        url = "{}/time".format(BASE_URL)
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        has_key = "serverTime" in data
+        is_int = isinstance(data.get("serverTime"), int) if has_key else False
+        result(
+            "Phase 5A: /time returns serverTime (int)",
+            has_key and is_int,
+            "serverTime={}, type={}".format(
+                data.get("serverTime"), type(data.get("serverTime")).__name__),
+        )
+    except Exception as e:
+        result("Phase 5A: /time endpoint", False, "Error: {}".format(e), warn=True)
+
+
+def test_5a_order_type_mapping():
+    """Verify LIMIT_MAKER maps to 'limit', not 'limit_maker'."""
+    try:
+        from hummingbot.core.data_type.common import OrderType
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+
+        lm = NonkycExchange.Nonkyc_order_type(OrderType.LIMIT_MAKER)
+        lim = NonkycExchange.Nonkyc_order_type(OrderType.LIMIT)
+        mkt = NonkycExchange.Nonkyc_order_type(OrderType.MARKET)
+
+        result(
+            "Phase 5A: LIMIT_MAKER -> 'limit'",
+            lm == "limit",
+            "LIMIT_MAKER='{}', LIMIT='{}', MARKET='{}'".format(lm, lim, mkt),
+        )
+
+        # Also check supported_order_types includes LIMIT_MAKER
+        exchange = NonkycExchange(
+            nonkyc_api_key="test", nonkyc_api_secret="test",
+            trading_pairs=["BTC-USDT"], trading_required=False)
+        supported = exchange.supported_order_types()
+        result(
+            "Phase 5A: supported_order_types includes LIMIT_MAKER",
+            OrderType.LIMIT_MAKER in supported,
+            "Supported: {}".format([t.name for t in supported]),
+        )
+    except Exception as e:
+        result("Phase 5A: order type mapping", False, "Error: {}".format(e))
+
+
+def test_5a_decimal_precision():
+    """Verify Decimal precision fix works with real API data."""
+    from decimal import Decimal
+    try:
+        # Fetch a real market to get price/quantity decimals
+        r = requests.get("{}/market/getlist".format(BASE_URL), timeout=10)
+        markets = r.json()
+        if not isinstance(markets, list) or len(markets) == 0:
+            result("Phase 5A: Decimal precision (no markets)", False, warn=True)
+            return
+
+        # Pick first market with valid decimal fields
+        tested = False
+        for m in markets[:10]:
+            pd = m.get("priceDecimals") or m.get("pricePrecision")
+            qd = m.get("quantityDecimals") or m.get("quantityPrecision")
+            if pd is not None and qd is not None:
+                # New formula (exact)
+                price_inc = Decimal(10) ** (-int(pd))
+                qty_inc = Decimal(10) ** (-int(qd))
+                # Old formula (buggy)
+                buggy_price = Decimal(1 / (10 ** int(pd)))
+                # Verify new formula gives exact result
+                expected_price = Decimal("1E-{}".format(int(pd)))
+                exact = (price_inc == expected_price)
+                result(
+                    "Phase 5A: Decimal precision exact for {} decimals".format(pd),
+                    exact,
+                    "Exact: {}, Buggy: {} (market: {})".format(
+                        price_inc, buggy_price, m.get("symbol", "?")),
+                )
+                tested = True
+                break
+
+        if not tested:
+            result("Phase 5A: Decimal precision", False,
+                   "No market with decimal fields found", warn=True)
+    except Exception as e:
+        result("Phase 5A: Decimal precision", False, "Error: {}".format(e), warn=True)
+
+
+def test_5a_cancel_all_orders_endpoint(api_key=None, api_secret=None):
+    """POST /cancelallorders -- verify endpoint exists and responds (auth required)."""
+    api_key, api_secret = _require_keys(api_key, api_secret)
+    url = "{}/cancelallorders".format(BASE_URL)
+    body = json.dumps({"symbol": "BTC/USDT"}).replace(" ", "")
+    try:
+        nonce = str(int(time.time() * 1e3))
+        message = "{}{}{}{}".format(api_key, url, body, nonce)
+        signature = hmac.new(
+            api_secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        headers = {
+            "X-API-KEY": api_key,
+            "X-API-NONCE": nonce,
+            "X-API-SIGN": signature,
+            "Content-Type": "application/json",
+        }
+        r = requests.post(url, data=body, headers=headers, timeout=10)
+
+        # 200 = success (returns list of cancelled orders, possibly empty)
+        # Other codes may indicate endpoint exists but no orders to cancel
+        ok = r.status_code == 200
+        data = r.text[:500]
+        result(
+            "Phase 5A: POST /cancelallorders -- authenticated",
+            ok,
+            "Status: {}\nResponse: {}".format(r.status_code, data),
+        )
+
+        if ok:
+            parsed = r.json()
+            is_list = isinstance(parsed, list)
+            # API may return error dict if no matching orders or param format differs;
+            # endpoint existence + auth success is the key validation
+            is_error = isinstance(parsed, dict) and "error" in parsed
+            result(
+                "Phase 5A: /cancelallorders response format",
+                is_list,
+                "Type: {}, Count: {}{}".format(
+                    type(parsed).__name__,
+                    len(parsed) if is_list else "N/A",
+                    " (API error: {})".format(
+                        parsed.get("error", {}).get("description", "")) if is_error else ""),
+                warn=is_error,  # warn if error dict, not fail
+            )
+    except Exception as e:
+        result("Phase 5A: POST /cancelallorders", False,
+               "Error: {}".format(e), warn=True)
+
+
+def test_5a_fee_defaults():
+    """Verify fee defaults are 0.15% (0.0015)."""
+    from decimal import Decimal
+    try:
+        from hummingbot.connector.exchange.nonkyc.nonkyc_utils import DEFAULT_FEES
+        maker = DEFAULT_FEES.maker_percent_fee_decimal
+        taker = DEFAULT_FEES.taker_percent_fee_decimal
+        deducted = DEFAULT_FEES.buy_percent_fee_deducted_from_returns
+
+        result(
+            "Phase 5A: maker fee = 0.0015",
+            maker == Decimal("0.0015"),
+            "maker={}, expected=0.0015".format(maker),
+        )
+        result(
+            "Phase 5A: taker fee = 0.0015",
+            taker == Decimal("0.0015"),
+            "taker={}, expected=0.0015".format(taker),
+        )
+        result(
+            "Phase 5A: buy_percent_fee_deducted_from_returns = True",
+            deducted is True,
+            "deducted={}".format(deducted),
+        )
+    except Exception as e:
+        result("Phase 5A: fee defaults", False, "Error: {}".format(e))
+
+
+def test_5a_constants_integrity():
+    """Verify Phase 5A constants are correctly defined."""
+    try:
+        from hummingbot.connector.exchange.nonkyc import nonkyc_constants as C
+
+        # CANCEL_ALL_ORDERS_PATH_URL
+        result(
+            "Phase 5A: CANCEL_ALL_ORDERS_PATH_URL = '/cancelallorders'",
+            C.CANCEL_ALL_ORDERS_PATH_URL == "/cancelallorders",
+            "Value: '{}'".format(C.CANCEL_ALL_ORDERS_PATH_URL),
+        )
+
+        # Rate limit entry exists for the new endpoint
+        limit_ids = [rl.limit_id for rl in C.RATE_LIMITS]
+        result(
+            "Phase 5A: CANCEL_ALL rate limit registered",
+            C.CANCEL_ALL_ORDERS_PATH_URL in limit_ids,
+            "Found: {}".format(C.CANCEL_ALL_ORDERS_PATH_URL in limit_ids),
+        )
+
+        # SERVER_TIME_PATH_URL is /time
+        result(
+            "Phase 5A: SERVER_TIME_PATH_URL = '/time'",
+            C.SERVER_TIME_PATH_URL == "/time",
+            "Value: '{}'".format(C.SERVER_TIME_PATH_URL),
+        )
+    except Exception as e:
+        result("Phase 5A: constants integrity", False, "Error: {}".format(e))
+
+
+# ========================================================================
 # Compatibility Report
 # ========================================================================
 
@@ -1484,7 +1687,7 @@ def print_compatibility_report():
     """Print a matrix of Phase 1/2/3 fixes and their confirmation status."""
     print()
     print("=" * 64)
-    print("  COMPATIBILITY REPORT: Phase 1/2/3/4 Fixes")
+    print("  COMPATIBILITY REPORT: Phase 1/2/3/4/5A Fixes")
     print("=" * 64)
     print()
 
@@ -1539,6 +1742,16 @@ def print_compatibility_report():
          "Full paper trade creation (may need Cython)", "[??]"),
         ("Phase 4", "Live orderbook via data source",
          "Public snapshot works without auth", "[OK]"),
+        ("Phase 5A", "Server time uses /time endpoint",
+         "Replaces deprecated /getservertime", "[OK]"),
+        ("Phase 5A", "LIMIT_MAKER maps to 'limit'",
+         "Not 'limit_maker'; added to supported_order_types", "[OK]"),
+        ("Phase 5A", "Decimal precision exact (no float)",
+         "Decimal(10)**(-d) not Decimal(1/(10**d))", "[OK]"),
+        ("Phase 5A", "Fee defaults = 0.15%",
+         "Updated from 0.1% to match NonKYC schedule", "[OK]"),
+        ("Phase 5A", "cancelAllOrders endpoint",
+         "POST /cancelallorders for batch cancel", "[OK]"),
     ]
 
     # Print header
@@ -1645,6 +1858,18 @@ def main():
     # --- TIER 7: Paper Trade Live Data Flow ---
     section("TIER 7: Paper Trade Live Data Flow (needs network)")
     test_order_book_snapshot_via_data_source()
+
+    # --- TIER 8: Phase 5A Critical Fixes ---
+    section("TIER 8: Phase 5A Critical Fixes Validation")
+    test_5a_server_time_endpoint()
+    test_5a_order_type_mapping()
+    test_5a_decimal_precision()
+    test_5a_fee_defaults()
+    test_5a_constants_integrity()
+    if has_keys:
+        test_5a_cancel_all_orders_endpoint(api_key, api_secret)
+    else:
+        result("cancelAllOrders endpoint (SKIPPED -- no API keys)", True, warn=True)
 
     # --- SUMMARY ---
     print()

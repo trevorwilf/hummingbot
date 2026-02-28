@@ -33,6 +33,7 @@ ACCOUNT_TRADES_PATH_URL = "/account/trades"
 CREATE_ORDER_PATH_URL = "/createorder"
 CANCEL_ORDER_PATH_URL = "/cancelorder"
 ORDER_INFO_PATH_URL = "/getorder"
+CANCEL_ALL_ORDERS_PATH_URL = "/cancelallorders"
 
 # Deprecated private endpoints
 USER_TRADES_PATH_URL = "/gettrades"  # Deprecated: use ACCOUNT_TRADES_PATH_URL
@@ -144,6 +145,12 @@ RATE_LIMITS = [
 
     RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 4),
+                             LinkedLimitWeightPair(ORDERS, 1),
+                             LinkedLimitWeightPair(ORDERS_24HR, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+
+    RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 10),
                              LinkedLimitWeightPair(ORDERS, 1),
                              LinkedLimitWeightPair(ORDERS_24HR, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
