@@ -31,6 +31,7 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 class NonkycExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    _TRADING_FEE_CACHE_TTL = 3600  # Recompute fees from trade history at most once per hour
 
     web_utils = web_utils
 
@@ -50,6 +51,7 @@ class NonkycExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._last_trades_poll_nonkyc_timestamp = 1.0
         self._trading_fees: Dict[str, Decimal] = {}
+        self._last_fee_computation_time: float = 0.0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -69,7 +71,10 @@ class NonkycExchange(ExchangePyBase):
 
     @staticmethod
     def to_hb_order_type(nonkyc_type: str) -> OrderType:
-        return OrderType[nonkyc_type.upper()]
+        try:
+            return OrderType[nonkyc_type.upper()]
+        except KeyError:
+            return OrderType.LIMIT  # Safe default for unknown types
 
     @property
     def authenticator(self):
@@ -509,14 +514,24 @@ class NonkycExchange(ExchangePyBase):
         Maker vs taker is determined by comparing the 'side' and 'triggeredBy' fields:
             - side != triggeredBy -> maker (your resting order was matched)
             - side == triggeredBy -> taker (you matched a resting order)
+
+        Cached for 1 hour to avoid fetching full trade history on every poll.
         """
+        now = self._time_synchronizer.time()
+        if now - self._last_fee_computation_time < self._TRADING_FEE_CACHE_TTL:
+            return  # Skip — cached result is still fresh
+
         try:
+            # Only fetch trades from the last 24 hours for fee calculation
+            since_ts = str(int((now - 86400) * 1e3))
             all_trades = await self._api_get(
                 path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
+                params={"since": since_ts},
                 is_auth_required=True)
 
             if not all_trades:
-                self.logger().debug("No trade history found for dynamic fee calculation. Using defaults.")
+                self.logger().debug("No recent trade history for dynamic fee calculation. Using defaults.")
+                self._last_fee_computation_time = now
                 return
 
             maker_rates = []
@@ -530,14 +545,14 @@ class NonkycExchange(ExchangePyBase):
                     notional = quantity * price
 
                     if notional <= 0 or fee <= 0:
-                        continue  # Skip zero-value or zero-fee trades
+                        continue
 
                     fee_rate = fee / notional
                     side = str(trade.get("side", "")).lower()
                     triggered_by = str(trade.get("triggeredBy", "")).lower()
 
                     if not side or not triggered_by:
-                        continue  # Skip trades with missing classification data
+                        continue
 
                     if side != triggered_by:
                         maker_rates.append(fee_rate)
@@ -545,7 +560,7 @@ class NonkycExchange(ExchangePyBase):
                         taker_rates.append(fee_rate)
 
                 except (InvalidOperation, DivisionByZero, TypeError, KeyError):
-                    continue  # Skip malformed trade entries
+                    continue
 
             if maker_rates:
                 avg_maker = sum(maker_rates) / len(maker_rates)
@@ -554,7 +569,8 @@ class NonkycExchange(ExchangePyBase):
                 avg_taker = sum(taker_rates) / len(taker_rates)
                 self._trading_fees["taker_fee"] = avg_taker
 
-            # Log if computed rates differ from defaults
+            self._last_fee_computation_time = now
+
             if self._trading_fees:
                 default_schema = self.trade_fee_schema()
                 computed_maker = self._trading_fees.get("maker_fee")
@@ -780,9 +796,15 @@ class NonkycExchange(ExchangePyBase):
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
             base_asset, quote_asset = split_hb_trading_pair(trading_pair=order.trading_pair)
 
+            # Limit trade query to trades since the order was created (avoid fetching full history)
+            since_ts = str(int(order.creation_timestamp * 1e3)) if order.creation_timestamp > 0 else None
+            params = {"symbol": symbol}
+            if since_ts:
+                params["since"] = since_ts
+
             all_fills_response = await self._api_get(
                 path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
-                params={"symbol": symbol},
+                params=params,
                 is_auth_required=True,)
 
             filtered_trades = [trade for trade in all_fills_response if trade["orderid"] == exchange_order_id]
@@ -868,12 +890,19 @@ class NonkycExchange(ExchangePyBase):
 
         for symbol_data in filter(nonkyc_utils.is_market_active, exchange_info):
             symbol = symbol_data["symbol"]
-            parts = symbol.split('/')
-            if len(parts) != 2:
-                self.logger().warning(f"Skipping market with unexpected symbol format: {symbol}")
-                continue
-            mapping[symbol] = combine_to_hb_trading_pair(base=symbol_data["primaryTicker"],
-                                                         quote=parts[1])
+            base = symbol_data.get("primaryTicker")
+            quote = symbol_data.get("secondaryTicker")
+
+            if not base or not quote:
+                # Fallback to splitting symbol
+                parts = symbol.split('/')
+                if len(parts) != 2:
+                    self.logger().warning(f"Skipping market with unexpected symbol format: {symbol}")
+                    continue
+                base = base or parts[0]
+                quote = quote or parts[1]
+
+            mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:

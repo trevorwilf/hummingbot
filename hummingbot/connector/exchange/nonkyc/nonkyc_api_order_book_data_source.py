@@ -172,6 +172,16 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 params, time.time(), metadata={"trading_pair": trading_pair})
             message_queue.put_nowait(snapshot_msg)
 
+    async def _on_order_book_ws_interruption(self, websocket_assistant: Optional[WSAssistant]):
+        """
+        Called when the order book WebSocket connection is interrupted.
+        Clears sequence tracking so the next connection gets a fresh snapshot,
+        and adds a small delay to avoid hammering the server on rapid reconnects.
+        """
+        self._last_sequence.clear()
+        websocket_assistant and await websocket_assistant.disconnect()
+        self._ws_assistant = None
+
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""
         if "result" not in event_message:

@@ -134,9 +134,9 @@ class TestPhase7AOrderTypeSafety(unittest.TestCase):
         self.assertEqual(OrderType.LIMIT, NonkycExchange.to_hb_order_type("Limit"))
         self.assertEqual(OrderType.MARKET, NonkycExchange.to_hb_order_type("Market"))
 
-    def test_invalid_type_raises(self):
-        with self.assertRaises(KeyError):
-            NonkycExchange.to_hb_order_type("stop_loss")
+    def test_invalid_type_returns_limit(self):
+        # Phase 2 Fix 4: unknown types now return LIMIT instead of raising KeyError
+        self.assertEqual(OrderType.LIMIT, NonkycExchange.to_hb_order_type("stop_loss"))
 
 
 class TestPhase7AFeeExtraction(unittest.TestCase):
