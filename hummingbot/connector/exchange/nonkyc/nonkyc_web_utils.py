@@ -71,9 +71,10 @@ async def get_current_server_time(
         method=RESTMethod.GET,
         throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
     )
-    server_time = response["serverTime"]
-    # NonKYC may return milliseconds — normalize to seconds if needed
-    import time as _time
-    if server_time > _time.time() * 100:  # If >100x current unix seconds, it's milliseconds
-        server_time = server_time / 1e3
+    server_time = float(response["serverTime"])
+
+    # Normalize: if value looks like milliseconds (> year 2001 in ms), convert to seconds
+    if server_time > 1_000_000_000_000:
+        server_time = server_time / 1000.0
+
     return server_time

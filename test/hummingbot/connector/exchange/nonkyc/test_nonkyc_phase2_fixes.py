@@ -63,7 +63,8 @@ class TestFix1TradeQueryPagination(unittest.TestCase):
 
         self.assertIn("since", captured_params,
                        "REST params should include 'since' when order has creation_timestamp")
-        self.assertEqual(captured_params["since"], "1700000000000")
+        # Phase 3 adds 60-second safety margin: (1700000000 - 60) * 1000 = 1699999940000
+        self.assertEqual(captured_params["since"], "1699999940000")
 
     def test_since_param_omitted_when_no_creation_timestamp(self):
         """Orders with creation_timestamp=0 should NOT include 'since'."""

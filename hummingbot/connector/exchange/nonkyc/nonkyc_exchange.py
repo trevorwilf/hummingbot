@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,7 +33,6 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 class NonkycExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
-    _TRADING_FEE_CACHE_TTL = 3600  # Recompute fees from trade history at most once per hour
 
     web_utils = web_utils
 
@@ -51,7 +52,8 @@ class NonkycExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._last_trades_poll_nonkyc_timestamp = 1.0
         self._trading_fees: Dict[str, Decimal] = {}
-        self._last_fee_computation_time: float = 0.0
+        self._trading_fees_last_computed: float = 0.0
+        self._trading_fees_ttl: float = 3600.0  # 1 hour cache TTL
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -71,10 +73,14 @@ class NonkycExchange(ExchangePyBase):
 
     @staticmethod
     def to_hb_order_type(nonkyc_type: str) -> OrderType:
+        """Convert NonKYC order type to Hummingbot OrderType. Defaults to LIMIT for unknown types."""
         try:
             return OrderType[nonkyc_type.upper()]
         except KeyError:
-            return OrderType.LIMIT  # Safe default for unknown types
+            logging.getLogger(__name__).warning(
+                f"Unknown NonKYC order type '{nonkyc_type}', defaulting to LIMIT"
+            )
+            return OrderType.LIMIT
 
     @property
     def authenticator(self):
@@ -515,11 +521,14 @@ class NonkycExchange(ExchangePyBase):
             - side != triggeredBy -> maker (your resting order was matched)
             - side == triggeredBy -> taker (you matched a resting order)
 
-        Cached for 1 hour to avoid fetching full trade history on every poll.
+        Results are cached for 1 hour (_trading_fees_ttl) since NonKYC fee tiers
+        rarely change. This prevents fetching the entire trade history every poll cycle.
         """
-        now = self._time_synchronizer.time()
-        if now - self._last_fee_computation_time < self._TRADING_FEE_CACHE_TTL:
-            return  # Skip — cached result is still fresh
+        # Check cache TTL — skip if fees were computed recently
+        now = self._time_synchronizer.time() if hasattr(self, '_time_synchronizer') else time.time()
+        if (self._trading_fees
+                and (now - self._trading_fees_last_computed) < self._trading_fees_ttl):
+            return
 
         try:
             # Only fetch trades from the last 24 hours for fee calculation
@@ -530,8 +539,7 @@ class NonkycExchange(ExchangePyBase):
                 is_auth_required=True)
 
             if not all_trades:
-                self.logger().debug("No recent trade history for dynamic fee calculation. Using defaults.")
-                self._last_fee_computation_time = now
+                self.logger().debug("No trade history found for dynamic fee calculation. Using defaults.")
                 return
 
             maker_rates = []
@@ -569,7 +577,7 @@ class NonkycExchange(ExchangePyBase):
                 avg_taker = sum(taker_rates) / len(taker_rates)
                 self._trading_fees["taker_fee"] = avg_taker
 
-            self._last_fee_computation_time = now
+            self._trading_fees_last_computed = now
 
             if self._trading_fees:
                 default_schema = self.trade_fee_schema()
@@ -796,11 +804,13 @@ class NonkycExchange(ExchangePyBase):
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
             base_asset, quote_asset = split_hb_trading_pair(trading_pair=order.trading_pair)
 
-            # Limit trade query to trades since the order was created (avoid fetching full history)
-            since_ts = str(int(order.creation_timestamp * 1e3)) if order.creation_timestamp > 0 else None
+            # Use the order's creation timestamp to limit the trade window.
+            # This prevents fetching the entire trade history for accounts with
+            # thousands of trades. Subtract 60 seconds as safety margin.
             params = {"symbol": symbol}
-            if since_ts:
-                params["since"] = since_ts
+            if order.creation_timestamp and order.creation_timestamp > 0:
+                since_ms = int((order.creation_timestamp - 60) * 1e3)
+                params["since"] = str(since_ms)
 
             all_fills_response = await self._api_get(
                 path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
