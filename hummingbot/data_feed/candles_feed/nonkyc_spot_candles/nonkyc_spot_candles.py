@@ -2,6 +2,8 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
+import numpy as np
+
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
@@ -23,7 +25,7 @@ class NonKYCSpotCandles(CandlesBase):
 
     _logger: Optional[HummingbotLogger] = None
 
-    # Auto-fallback for intervals NonKYC doesn't support (Dashboard defaults to 1m)
+    # Auto-fallback for intervals NonKYC doesn't support (Dashboard defaults may request these)
     _INTERVAL_FALLBACK = {"1m": "5m", "3m": "5m"}
 
     @classmethod
@@ -33,6 +35,7 @@ class NonKYCSpotCandles(CandlesBase):
         return cls._logger
 
     def __init__(self, trading_pair: str, interval: str = "1h", max_records: int = 150):
+        # "1h" is a NonKYC-supported interval — no change needed
         # Auto-fallback for unsupported intervals before the base class bare-raises
         if interval in self._INTERVAL_FALLBACK:
             self.logger().warning(
@@ -94,6 +97,69 @@ class NonKYCSpotCandles(CandlesBase):
     def get_exchange_trading_pair(self, trading_pair: str) -> str:
         """Hummingbot uses 'BTC-USDT'; NonKYC uses 'BTC/USDT'."""
         return trading_pair.replace("-", "/")
+
+    # ------------------------------------------------------------------
+    # FIX 2: Override equidistance check to tolerate gaps
+    # ------------------------------------------------------------------
+    def check_candles_sorted_and_equidistant(self, candles: np.ndarray):
+        """
+        NonKYC override: tolerate gaps in candle data.
+
+        NonKYC is a low-liquidity exchange where periods with no trades
+        produce missing candle bars.  We verify:
+          1. Timestamps are sorted ascending
+          2. Every timestamp step is an exact multiple of the interval
+             (gaps are OK, misaligned timestamps are not)
+
+        Without this override the base class rejects any non-contiguous
+        data and enters an infinite reset loop.
+        """
+        if len(self._candles) <= 1:
+            return
+        timestamps = candles[:, 0].astype(float)
+        diffs = np.diff(timestamps)
+        if not np.all(diffs >= 0):
+            self.logger().warning("Candles are not sorted by timestamp in ascending order.")
+            self._reset_candles()
+            return
+        interval_seconds = self.get_seconds_from_interval(self.interval)
+        if interval_seconds > 0:
+            remainders = diffs % interval_seconds
+            # Allow exact multiples only (remainder < 1s accounts for float precision)
+            if not np.all(remainders < 1.0):
+                self.logger().warning(
+                    "Candle timestamps are not aligned to interval boundaries. Resetting."
+                )
+                self._reset_candles()
+                return
+
+    # ------------------------------------------------------------------
+    # FIX 3: Override fetch_candles to handle "Market not found" gracefully
+    # ------------------------------------------------------------------
+    async def fetch_candles(
+        self,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: Optional[int] = None,
+    ):
+        """
+        Override to gracefully handle NonKYC 'Market not found' errors.
+
+        Returns an empty array instead of raising, so
+        fill_historical_candles doesn't spin in an infinite retry loop.
+        """
+        try:
+            return await super().fetch_candles(
+                start_time=start_time, end_time=end_time, limit=limit
+            )
+        except IOError as e:
+            if "Market not found" in str(e):
+                self.logger().warning(
+                    f"Market '{self._ex_trading_pair}' not found on NonKYC REST API. "
+                    f"Verify this is an active trading pair."
+                )
+                return np.array([]).reshape(0, 10)
+            raise
 
     def _get_rest_candles_params(
         self,
@@ -212,12 +278,15 @@ class NonKYCSpotCandles(CandlesBase):
         # The base class will use fill_historical_candles() via REST for older data.
         return self._parse_ws_candle(candles_data[0])
 
+    # ------------------------------------------------------------------
+    # FIX 1: Handle both "timestamp" and "datetime" field names
+    # ------------------------------------------------------------------
     def _parse_ws_candle(self, candle: dict):
         """
         Parse a single NonKYC WS candle object into the standard dict format.
 
-        NonKYC WS candle fields:
-        - timestamp: ISO8601 string (e.g., "2024-01-01T00:00:00.000Z")
+        NonKYC WS candle fields (docs say "timestamp", live API sends "datetime"):
+        - timestamp/datetime: ISO8601 string (e.g., "2024-01-01T00:00:00.000Z")
         - open, close: string prices
         - min, max: string prices (NOT "low"/"high")
         - volume: string
@@ -225,7 +294,14 @@ class NonKYCSpotCandles(CandlesBase):
         Returns dict with float values, or None on parse failure.
         """
         try:
-            ts_str = candle["timestamp"]
+            # NonKYC docs say "timestamp" but live API sends "datetime"
+            ts_str = candle.get("timestamp") or candle.get("datetime")
+            if ts_str is None:
+                self.logger().warning(
+                    f"No timestamp/datetime field in WS candle — keys: {list(candle.keys())}"
+                )
+                return None
+
             # Handle ISO8601 timestamp → epoch seconds
             if isinstance(ts_str, str):
                 dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))

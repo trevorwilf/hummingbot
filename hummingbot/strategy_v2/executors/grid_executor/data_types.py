@@ -31,7 +31,7 @@ class GridExecutorConfig(ExecutorConfigBase):
     safe_extra_spread: Decimal = Decimal("0.0001")
     # Risk Management
     triple_barrier_config: TripleBarrierConfig
-    leverage: int = 20
+    leverage: int = 1
     level_id: Optional[str] = None
     deduct_base_fees: bool = False
     keep_position: bool = False

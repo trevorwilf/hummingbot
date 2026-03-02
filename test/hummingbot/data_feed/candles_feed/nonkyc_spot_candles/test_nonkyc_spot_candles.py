@@ -2,8 +2,11 @@ import asyncio
 import json
 import re
 import time
+from collections import deque
 from test.hummingbot.data_feed.candles_feed.test_candles_base import TestCandlesBase
+from unittest.mock import AsyncMock, patch
 
+import numpy as np
 from aioresponses import aioresponses
 
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
@@ -469,3 +472,134 @@ class TestNonKYCSpotCandles(TestCandlesBase):
         ]}
         result = self.data_feed._parse_rest_candles(data)
         self.assertEqual(len(result), 2)  # Bad bar skipped, 2 valid bars remain
+
+    # -- FIX 1: datetime vs timestamp field name tests -------------------------
+
+    def test_parse_ws_candle_datetime_field(self):
+        """Live API sends 'datetime' instead of 'timestamp' — should work."""
+        candle = {"datetime": "2024-06-01T00:00:00.000Z", "open": "100",
+                  "close": "110", "min": "95", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNotNone(result)
+        from datetime import datetime, timezone
+        expected = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(result["timestamp"], expected)
+
+    def test_parse_ws_candle_timestamp_preferred_over_datetime(self):
+        """When both 'timestamp' and 'datetime' exist, 'timestamp' wins."""
+        candle = {
+            "timestamp": "2024-06-01T00:00:00.000Z",
+            "datetime": "2024-07-01T00:00:00.000Z",
+            "open": "100", "close": "110", "min": "95", "max": "115", "volume": "50",
+        }
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNotNone(result)
+        from datetime import datetime, timezone
+        # Should use timestamp (June), not datetime (July)
+        expected = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(result["timestamp"], expected)
+
+    def test_parse_ws_candle_no_timestamp_or_datetime(self):
+        """Missing both 'timestamp' and 'datetime' should return None."""
+        candle = {"open": "100", "close": "110", "min": "95", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNone(result)
+
+    def test_parse_ws_message_update_with_datetime_field(self):
+        """Full WS updateCandles message using 'datetime' field should parse correctly."""
+        msg = {
+            "jsonrpc": "2.0",
+            "method": "updateCandles",
+            "params": {
+                "data": [
+                    {
+                        "datetime": "2024-06-01T12:00:00.000Z",
+                        "open": "42000.5",
+                        "close": "42050.0",
+                        "min": "41900.0",
+                        "max": "42100.0",
+                        "volume": "123.456",
+                    }
+                ],
+                "symbol": "BTC/USDT",
+                "period": 5,
+            },
+        }
+        result = self.data_feed._parse_websocket_message(msg)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["open"], 42000.5)
+        self.assertEqual(result["high"], 42100.0)
+        self.assertEqual(result["low"], 41900.0)
+
+    # -- FIX 2: Gap-tolerant equidistance check tests --------------------------
+
+    def test_check_candles_sorted_and_equidistant_with_gaps(self):
+        """Gaps (multiples of interval) should be tolerated — no reset."""
+        interval_sec = 300  # 5m
+        # 4 candles with a 2-bar gap between candle 2 and 3
+        candles = np.array([
+            [1700000000, 100, 110, 90, 105, 50, 0, 0, 0, 0],
+            [1700000000 + interval_sec, 105, 112, 92, 108, 55, 0, 0, 0, 0],
+            [1700000000 + interval_sec * 3, 108, 115, 95, 110, 60, 0, 0, 0, 0],  # gap: 2 intervals
+            [1700000000 + interval_sec * 4, 110, 118, 98, 112, 65, 0, 0, 0, 0],
+        ], dtype=float)
+        # Pre-fill _candles deque so len > 1
+        self.data_feed._candles = deque(candles.tolist(), maxlen=150)
+        # Should NOT reset (gaps are OK)
+        self.data_feed.check_candles_sorted_and_equidistant(candles)
+        self.assertEqual(len(self.data_feed._candles), 4)
+
+    def test_check_candles_misaligned_timestamps_resets(self):
+        """Timestamps not aligned to interval multiples should trigger reset."""
+        interval_sec = 300  # 5m
+        candles = np.array([
+            [1700000000, 100, 110, 90, 105, 50, 0, 0, 0, 0],
+            [1700000000 + 200, 105, 112, 92, 108, 55, 0, 0, 0, 0],  # 200s — not a multiple of 300
+            [1700000000 + interval_sec, 108, 115, 95, 110, 60, 0, 0, 0, 0],
+        ], dtype=float)
+        self.data_feed._candles = deque(candles.tolist(), maxlen=150)
+        self.data_feed.check_candles_sorted_and_equidistant(candles)
+        # Should have reset (misaligned)
+        self.assertEqual(len(self.data_feed._candles), 0)
+
+    def test_check_candles_unsorted_resets(self):
+        """Unsorted timestamps should trigger reset."""
+        interval_sec = 300
+        candles = np.array([
+            [1700000000 + interval_sec, 105, 112, 92, 108, 55, 0, 0, 0, 0],
+            [1700000000, 100, 110, 90, 105, 50, 0, 0, 0, 0],  # out of order
+        ], dtype=float)
+        self.data_feed._candles = deque(candles.tolist(), maxlen=150)
+        self.data_feed.check_candles_sorted_and_equidistant(candles)
+        self.assertEqual(len(self.data_feed._candles), 0)
+
+    # -- FIX 3: fetch_candles "Market not found" IOError tests -----------------
+
+    def test_fetch_candles_market_not_found_returns_empty(self):
+        """IOError with 'Market not found' should return empty (0,10) array."""
+        async def _run():
+            with patch.object(
+                type(self.data_feed).__bases__[0],
+                "fetch_candles",
+                new_callable=AsyncMock,
+                side_effect=IOError("HTTP status 400 - Market not found for BTC/USDT"),
+            ):
+                result = await self.data_feed.fetch_candles()
+                self.assertIsInstance(result, np.ndarray)
+                self.assertEqual(result.shape, (0, 10))
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_fetch_candles_other_ioerror_raises(self):
+        """IOError without 'Market not found' should still raise."""
+        async def _run():
+            with patch.object(
+                type(self.data_feed).__bases__[0],
+                "fetch_candles",
+                new_callable=AsyncMock,
+                side_effect=IOError("HTTP status 500 - Internal server error"),
+            ):
+                with self.assertRaises(IOError):
+                    await self.data_feed.fetch_candles()
+
+        asyncio.get_event_loop().run_until_complete(_run())
