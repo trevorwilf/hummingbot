@@ -25,6 +25,7 @@ from hummingbot.data_feed.candles_feed.kucoin_perpetual_candles.kucoin_perpetual
 from hummingbot.data_feed.candles_feed.kucoin_spot_candles.kucoin_spot_candles import KucoinSpotCandles
 from hummingbot.data_feed.candles_feed.mexc_perpetual_candles.mexc_perpetual_candles import MexcPerpetualCandles
 from hummingbot.data_feed.candles_feed.mexc_spot_candles.mexc_spot_candles import MexcSpotCandles
+from hummingbot.data_feed.candles_feed.nonkyc_spot_candles.nonkyc_spot_candles import NonKYCSpotCandles
 from hummingbot.data_feed.candles_feed.okx_perpetual_candles.okx_perpetual_candles import OKXPerpetualCandles
 from hummingbot.data_feed.candles_feed.okx_spot_candles.okx_spot_candles import OKXSpotCandles
 
@@ -67,6 +68,7 @@ class CandlesFactory:
         "dexalot": DexalotSpotCandles,
         "bitmart_perpetual": BitmartPerpetualCandles,
         "btc_markets": BtcMarketsSpotCandles,
+        "nonkyc": NonKYCSpotCandles,
     }
 
     @classmethod

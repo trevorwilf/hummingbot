@@ -4,6 +4,7 @@ from hummingbot.data_feed.candles_feed.binance_perpetual_candles import BinanceP
 from hummingbot.data_feed.candles_feed.binance_spot_candles import BinanceSpotCandles
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.data_feed.candles_feed.nonkyc_spot_candles import NonKYCSpotCandles
 
 
 class TestCandlesFactory(unittest.TestCase):
@@ -23,6 +24,15 @@ class TestCandlesFactory(unittest.TestCase):
             interval="1m"
         ))
         self.assertIsInstance(candles, BinancePerpetualCandles)
+        candles.stop()
+
+    def test_get_nonkyc_candles_spot(self):
+        candles = CandlesFactory.get_candle(CandlesConfig(
+            connector="nonkyc",
+            trading_pair="BTC-USDT",
+            interval="5m"
+        ))
+        self.assertIsInstance(candles, NonKYCSpotCandles)
         candles.stop()
 
     def test_get_non_existing_candles(self):
