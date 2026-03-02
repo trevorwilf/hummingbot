@@ -23,13 +23,28 @@ class NonKYCSpotCandles(CandlesBase):
 
     _logger: Optional[HummingbotLogger] = None
 
+    # Auto-fallback for intervals NonKYC doesn't support (Dashboard defaults to 1m)
+    _INTERVAL_FALLBACK = {"1m": "5m", "3m": "5m"}
+
     @classmethod
     def logger(cls) -> HummingbotLogger:
         if cls._logger is None:
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
-    def __init__(self, trading_pair: str, interval: str = "5m", max_records: int = 150):
+    def __init__(self, trading_pair: str, interval: str = "1h", max_records: int = 150):
+        # Auto-fallback for unsupported intervals before the base class bare-raises
+        if interval in self._INTERVAL_FALLBACK:
+            self.logger().warning(
+                f"Interval '{interval}' not supported by NonKYC, "
+                f"falling back to '{self._INTERVAL_FALLBACK[interval]}'"
+            )
+            interval = self._INTERVAL_FALLBACK[interval]
+        if interval not in CONSTANTS.INTERVALS:
+            raise ValueError(
+                f"Interval '{interval}' is not supported by NonKYC. "
+                f"Supported intervals: {list(CONSTANTS.INTERVALS.keys())}"
+            )
         super().__init__(trading_pair, interval, max_records)
 
     @property
@@ -116,24 +131,34 @@ class NonKYCSpotCandles(CandlesBase):
 
         Zero-fills: quote_asset_volume, n_trades, taker_buy_base_volume, taker_buy_quote_volume
         """
-        bars = data.get("bars", []) if isinstance(data, dict) else data
+        if not isinstance(data, dict):
+            self.logger().warning(f"Unexpected REST candle response type: {type(data)} — data: {data}")
+            return []
+        bars = data.get("bars", [])
         if not bars:
+            if data.get("error") or data.get("message"):
+                self.logger().warning(
+                    f"NonKYC REST candle error: {data.get('error', data.get('message', 'unknown'))}"
+                )
             return []
         result = []
         for bar in bars:
-            timestamp = self.ensure_timestamp_in_seconds(bar["time"])
-            result.append([
-                timestamp,
-                float(bar["open"]),
-                float(bar["high"]),
-                float(bar["low"]),
-                float(bar["close"]),
-                float(bar["volume"]),
-                0.0,   # quote_asset_volume  (not provided by NonKYC)
-                0.0,   # n_trades            (not provided by NonKYC)
-                0.0,   # taker_buy_base_volume  (not provided by NonKYC)
-                0.0,   # taker_buy_quote_volume (not provided by NonKYC)
-            ])
+            try:
+                timestamp = self.ensure_timestamp_in_seconds(bar["time"])
+                result.append([
+                    timestamp,
+                    float(bar["open"]),
+                    float(bar["high"]),
+                    float(bar["low"]),
+                    float(bar["close"]),
+                    float(bar["volume"]),
+                    0.0,   # quote_asset_volume  (not provided by NonKYC)
+                    0.0,   # n_trades            (not provided by NonKYC)
+                    0.0,   # taker_buy_base_volume  (not provided by NonKYC)
+                    0.0,   # taker_buy_quote_volume (not provided by NonKYC)
+                ])
+            except (KeyError, ValueError, TypeError) as e:
+                self.logger().warning(f"Failed to parse REST candle bar: {e} — data: {bar}")
         return result
 
     def ws_subscription_payload(self) -> dict:
@@ -153,45 +178,76 @@ class NonKYCSpotCandles(CandlesBase):
 
     def _parse_websocket_message(self, data: dict):
         """
-        Parse NonKYC WS candle messages.
+        Parse NonKYC WS candle messages into the standard dict expected by the base class.
 
-        Handles:
-        - Subscription ack: {"jsonrpc": "2.0", "result": true, "id": 1} → ignored
-        - snapshotCandles: array sorted newest-first → use first entry
-        - updateCandles: usually single candle → use first entry
+        Handles three message types:
+        - Subscription ack: {"result": true, "id": ...} → ignored (return None)
+        - snapshotCandles: snapshot with array of candles → return latest candle
+        - updateCandles: single candle update → return that candle
+
+        The base class (_process_websocket_messages_task) expects a dict with
+        standard candle keys, or None to skip.
         """
         if data is None:
             return None
-        method = data.get("method")
-        if method is None and "result" in data:
+
+        # Ignore subscription confirmations: {"jsonrpc": "2.0", "result": true, "id": 123}
+        if "result" in data:
             return None
+
+        method = data.get("method", "")
+
+        # Only process candle methods
         if method not in ("snapshotCandles", "updateCandles"):
             return None
+
         params = data.get("params", {})
         candles_data = params.get("data", [])
+
         if not candles_data:
             return None
-        candle = candles_data[0]
-        return self._parse_ws_candle(candle)
 
-    def _parse_ws_candle(self, candle: dict) -> dict:
-        """
-        Convert a single NonKYC WS candle to the standard dict.
+        # Both snapshot and update: parse the first (latest) candle.
+        # For snapshots (newest-first), [0] is the latest candle.
+        # The base class will use fill_historical_candles() via REST for older data.
+        return self._parse_ws_candle(candles_data[0])
 
-        WS fields use 'min'/'max' (not 'low'/'high') and ISO8601 timestamps.
+    def _parse_ws_candle(self, candle: dict):
         """
-        ts_str = candle["timestamp"]
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        timestamp = dt.replace(tzinfo=timezone.utc).timestamp()
-        return {
-            "timestamp": timestamp,
-            "open": candle["open"],
-            "high": candle["max"],
-            "low": candle["min"],
-            "close": candle["close"],
-            "volume": candle["volume"],
-            "quote_asset_volume": 0.0,
-            "n_trades": 0.0,
-            "taker_buy_base_volume": 0.0,
-            "taker_buy_quote_volume": 0.0,
-        }
+        Parse a single NonKYC WS candle object into the standard dict format.
+
+        NonKYC WS candle fields:
+        - timestamp: ISO8601 string (e.g., "2024-01-01T00:00:00.000Z")
+        - open, close: string prices
+        - min, max: string prices (NOT "low"/"high")
+        - volume: string
+
+        Returns dict with float values, or None on parse failure.
+        """
+        try:
+            ts_str = candle["timestamp"]
+            # Handle ISO8601 timestamp → epoch seconds
+            if isinstance(ts_str, str):
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                timestamp = dt.timestamp()
+            else:
+                # Already numeric (milliseconds or seconds)
+                timestamp = float(ts_str)
+                if timestamp > 1e12:
+                    timestamp = timestamp / 1000.0
+
+            return {
+                "timestamp": float(timestamp),
+                "open": float(candle["open"]),
+                "high": float(candle["max"]),      # NonKYC uses "max" not "high"
+                "low": float(candle["min"]),        # NonKYC uses "min" not "low"
+                "close": float(candle["close"]),
+                "volume": float(candle["volume"]),
+                "quote_asset_volume": 0.0,
+                "n_trades": 0.0,
+                "taker_buy_base_volume": 0.0,
+                "taker_buy_quote_volume": 0.0,
+            }
+        except (KeyError, ValueError, TypeError) as e:
+            self.logger().warning(f"Failed to parse WS candle: {e} — data: {candle}")
+            return None

@@ -192,9 +192,27 @@ class TestNonKYCSpotCandles(TestCandlesBase):
         self.assertNotIn("3m", self.data_feed.intervals)
 
     def test_unsupported_interval_raises(self):
-        """Attempting to create with 1m interval should raise (NonKYC minimum is 5m)."""
-        with self.assertRaises(Exception):
-            NonKYCSpotCandles(trading_pair="BTC-USDT", interval="1m")
+        """Truly unsupported interval (e.g., '2h') should raise ValueError."""
+        with self.assertRaises(ValueError):
+            NonKYCSpotCandles(trading_pair="BTC-USDT", interval="2h")
+
+    def test_interval_fallback_1m_to_5m(self):
+        """1m interval should auto-fallback to 5m (NonKYC minimum is 5m)."""
+        candles = NonKYCSpotCandles(trading_pair="BTC-USDT", interval="1m")
+        self.assertEqual(candles.interval, "5m")
+        candles.stop()
+
+    def test_interval_fallback_3m_to_5m(self):
+        """3m interval should auto-fallback to 5m."""
+        candles = NonKYCSpotCandles(trading_pair="BTC-USDT", interval="3m")
+        self.assertEqual(candles.interval, "5m")
+        candles.stop()
+
+    def test_default_interval_is_1h(self):
+        """Default interval should be 1h (not 1m)."""
+        candles = NonKYCSpotCandles(trading_pair="BTC-USDT")
+        self.assertEqual(candles.interval, "1h")
+        candles.stop()
 
     def test_rest_candles_params_basic(self):
         """Should build correct REST params with symbol, resolution, countBack."""
@@ -317,17 +335,17 @@ class TestNonKYCSpotCandles(TestCandlesBase):
         }
         result = self.data_feed._parse_websocket_message(msg)
         self.assertIsNotNone(result)
-        self.assertEqual(result["open"], "42000.5")
-        self.assertEqual(result["high"], "42100.0")   # mapped from max
-        self.assertEqual(result["low"], "41900.0")     # mapped from min
+        self.assertEqual(result["open"], 42000.5)
+        self.assertEqual(result["high"], 42100.0)   # mapped from max
+        self.assertEqual(result["low"], 41900.0)     # mapped from min
 
     def test_parse_ws_candle_min_max_mapping(self):
         """WS candles use 'min'/'max' — verify they map to 'low'/'high'."""
         candle = {"timestamp": "2024-06-01T00:00:00Z", "open": "100",
                   "close": "110", "min": "95", "max": "115", "volume": "50"}
         result = self.data_feed._parse_ws_candle(candle)
-        self.assertEqual(result["low"], "95")    # from min
-        self.assertEqual(result["high"], "115")  # from max
+        self.assertEqual(result["low"], 95.0)    # from min
+        self.assertEqual(result["high"], 115.0)  # from max
 
     def test_parse_ws_candle_iso8601_z_suffix(self):
         """Should parse ISO8601 with 'Z' suffix correctly."""
@@ -371,3 +389,83 @@ class TestNonKYCSpotCandles(TestCandlesBase):
         candle = CandlesFactory.get_candle(config)
         self.assertIsInstance(candle, NonKYCSpotCandles)
         candle.stop()
+
+    def test_candles_factory_creates_instance_with_1m_fallback(self):
+        """CandlesFactory with 1m interval should auto-fallback to 5m for NonKYC."""
+        from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
+        from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+        config = CandlesConfig(connector="nonkyc", trading_pair="BTC-USDT", interval="1m")
+        candle = CandlesFactory.get_candle(config)
+        self.assertIsInstance(candle, NonKYCSpotCandles)
+        self.assertEqual(candle.interval, "5m")
+        candle.stop()
+
+    # -- Bug 2: WS candle parsing error handling tests -------------------------
+
+    def test_parse_ws_candle_missing_timestamp_returns_none(self):
+        """Missing 'timestamp' key should return None (not crash)."""
+        candle = {"open": "100", "close": "110", "min": "95", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNone(result)
+
+    def test_parse_ws_candle_missing_min_returns_none(self):
+        """Missing 'min' key should return None (not crash)."""
+        candle = {"timestamp": "2024-01-01T00:00:00Z", "open": "100",
+                  "close": "110", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNone(result)
+
+    def test_parse_ws_candle_invalid_price_returns_none(self):
+        """Non-numeric price should return None."""
+        candle = {"timestamp": "2024-01-01T00:00:00Z", "open": "not_a_number",
+                  "close": "110", "min": "95", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNone(result)
+
+    def test_parse_ws_candle_numeric_timestamp_seconds(self):
+        """Numeric timestamp in seconds should be handled."""
+        candle = {"timestamp": 1704067200, "open": "100",
+                  "close": "110", "min": "95", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["timestamp"], 1704067200.0)
+
+    def test_parse_ws_candle_numeric_timestamp_milliseconds(self):
+        """Numeric timestamp in milliseconds should be converted to seconds."""
+        candle = {"timestamp": 1704067200000, "open": "100",
+                  "close": "110", "min": "95", "max": "115", "volume": "50"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["timestamp"], 1704067200.0)
+
+    def test_parse_ws_candle_returns_all_float_values(self):
+        """All values in the returned dict should be float."""
+        candle = {"timestamp": "2024-01-01T00:00:00Z", "open": "100.5",
+                  "close": "110.3", "min": "95.1", "max": "115.7", "volume": "50.25"}
+        result = self.data_feed._parse_ws_candle(candle)
+        self.assertIsNotNone(result)
+        for key, value in result.items():
+            self.assertIsInstance(value, float, f"Value for key '{key}' is not float: {type(value)}")
+
+    # -- Bug 3: REST error handling tests --------------------------------------
+
+    def test_parse_rest_candles_non_dict_input(self):
+        """Non-dict input should return empty list and log warning."""
+        result = self.data_feed._parse_rest_candles("not a dict")
+        self.assertEqual(result, [])
+
+    def test_parse_rest_candles_error_response(self):
+        """Error response from API should log warning and return empty list."""
+        data = {"error": "Invalid symbol", "bars": []}
+        result = self.data_feed._parse_rest_candles(data)
+        self.assertEqual(result, [])
+
+    def test_parse_rest_candles_malformed_bar_skipped(self):
+        """A malformed bar should be skipped, not crash the whole batch."""
+        data = {"bars": [
+            {"time": 1700000000, "open": 100, "high": 110, "low": 90, "close": 105, "volume": 50},
+            {"time": 1700000300, "open": "bad_value", "high": 110, "low": 90, "close": 105, "volume": 50},
+            {"time": 1700000600, "open": 102, "high": 112, "low": 92, "close": 107, "volume": 55},
+        ]}
+        result = self.data_feed._parse_rest_candles(data)
+        self.assertEqual(len(result), 2)  # Bad bar skipped, 2 valid bars remain
