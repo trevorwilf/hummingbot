@@ -71,11 +71,8 @@ class CandlesFactory:
         "dexalot": DexalotSpotCandles,
         "bitmart_perpetual": BitmartPerpetualCandles,
         "btc_markets": BtcMarketsSpotCandles,
-<<<<<<< HEAD
         "nonkyc": NonKYCSpotCandles,
-=======
         "pacifica_perpetual": PacificaPerpetualCandles,
->>>>>>> origin/master
     }
 
     @classmethod
