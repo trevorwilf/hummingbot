@@ -81,15 +81,26 @@ class SQLConnectionManager(TransactionBase):
             with self._engine.begin() as conn:
                 inspector = inspect(conn)
 
-                for tname, fkcs in reversed(
+                for reflected_tname, fkcs in reversed(
                         inspector.get_sorted_table_and_fkc_names()):
-                    if fkcs:
-                        if not self._engine.dialect.supports_alter:
+
+                    if not fkcs or not self._engine.dialect.supports_alter:
+                        continue
+
+                    for fkc in fkcs:
+                        # SQLAlchemy may return fkc as a (table_name, constraint_name)
+                        # tuple or as a plain constraint name string, depending on version.
+                        if isinstance(fkc, (tuple, list)):
+                            target_tname, fk_name = fkc
+                        else:
+                            target_tname, fk_name = reflected_tname, fkc
+
+                        if target_tname is None or not fk_name:
                             continue
-                        for fkc in fkcs:
-                            fk_constraint = ForeignKeyConstraint((), (), name=fkc)
-                            Table(tname, MetaData(), fk_constraint)
-                            conn.execute(DropConstraint(fk_constraint))
+
+                        fk_constraint = ForeignKeyConstraint((), (), name=fk_name)
+                        Table(target_tname, MetaData(), fk_constraint)
+                        conn.execute(DropConstraint(fk_constraint))
 
         self._session_cls = sessionmaker(bind=self._engine)
 
