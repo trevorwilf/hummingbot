@@ -71,7 +71,7 @@ class TestPostAuthBodyMatchesSignature(_Base):
         self.assertIn("X-API-SIGN", req.headers)
 
         # Reconstruct expected signature
-        expected_body = json.dumps(json.loads(original_body)).replace(" ", "")
+        expected_body = json.dumps(json.loads(original_body), separators=(',', ':'))
         expected_nonce = str(int(1700000000.0 * 1e3))
         to_sign = f"{url}{expected_body}"
         expected_message = f"TESTKEY{to_sign}{expected_nonce}"
@@ -90,7 +90,9 @@ class TestGetAuthStableWithUnorderedParams(_Base):
     """7C-2: GET requests with identical params in different insertion
     order produce the same signature."""
 
-    def test_get_params_different_order_same_signature(self):
+    def test_get_params_preserve_insertion_order(self):
+        """GET params are signed in dict insertion order (matching aiohttp).
+        Slashes in values must NOT be percent-encoded."""
         mock_time = MagicMock()
         mock_time.time.return_value = 1700000000.0
         auth = NonkycAuth(api_key="TESTKEY", secret_key="TESTSECRET", time_provider=mock_time)
@@ -100,13 +102,13 @@ class TestGetAuthStableWithUnorderedParams(_Base):
 
         req_a = RESTRequest(method=RESTMethod.GET, url=url,
                             params={"status": "active", "symbol": "BTC/USDT"}, is_auth_required=True)
-        req_b = RESTRequest(method=RESTMethod.GET, url=url,
-                            params={"symbol": "BTC/USDT", "status": "active"}, is_auth_required=True)
         self.async_run(auth.rest_authenticate(req_a))
-        self.async_run(auth.rest_authenticate(req_b))
 
-        self.assertEqual(req_a.headers["X-API-SIGN"], req_b.headers["X-API-SIGN"],
-                         "Signatures must match regardless of param insertion order")
+        # Params baked into URL, not percent-encoded
+        self.assertIn("status=active&symbol=BTC/USDT", req_a.url)
+        self.assertNotIn("%2F", req_a.url)
+        self.assertIsNone(req_a.params)
+        self.assertIn("X-API-SIGN", req_a.headers)
 
 
 # =========================================================================

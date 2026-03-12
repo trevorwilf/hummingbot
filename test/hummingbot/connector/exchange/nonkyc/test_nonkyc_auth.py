@@ -4,7 +4,6 @@ import hmac
 import json
 from unittest import TestCase
 from unittest.mock import MagicMock
-from urllib.parse import urlencode
 
 from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
@@ -40,14 +39,17 @@ class NonkycAuthTests(TestCase):
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
         expected_nonce = int(now * 1e3)  # 1234567890000
-        sorted_params = sorted(params.items())
-        full_url = f"{url}?{urlencode(sorted_params)}"
+        # Params are baked in raw (no urlencode), preserving insertion order
+        full_url = f"{url}?symbol=BTC/USDT&side=buy"
         expected_message = f"{self._api_key}{full_url}{expected_nonce}"
         expected_signature = self._generate_signature(expected_message)
 
         self.assertEqual(str(expected_nonce), configured_request.headers["X-API-NONCE"])
         self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
         self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
+        # Params should be baked into URL and cleared
+        self.assertEqual(full_url, configured_request.url)
+        self.assertIsNone(configured_request.params)
 
     def test_rest_authenticate_get_with_trade_params(self):
         """Verify GET signing includes query params for /account/trades."""
@@ -57,19 +59,24 @@ class NonkycAuthTests(TestCase):
 
         auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
 
-        params = {"market": "test_market_id"}
+        params = {"symbol": "ARRR/USDT"}
         url = "https://api.nonkyc.io/api/v2/account/trades"
         request = RESTRequest(method=RESTMethod.GET, url=url, params=params, is_auth_required=True)
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
         expected_nonce = int(now * 1e3)
-        full_url = f"{url}?{urlencode(sorted(params.items()))}"
+        # The '/' in ARRR/USDT must NOT be encoded as %2F
+        full_url = f"{url}?symbol=ARRR/USDT"
         expected_message = f"{self._api_key}{full_url}{expected_nonce}"
         expected_signature = self._generate_signature(expected_message)
 
         self.assertEqual(str(expected_nonce), configured_request.headers["X-API-NONCE"])
         self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
         self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
+        # Verify '/' is NOT encoded
+        self.assertIn("ARRR/USDT", configured_request.url)
+        self.assertNotIn("%2F", configured_request.url)
+        self.assertIsNone(configured_request.params)
 
     def test_rest_authenticate_get_no_params(self):
         """Verify GET signing works without query params."""
@@ -90,6 +97,26 @@ class NonkycAuthTests(TestCase):
         self.assertEqual(str(expected_nonce), configured_request.headers["X-API-NONCE"])
         self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
         self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
+        # URL unchanged, params still None
+        self.assertEqual(url, configured_request.url)
+
+    def test_rest_authenticate_get_preserves_insertion_order(self):
+        """Verify params are NOT sorted — insertion order is preserved to match aiohttp."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        # 'symbol' comes before 'since' in insertion order but after in alphabetical
+        params = {"symbol": "ARRR/USDT", "since": "1000"}
+        url = "https://api.nonkyc.io/api/v2/account/trades"
+        request = RESTRequest(method=RESTMethod.GET, url=url, params=params, is_auth_required=True)
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        # Must be insertion order, NOT alphabetical
+        expected_url = f"{url}?symbol=ARRR/USDT&since=1000"
+        self.assertEqual(expected_url, configured_request.url)
 
     def test_rest_authenticate_post(self):
         now = 1234567890.000

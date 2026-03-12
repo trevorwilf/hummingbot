@@ -4,8 +4,6 @@ import json
 import random
 import string
 from typing import Dict
-from urllib.parse import urlencode
-
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSRequest
@@ -29,9 +27,21 @@ class NonkycAuth(AuthBase):
             headers.update(request.headers)
 
         if request.method == RESTMethod.GET:
-            sorted_params = sorted(request.params.items()) if request.params else []
-            url = f"{request.url}?{urlencode(sorted_params)}" if sorted_params else request.url
-            headers.update(self.header_for_authentication(data=(url)))
+            # Build the full URL with query params baked in, then sign it.
+            #
+            # CRITICAL: Do NOT use urllib.parse.urlencode() here.
+            # urlencode() encodes '/' as '%2F', but aiohttp (via yarl) does NOT
+            # encode '/' in query parameter values. The NonKYC server verifies the
+            # HMAC against the URL it receives (the yarl version), so the signed
+            # URL must be byte-identical to what aiohttp sends.
+            #
+            # By baking params into request.url and clearing request.params, we
+            # ensure the auth signs EXACTLY the URL the HTTP client transmits.
+            if request.params:
+                qs_parts = [f"{k}={v}" for k, v in request.params.items()]
+                request.url = f"{request.url}?{'&'.join(qs_parts)}"
+                request.params = None  # Prevent aiohttp from re-encoding
+            headers.update(self.header_for_authentication(data=request.url))
 
         elif request.method == RESTMethod.POST:
             json_str = json.dumps(json.loads(request.data), separators=(',', ':'))

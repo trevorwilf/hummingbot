@@ -83,8 +83,10 @@ class TestPhase7AGetAuth(unittest.TestCase):
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(asyncio.wait_for(coro, 1))
 
-    def test_different_param_order_same_signature(self):
-        """Identical params in different insertion order must produce the same signature."""
+    def test_param_order_preserved_in_signature(self):
+        """Params are signed in dict insertion order (matching aiohttp behavior).
+        Different insertion orders produce different signatures because the server
+        sees the URL exactly as aiohttp transmits it."""
         url = "https://api.nonkyc.io/api/v2/account/orders"
         req_a = RESTRequest(method=RESTMethod.GET, url=url,
                             params={"status": "active", "symbol": "BTC/USDT"},
@@ -94,8 +96,14 @@ class TestPhase7AGetAuth(unittest.TestCase):
                             is_auth_required=True)
         cfg_a = self._run(self.auth.rest_authenticate(req_a))
         cfg_b = self._run(self.auth.rest_authenticate(req_b))
-        self.assertEqual(cfg_a.headers["X-API-SIGN"], cfg_b.headers["X-API-SIGN"],
-                         "Signatures must match regardless of param insertion order")
+        # Params baked into URL in insertion order
+        self.assertIn("status=active&symbol=BTC/USDT", cfg_a.url)
+        self.assertIn("symbol=BTC/USDT&status=active", cfg_b.url)
+        self.assertIsNone(cfg_a.params)
+        self.assertIsNone(cfg_b.params)
+        # Slash must not be percent-encoded
+        self.assertNotIn("%2F", cfg_a.url)
+        self.assertNotIn("%2F", cfg_b.url)
 
     def test_no_params_still_authenticates(self):
         """GET with no params must still produce valid headers."""
