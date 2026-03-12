@@ -479,12 +479,33 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         self.cancel_open_orders()
-        if self.amount_to_close >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+        close_amount = self.amount_to_close
+        # For spot positions, cap close amount to available balance to prevent
+        # "Insufficient funds" retry storms when balance < theoretical position size.
+        if not self.is_perpetual:
+            connector = self.connectors[self.config.connector_name]
+            if self.close_order_side == TradeType.SELL:
+                base_asset = self.config.trading_pair.split("-")[0]
+                available = connector.available_balances.get(base_asset, Decimal("0"))
+                if Decimal("0") < available < close_amount:
+                    close_amount = connector.quantize_order_amount(
+                        self.config.trading_pair, available)
+            else:
+                quote_asset = self.config.trading_pair.split("-")[1]
+                available_quote = connector.available_balances.get(quote_asset, Decimal("0"))
+                mid_price = self.get_price(
+                    self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+                if mid_price > Decimal("0"):
+                    max_base = available_quote / mid_price
+                    if Decimal("0") < max_base < close_amount:
+                        close_amount = connector.quantize_order_amount(
+                            self.config.trading_pair, max_base)
+        if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 order_type=OrderType.MARKET,
-                amount=self.amount_to_close,
+                amount=close_amount,
                 price=price,
                 side=self.close_order_side,
                 position_action=PositionAction.CLOSE,
