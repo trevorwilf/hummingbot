@@ -20,6 +20,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     TRADE_STREAM_ID = 1
     DIFF_STREAM_ID = 2
     ONE_HOUR = 60 * 60
+    SNAPSHOT_RESYNC_COOLDOWN = 5.0  # seconds between resync attempts per trading pair
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -36,6 +37,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._domain = domain
         self._api_factory = api_factory
         self._last_sequence: Dict[str, int] = {}
+        self._last_resync_time: Dict[str, float] = {}
         self._ws_request_id: int = 0  # JSON-RPC 2.0 request id counter
 
     def _next_ws_id(self) -> int:
@@ -145,7 +147,12 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return
 
             if last_seq > 0 and sequence > last_seq + 1:
-                # Gap detected — trigger REST snapshot resync
+                # Gap detected — trigger REST snapshot resync with cooldown
+                now = time.time()
+                last_resync = self._last_resync_time.get(trading_pair, 0)
+                if now - last_resync < self.SNAPSHOT_RESYNC_COOLDOWN:
+                    return  # Skip, cooldown active
+                self._last_resync_time[trading_pair] = now
                 self.logger().warning(
                     f"Orderbook sequence gap for {trading_pair}: expected {last_seq + 1}, got {sequence}. "
                     f"Requesting REST snapshot resync."
@@ -161,7 +168,13 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raw_message, time.time(), {"trading_pair": trading_pair})
             message_queue.put_nowait(order_book_message)
 
-    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
+        # Handle pre-parsed OrderBookMessage from REST resync path
+        if isinstance(raw_message, OrderBookMessage):
+            self._last_sequence[raw_message.trading_pair] = int(raw_message.update_id)
+            message_queue.put_nowait(raw_message)
+            return
+        # Original dict-based parsing for WebSocket messages
         if "result" not in raw_message:
             params = raw_message.get("params", {})
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
@@ -179,6 +192,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         and adds a small delay to avoid hammering the server on rapid reconnects.
         """
         self._last_sequence.clear()
+        self._last_resync_time.clear()
         websocket_assistant and await websocket_assistant.disconnect()
         self._ws_assistant = None
 
