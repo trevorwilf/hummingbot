@@ -49,6 +49,48 @@ class NonkycAuthTests(TestCase):
         self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
         self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
 
+    def test_rest_authenticate_get_with_trade_params(self):
+        """Verify GET signing includes query params for /account/trades."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        params = {"market": "test_market_id"}
+        url = "https://api.nonkyc.io/api/v2/account/trades"
+        request = RESTRequest(method=RESTMethod.GET, url=url, params=params, is_auth_required=True)
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        expected_nonce = int(now * 1e3)
+        full_url = f"{url}?{urlencode(sorted(params.items()))}"
+        expected_message = f"{self._api_key}{full_url}{expected_nonce}"
+        expected_signature = self._generate_signature(expected_message)
+
+        self.assertEqual(str(expected_nonce), configured_request.headers["X-API-NONCE"])
+        self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
+        self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
+
+    def test_rest_authenticate_get_no_params(self):
+        """Verify GET signing works without query params."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        url = "https://api.nonkyc.io/api/v2/balances"
+        request = RESTRequest(method=RESTMethod.GET, url=url, params=None, is_auth_required=True)
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        expected_nonce = int(now * 1e3)
+        expected_message = f"{self._api_key}{url}{expected_nonce}"
+        expected_signature = self._generate_signature(expected_message)
+
+        self.assertEqual(str(expected_nonce), configured_request.headers["X-API-NONCE"])
+        self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
+        self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
+
     def test_rest_authenticate_post(self):
         now = 1234567890.000
         mock_time_provider = MagicMock()
@@ -67,13 +109,42 @@ class NonkycAuthTests(TestCase):
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
         expected_nonce = int(now * 1e3)
-        json_str = json.dumps(json.loads(json.dumps(body))).replace(" ", "")
+        json_str = json.dumps(body, separators=(',', ':'))
         expected_message = f"{self._api_key}{url}{json_str}{expected_nonce}"
         expected_signature = self._generate_signature(expected_message)
 
         self.assertEqual(str(expected_nonce), configured_request.headers["X-API-NONCE"])
         self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
         self.assertEqual(self._api_key, configured_request.headers["X-API-KEY"])
+
+    def test_rest_authenticate_post_with_spaces_in_values(self):
+        """Verify POST signing preserves spaces within JSON values (uses separators, not replace)."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        body = {"note": "hello world", "symbol": "BTC/USDT"}
+        url = "https://api.nonkyc.io/api/v2/createorder"
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url=url,
+            data=json.dumps(body),
+            is_auth_required=True,
+        )
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        expected_nonce = int(now * 1e3)
+        json_str = json.dumps(body, separators=(',', ':'))
+        # Spaces in "hello world" must be preserved
+        self.assertIn("hello world", json_str)
+        expected_message = f"{self._api_key}{url}{json_str}{expected_nonce}"
+        expected_signature = self._generate_signature(expected_message)
+
+        self.assertEqual(expected_signature, configured_request.headers["X-API-SIGN"])
+        # The signed body must also preserve spaces in values
+        self.assertIn("hello world", configured_request.data)
 
     def test_ws_authenticate_message(self):
         mock_time_provider = MagicMock()

@@ -34,7 +34,7 @@ class NonkycAuth(AuthBase):
             headers.update(self.header_for_authentication(data=(url)))
 
         elif request.method == RESTMethod.POST:
-            json_str = (json.dumps(json.loads(request.data))).replace(" ", "")
+            json_str = json.dumps(json.loads(request.data), separators=(',', ':'))
             to_sign = f"{request.url}{json_str}"
             headers.update(self.header_for_authentication(to_sign))
             request.data = json_str  # Body must match what was signed (per NonKYC API spec)
