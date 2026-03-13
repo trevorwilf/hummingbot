@@ -707,3 +707,243 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(result["controller2"]["executors"]), 0)
         self.assertEqual(len(result["controller3"]["executors"]), 0)
         self.assertEqual(len(result["controller3"]["positions"]), 0)
+
+    # ---- Action ordering tests ----
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_execute_actions_stop_before_create(self, markets_recorder_mock):
+        """All stop actions must execute before any create actions."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+        call_order = []
+
+        def mock_create(action):
+            call_order.append("create")
+
+        def mock_stop(action):
+            call_order.append("stop")
+
+        self.orchestrator.create_executor = mock_create
+        self.orchestrator.stop_executor = mock_stop
+
+        # Set up active executors so stop can find them (not needed with mock, but keep structure)
+        config1 = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+        config2 = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(100), amount=Decimal(10))
+
+        # Mixed order: create, stop, create, stop
+        actions = [
+            CreateExecutorAction(executor_config=config1, controller_id="test"),
+            StopExecutorAction(executor_id="ex1", controller_id="test"),
+            CreateExecutorAction(executor_config=config2, controller_id="test"),
+            StopExecutorAction(executor_id="ex2", controller_id="test"),
+        ]
+        self.orchestrator.execute_actions(actions)
+
+        # All stops must come before all creates
+        stop_indices = [i for i, v in enumerate(call_order) if v == "stop"]
+        create_indices = [i for i, v in enumerate(call_order) if v == "create"]
+        self.assertTrue(all(s < c for s in stop_indices for c in create_indices),
+                        f"Stops must precede creates, got order: {call_order}")
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_execute_actions_store_before_create(self, markets_recorder_mock):
+        """Store actions must execute before create actions."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+        call_order = []
+
+        def mock_create(action):
+            call_order.append("create")
+
+        def mock_store(action):
+            call_order.append("store")
+
+        self.orchestrator.create_executor = mock_create
+        self.orchestrator.store_executor = mock_store
+
+        config = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+
+        actions = [
+            CreateExecutorAction(executor_config=config, controller_id="test"),
+            StoreExecutorAction(executor_id="ex1", controller_id="test"),
+        ]
+        self.orchestrator.execute_actions(actions)
+
+        self.assertEqual(call_order, ["store", "create"])
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_execute_actions_full_ordering(self, markets_recorder_mock):
+        """Full ordering: stop → store → create regardless of input order."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+        call_order = []
+
+        def mock_create(action):
+            call_order.append("create")
+
+        def mock_stop(action):
+            call_order.append("stop")
+
+        def mock_store(action):
+            call_order.append("store")
+
+        self.orchestrator.create_executor = mock_create
+        self.orchestrator.stop_executor = mock_stop
+        self.orchestrator.store_executor = mock_store
+
+        config = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+
+        # Deliberately scrambled order
+        actions = [
+            CreateExecutorAction(executor_config=config, controller_id="test"),
+            StoreExecutorAction(executor_id="ex_store", controller_id="test"),
+            StopExecutorAction(executor_id="ex_stop", controller_id="test"),
+            CreateExecutorAction(executor_config=config, controller_id="test"),
+        ]
+        self.orchestrator.execute_actions(actions)
+
+        self.assertEqual(call_order, ["stop", "store", "create", "create"])
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_preflight_budget_drops_overallocated_action(self, markets_recorder_mock):
+        """Budget preflight drops the second action when balance is insufficient for both."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        # Set up a mock budget checker that zeros out the second candidate
+        mock_budget_checker = MagicMock()
+        call_count = [0]
+
+        def mock_adjust(candidate, all_or_none=False):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First action survives
+                return candidate
+            else:
+                # Second action gets zeroed out
+                candidate.amount = Decimal("0")
+                return candidate
+
+        mock_budget_checker.adjust_candidate_and_lock_available_collateral = mock_adjust
+        mock_budget_checker.reset_locked_collateral = MagicMock()
+
+        mock_connector = MagicMock()
+        mock_connector.budget_checker = mock_budget_checker
+        self.mock_strategy.connectors = {"binance": mock_connector}
+
+        config1 = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(50))
+        config2 = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(50))
+
+        actions = [
+            CreateExecutorAction(executor_config=config1, controller_id="test"),
+            CreateExecutorAction(executor_config=config2, controller_id="test"),
+        ]
+
+        with self.assertLogs(level="INFO") as log:
+            result = self.orchestrator._preflight_budget_check(actions)
+
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], actions[0])
+        # Verify log message mentions dropped action
+        self.assertTrue(any("dropped 1 action" in msg for msg in log.output))
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_preflight_budget_allows_affordable_actions(self, markets_recorder_mock):
+        """Both actions survive when budget is sufficient for both."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        mock_budget_checker = MagicMock()
+        mock_budget_checker.adjust_candidate_and_lock_available_collateral = lambda candidate, all_or_none=False: candidate
+        mock_budget_checker.reset_locked_collateral = MagicMock()
+
+        mock_connector = MagicMock()
+        mock_connector.budget_checker = mock_budget_checker
+        self.mock_strategy.connectors = {"binance": mock_connector}
+
+        config1 = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+        config2 = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+
+        actions = [
+            CreateExecutorAction(executor_config=config1, controller_id="test"),
+            CreateExecutorAction(executor_config=config2, controller_id="test"),
+        ]
+
+        result = self.orchestrator._preflight_budget_check(actions)
+        self.assertEqual(len(result), 2)
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_preflight_budget_separate_connectors(self, markets_recorder_mock):
+        """Actions on different connectors are budgeted independently."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        # Set up two connectors, each with its own budget checker
+        mock_budget_checker_a = MagicMock()
+        mock_budget_checker_a.adjust_candidate_and_lock_available_collateral = lambda candidate, all_or_none=False: candidate
+        mock_budget_checker_a.reset_locked_collateral = MagicMock()
+
+        mock_budget_checker_b = MagicMock()
+        mock_budget_checker_b.adjust_candidate_and_lock_available_collateral = lambda candidate, all_or_none=False: candidate
+        mock_budget_checker_b.reset_locked_collateral = MagicMock()
+
+        mock_connector_a = MagicMock()
+        mock_connector_a.budget_checker = mock_budget_checker_a
+        mock_connector_b = MagicMock()
+        mock_connector_b.budget_checker = mock_budget_checker_b
+
+        self.mock_strategy.connectors = {
+            "binance": mock_connector_a,
+            "coinbase": mock_connector_b,
+        }
+
+        config_a = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(100))
+        config_b = PositionExecutorConfig(
+            timestamp=1234, connector_name="coinbase", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(100))
+
+        actions = [
+            CreateExecutorAction(executor_config=config_a, controller_id="test"),
+            CreateExecutorAction(executor_config=config_b, controller_id="test"),
+        ]
+
+        result = self.orchestrator._preflight_budget_check(actions)
+        self.assertEqual(len(result), 2)
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_preflight_budget_exception_allows_action_through(self, markets_recorder_mock):
+        """If budget checker raises an exception, the action passes through with a warning."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        mock_budget_checker = MagicMock()
+        mock_budget_checker.adjust_candidate_and_lock_available_collateral = MagicMock(
+            side_effect=RuntimeError("budget checker error"))
+        mock_budget_checker.reset_locked_collateral = MagicMock()
+
+        mock_connector = MagicMock()
+        mock_connector.budget_checker = mock_budget_checker
+        self.mock_strategy.connectors = {"binance": mock_connector}
+
+        config = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+
+        actions = [CreateExecutorAction(executor_config=config, controller_id="test")]
+
+        with self.assertLogs(level="WARNING") as log:
+            result = self.orchestrator._preflight_budget_check(actions)
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(any("Budget preflight failed" in msg for msg in log.output))

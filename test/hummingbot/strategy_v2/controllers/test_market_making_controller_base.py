@@ -184,6 +184,7 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         # Create a mock active rebalance executor
         mock_executor = MagicMock(spec=ExecutorInfo)
         mock_executor.is_active = True
+        mock_executor.id = "rebalance_executor_0"
         mock_executor.custom_info = {"level_id": "position_rebalance"}
         controller.executors_info = [mock_executor]
 
@@ -575,6 +576,8 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         # Add an active buy executor that covers the full shortage
         mock_buy_executor = MagicMock(spec=ExecutorInfo)
         mock_buy_executor.is_active = True
+        mock_buy_executor.id = "mock_buy_0"
+        mock_buy_executor.type = "position_executor"
         mock_buy_executor.config = MagicMock()
         mock_buy_executor.config.connector_name = "binance"
         mock_buy_executor.config.trading_pair = "ETH-USDT"
@@ -599,6 +602,8 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         # Active buy executor covers half the shortage
         mock_buy_executor = MagicMock(spec=ExecutorInfo)
         mock_buy_executor.is_active = True
+        mock_buy_executor.id = "mock_buy_0"
+        mock_buy_executor.type = "position_executor"
         mock_buy_executor.config = MagicMock()
         mock_buy_executor.config.connector_name = "binance"
         mock_buy_executor.config.trading_pair = "ETH-USDT"
@@ -654,3 +659,266 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
             sell_spreads=[0.01],
         )
         self.assertEqual(config.rebalance_cooldown_time, 60)
+
+    @patch("hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerBase.get_executor_config", new_callable=MagicMock)
+    async def test_determine_executor_actions_stop_before_create(self, executor_config_mock: MagicMock):
+        """All StopExecutorAction instances must appear before all CreateExecutorAction instances."""
+        executor_config_mock.return_value = PositionExecutorConfig(
+            timestamp=1234, controller_id=self.controller.config.id, connector_name="binance_perpetual",
+            trading_pair="ETH-USDT", side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+        type(self.mock_market_data_provider).get_price_by_type = MagicMock(return_value=Decimal("100"))
+        self.mock_market_data_provider.time = MagicMock(return_value=999999)
+        await self.controller.update_processed_data()
+
+        # Create a mock executor that is past refresh time (will trigger stop)
+        from hummingbot.strategy_v2.models.base import RunnableStatus
+        mock_executor = MagicMock(spec=ExecutorInfo)
+        mock_executor.is_active = True
+        mock_executor.is_trading = False
+        mock_executor.timestamp = 0  # Very old — will be refreshed
+        mock_executor.close_type = None
+        mock_executor.custom_info = {"level_id": "buy_0"}
+        mock_executor.id = "old_executor"
+        self.controller.executors_info = [mock_executor]
+
+        actions = self.controller.determine_executor_actions()
+
+        # Find indices of stop and create actions
+        stop_indices = [i for i, a in enumerate(actions) if isinstance(a, StopExecutorAction)]
+        create_indices = [i for i, a in enumerate(actions) if isinstance(a, CreateExecutorAction)]
+
+        if stop_indices and create_indices:
+            self.assertTrue(
+                max(stop_indices) < min(create_indices),
+                f"Stop actions must precede create actions. Got stops at {stop_indices}, creates at {create_indices}"
+            )
+
+    # ---- Real ExecutorInfo integration tests (not MagicMock) ----
+
+    def _make_real_executor_info(
+        self,
+        executor_type: str,
+        side: TradeType,
+        connector_name: str,
+        trading_pair: str,
+        amount: Decimal,
+        level_id: str = "buy_0",
+        is_active: bool = True,
+    ) -> ExecutorInfo:
+        """Create a real ExecutorInfo (not MagicMock) for integration-grade tests."""
+        from hummingbot.strategy_v2.models.base import RunnableStatus
+
+        if executor_type == "position_executor":
+            config = PositionExecutorConfig(
+                timestamp=1000000.0,
+                controller_id="test",
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                side=side,
+                amount=amount,
+                entry_price=Decimal("0.25"),
+                level_id=level_id,
+            )
+            custom_info = {
+                "level_id": level_id,
+                "side": side,
+                "current_position_average_price": Decimal("0.25"),
+                "current_retries": 0,
+                "max_retries": 10,
+                "close_price": Decimal("0"),
+                "open_order_last_update": None,
+                "order_ids": [],
+                "held_position_orders": [],
+            }
+        else:  # order_executor
+            config = OrderExecutorConfig(
+                timestamp=1000000.0,
+                controller_id="test",
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                side=side,
+                amount=amount,
+                price=Decimal("0.25"),
+                execution_strategy=ExecutionStrategy.MARKET,
+                level_id=level_id,
+            )
+            custom_info = {
+                "level_id": level_id,
+                "current_retries": 0,
+                "max_retries": 10,
+                "order_id": None,
+                "order_last_update": None,
+                "held_position_orders": [],
+            }
+
+        return ExecutorInfo(
+            id=f"test-{level_id}-{side.name}",
+            timestamp=1000000.0,
+            type=executor_type,
+            status=RunnableStatus.RUNNING if is_active else RunnableStatus.TERMINATED,
+            config=config,
+            net_pnl_pct=Decimal("0"),
+            net_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            filled_amount_quote=Decimal("0"),
+            is_active=is_active,
+            is_trading=False,
+            custom_info=custom_info,
+        )
+
+    def test_inflight_buy_real_position_executor_info(self):
+        """Real PositionExecutorConfig is correctly detected as inflight buy."""
+        controller = self._make_spot_controller()
+        real_exec = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("10.0"), "buy_0")
+        controller.executors_info = [real_exec]
+
+        result = controller.get_inflight_buy_base_amount()
+        self.assertEqual(result, Decimal("10.0"))
+
+    def test_inflight_buy_real_order_executor_info(self):
+        """Real OrderExecutorConfig is correctly detected as inflight buy."""
+        controller = self._make_spot_controller()
+        real_exec = self._make_real_executor_info(
+            "order_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("7.5"), "position_rebalance")
+        controller.executors_info = [real_exec]
+
+        result = controller.get_inflight_buy_base_amount()
+        self.assertEqual(result, Decimal("7.5"))
+
+    def test_inflight_buy_mixed_executor_types(self):
+        """Mixed executor types: only BUY-side executors are counted."""
+        controller = self._make_spot_controller()
+        pos_buy = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("5.0"), "buy_0")
+        ord_buy = self._make_real_executor_info(
+            "order_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("3.0"), "position_rebalance")
+        pos_sell = self._make_real_executor_info(
+            "position_executor", TradeType.SELL, "binance", "ETH-USDT", Decimal("4.0"), "sell_0")
+        controller.executors_info = [pos_buy, ord_buy, pos_sell]
+
+        result = controller.get_inflight_buy_base_amount()
+        self.assertEqual(result, Decimal("8.0"))
+
+    def test_inflight_buy_inactive_executor_excluded(self):
+        """Inactive (TERMINATED) executor is excluded from inflight buy count."""
+        controller = self._make_spot_controller()
+        inactive = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("10.0"), "buy_0",
+            is_active=False)
+        controller.executors_info = [inactive]
+
+        result = controller.get_inflight_buy_base_amount()
+        self.assertEqual(result, Decimal("0"))
+
+    def test_check_rebalance_suppressed_by_real_inflight_buy(self):
+        """Full integration: real inflight buy covers shortage, no rebalance emitted."""
+        current_time = 1000000.0
+        controller = self._make_spot_controller(rebalance_cooldown_time=60)
+        controller._last_rebalance_attempt_timestamp = 0.0
+        controller.positions_held = []
+        self.mock_market_data_provider.time.return_value = current_time
+
+        # Real PositionExecutor BUY with amount >= required
+        real_exec = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("10.0"), "buy_0")
+        controller.executors_info = [real_exec]
+
+        with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
+            result = controller.check_position_rebalance()
+
+        self.assertIsNone(result)
+
+    def test_check_rebalance_with_partial_inflight_real(self):
+        """Partial inflight buy: rebalance emitted for the remaining shortage."""
+        current_time = 1000000.0
+        controller = self._make_spot_controller(rebalance_cooldown_time=60)
+        controller._last_rebalance_attempt_timestamp = 0.0
+        controller.positions_held = []
+        self.mock_market_data_provider.time.return_value = current_time
+
+        # Real inflight buy covers only 4.0 of 10.0 required
+        real_exec = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("4.0"), "buy_0")
+        controller.executors_info = [real_exec]
+
+        with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
+            result = controller.check_position_rebalance()
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, CreateExecutorAction)
+        self.assertEqual(result.executor_config.side, TradeType.BUY)
+        self.assertEqual(result.executor_config.amount, Decimal("6.0"))
+
+    def test_get_effective_base_inventory_breakdown(self):
+        """get_effective_base_inventory returns correct breakdown dict."""
+        controller = self._make_spot_controller(
+            position_rebalance_threshold_pct=Decimal("0.05"))
+        controller.processed_data = {"reference_price": Decimal("100"), "spread_multiplier": Decimal("1")}
+
+        # positions_held: 3.0 base
+        mock_position = MagicMock()
+        mock_position.connector_name = "binance"
+        mock_position.trading_pair = "ETH-USDT"
+        mock_position.side = TradeType.BUY
+        mock_position.amount = Decimal("3.0")
+        controller.positions_held = [mock_position]
+
+        # active BUY executor: 2.0 base inflight
+        real_exec = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("2.0"), "buy_0")
+        controller.executors_info = [real_exec]
+
+        with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
+            inv = controller.get_effective_base_inventory()
+
+        self.assertEqual(inv["required_base"], Decimal("10.0"))
+        self.assertEqual(inv["held_base"], Decimal("3.0"))
+        self.assertEqual(inv["inflight_buy_base"], Decimal("2.0"))
+        self.assertEqual(inv["raw_shortage"], Decimal("7.0"))
+        self.assertEqual(inv["adjusted_shortage"], Decimal("5.0"))
+        self.assertEqual(inv["threshold"], Decimal("0.50"))
+        self.assertTrue(inv["needs_rebalance"])  # 5.0 > 0.50
+
+    def test_rebalance_debug_logging_emitted(self):
+        """check_position_rebalance emits structured DEBUG log with inventory components."""
+        import logging
+        current_time = 1000000.0
+        controller = self._make_spot_controller(rebalance_cooldown_time=60)
+        controller._last_rebalance_attempt_timestamp = 0.0
+        controller.positions_held = []
+        controller.executors_info = []
+        self.mock_market_data_provider.time.return_value = current_time
+
+        # The logger is from RunnableBase: logging.getLogger(__name__) in runnable_base.py
+        logger = logging.getLogger("hummingbot.strategy_v2.runnable_base")
+        with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
+            with self.assertLogs(logger, level="DEBUG") as log:
+                controller.check_position_rebalance()
+
+        # Find the rebalance check log line
+        rebalance_logs = [m for m in log.output if "Rebalance check for" in m]
+        self.assertTrue(len(rebalance_logs) > 0, "Expected 'Rebalance check for' in DEBUG logs")
+        msg = rebalance_logs[0]
+        self.assertIn("required_base=", msg)
+        self.assertIn("held_base=", msg)
+        self.assertIn("inflight_buy=", msg)
+        self.assertIn("adjusted_diff=", msg)
+
+    def test_inflight_buy_logging_when_found(self):
+        """get_inflight_buy_base_amount emits DEBUG log when executors are found."""
+        import logging
+        controller = self._make_spot_controller()
+        real_exec = self._make_real_executor_info(
+            "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("5.0"), "buy_0")
+        controller.executors_info = [real_exec]
+
+        logger = logging.getLogger("hummingbot.strategy_v2.runnable_base")
+        with self.assertLogs(logger, level="DEBUG") as log:
+            controller.get_inflight_buy_base_amount()
+
+        inflight_logs = [m for m in log.output if "Inflight buy detection" in m]
+        self.assertTrue(len(inflight_logs) > 0, "Expected 'Inflight buy detection' in DEBUG logs")
+        msg = inflight_logs[0]
+        self.assertIn(real_exec.id, msg)
+        self.assertIn("5.0", msg)

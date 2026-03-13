@@ -230,10 +230,12 @@ class MarketMakingControllerBase(ControllerBase):
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Determine actions based on the provided executor handler report.
+        Stop actions are emitted before create actions so that outgoing executors
+        release their collateral before new ones attempt budget validation.
         """
         actions = []
-        actions.extend(self.create_actions_proposal())
         actions.extend(self.stop_actions_proposal())
+        actions.extend(self.create_actions_proposal())
         return actions
 
     def create_actions_proposal(self) -> List[ExecutorAction]:
@@ -358,12 +360,16 @@ class MarketMakingControllerBase(ControllerBase):
             filter_func=lambda x: x.is_active and x.custom_info.get("level_id") == "position_rebalance"
         )
         if len(active_rebalance) > 0:
-            # If there's already an active rebalance executor, skip rebalancing
+            self.logger().debug(
+                f"Rebalance check for {self.config.trading_pair}: "
+                f"skipped — active rebalance executor exists (id={active_rebalance[0].id})"
+            )
             return None
 
         # Check cooldown — suppress rebalance if last attempt was too recent
         current_time = self.market_data_provider.time()
-        if current_time - self._last_rebalance_attempt_timestamp < self.config.rebalance_cooldown_time:
+        time_since_last = current_time - self._last_rebalance_attempt_timestamp
+        if time_since_last < self.config.rebalance_cooldown_time:
             return None
 
         required_base_amount = self.config.get_required_base_amount(Decimal(self.processed_data["reference_price"]))
@@ -373,12 +379,26 @@ class MarketMakingControllerBase(ControllerBase):
         base_amount_diff = required_base_amount - current_base_amount
 
         # Account for in-flight buy orders already working to replenish
+        inflight_buy = Decimal("0")
         if base_amount_diff > 0:
             inflight_buy = self.get_inflight_buy_base_amount()
             base_amount_diff = max(Decimal("0"), base_amount_diff - inflight_buy)
 
         # Check if difference exceeds threshold
         threshold_amount = required_base_amount * self.config.position_rebalance_threshold_pct
+
+        # Structured debug log for every rebalance evaluation
+        self.logger().debug(
+            f"Rebalance check for {self.config.trading_pair}: "
+            f"required_base={required_base_amount:.6f}, "
+            f"held_base={current_base_amount:.6f}, "
+            f"inflight_buy={inflight_buy:.6f}, "
+            f"adjusted_diff={base_amount_diff:.6f}, "
+            f"threshold={threshold_amount:.6f}, "
+            f"will_rebalance={abs(base_amount_diff) > threshold_amount}, "
+            f"active_executors_count={len(self.executors_info)}, "
+            f"positions_held_count={len(self.positions_held)}"
+        )
 
         if abs(base_amount_diff) > threshold_amount:
             # We need to rebalance
@@ -396,19 +416,44 @@ class MarketMakingControllerBase(ControllerBase):
         """
         Get the total base amount of active buy-side executors that are working to
         replenish inventory (includes both PMM buy levels and pending rebalance buys).
+        Uses defensive attribute access to handle different executor config types.
         """
         inflight_buy_amount = Decimal("0")
-        active_buy_executors = self.filter_executors(
-            executors=self.executors_info,
-            filter_func=lambda x: (
-                x.is_active and
-                x.config.connector_name == self.config.connector_name and
-                x.config.trading_pair == self.config.trading_pair and
-                x.config.side == TradeType.BUY
+        matched_executors = []
+
+        for executor in self.executors_info:
+            if not executor.is_active:
+                continue
+
+            config = executor.config
+            # Defensive attribute access — different config types may have different shapes
+            try:
+                exec_connector = config.connector_name
+                exec_pair = config.trading_pair
+                exec_side = config.side
+                exec_amount = config.amount
+            except AttributeError:
+                continue
+
+            if (exec_connector == self.config.connector_name and
+                    exec_pair == self.config.trading_pair and
+                    exec_side == TradeType.BUY):
+                inflight_buy_amount += exec_amount
+                matched_executors.append({
+                    "id": executor.id,
+                    "type": executor.type,
+                    "amount": str(exec_amount),
+                    "level_id": executor.custom_info.get("level_id", "unknown"),
+                })
+
+        if matched_executors:
+            self.logger().debug(
+                f"Inflight buy detection for {self.config.trading_pair}: "
+                f"found {len(matched_executors)} active BUY executor(s), "
+                f"total_inflight={inflight_buy_amount}. "
+                f"Details: {matched_executors}"
             )
-        )
-        for executor in active_buy_executors:
-            inflight_buy_amount += executor.config.amount
+
         return inflight_buy_amount
 
     def get_current_base_position(self) -> Decimal:
@@ -427,6 +472,31 @@ class MarketMakingControllerBase(ControllerBase):
                     total_base_amount -= position.amount
 
         return total_base_amount
+
+    def get_effective_base_inventory(self) -> dict:
+        """
+        Compute a full breakdown of effective base inventory for rebalance decisions.
+        Returns a dict with all components for debugging and testing.
+        """
+        held = self.get_current_base_position()
+        inflight_buy = self.get_inflight_buy_base_amount()
+        required = self.config.get_required_base_amount(
+            Decimal(self.processed_data.get("reference_price", "0"))
+        ) if "reference_price" in self.processed_data else Decimal("0")
+
+        raw_diff = required - held
+        adjusted_diff = max(Decimal("0"), raw_diff - inflight_buy) if raw_diff > 0 else raw_diff
+        threshold = required * self.config.position_rebalance_threshold_pct
+
+        return {
+            "required_base": required,
+            "held_base": held,
+            "inflight_buy_base": inflight_buy,
+            "raw_shortage": raw_diff,
+            "adjusted_shortage": adjusted_diff,
+            "threshold": threshold,
+            "needs_rebalance": abs(adjusted_diff) > threshold,
+        }
 
     def create_position_rebalance_order(self, side: TradeType, amount: Decimal) -> CreateExecutorAction:
         """

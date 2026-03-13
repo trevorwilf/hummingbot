@@ -730,11 +730,13 @@ class StrategyV2Base(StrategyPyBase):
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Determine actions based on the provided executor handler report.
+        Order: stop → store → create, so outgoing executors release collateral
+        before new ones attempt budget validation.
         """
         actions = []
-        actions.extend(self.create_actions_proposal())
         actions.extend(self.stop_actions_proposal())
         actions.extend(self.store_actions_proposal())
+        actions.extend(self.create_actions_proposal())
         return actions
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:

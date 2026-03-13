@@ -386,10 +386,128 @@ class ExecutorOrchestrator:
 
     def execute_actions(self, actions: List[ExecutorAction]):
         """
-        Execute a list of actions.
+        Execute a list of actions in the correct order:
+        1. StopExecutorAction — free collateral from outgoing executors first
+        2. StoreExecutorAction — persist completed executors
+        3. CreateExecutorAction — create new executors after budget preflight
         """
-        for action in actions:
+        stop_actions = [a for a in actions if isinstance(a, StopExecutorAction)]
+        store_actions = [a for a in actions if isinstance(a, StoreExecutorAction)]
+        create_actions = [a for a in actions if isinstance(a, CreateExecutorAction)]
+
+        for action in stop_actions:
             self.execute_action(action)
+        for action in store_actions:
+            self.execute_action(action)
+
+        # Run batch budget preflight before creating executors
+        surviving_creates = self._preflight_budget_check(create_actions)
+        for action in surviving_creates:
+            self.execute_action(action)
+
+    def _preflight_budget_check(self, create_actions: List[CreateExecutorAction]) -> List[CreateExecutorAction]:
+        """
+        Run a batch budget preflight across all create-actions for the cycle.
+        Returns only the actions that survive the budget check.
+        Actions are checked in order; earlier actions have priority for collateral.
+        """
+        if not create_actions:
+            return create_actions
+
+        from hummingbot.core.data_type.common import OrderType, PriceType
+        from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+
+        # Group by connector
+        connector_groups = {}
+        ungrouped_actions = []
+        for action in create_actions:
+            connector_name = getattr(action.executor_config, 'connector_name', None)
+            if connector_name is None:
+                # Configs like ArbitrageExecutorConfig don't have a single connector_name
+                ungrouped_actions.append(action)
+                continue
+            if connector_name not in connector_groups:
+                connector_groups[connector_name] = []
+            connector_groups[connector_name].append(action)
+
+        surviving_actions = list(ungrouped_actions)
+        dropped_actions = []
+
+        for connector_name, group_actions in connector_groups.items():
+            connector = self.strategy.connectors.get(connector_name)
+            if connector is None:
+                # No connector available, let actions through (they'll fail normally)
+                surviving_actions.extend(group_actions)
+                continue
+
+            budget_checker = connector.budget_checker
+            budget_checker.reset_locked_collateral()
+
+            for action in group_actions:
+                config = action.executor_config
+                # Build an order candidate from the executor config
+                try:
+                    # Determine price for validation
+                    price = getattr(config, 'entry_price', None) or getattr(config, 'price', None)
+                    if price is None or (hasattr(price, 'is_nan') and price.is_nan()):
+                        # For market orders, use current market price
+                        price = self.strategy.market_data_provider.get_price_by_type(
+                            connector_name, config.trading_pair,
+                            PriceType.BestAsk if config.side == TradeType.BUY else PriceType.BestBid)
+
+                    is_maker = True  # Conservative default
+                    if hasattr(config, 'execution_strategy'):
+                        from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
+                        is_maker = config.execution_strategy not in [ExecutionStrategy.MARKET]
+                    elif hasattr(config, 'triple_barrier_config'):
+                        is_maker = config.triple_barrier_config.open_order_type.is_limit_type()
+
+                    is_perpetual = "perpetual" in connector_name
+
+                    if is_perpetual:
+                        candidate = PerpetualOrderCandidate(
+                            trading_pair=config.trading_pair,
+                            is_maker=is_maker,
+                            order_type=OrderType.LIMIT if is_maker else OrderType.MARKET,
+                            order_side=config.side,
+                            amount=config.amount,
+                            price=price,
+                            leverage=Decimal(getattr(config, 'leverage', 1)),
+                        )
+                    else:
+                        candidate = OrderCandidate(
+                            trading_pair=config.trading_pair,
+                            is_maker=is_maker,
+                            order_type=OrderType.LIMIT if is_maker else OrderType.MARKET,
+                            order_side=config.side,
+                            amount=config.amount,
+                            price=price,
+                        )
+
+                    adjusted = budget_checker.adjust_candidate_and_lock_available_collateral(candidate, all_or_none=True)
+                    if adjusted.amount == Decimal("0"):
+                        dropped_actions.append(action)
+                    else:
+                        surviving_actions.append(action)
+                except Exception as e:
+                    self.logger().warning(
+                        f"Budget preflight failed for action on {config.trading_pair}: {e}. "
+                        f"Allowing action through.")
+                    surviving_actions.append(action)
+
+            budget_checker.reset_locked_collateral()
+
+        if dropped_actions:
+            dropped_summary = ", ".join(
+                f"{a.executor_config.trading_pair} {a.executor_config.side.name} {a.executor_config.amount}"
+                for a in dropped_actions
+            )
+            self.logger().info(
+                f"Budget preflight: dropped {len(dropped_actions)} action(s) due to insufficient balance: "
+                f"[{dropped_summary}]"
+            )
+
+        return surviving_actions
 
     def create_executor(self, action: CreateExecutorAction):
         """
