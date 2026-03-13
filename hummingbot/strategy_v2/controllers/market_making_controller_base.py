@@ -115,6 +115,12 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the position rebalance threshold percentage (e.g., 0.05 for 5%): ",
             "prompt_on_new": True, "is_updatable": True}
     )
+    rebalance_cooldown_time: int = Field(
+        default=60,
+        json_schema_extra={
+            "prompt": "Enter the cooldown time in seconds after a rebalance attempt (e.g., 60): ",
+            "is_updatable": True}
+    )
     skip_rebalance: bool = Field(default=False)
 
     @field_validator("trailing_stop", mode="before")
@@ -217,6 +223,7 @@ class MarketMakingControllerBase(ControllerBase):
     def __init__(self, config: MarketMakingControllerConfigBase, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
+        self._last_rebalance_attempt_timestamp: float = 0.0
         self.market_data_provider.initialize_rate_sources([ConnectorPair(
             connector_name=config.connector_name, trading_pair=config.trading_pair)])
 
@@ -237,10 +244,11 @@ class MarketMakingControllerBase(ControllerBase):
 
         # Check if we need to rebalance position first
         position_rebalance_action = self.check_position_rebalance()
-        if position_rebalance_action:
-            create_actions.append(position_rebalance_action)
+        if position_rebalance_action is not None:
+            # Rebalance is EXCLUSIVE — do not create PMM levels in the same cycle
+            return [position_rebalance_action]
 
-        # Create normal market making levels
+        # Only create normal market making levels if no rebalance action was produced
         levels_to_execute = self.get_levels_to_execute()
         for level_id in levels_to_execute:
             price, amount = self.get_price_and_amount(level_id)
@@ -353,17 +361,28 @@ class MarketMakingControllerBase(ControllerBase):
             # If there's already an active rebalance executor, skip rebalancing
             return None
 
+        # Check cooldown — suppress rebalance if last attempt was too recent
+        current_time = self.market_data_provider.time()
+        if current_time - self._last_rebalance_attempt_timestamp < self.config.rebalance_cooldown_time:
+            return None
+
         required_base_amount = self.config.get_required_base_amount(Decimal(self.processed_data["reference_price"]))
         current_base_amount = self.get_current_base_position()
 
         # Calculate the difference
         base_amount_diff = required_base_amount - current_base_amount
 
+        # Account for in-flight buy orders already working to replenish
+        if base_amount_diff > 0:
+            inflight_buy = self.get_inflight_buy_base_amount()
+            base_amount_diff = max(Decimal("0"), base_amount_diff - inflight_buy)
+
         # Check if difference exceeds threshold
         threshold_amount = required_base_amount * self.config.position_rebalance_threshold_pct
 
         if abs(base_amount_diff) > threshold_amount:
             # We need to rebalance
+            self._last_rebalance_attempt_timestamp = current_time
             if base_amount_diff > 0:
                 # Need to buy more base asset
                 return self.create_position_rebalance_order(TradeType.BUY, abs(base_amount_diff))
@@ -372,6 +391,25 @@ class MarketMakingControllerBase(ControllerBase):
                 return self.create_position_rebalance_order(TradeType.SELL, abs(base_amount_diff))
 
         return None
+
+    def get_inflight_buy_base_amount(self) -> Decimal:
+        """
+        Get the total base amount of active buy-side executors that are working to
+        replenish inventory (includes both PMM buy levels and pending rebalance buys).
+        """
+        inflight_buy_amount = Decimal("0")
+        active_buy_executors = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: (
+                x.is_active and
+                x.config.connector_name == self.config.connector_name and
+                x.config.trading_pair == self.config.trading_pair and
+                x.config.side == TradeType.BUY
+            )
+        )
+        for executor in active_buy_executors:
+            inflight_buy_amount += executor.config.amount
+        return inflight_buy_amount
 
     def get_current_base_position(self) -> Decimal:
         """

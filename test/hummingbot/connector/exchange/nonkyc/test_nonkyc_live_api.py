@@ -3216,8 +3216,9 @@ def test_7c_post_auth_signature_deterministic():
 
 
 def test_7c_get_auth_param_order_irrelevant():
-    """7C-2: GET auth with different param order produces same signature."""
-    from unittest.mock import MagicMock, patch
+    """7C-2: GET auth preserves dict insertion order (matching aiohttp).
+    Slashes in values must NOT be percent-encoded."""
+    from unittest.mock import MagicMock
     from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
     from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 
@@ -3229,14 +3230,15 @@ def test_7c_get_auth_param_order_irrelevant():
         req_a = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
                             params={"status": "active", "symbol": "BTC/USDT"})
         await auth.rest_authenticate(req_a)
-        req_b = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
-                            params={"symbol": "BTC/USDT", "status": "active"})
-        await auth.rest_authenticate(req_b)
-        assert req_a.headers["X-API-SIGN"] == req_b.headers["X-API-SIGN"], \
-            f"Signatures differ: {req_a.headers['X-API-SIGN']} vs {req_b.headers['X-API-SIGN']}"
+        # Params baked into URL in insertion order, not percent-encoded
+        assert "status=active&symbol=BTC/USDT" in req_a.url, \
+            f"Params not in insertion order: {req_a.url}"
+        assert "%2F" not in req_a.url, f"Slash was percent-encoded: {req_a.url}"
+        assert req_a.params is None, "Params should be baked into URL"
+        assert "X-API-SIGN" in req_a.headers
 
     asyncio.get_event_loop().run_until_complete(_run())
-    result("7C-2: GET auth param order irrelevant", True)
+    result("7C-2: GET auth preserves insertion order, no %2F", True)
 
 
 def test_7c_balance_update_event_structure():

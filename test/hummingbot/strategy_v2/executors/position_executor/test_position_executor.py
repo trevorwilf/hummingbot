@@ -35,8 +35,15 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         strategy.buy.side_effect = ["OID-BUY-1", "OID-BUY-2", "OID-BUY-3"]
         strategy.sell.side_effect = ["OID-SELL-1", "OID-SELL-2", "OID-SELL-3"]
         strategy.cancel.return_value = None
+        connector_mock = MagicMock(spec=ExchangePyBase)
+        # Provide realistic available_balances and price so the spot balance-capping
+        # code path in place_close_order_and_cancel_open_orders doesn't hit MagicMock
+        # comparison errors (Decimal vs MagicMock).
+        type(connector_mock).available_balances = PropertyMock(
+            return_value={"ETH": Decimal("1000"), "USDT": Decimal("100000")})
+        connector_mock.get_price_by_type.return_value = Decimal("100")
         strategy.connectors = {
-            "binance": MagicMock(spec=ExchangePyBase),
+            "binance": connector_mock,
         }
         return strategy
 
