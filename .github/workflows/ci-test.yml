@@ -1,0 +1,87 @@
+name: CI Tests
+
+on:
+  pull_request:
+    branches: [main, development, nonkyc]
+  push:
+    branches: [main, development, nonkyc]
+
+jobs:
+  collect-smoke:
+    name: Collection Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install minimal deps
+        run: |
+          pip install pytest pytest-asyncio
+          pip install -e . || true
+      - name: Collect tests (non-blocking)
+        run: pytest --collect-only -m "not quarantined and not live_api" test/ 2>&1 | tail -20
+        continue-on-error: true
+
+  unit-fast:
+    name: Fast Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          pip install -e ".[test]" || pip install -e .
+          pip install pytest pytest-asyncio coverage
+      - name: Run blocking tests
+        run: |
+          coverage run -m pytest \
+            --ignore="test/mock" \
+            -m "not quarantined and not live_api" \
+            test/ -q
+      - name: Coverage report
+        run: |
+          coverage report
+          coverage xml
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+
+  strategy-v2-critical:
+    name: Strategy V2 Critical Lane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: pip install -e ".[test]" || pip install -e .
+      - name: Run strategy-v2 tests
+        run: |
+          pytest test/hummingbot/strategy_v2/ -v -m "not quarantined and not live_api"
+
+  quarantined:
+    name: Quarantined Tests (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: pip install -e ".[test]" || pip install -e .
+      - name: Run quarantined tests
+        run: pytest -m "quarantined" test/ --no-header -rN || true

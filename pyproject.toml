@@ -1,5 +1,10 @@
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "quarantined: tests that are temporarily broken or flaky and excluded from the blocking CI lane",
+    "live_api: tests that hit live exchange endpoints and require real API credentials",
+    "slow: tests that take more than 30 seconds to run",
+]
 
 [tool.black]
 line-length = 120

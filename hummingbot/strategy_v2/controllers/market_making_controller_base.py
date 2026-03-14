@@ -122,6 +122,14 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
             "is_updatable": True}
     )
     skip_rebalance: bool = Field(default=False)
+    use_wallet_balance: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": "Seed sell-side inventory from existing wallet balance? (True/False): ",
+            "prompt_on_new": True,
+            "is_updatable": False
+        }
+    )
 
     @field_validator("trailing_stop", mode="before")
     @classmethod
@@ -224,8 +232,57 @@ class MarketMakingControllerBase(ControllerBase):
         super().__init__(config, *args, **kwargs)
         self.config = config
         self._last_rebalance_attempt_timestamp: float = 0.0
+        self._wallet_balance_seeded: bool = False
         self.market_data_provider.initialize_rate_sources([ConnectorPair(
             connector_name=config.connector_name, trading_pair=config.trading_pair)])
+
+    def compute_wallet_seed_amount(self, reference_price: Decimal) -> Decimal:
+        """
+        Compute how much base asset to seed from the wallet into the controller's inventory.
+
+        When use_wallet_balance is True, queries the exchange for the available balance
+        of the base asset and returns min(available_balance, required_base_for_sell_side).
+        Returns Decimal("0") if the flag is False or the base asset has no available balance.
+
+        :param reference_price: Current market price for the trading pair
+        :return: Amount of base asset to seed as initial inventory
+        """
+        if not self.config.use_wallet_balance:
+            return Decimal("0")
+
+        # Extract base asset from trading pair (e.g., "ARRR-USDT" -> "ARRR")
+        base_asset = self.config.trading_pair.split("-")[0]
+
+        try:
+            available_balance = self.market_data_provider.get_available_balance(
+                self.config.connector_name, base_asset
+            )
+        except Exception as e:
+            self.logger().warning(
+                f"Wallet seed for {self.config.trading_pair}: "
+                f"failed to query balance for {base_asset} — {e}"
+            )
+            return Decimal("0")
+
+        if available_balance is None or available_balance <= Decimal("0"):
+            self.logger().info(
+                f"Wallet seed for {self.config.trading_pair}: "
+                f"no available {base_asset} balance to seed."
+            )
+            return Decimal("0")
+
+        # Compute how much base the sell side needs
+        required_base = self.config.get_required_base_amount(reference_price)
+
+        # Take the lesser of what's available and what's needed
+        seed_amount = min(available_balance, required_base)
+
+        self.logger().info(
+            f"Wallet seed for {self.config.trading_pair}: "
+            f"available={available_balance}, required={required_base}, "
+            f"seeding={seed_amount} {base_asset}"
+        )
+        return seed_amount
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """

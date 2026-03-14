@@ -26,20 +26,11 @@ CONDA_ENV=hummingbot
 ```json
 {
     "python.testing.pytestEnabled": true,
+    // Test selection is marker-based. See pyproject.toml for registered markers.
+    // Quarantined tests are auto-excluded. Do NOT add --ignore paths here.
     "python.testing.pytestArgs": [
         "test",
-        // "-v",  // optional: verbose output
-
-        // From MakeFile (currently broken tests - KEEP UPDATED)
-        "--ignore=test/hummingbot/connector/derivative/dydx_v4_perpetual/",
-        "--ignore=test/hummingbot/connector/derivative/injective_v2_perpetual/",
-        "--ignore=test/hummingbot/connector/exchange/injective_v2/",
-        "--ignore=test/hummingbot/remote_iface/",
-        "--ignore=test/connector/utilities/oms_connector/",
-        "--ignore=test/hummingbot/strategy/amm_arb/",
-
-        // Skip prompt tests that modify conf_client.yml
-        "--ignore=test/hummingbot/client/command/test_create_command.py",
+        "-m", "not quarantined and not live_api"
     ],
     "python.envFile": "${workspaceFolder}/.env",
     "python.terminal.activateEnvironment": true,
@@ -107,9 +98,10 @@ CONDA_ENV=hummingbot
     * In the Testing View, right-click on the test(s) you want to debug and select "Debug".
     * VS Code/Cursor will start the debugger and stop at your breakpoints, allowing you to inspect variables, step through code, and understand the flow of execution.
 
-**VI. Notes on Ignored Tests:**
+**VI. Notes on Test Selection:**
 
-* **Broken Tests (Makefile):** The `--ignore` flags in `settings.json` exclude tests that are currently known to be broken (as indicated in the project's `Makefile`). **It is crucial to regularly review and update this list if the status of these tests changes.**
-* **`test_create_command.py`:** Tests in `test_create_command.py` are ignored because they modify the `conf_client.yml` file. Running these tests locally can potentially interfere with your Hummingbot configuration. If you make changes that could affect these commands, ensure your Pull Request (PR) will pass the automated tests, as they might be run in the CI environment.
+* **Marker-based selection:** Tests are categorized using pytest markers defined in `pyproject.toml`. The `settings.json` configuration excludes `quarantined` and `live_api` tests by default. Quarantined directories have a `conftest.py` with `pytestmark = pytest.mark.quarantined`.
+* **To run quarantined tests:** Use `pytest -m "quarantined" test/` from the command line.
+* **To run live API tests:** Use `pytest -m "live_api" test/ -v` (requires API credentials).
 
-By following these steps, you can effectively use VS Code or Cursor to run and debug Hummingbot tests, leveraging the IDE's features for a more integrated and potentially more efficient testing experience, especially when debugging is required. Remember to keep the ignored tests list up-to-date with the `Makefile` to maintain consistency.
+By following these steps, you can effectively use VS Code or Cursor to run and debug Hummingbot tests, leveraging the IDE's features for a more integrated and potentially more efficient testing experience, especially when debugging is required.

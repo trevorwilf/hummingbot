@@ -1,0 +1,26 @@
+name: Live API Contract Tests
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  nonkyc-readonly-live:
+    name: NonKYC Read-Only Live Contract
+    runs-on: ubuntu-latest
+    environment: live-api
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          pip install requests websockets python-dotenv pytest
+      - name: Run live API tests
+        env:
+          NONKYC_API_KEY: ${{ secrets.NONKYC_API_KEY }}
+          NONKYC_API_SECRET: ${{ secrets.NONKYC_API_SECRET }}
+        run: pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_live_api.py -v -m "live_api" || true

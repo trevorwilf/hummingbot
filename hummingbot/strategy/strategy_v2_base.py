@@ -18,7 +18,7 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import MarketDict, PositionMode
+from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderType, PositionAction
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -287,6 +287,7 @@ class StrategyV2Base(StrategyPyBase):
             strategy=self,
             initial_positions_by_controller=self._collect_initial_positions()
         )
+        self._wallet_balances_seeded: bool = False
 
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
@@ -317,6 +318,14 @@ class StrategyV2Base(StrategyPyBase):
             self.update_executors_info()
             self.update_controllers_configs()
             if self.market_data_provider.ready and not self._is_stop_triggered:
+                # One-time wallet balance seeding once connectors and market data are ready
+                if not self._wallet_balances_seeded:
+                    self._seed_wallet_balances()
+                    # Refresh controller views so they see the newly-seeded positions
+                    # BEFORE determine_executor_actions() runs. Without this,
+                    # check_position_rebalance() would see empty positions_held and
+                    # fire a spurious buy order on the first tick.
+                    self.update_executors_info()
                 executor_actions: List[ExecutorAction] = self.determine_executor_actions()
                 for action in executor_actions:
                     self.executor_orchestrator.execute_action(action)
@@ -651,6 +660,65 @@ class StrategyV2Base(StrategyPyBase):
             self.logger().error(f"Error collecting initial positions: {e}", exc_info=True)
 
         return initial_positions_by_controller
+
+    def _seed_wallet_balances(self):
+        """
+        One-time wallet balance seeding for controllers with use_wallet_balance=True.
+        Called from on_tick() once market_data_provider is ready, so connectors have
+        fetched balances and prices are available.
+
+        For each market-making controller with the flag enabled, queries the exchange
+        for the available base asset balance, computes how much the sell side needs,
+        and injects min(available, required) as a PositionHold in the orchestrator.
+        """
+        self._wallet_balances_seeded = True  # Set first to avoid re-entry
+
+        for controller_id, controller in self.controllers.items():
+            config = controller.config
+            # Only applies to market making controllers with the flag
+            if not isinstance(config, MarketMakingControllerConfigBase):
+                continue
+            if not getattr(config, 'use_wallet_balance', False):
+                continue
+            # Skip if controller already marked as seeded (e.g., was restarted)
+            if getattr(controller, '_wallet_balance_seeded', False):
+                continue
+            # Skip perpetual connectors (no wallet inventory concept)
+            if "_perpetual" in config.connector_name:
+                self.logger().info(
+                    f"Wallet seed skipped for {controller_id}: perpetual connector"
+                )
+                controller._wallet_balance_seeded = True
+                continue
+
+            try:
+                # Get reference price
+                reference_price = self.market_data_provider.get_price_by_type(
+                    config.connector_name, config.trading_pair, PriceType.MidPrice
+                )
+                if reference_price is None or reference_price.is_nan() or reference_price <= Decimal("0"):
+                    self.logger().warning(
+                        f"Wallet seed deferred for {controller_id}: "
+                        f"no valid price for {config.trading_pair}"
+                    )
+                    self._wallet_balances_seeded = False  # Retry next tick
+                    continue
+
+                seed_amount = controller.compute_wallet_seed_amount(reference_price)
+                if seed_amount > Decimal("0"):
+                    self.executor_orchestrator.add_wallet_position(
+                        controller_id=controller_id,
+                        connector_name=config.connector_name,
+                        trading_pair=config.trading_pair,
+                        side=TradeType.BUY,  # Held base asset = BUY position
+                        amount=seed_amount,
+                    )
+                controller._wallet_balance_seeded = True
+            except Exception as e:
+                self.logger().error(
+                    f"Wallet seed failed for {controller_id}: {e}", exc_info=True
+                )
+                controller._wallet_balance_seeded = True  # Don't retry on error
 
     def initialize_controllers(self):
         """

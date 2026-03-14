@@ -9,13 +9,21 @@ endif
 
 test:
 	coverage run -m pytest \
- 	--ignore="test/mock" \
- 	--ignore="test/hummingbot/connector/exchange/ndax/" \
- 	--ignore="test/hummingbot/connector/derivative/dydx_v4_perpetual/" \
- 	--ignore="test/hummingbot/remote_iface/" \
- 	--ignore="test/connector/utilities/oms_connector/" \
- 	--ignore="test/hummingbot/strategy/amm_arb/" \
- 	--ignore="test/hummingbot/strategy/cross_exchange_market_making/" \
+	--ignore="test/mock" \
+	-m "not quarantined and not live_api" \
+	test/
+
+test_quarantined:
+	pytest -m "quarantined" test/ --no-header -rN || true
+
+test_live:
+	pytest -m "live_api" test/ -v
+
+test_strategy_v2_critical:
+	pytest test/hummingbot/strategy_v2/ -v -m "not quarantined and not live_api"
+
+test_nonkyc:
+	pytest test/hummingbot/connector/exchange/nonkyc/ -v -m "not live_api" \
 
 run_coverage: test
 	coverage report

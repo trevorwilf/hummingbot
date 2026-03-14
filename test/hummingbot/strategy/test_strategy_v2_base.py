@@ -165,7 +165,8 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.on_tick()
 
         # Assertions to ensure that methods are called
-        mock_update_executors_info.assert_called_once()
+        # May be called more than once on ticks that trigger wallet-balance seeding
+        mock_update_executors_info.assert_called()
         mock_update_controllers_configs.assert_called_once()
 
         # Verify that the respective action proposal methods are called

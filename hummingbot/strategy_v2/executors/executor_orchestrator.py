@@ -293,6 +293,50 @@ class ExecutorOrchestrator:
                 self.logger().info(f"Created initial position for controller {controller_id}: {position_config.amount} "
                                    f"{position_config.side.name} {position_config.trading_pair} on {position_config.connector_name}")
 
+    def add_wallet_position(self, controller_id: str, connector_name: str,
+                            trading_pair: str, side: TradeType, amount: Decimal):
+        """
+        Add a position hold seeded from an existing wallet balance.
+        Called after connectors are ready, to inject pre-existing asset holdings
+        as controller inventory without placing any orders.
+
+        :param controller_id: Controller ID to attach the position to
+        :param connector_name: Exchange connector name
+        :param trading_pair: Trading pair (e.g., "ARRR-USDT")
+        :param side: TradeType.BUY (representing held base asset)
+        :param amount: Base asset amount to seed
+        """
+        if amount <= Decimal("0"):
+            return
+
+        if controller_id not in self.positions_held:
+            self.positions_held[controller_id] = []
+
+        position_hold = PositionHold(connector_name, trading_pair, side)
+
+        # Set amounts based on side, using NaN for quote amounts (calculated lazily)
+        if side == TradeType.BUY:
+            position_hold.buy_amount_base = amount
+            position_hold.buy_amount_quote = Decimal("NaN")  # Will be calculated lazily
+            position_hold.sell_amount_base = Decimal("0")
+            position_hold.sell_amount_quote = Decimal("0")
+        else:
+            position_hold.sell_amount_base = amount
+            position_hold.sell_amount_quote = Decimal("NaN")  # Will be calculated lazily
+            position_hold.buy_amount_base = Decimal("0")
+            position_hold.buy_amount_quote = Decimal("0")
+
+        # Zero out fees and volume (this is a seed, not from a trade)
+        position_hold.volume_traded_quote = Decimal("0")
+        position_hold.cum_fees_quote = Decimal("0")
+
+        self.positions_held[controller_id].append(position_hold)
+
+        self.logger().info(
+            f"Wallet seed position added for controller {controller_id}: "
+            f"{amount} {side.name} {trading_pair} on {connector_name}"
+        )
+
     async def stop(self, max_executors_close_attempts: int = 3):
         """
         Stop the orchestrator task and all active executors.
