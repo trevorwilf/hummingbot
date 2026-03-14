@@ -3779,6 +3779,11 @@ def main():
     # --- COMPATIBILITY REPORT ---
     print_compatibility_report()
 
+    # --- HARD GATE: fail pytest if any checks failed ---
+    if FAIL > 0:
+        import pytest
+        pytest.fail(f"NonKYC live API validation found {FAIL} failure(s). See output above.")
+
 
 if __name__ == "__main__":
     main()

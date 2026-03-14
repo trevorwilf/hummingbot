@@ -72,6 +72,12 @@ class ActiveKillSwitch(KillSwitch):
 
     def stop(self):
         if self._check_profitability_task and not self._check_profitability_task.done():
+            # Guard: never cancel the currently executing task (prevents self-cancellation
+            # when kill switch triggers shutdown which calls stop_strategy which calls stop)
+            current = asyncio.current_task()
+            if current is not None and current is self._check_profitability_task:
+                self._started = False
+                return
             self._check_profitability_task.cancel()
         self._started = False
 

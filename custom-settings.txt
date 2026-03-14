@@ -1,0 +1,2 @@
+use_wallet_balance: true
+Binary option, if true hummingbot will take from existing wallets to help satisfy its startup needs.

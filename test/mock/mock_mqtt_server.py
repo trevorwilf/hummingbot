@@ -21,15 +21,20 @@ class FakeMQTTMessage(object):
 
 class FakeMQTTBroker:
     def __init__(self):
-        self._transport = None
+        self._shared_subscriptions = {}
+        self._shared_received_msgs = {}
+        self._transports = []
 
     def create_transport(self, *args, **kwargs):
-        if not self._transport:
-            self._transport = FakeMQTTTransport(*args, **kwargs)
-        return self._transport
+        transport = FakeMQTTTransport(
+            self._shared_subscriptions, self._shared_received_msgs,
+            *args, **kwargs
+        )
+        self._transports.append(transport)
+        return transport
 
     def publish_to_subscription(self, topic, payload):
-        callback = self._transport._subscriptions[topic]
+        callback = self._shared_subscriptions[topic]
         msg = FakeMQTTMessage(topic=topic, payload=payload)
         callback(client=None,
                  userdata=None,
@@ -37,11 +42,11 @@ class FakeMQTTBroker:
 
     @property
     def subscriptions(self):
-        return self._transport._subscriptions
+        return self._shared_subscriptions
 
     @property
     def received_msgs(self):
-        return self._transport._received_msgs
+        return self._shared_received_msgs
 
     def is_msg_received(self, topic, content=None, msg_key = 'msg'):
         msg_found = False
@@ -56,16 +61,16 @@ class FakeMQTTBroker:
         return msg_found
 
     def clear(self):
-        if self._transport is not None:
-            self._transport._received_msgs = {}
-            self._transport._subscriptions = {}
+        self._shared_received_msgs.clear()
+        self._shared_subscriptions.clear()
+        self._transports.clear()
 
 
 class FakeMQTTTransport:
 
-    def __init__(self, *args, **kwargs):
-        self._subscriptions = {}
-        self._received_msgs = {}
+    def __init__(self, shared_subscriptions, shared_received_msgs, *args, **kwargs):
+        self._subscriptions = shared_subscriptions
+        self._received_msgs = shared_received_msgs
         self._connected = False
 
     @property
@@ -96,7 +101,11 @@ class FakeMQTTTransport:
         self._connected = True
 
     def connect(self):
-        self._connected = True
+        # Do NOT set _connected here. RPCService.__init__ calls connect()
+        # before run(), and BaseRPCService.run() skips run_forever() if
+        # is_connected is True, which would prevent subscription registration.
+        # start() is called inside run_forever() AFTER subscribing.
+        pass
 
     def stop(self):
         self._connected = False

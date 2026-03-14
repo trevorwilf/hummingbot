@@ -105,7 +105,8 @@ class PerformanceMetricsUnitTest(unittest.TestCase):
 
         self.assertEqual(len(aggregated_buys), 2)
         trade = aggregated_buys[0]
-        self.assertTrue(trade.order_id == "order1" and trade.amount == 400 and trade.price == 15)
+        # VWAP: (100*10 + 300*20) / 400 = 7000/400 = 17.5
+        self.assertTrue(trade.order_id == "order1" and trade.amount == 400 and trade.price == 17.5)
         self.assertEqual(aggregated_buys[1], trades[1])
         self.assertEqual(len(aggregated_sells), 0)
 
@@ -120,7 +121,8 @@ class PerformanceMetricsUnitTest(unittest.TestCase):
         self.assertEqual(len(aggregated_buys), 0)
         self.assertEqual(len(aggregated_sells), 2)
         trade = aggregated_sells[0]
-        self.assertTrue(trade.order_id == "order1" and trade.amount == 400 and trade.price == 15)
+        # VWAP: (100*10 + 300*20) / 400 = 7000/400 = 17.5
+        self.assertTrue(trade.order_id == "order1" and trade.amount == 400 and trade.price == 17.5)
         self.assertEqual(aggregated_sells[1], trades[1])
 
     def test_performance_metrics(self):
@@ -326,6 +328,46 @@ class PerformanceMetricsUnitTest(unittest.TestCase):
         expected_fee_amount += flat_fees[0].amount * Decimal("0.9") * Decimal("2")
         expected_fee_amount += flat_fees[1].amount * Decimal("2")
         self.assertEqual(expected_fee_amount, performance_metric.fee_in_quote)
+
+    def test_aggregate_orders_does_not_mutate_originals(self):
+        trade1 = self.mock_trade(id="order1", amount=100, price=10)
+        trade2 = self.mock_trade(id="order1", amount=300, price=20)
+
+        PerformanceMetrics.aggregate_orders([trade1, trade2])
+
+        # Original fill objects must retain their original values
+        self.assertEqual(trade1.price, 10)
+        self.assertEqual(trade1.amount, 100)
+        self.assertEqual(trade2.price, 20)
+        self.assertEqual(trade2.amount, 300)
+
+    def test_aggregate_orders_vwap_correctness(self):
+        # Case 1: 100@10 + 300@20 → VWAP = 7000/400 = 17.5
+        trades = [
+            self.mock_trade(id="order1", amount=100, price=10),
+            self.mock_trade(id="order1", amount=300, price=20),
+        ]
+        result = PerformanceMetrics.aggregate_orders(trades)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].amount, 400)
+        self.assertEqual(result[0].price, 17.5)
+
+        # Case 2: 50@100 + 50@200 → VWAP = 15000/100 = 150.0
+        trades = [
+            self.mock_trade(id="order2", amount=50, price=100),
+            self.mock_trade(id="order2", amount=50, price=200),
+        ]
+        result = PerformanceMetrics.aggregate_orders(trades)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].amount, 100)
+        self.assertEqual(result[0].price, 150.0)
+
+    def test_aggregate_orders_single_fill_passthrough(self):
+        trade = self.mock_trade(id="unique_order", amount=500, price=42)
+        result = PerformanceMetrics.aggregate_orders([trade])
+        self.assertEqual(len(result), 1)
+        # Single fill should be returned as-is (same object)
+        self.assertIs(result[0], trade)
 
     def test__process_deducted_fees_impact_in_quote_vol(self):
         dummy_trade = Trade(trading_pair="HBOT-COINALPHA",

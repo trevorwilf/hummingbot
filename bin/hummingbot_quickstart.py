@@ -34,6 +34,16 @@ from hummingbot.core.management.console import start_management_console
 from hummingbot.core.utils.async_utils import safe_gather
 
 
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ('true', '1', 'yes'):
+        return True
+    elif value.lower() in ('false', '0', 'no'):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{value}'")
+
+
 class CmdlineParser(argparse.ArgumentParser):
     def __init__(self):
         super().__init__()
@@ -56,7 +66,7 @@ class CmdlineParser(argparse.ArgumentParser):
                           help="Try to automatically set config / logs / data dir permissions, "
                                "useful for Docker containers.")
         self.add_argument("--headless",
-                          type=bool,
+                          type=_parse_bool,
                           nargs='?',
                           const=True,
                           default=None,

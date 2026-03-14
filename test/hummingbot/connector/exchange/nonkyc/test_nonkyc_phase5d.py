@@ -293,6 +293,9 @@ class TestPhase5DCrashRecovery(unittest.TestCase):
         # Verify it returned without error
         self.assertIsNotNone(result)
 
+        # Verify the POST request was actually made to the cancel endpoint
+        self.assertTrue(len(mock_api.requests) > 0, "Expected at least one POST request to cancel endpoint")
+
 
 if __name__ == "__main__":
     unittest.main()

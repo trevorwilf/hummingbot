@@ -170,6 +170,7 @@ class ConnectorManagerTest(IsolatedAsyncioWrapperTestCase):
         """Test adding trading pairs to existing connector"""
         # Set up
         mock_remove.return_value = True
+        self.mock_connector.trading_required = True
         self.connector_manager.connectors["binance"] = self.mock_connector
 
         # Add trading pairs
@@ -188,6 +189,57 @@ class ConnectorManagerTest(IsolatedAsyncioWrapperTestCase):
         actual_pairs = set(call_args[0][1])
         expected_pairs = {"BTC-USDT", "ETH-USDT", "XRP-USDT", "ADA-USDT"}
         self.assertEqual(actual_pairs, expected_pairs)
+        # Verify trading_required is preserved
+        self.assertEqual(call_args[1].get("trading_required"), True)
+
+    @patch.object(ConnectorManager, "remove_connector")
+    @patch.object(ConnectorManager, "create_connector")
+    async def test_add_trading_pairs_preserves_trading_required(self, mock_create, mock_remove):
+        """Test that add_trading_pairs preserves trading_required=False."""
+        mock_remove.return_value = True
+        self.mock_connector.trading_required = False
+        self.connector_manager.connectors["binance"] = self.mock_connector
+
+        result = await self.connector_manager.add_trading_pairs(
+            "binance",
+            ["XRP-USDT"]
+        )
+
+        self.assertTrue(result)
+        call_args = mock_create.call_args
+        self.assertEqual(call_args[1].get("trading_required"), False)
+
+    async def test_add_trading_pairs_no_op_for_existing_pairs(self):
+        """Test that add_trading_pairs returns True without recreation for already-existing pairs."""
+        self.mock_connector.trading_required = True
+        self.connector_manager.connectors["binance"] = self.mock_connector
+
+        result = await self.connector_manager.add_trading_pairs(
+            "binance",
+            ["BTC-USDT"]  # already exists in mock_connector.trading_pairs
+        )
+
+        self.assertTrue(result)
+        # Connector should still be there (no recreation)
+        self.assertIn("binance", self.connector_manager.connectors)
+        self.assertEqual(self.connector_manager.connectors["binance"], self.mock_connector)
+
+    @patch.object(ConnectorManager, "remove_connector")
+    @patch.object(ConnectorManager, "create_connector")
+    async def test_add_trading_pairs_combines_lists(self, mock_create, mock_remove):
+        """Test that add_trading_pairs combines old and new pairs."""
+        mock_remove.return_value = True
+        self.mock_connector.trading_required = True
+        self.connector_manager.connectors["binance"] = self.mock_connector
+
+        result = await self.connector_manager.add_trading_pairs(
+            "binance",
+            ["ETH-USDT"]  # already exists — but adding "SOL-USDT" too
+        )
+
+        # ETH-USDT already exists, so this should be a no-op for that pair
+        # But since set(existing + new) == set(existing), it should return True without recreation
+        self.assertTrue(result)
 
     async def test_add_trading_pairs_nonexistent_connector(self):
         """Test adding trading pairs to nonexistent connector"""

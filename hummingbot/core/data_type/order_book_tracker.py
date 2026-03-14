@@ -262,6 +262,7 @@ class OrderBookTracker:
         self._order_book_snapshot_router_task: Optional[asyncio.Task] = None
         self._update_last_trade_prices_task: Optional[asyncio.Task] = None
         self._order_book_stream_listener_task: Optional[asyncio.Task] = None
+        self._cancelled_tasks: list = []
 
         # Metrics tracking
         self._metrics: OrderBookTrackerMetrics = OrderBookTrackerMetrics()
@@ -322,38 +323,34 @@ class OrderBookTracker:
         )
 
     def stop(self):
-        if self._init_order_books_task is not None:
-            self._init_order_books_task.cancel()
-            self._init_order_books_task = None
-        if self._emit_trade_event_task is not None:
-            self._emit_trade_event_task.cancel()
-            self._emit_trade_event_task = None
-        if self._order_book_diff_listener_task is not None:
-            self._order_book_diff_listener_task.cancel()
-            self._order_book_diff_listener_task = None
-        if self._order_book_snapshot_listener_task is not None:
-            self._order_book_snapshot_listener_task.cancel()
-            self._order_book_snapshot_listener_task = None
-        if self._order_book_trade_listener_task is not None:
-            self._order_book_trade_listener_task.cancel()
-            self._order_book_trade_listener_task = None
+        cancelled_tasks = []
 
-        if self._order_book_diff_router_task is not None:
-            self._order_book_diff_router_task.cancel()
-            self._order_book_diff_router_task = None
-        if self._order_book_snapshot_router_task is not None:
-            self._order_book_snapshot_router_task.cancel()
-            self._order_book_snapshot_router_task = None
-        if self._update_last_trade_prices_task is not None:
-            self._update_last_trade_prices_task.cancel()
-            self._update_last_trade_prices_task = None
-        if self._order_book_stream_listener_task is not None:
-            self._order_book_stream_listener_task.cancel()
-        if len(self._tracking_tasks) > 0:
-            for _, task in self._tracking_tasks.items():
+        for attr in ['_init_order_books_task', '_emit_trade_event_task',
+                     '_order_book_diff_listener_task', '_order_book_snapshot_listener_task',
+                     '_order_book_trade_listener_task', '_order_book_diff_router_task',
+                     '_order_book_snapshot_router_task', '_update_last_trade_prices_task',
+                     '_order_book_stream_listener_task']:
+            task = getattr(self, attr, None)
+            if task is not None:
                 task.cancel()
-            self._tracking_tasks.clear()
+                cancelled_tasks.append(task)
+                setattr(self, attr, None)
+
+        for _, task in self._tracking_tasks.items():
+            task.cancel()
+            cancelled_tasks.append(task)
+        self._tracking_tasks.clear()
         self._order_books_initialized.clear()
+
+        # Store for optional async await
+        self._cancelled_tasks = cancelled_tasks
+
+    async def async_stop(self):
+        """Stop all tasks and await their termination."""
+        self.stop()
+        if self._cancelled_tasks:
+            await asyncio.gather(*self._cancelled_tasks, return_exceptions=True)
+            self._cancelled_tasks = []
 
     async def wait_ready(self):
         await self._order_books_initialized.wait()

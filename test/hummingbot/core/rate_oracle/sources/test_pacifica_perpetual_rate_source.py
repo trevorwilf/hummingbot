@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytest.importorskip("solders", reason="solders package not installed, skipping Pacifica tests")
+
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.rate_oracle.sources.pacifica_perpetual_rate_source import PacificaPerpetualRateSource
 

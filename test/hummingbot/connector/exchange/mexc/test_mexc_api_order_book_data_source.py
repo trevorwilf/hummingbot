@@ -344,7 +344,8 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         msg: OrderBookMessage = await msg_queue.get()
 
-        self.assertEqual(int(diff_event["sendTime"]), msg.update_id)
+        # update_id should use toVersion for sequencing, not sendTime
+        self.assertEqual(diff_event["publicAggreDepths"]["toVersion"], msg.update_id)
 
     @aioresponses()
     async def test_listen_for_order_book_snapshots_cancelled_when_fetching_snapshot(self, mock_api):

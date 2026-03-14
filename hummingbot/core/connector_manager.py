@@ -122,6 +122,14 @@ class ConnectorManager:
             self._logger.warning(f"Connector {connector_name} not found")
             return False
 
+        connector = self.connectors[connector_name]
+        # Warn about potential orphaned resources
+        if hasattr(connector, '_order_book_tracker') and connector._order_book_tracker is not None:
+            self._logger.warning(
+                f"Removing connector {connector_name} that may have active tracker tasks. "
+                f"Ensure caller coordinates teardown."
+            )
+
         del self.connectors[connector_name]
         self._logger.info(f"Removed connector: {connector_name}")
         return True
@@ -129,6 +137,7 @@ class ConnectorManager:
     async def add_trading_pairs(self, connector_name: str, trading_pairs: List[str]) -> bool:
         """
         Add trading pairs to an existing connector.
+        Preserves original connector configuration during recreation.
 
         Args:
             connector_name: Name of the connector
@@ -141,15 +150,26 @@ class ConnectorManager:
             self._logger.error(f"Connector {connector_name} not found")
             return False
 
-        # Most connectors require recreation to add pairs
-        # So we'll recreate with the combined list
         connector = self.connectors[connector_name]
         existing_pairs = connector.trading_pairs
         all_pairs = list(set(existing_pairs + trading_pairs))
 
-        # Remove and recreate
+        if set(all_pairs) == set(existing_pairs):
+            self._logger.info(f"All requested pairs already exist on {connector_name}")
+            return True
+
+        # Preserve original connector configuration
+        original_trading_required = getattr(connector, 'trading_required', True)
+
+        # Remove and recreate with preserved config
         self.remove_connector(connector_name)
-        self.create_connector(connector_name, all_pairs)
+        self.create_connector(connector_name, all_pairs, trading_required=original_trading_required)
+
+        self._logger.info(f"Recreated connector {connector_name} with pairs: {all_pairs}")
+        self._logger.warning(
+            f"Connector {connector_name} was recreated. If attached to a running strategy, "
+            f"clock/recorder/metrics re-registration may be required."
+        )
 
         return True
 

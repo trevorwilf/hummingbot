@@ -1,4 +1,3 @@
-import time
 import unittest
 from decimal import Decimal
 
@@ -29,7 +28,10 @@ class LimitOrderUnitTest(unittest.TestCase):
         self.assertEqual(-1, order.age())
 
     def test_order_creation_with_all_values(self):
-        created = int((time.time() - 100.) * 1e6)
+        # Use fixed timestamps that fit in C long (32-bit on Windows).
+        # creation_timestamp is in microseconds; use small values to avoid overflow.
+        created = 1_000_000_000  # 1000 seconds in microseconds
+        end_time_now = created + int(100 * 1e6)  # 100 seconds later
         order = LimitOrder(client_order_id="HBOT_1",
                            trading_pair="HBOT-USDT",
                            is_buy=False,
@@ -44,16 +46,17 @@ class LimitOrderUnitTest(unittest.TestCase):
         self.assertEqual(Decimal("0.5"), order.filled_quantity)
         self.assertEqual(created, order.creation_timestamp)
         self.assertEqual(LimitOrderStatus.OPEN, order.status)
-        self.assertEqual(100, order.age())
-        end_time = created + (50 * 1e6)
+        # Use age_til with a controlled end time instead of age() which uses time.time()
+        self.assertEqual(100, order.age_til(end_time_now))
+        end_time = created + int(50 * 1e6)
         self.assertEqual(50, order.age_til(end_time))
-        end_time = created - (50 * 1e6)
+        end_time = created - int(50 * 1e6)
         self.assertEqual(-1, order.age_til(end_time))
 
     def test_to_pandas(self):
-        # Fix the timestamp here so that we can test order age accurately
-        created = 1625835199511442
-        now_ts = created + 100 * 1e6
+        # Use a timestamp that fits in C long (32-bit on Windows, max ~2.1 billion)
+        created = 1_000_000_000  # 1000 seconds in microseconds
+        now_ts = created + int(100 * 1e6)
         self.maxDiff = None
         orders = [
             LimitOrder("HBOT_1", "A-B", True, "A", "B", Decimal("1"), Decimal("1.5")),

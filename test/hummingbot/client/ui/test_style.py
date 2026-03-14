@@ -132,7 +132,9 @@ class StyleTest(unittest.TestCase):
 
         self.assertEqual(style.class_names_and_attrs, load_style(adapter).class_names_and_attrs)
 
-    def test_reset_style(self):
+    @patch("hummingbot.client.ui.style.is_windows")
+    def test_reset_style(self, is_windows_mock):
+        is_windows_mock.return_value = False
         global_config_map = ClientConfigMap()
         global_config_map.color.top_pane = "#FAFAFA"
         global_config_map.color.bottom_pane = "#FAFAFA"

@@ -858,3 +858,88 @@ class LatencyStatsEdgeCasesTests(unittest.TestCase):
         stats.record(-1.0)  # Shouldn't happen but shouldn't crash
 
         self.assertEqual(-1.0, stats.min_ms)
+
+
+class OrderBookTrackerStopStartTests(IsolatedAsyncioWrapperTestCase):
+    """Tests for stop/start race condition fixes."""
+
+    def setUp(self):
+        super().setUp()
+        self.data_source = MagicMock(spec=OrderBookTrackerDataSource)
+        self.data_source.listen_for_order_book_diffs = AsyncMock()
+        self.data_source.listen_for_trades = AsyncMock()
+        self.data_source.listen_for_order_book_snapshots = AsyncMock()
+        self.data_source.listen_for_subscriptions = AsyncMock()
+        self.data_source.get_new_order_book = AsyncMock(return_value=OrderBook())
+        self.trading_pairs = ["BTC-USDT"]
+
+    def _create_tracker(self):
+        return OrderBookTracker(
+            data_source=self.data_source,
+            trading_pairs=self.trading_pairs,
+        )
+
+    async def test_async_stop_awaits_task_termination(self):
+        """async_stop should cancel all tasks and await their termination."""
+        tracker = self._create_tracker()
+        tracker.start()
+
+        # Verify tasks were created
+        self.assertIsNotNone(tracker._emit_trade_event_task)
+
+        await tracker.async_stop()
+
+        # All task references should be None
+        self.assertIsNone(tracker._init_order_books_task)
+        self.assertIsNone(tracker._emit_trade_event_task)
+        self.assertIsNone(tracker._order_book_diff_listener_task)
+        self.assertIsNone(tracker._order_book_snapshot_listener_task)
+        self.assertIsNone(tracker._order_book_trade_listener_task)
+        self.assertIsNone(tracker._order_book_diff_router_task)
+        self.assertIsNone(tracker._order_book_snapshot_router_task)
+        self.assertIsNone(tracker._update_last_trade_prices_task)
+        self.assertIsNone(tracker._order_book_stream_listener_task)
+        # Cancelled tasks list should be cleared
+        self.assertEqual(tracker._cancelled_tasks, [])
+
+    def test_stop_start_no_duplicate_tasks(self):
+        """After stop then start, each task type should have exactly one instance."""
+        tracker = self._create_tracker()
+        tracker.start()
+        tracker.stop()
+        tracker.start()
+
+        # Each task attribute should have a single task
+        task_attrs = [
+            '_init_order_books_task', '_emit_trade_event_task',
+            '_order_book_diff_listener_task', '_order_book_snapshot_listener_task',
+            '_order_book_trade_listener_task', '_order_book_diff_router_task',
+            '_order_book_snapshot_router_task', '_update_last_trade_prices_task',
+            '_order_book_stream_listener_task',
+        ]
+        for attr in task_attrs:
+            task = getattr(tracker, attr)
+            self.assertIsNotNone(task, f"{attr} should not be None after start()")
+
+        tracker.stop()
+
+    def test_stop_clears_tracking_tasks(self):
+        """stop() should clear all tracking tasks."""
+        tracker = self._create_tracker()
+        tracker.start()
+
+        # Add a fake tracking task
+        tracker._tracking_tasks["BTC-USDT"] = asyncio.ensure_future(asyncio.sleep(100))
+
+        tracker.stop()
+
+        self.assertEqual(len(tracker._tracking_tasks), 0)
+
+    def test_cancelled_tasks_populated_after_stop(self):
+        """After stop(), _cancelled_tasks should contain the cancelled tasks."""
+        tracker = self._create_tracker()
+        tracker.start()
+        tracker.stop()
+
+        # Should have cancelled tasks
+        self.assertGreater(len(tracker._cancelled_tasks), 0)

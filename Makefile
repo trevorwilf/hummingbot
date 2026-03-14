@@ -22,6 +22,12 @@ test_live:
 test_strategy_v2_critical:
 	pytest test/hummingbot/strategy_v2/ -v -m "not quarantined and not live_api"
 
+test_release:
+	pytest -m "not quarantined" test/ -v --tb=long
+
+test_nonkyc_live:
+	pytest -m "live_api" test/hummingbot/connector/exchange/nonkyc/ -v --tb=long
+
 test_nonkyc:
 	pytest test/hummingbot/connector/exchange/nonkyc/ -v -m "not live_api" \
 

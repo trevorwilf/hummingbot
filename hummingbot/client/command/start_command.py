@@ -55,8 +55,7 @@ class StartCommand(GatewayChainApiManager):
                           v2_conf: Optional[str] = None,
                           is_quickstart: Optional[bool] = False):
 
-        if self._in_start_check or (
-                self.trading_core.strategy_task is not None and not self.trading_core.strategy_task.done()):
+        if self._in_start_check or self.trading_core._strategy_running:
             self.notify('The bot is already running - please run "stop" first')
             return
 
@@ -123,6 +122,9 @@ class StartCommand(GatewayChainApiManager):
             )
             if not success:
                 self._in_start_check = False
+                if self.trading_core._strategy_running:
+                    self.notify('The bot is already running - please run "stop" first')
+                    return
                 self.trading_core.strategy_name = None
                 self.strategy_file_name = None
                 self.notify("Invalid strategy. Start aborted.")

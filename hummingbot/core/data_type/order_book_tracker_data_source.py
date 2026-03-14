@@ -84,11 +84,12 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
                 raise
             except ConnectionError as connection_exception:
                 self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+                await self._sleep(5.0)
             except Exception:
                 self.logger().exception(
                     "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...",
                 )
-                await self._sleep(1.0)
+                await self._sleep(5.0)
             finally:
                 self._ws_assistant = None  # Clear reference on disconnect
                 await self._on_order_stream_interruption(websocket_assistant=ws)

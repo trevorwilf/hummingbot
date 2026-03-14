@@ -42,11 +42,18 @@ class MexcOrderBook(OrderBook):
         """
         if metadata:
             msg.update(metadata)
+
+        depth_data = msg.get('publicAggreDepths', {})
+        # Use toVersion for sequencing — this is the correct MEXC version field
+        # for order book reconciliation. Falls back to timestamp only if version unavailable.
+        update_id = depth_data.get('toVersion') or depth_data.get('version') or timestamp
+
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
-            "update_id": timestamp,
-            "bids": [[i['price'], i['quantity']] for i in msg['publicAggreDepths'].get("bids", [])],
-            "asks": [[i['price'], i['quantity']] for i in msg['publicAggreDepths'].get("asks", [])],
+            "update_id": update_id,
+            "first_update_id": depth_data.get('fromVersion'),
+            "bids": [[i['price'], i['quantity']] for i in depth_data.get("bids", [])],
+            "asks": [[i['price'], i['quantity']] for i in depth_data.get("asks", [])],
         }, timestamp=float(timestamp) * 1e-3)
 
     @classmethod

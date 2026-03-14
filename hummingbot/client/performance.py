@@ -102,14 +102,19 @@ class PerformanceMetrics:
 
         aggregated_orders = []
         for group in grouped_orders.values():
-            aggregated_prices = 0
-            aggregated_amounts = 0
-            for order in group:
-                aggregated_prices += order.price
-                aggregated_amounts += order.amount
-            aggregated = group[0]
-            aggregated.price = aggregated_prices / len(group)
-            aggregated.amount = aggregated_amounts
+            if len(group) == 1:
+                aggregated_orders.append(group[0])
+                continue
+
+            # Amount-weighted average price (VWAP), not arithmetic mean
+            total_amount = sum(order.amount for order in group)
+            weighted_price = sum(order.amount * order.price for order in group) / total_amount if total_amount else 0
+
+            # Create a lightweight copy — never mutate original fill objects
+            from copy import copy
+            aggregated = copy(group[0])
+            aggregated.price = weighted_price
+            aggregated.amount = total_amount
             aggregated_orders.append(aggregated)
 
         return aggregated_orders

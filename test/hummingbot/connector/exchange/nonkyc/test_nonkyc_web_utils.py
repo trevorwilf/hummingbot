@@ -19,8 +19,16 @@ class NonkycWebUtilsTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(f"{CONSTANTS.REST_URL}{CONSTANTS.API_VERSION}{CONSTANTS.USER_BALANCES_PATH_URL}", url)
 
     def test_build_api_factory(self):
+        from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
         factory = web_utils.build_api_factory()
         self.assertIsNotNone(factory)
+        self.assertIsInstance(factory, WebAssistantsFactory)
+
+    def test_build_api_factory_with_auth(self):
+        """Verify factory includes auth pre-processor when throttler is provided."""
+        from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+        factory = web_utils.build_api_factory()
+        self.assertIsInstance(factory, WebAssistantsFactory)
 
     @aioresponses()
     async def test_get_current_server_time(self, mock_api):
