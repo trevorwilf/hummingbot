@@ -86,8 +86,17 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         # Make sure the listen key management task is running
         await self._ensure_listen_key_task_running()
 
-        # Wait for the listen key to be initialized
-        await self._listen_key_initialized_event.wait()
+        # Wait for the listen key to be initialized (with timeout)
+        try:
+            await asyncio.wait_for(
+                self._listen_key_initialized_event.wait(),
+                timeout=60.0  # Fail after 60 seconds of no listen key
+            )
+        except asyncio.TimeoutError:
+            raise IOError(
+                "Failed to acquire MEXC listen key within 60 seconds. "
+                "Check API credentials and network connectivity."
+            )
 
         # Get a websocket assistant and connect it
         ws = await self._get_ws_assistant()
@@ -250,7 +259,8 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         finally:
             # Cleanup on task termination
             self.logger().info("Listen key management task stopped")
-            await self._ws_assistant.disconnect()
+            if self._ws_assistant is not None:
+                await self._ws_assistant.disconnect()
             self._current_listen_key = None
             self._listen_key_initialized_event.clear()
 

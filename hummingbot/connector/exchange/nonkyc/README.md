@@ -41,7 +41,9 @@ Rate oracle source: `hummingbot/core/rate_oracle/sources/nonkyc_rate_source.py`
 
 ### Order Types
 - NonKYC supports `limit` and `market` only
-- `LIMIT_MAKER` is mapped to `limit` -- **no native post-only support**
+- **LIMIT_MAKER is NOT supported** -- NonKYC has no native post-only/maker-only order type.
+  Attempting LIMIT_MAKER raises `ValueError`. Use `OrderType.LIMIT` instead, but note that
+  limit orders on NonKYC may cross the spread and take liquidity.
 - Maker/taker classification uses the `triggeredBy` field from trade history
 
 ### Balance Fields
@@ -60,11 +62,14 @@ Rate oracle source: `hummingbot/core/rate_oracle/sources/nonkyc_rate_source.py`
 
 ## Known Limitations
 
-1. **No post-only orders**: LIMIT_MAKER maps to regular limit; can cross spread
-2. **Estimated rate limits**: May need tuning for high-frequency strategies
+1. **No post-only orders**: LIMIT_MAKER is not supported; raises ValueError
+2. **Estimated rate limits**: Not exchange-sourced; may need tuning for high-frequency strategies
 3. **Single domain**: `DEFAULT_DOMAIN` is a compatibility placeholder, not used in URLs
-4. **Cancel by symbol required**: `/cancelallorders` requires a `symbol` parameter
+4. **Cancel by symbol required**: `/cancelallorders` requires a `symbol` parameter.
+   When `cancel_all_orders_on_exchange(None)` is called, it fans out across all pairs with active orders.
 5. **No native stop-loss/take-profit**: Only `limit` and `market` order types
+6. **Order book recovery**: Diffs are dropped during resync (not applied to stale books).
+   After max resync failures, a `ConnectionError` triggers WebSocket reconnect.
 
 ## Running Tests
 
@@ -102,3 +107,4 @@ python test/hummingbot/connector/exchange/nonkyc/nonkyc_auth_test.py
 | 6 | Rate oracle source |
 | 7A | Auth hardening: POST minify, GET param sort, fee token, etc. |
 | 7B | WS JSON-RPC id compliance, code quality, documentation |
+| 8 | Expert review fixes: LIMIT_MAKER removal, safe symbol parsing, cancel fan-out, resync hardening |

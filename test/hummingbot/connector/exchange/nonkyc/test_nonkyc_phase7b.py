@@ -167,8 +167,9 @@ class TestPhase7BVariableNaming(unittest.TestCase):
         """Renamed method still works correctly."""
         from hummingbot.core.data_type.common import OrderType
         self.assertEqual("limit", NonkycExchange.nonkyc_order_type(OrderType.LIMIT))
-        self.assertEqual("limit", NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER))
         self.assertEqual("market", NonkycExchange.nonkyc_order_type(OrderType.MARKET))
+        with self.assertRaises(ValueError):
+            NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
 
     def test_last_trades_poll_timestamp_renamed(self):
         """Instance var renamed to _last_trades_poll_nonkyc_timestamp."""

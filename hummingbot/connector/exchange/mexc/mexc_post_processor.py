@@ -6,7 +6,7 @@ from hummingbot.core.web_assistant.ws_post_processors import WSPostProcessorBase
 
 
 class MexcPostProcessor(WSPostProcessorBase):
-    async def post_process(response: WSResponse) -> WSResponse:
+    async def post_process(self, response: WSResponse) -> WSResponse:
         message = response.data
         try:
             if isinstance(message, dict):

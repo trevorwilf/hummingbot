@@ -86,7 +86,7 @@ WARN = 0
 
 
 def result(test_name, passed, detail="", warn=False):
-    """Print a [PASS]/[FAIL]/[WARN] line and bump the global counters."""
+    """Print a [PASS]/[FAIL]/[WARN] line, bump global counters, and assert on failure."""
     global PASS, FAIL, WARN
     if warn:
         WARN += 1
@@ -102,6 +102,26 @@ def result(test_name, passed, detail="", warn=False):
         for line in detail.split("\n"):
             print("       {}".format(line))
     print()
+    # Native pytest assertion -- makes the test fail properly
+    if not warn and not passed:
+        assert False, f"{test_name}: {detail}"
+
+
+def test_meta_gate_fails_on_bad_response():
+    """Prove the test gate actually fails when a check fails."""
+    # This test validates the test infrastructure itself
+    if pytest is not None:
+        with pytest.raises(AssertionError):
+            result("meta_test_intentional_failure", False, "This failure is expected")
+    else:
+        try:
+            result("meta_test_intentional_failure", False, "This failure is expected")
+            assert False, "result() should have raised AssertionError"
+        except AssertionError:
+            pass  # Expected
+    # Reset the FAIL counter since the failure above was intentional
+    global FAIL
+    FAIL -= 1
 
 
 def section(title):
@@ -1499,29 +1519,35 @@ def test_5a_server_time_endpoint():
 
 
 def test_5a_order_type_mapping():
-    """Verify LIMIT_MAKER maps to 'limit', not 'limit_maker'."""
+    """Verify LIMIT_MAKER raises ValueError and supported types exclude it."""
     try:
         from hummingbot.core.data_type.common import OrderType
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
 
-        lm = NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
         lim = NonkycExchange.nonkyc_order_type(OrderType.LIMIT)
         mkt = NonkycExchange.nonkyc_order_type(OrderType.MARKET)
 
+        # LIMIT_MAKER now raises ValueError
+        lm_raises = False
+        try:
+            NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
+        except ValueError:
+            lm_raises = True
+
         result(
-            "Phase 5A: LIMIT_MAKER -> 'limit'",
-            lm == "limit",
-            "LIMIT_MAKER='{}', LIMIT='{}', MARKET='{}'".format(lm, lim, mkt),
+            "Phase 5A: LIMIT_MAKER raises ValueError",
+            lm_raises,
+            "LIMIT='{}', MARKET='{}', LIMIT_MAKER raises={}".format(lim, mkt, lm_raises),
         )
 
-        # Also check supported_order_types includes LIMIT_MAKER
+        # supported_order_types should NOT include LIMIT_MAKER
         exchange = NonkycExchange(
             nonkyc_api_key="test", nonkyc_api_secret="test",
             trading_pairs=["BTC-USDT"], trading_required=False)
         supported = exchange.supported_order_types()
         result(
-            "Phase 5A: supported_order_types includes LIMIT_MAKER",
-            OrderType.LIMIT_MAKER in supported,
+            "Phase 5A: supported_order_types excludes LIMIT_MAKER",
+            OrderType.LIMIT_MAKER not in supported,
             "Supported: {}".format([t.name for t in supported]),
         )
     except Exception as e:
@@ -2026,10 +2052,11 @@ def test_5c_get_fee_with_cache():
             "taker_fee": Decimal("0.003"),
         }
 
-        # LIMIT_MAKER -> maker fee
-        fee_maker = ex._get_fee("BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY, Decimal("1"))
+        # is_maker=True -> maker fee
+        fee_maker = ex._get_fee("BTC", "USDT", OrderType.LIMIT, TradeType.BUY, Decimal("1"),
+                                is_maker=True)
         result(
-            "Phase 5C: LIMIT_MAKER uses cached maker_fee (0.002)",
+            "Phase 5C: is_maker=True uses cached maker_fee (0.002)",
             fee_maker.percent == Decimal("0.002"),
             "Got: {}".format(fee_maker.percent),
         )
@@ -3009,12 +3036,16 @@ def test_7b_nonkyc_order_type_renamed():
     result("7B-2: Nonkyc_order_type (mixed case) removed", not has_old)
 
     if has_new:
-        lm = NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
         lim = NonkycExchange.nonkyc_order_type(OrderType.LIMIT)
         mkt = NonkycExchange.nonkyc_order_type(OrderType.MARKET)
+        lm_raises = False
+        try:
+            NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
+        except ValueError:
+            lm_raises = True
         result("7B-2: Renamed method still maps correctly",
-               lm == "limit" and lim == "limit" and mkt == "market",
-               f"LIMIT_MAKER={lm}, LIMIT={lim}, MARKET={mkt}")
+               lim == "limit" and mkt == "market" and lm_raises,
+               f"LIMIT={lim}, MARKET={mkt}, LIMIT_MAKER raises={lm_raises}")
 
 
 def test_7b_last_trades_poll_timestamp_renamed():

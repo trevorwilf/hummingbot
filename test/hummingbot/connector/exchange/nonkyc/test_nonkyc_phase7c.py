@@ -228,17 +228,17 @@ class TestMarketOrderNoPrice(_Base):
     """7C-7: MARKET orders must NOT include a price param in API body."""
 
     def test_market_order_has_no_price_param(self):
-        """Verify the conditional in _place_order only adds price for LIMIT/LIMIT_MAKER."""
+        """Verify the conditional in _place_order only adds price for LIMIT."""
         type_market = NonkycExchange.nonkyc_order_type(OrderType.MARKET)
         type_limit = NonkycExchange.nonkyc_order_type(OrderType.LIMIT)
-        type_lm = NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
         self.assertEqual("market", type_market)
         self.assertEqual("limit", type_limit)
-        self.assertEqual("limit", type_lm)
-        # The code adds price only when: order_type is LIMIT or LIMIT_MAKER
+        # LIMIT_MAKER is no longer supported -- raises ValueError
+        with self.assertRaises(ValueError):
+            NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
+        # The code adds price only when: order_type is LIMIT
         # MARKET is explicitly excluded
         self.assertIsNot(OrderType.MARKET, OrderType.LIMIT)
-        self.assertIsNot(OrderType.MARKET, OrderType.LIMIT_MAKER)
 
     def test_limit_order_includes_price(self):
         """LIMIT order must include price."""

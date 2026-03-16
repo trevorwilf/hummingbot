@@ -239,7 +239,7 @@ class TestFix3OrderBookReconnectBackoff(unittest.TestCase):
         ws_assistant.disconnect = AsyncMock()
 
         asyncio.get_event_loop().run_until_complete(
-            data_source._on_order_book_ws_interruption(ws_assistant)
+            data_source._on_order_stream_interruption(ws_assistant)
         )
 
         self.assertEqual(len(data_source._last_sequence), 0,
@@ -260,7 +260,7 @@ class TestFix3OrderBookReconnectBackoff(unittest.TestCase):
         ws_assistant.disconnect = AsyncMock()
 
         asyncio.get_event_loop().run_until_complete(
-            data_source._on_order_book_ws_interruption(ws_assistant)
+            data_source._on_order_stream_interruption(ws_assistant)
         )
 
         ws_assistant.disconnect.assert_called_once()
@@ -279,7 +279,7 @@ class TestFix3OrderBookReconnectBackoff(unittest.TestCase):
 
         # Should not raise
         asyncio.get_event_loop().run_until_complete(
-            data_source._on_order_book_ws_interruption(None)
+            data_source._on_order_stream_interruption(None)
         )
 
         self.assertEqual(len(data_source._last_sequence), 0)

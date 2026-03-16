@@ -1,4 +1,5 @@
 import asyncio
+import random
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -23,6 +24,12 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
     _DYNAMIC_SUBSCRIBE_ID_START = 100
     _next_subscribe_id: int = _DYNAMIC_SUBSCRIBE_ID_START
 
+    # Order book continuity tracking constants
+    SNAPSHOT_RESYNC_MAX_FAILURES = 5
+    SNAPSHOT_RESYNC_INITIAL_DELAY = 2.0
+    SNAPSHOT_RESYNC_BACKOFF_FACTOR = 2.0
+    SNAPSHOT_RESYNC_MAX_DELAY = 60.0
+
     _logger: Optional[HummingbotLogger] = None
 
     def __init__(self,
@@ -36,6 +43,12 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+
+        # Version continuity tracking (per trading pair)
+        self._last_to_version: Dict[str, int] = {}
+        self._resync_pending: Dict[str, bool] = {}
+        self._resync_failure_count: Dict[str, int] = {}
+        self._resync_next_allowed_time: Dict[str, float] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -130,11 +143,143 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "code" not in raw_message:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["symbol"])
-            order_book_message: OrderBookMessage = MexcOrderBook.diff_message_from_exchange(
-                raw_message, timestamp=float(raw_message['sendTime']), metadata={"trading_pair": trading_pair})
+        if "code" in raw_message:
+            return
+
+        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
+            symbol=raw_message["symbol"])
+
+        order_book_message: OrderBookMessage = MexcOrderBook.diff_message_from_exchange(
+            raw_message, timestamp=float(raw_message['sendTime']),
+            metadata={"trading_pair": trading_pair})
+
+        # If resync is pending, check if retry is due; either way drop this diff
+        if self._resync_pending.get(trading_pair, False):
+            now = time.time()
+            next_allowed = self._resync_next_allowed_time.get(trading_pair, 0)
+            if now >= next_allowed:
+                await self._attempt_resync(trading_pair)
+            return
+
+        from_version = order_book_message.content.get("first_update_id")
+        to_version = order_book_message.update_id
+        last_to = self._last_to_version.get(trading_pair)
+
+        # If we don't have continuity state yet (first diff after startup/reconnect),
+        # accept the diff and start tracking
+        if last_to is None:
+            self._last_to_version[trading_pair] = to_version
             message_queue.put_nowait(order_book_message)
+            return
+
+        # Check continuity: fromVersion must equal last_toVersion + 1
+        if from_version is not None and from_version != last_to + 1:
+            if to_version <= last_to:
+                # Stale/duplicate diff -- just drop it
+                return
+
+            self.logger().warning(
+                f"MEXC order book version gap for {trading_pair}: "
+                f"expected fromVersion={last_to + 1}, got {from_version}. "
+                f"Triggering REST snapshot resync."
+            )
+            await self._initiate_resync(trading_pair)
+            return
+
+        # Continuity is valid -- accept the diff and update tracking
+        self._last_to_version[trading_pair] = to_version
+        message_queue.put_nowait(order_book_message)
+
+    async def _initiate_resync(self, trading_pair: str):
+        """Mark a pair as needing resync and attempt the first snapshot fetch."""
+        self._resync_pending[trading_pair] = True
+        await self._attempt_resync(trading_pair)
+
+    async def _attempt_resync(self, trading_pair: str):
+        """
+        Attempt to fetch a fresh REST snapshot and apply it.
+        On failure, apply exponential backoff and keep resync_pending=True
+        so diffs continue to be dropped.
+        On max failures, trigger a full websocket reconnect.
+        """
+        failure_count = self._resync_failure_count.get(trading_pair, 0)
+
+        # Check if max failures exceeded -- trigger reconnect
+        if failure_count >= self.SNAPSHOT_RESYNC_MAX_FAILURES:
+            self.logger().warning(
+                f"MEXC order book resync for {trading_pair} failed "
+                f"{failure_count} consecutive times. Triggering WebSocket reconnect."
+            )
+            self._resync_failure_count[trading_pair] = 0
+            self._resync_pending[trading_pair] = False
+            raise ConnectionError(
+                f"MEXC order book resync for {trading_pair} failed "
+                f"{failure_count} times -- triggering reconnect"
+            )
+
+        self.logger().info(
+            f"MEXC order book resync for {trading_pair} "
+            f"(attempt {failure_count + 1}/{self.SNAPSHOT_RESYNC_MAX_FAILURES})"
+        )
+
+        try:
+            snapshot_msg = await self._order_book_snapshot(trading_pair)
+            snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
+            snapshot_queue.put_nowait(snapshot_msg)
+
+            # Update continuity tracking from fresh snapshot
+            self._last_to_version[trading_pair] = snapshot_msg.update_id
+
+            # Success -- reset failure state
+            self._resync_failure_count[trading_pair] = 0
+            self._resync_next_allowed_time[trading_pair] = 0
+            self._resync_pending[trading_pair] = False
+
+            self.logger().info(
+                f"MEXC order book resync for {trading_pair} succeeded. "
+                f"New version base: {snapshot_msg.update_id}"
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Snapshot failed -- apply exponential backoff
+            # Keep resync_pending=True so diffs are dropped
+            self._resync_failure_count[trading_pair] = failure_count + 1
+            delay = min(
+                self.SNAPSHOT_RESYNC_INITIAL_DELAY * (self.SNAPSHOT_RESYNC_BACKOFF_FACTOR ** failure_count),
+                self.SNAPSHOT_RESYNC_MAX_DELAY
+            )
+            jitter = delay * random.uniform(0, 0.25)
+            self._resync_next_allowed_time[trading_pair] = time.time() + delay + jitter
+
+            self.logger().warning(
+                f"MEXC order book resync for {trading_pair} failed "
+                f"(attempt {failure_count + 1}): {e}. "
+                f"Next retry in {delay + jitter:.1f}s."
+            )
+
+    async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
+        """
+        Handle snapshot messages. Supports both:
+        - Pre-parsed OrderBookMessage objects from the resync path
+        - Raw dict messages from the normal REST snapshot pipeline
+        """
+        if isinstance(raw_message, OrderBookMessage):
+            message_queue.put_nowait(raw_message)
+        else:
+            snapshot_msg = MexcOrderBook.snapshot_message_from_exchange(
+                raw_message, time.time(),
+                metadata={"trading_pair": raw_message.get("trading_pair", "")})
+            message_queue.put_nowait(snapshot_msg)
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        """Clear all continuity tracking state on websocket interruption."""
+        self._last_to_version.clear()
+        self._resync_pending.clear()
+        self._resync_failure_count.clear()
+        self._resync_next_allowed_time.clear()
+        await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""

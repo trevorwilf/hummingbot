@@ -86,29 +86,29 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     payload=self._auth.generate_ws_authentication_message())
                 await ws.send(auth_message)
 
-                # Wait for auth response with timeout, skipping non-auth messages
-                deadline = asyncio.get_event_loop().time() + base_timeout * attempt
-                async for ws_response in ws.iter_messages():
-                    if asyncio.get_event_loop().time() > deadline:
-                        raise asyncio.TimeoutError(
-                            f"WS auth response not received within {base_timeout * attempt}s")
+                # Wait for auth response with hard timeout on silent sockets
+                try:
+                    async with asyncio.timeout(base_timeout * attempt):
+                        async for ws_response in ws.iter_messages():
+                            data = ws_response.data
+                            if not isinstance(data, dict):
+                                continue  # skip non-dict messages
 
-                    data = ws_response.data
-                    if not isinstance(data, dict):
-                        continue  # skip non-dict messages
+                            if data.get("result") is True:
+                                self.logger().info("WebSocket authentication successful")
+                                return
+                            elif "error" in data:
+                                error_msg = data.get("error", {}).get("message", "Unknown error")
+                                raise IOError(f"WebSocket authentication failed: {error_msg}")
 
-                    if data.get("result") is True:
-                        self.logger().info("WebSocket authentication successful")
-                        return
-                    elif "error" in data:
-                        error_msg = data.get("error", {}).get("message", "Unknown error")
-                        raise IOError(f"WebSocket authentication failed: {error_msg}")
+                            # Not an auth response (e.g., ticker update) — keep waiting
+                            continue
 
-                    # Not an auth response (e.g., ticker update) — keep waiting
-                    continue
-
-                # iter_messages exhausted without auth response
-                raise IOError("WebSocket closed before authentication completed")
+                        # iter_messages exhausted without auth response
+                        raise IOError("WebSocket closed before authentication completed")
+                except asyncio.TimeoutError:
+                    raise asyncio.TimeoutError(
+                        f"WS auth response not received within {base_timeout * attempt}s")
 
             except asyncio.CancelledError:
                 raise

@@ -11,9 +11,10 @@ from hummingbot.core.data_type.common import OrderType
 class TestPhase5AOrderTypes(unittest.TestCase):
     """Test LIMIT_MAKER order type mapping and supported types."""
 
-    def test_limit_maker_maps_to_limit(self):
+    def test_limit_maker_raises_value_error(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
-        self.assertEqual(NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER), "limit")
+        with self.assertRaises(ValueError):
+            NonkycExchange.nonkyc_order_type(OrderType.LIMIT_MAKER)
 
     def test_limit_maps_to_limit(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
@@ -23,12 +24,12 @@ class TestPhase5AOrderTypes(unittest.TestCase):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
         self.assertEqual(NonkycExchange.nonkyc_order_type(OrderType.MARKET), "market")
 
-    def test_supported_types_includes_limit_maker(self):
+    def test_supported_types_excludes_limit_maker(self):
         from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
         exchange = NonkycExchange(
             nonkyc_api_key="test", nonkyc_api_secret="test",
             trading_pairs=["BTC-USDT"], trading_required=False)
-        self.assertIn(OrderType.LIMIT_MAKER, exchange.supported_order_types())
+        self.assertNotIn(OrderType.LIMIT_MAKER, exchange.supported_order_types())
 
 
 class TestPhase5ADecimalPrecision(unittest.TestCase):

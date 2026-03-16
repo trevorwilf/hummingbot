@@ -23,7 +23,7 @@ class MexcOrderBook(OrderBook):
             msg.update(metadata)
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": msg["trading_pair"],
-            "update_id": msg["lastUpdateId"],
+            "update_id": int(msg["lastUpdateId"]),
             "bids": msg["bids"],
             "asks": msg["asks"]
         }, timestamp=float(timestamp))
@@ -44,14 +44,24 @@ class MexcOrderBook(OrderBook):
             msg.update(metadata)
 
         depth_data = msg.get('publicAggreDepths', {})
-        # Use toVersion for sequencing — this is the correct MEXC version field
-        # for order book reconciliation. Falls back to timestamp only if version unavailable.
-        update_id = depth_data.get('toVersion') or depth_data.get('version') or timestamp
+
+        # Cast version fields to int — protobuf defines them as str
+        to_version = depth_data.get('toVersion')
+        from_version = depth_data.get('fromVersion')
+
+        if to_version is not None:
+            update_id = int(to_version)
+        elif depth_data.get('version') is not None:
+            update_id = int(depth_data['version'])
+        else:
+            update_id = int(float(timestamp))
+
+        first_update_id = int(from_version) if from_version is not None else None
 
         return OrderBookMessage(OrderBookMessageType.DIFF, {
             "trading_pair": msg["trading_pair"],
             "update_id": update_id,
-            "first_update_id": depth_data.get('fromVersion'),
+            "first_update_id": first_update_id,
             "bids": [[i['price'], i['quantity']] for i in depth_data.get("bids", [])],
             "asks": [[i['price'], i['quantity']] for i in depth_data.get("asks", [])],
         }, timestamp=float(timestamp) * 1e-3)

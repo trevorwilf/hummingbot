@@ -377,8 +377,6 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             for i in range(3):
                 # Reset backoff timer to allow immediate retry
                 self.data_source._resync_next_allowed_time[self.trading_pair] = 0
-                # Reset resync pending
-                self.data_source._resync_pending[self.trading_pair] = False
                 await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
                 recorded_times.append(
                     self.data_source._resync_next_allowed_time[self.trading_pair]
@@ -495,8 +493,8 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         # Diff should be processed normally
         self.assertFalse(msg_queue.empty())
 
-    async def test_resync_pending_cleared_on_failure(self):
-        """After a failed resync, pending flag should be cleared so diffs can flow."""
+    async def test_resync_pending_stays_true_on_failure(self):
+        """After a failed resync, pending flag should stay True so diffs are dropped."""
         self.data_source._last_sequence[self.trading_pair] = 100
         self._setup_snapshot_queue()
 
@@ -506,11 +504,58 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         ):
             await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
 
-        # Pending should be cleared even after failure
+        # Pending should stay True — diffs will be dropped until successful resync
+        self.assertTrue(self.data_source._resync_pending.get(self.trading_pair, False))
+
+    async def test_diffs_dropped_after_snapshot_failure(self):
+        """After snapshot failure with resync_pending=True, subsequent diffs should be dropped."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        self.data_source._resync_pending[self.trading_pair] = True
+        # Set next allowed time far in the future so no retry happens
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
+
+        msg_queue = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(101), msg_queue
+        )
+
+        # Diff should have been dropped
+        self.assertTrue(msg_queue.empty())
+
+    @aioresponses()
+    async def test_resync_retried_after_backoff_elapses(self, mock_api):
+        """After backoff timer elapses, resync should be retried on next incoming diff."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 1
+        # Set next allowed time in the past so retry happens
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() - 1
+        snapshot_queue = self._setup_snapshot_queue()
+
+        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKET_ORDERBOOK_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        snapshot_response = {
+            "marketid": "643bfeeb5e07bba23a98a981",
+            "symbol": self.ex_trading_pair,
+            "timestamp": 1772169899391,
+            "sequence": "200",
+            "bids": [{"price": "67679.55", "quantity": "0.000422"}],
+            "asks": [{"price": "67883.06", "quantity": "0.010917"}],
+        }
+        mock_api.get(regex_url, body=json.dumps(snapshot_response))
+
+        msg_queue = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(105), msg_queue
+        )
+
+        # Resync should have been retried and succeeded
         self.assertFalse(self.data_source._resync_pending.get(self.trading_pair, False))
+        self.assertEqual(0, self.data_source._resync_failure_count[self.trading_pair])
+        self.assertFalse(snapshot_queue.empty())
 
     async def test_max_failures_triggers_reconnect(self):
-        """After SNAPSHOT_RESYNC_MAX_FAILURES, CancelledError should be raised."""
+        """After SNAPSHOT_RESYNC_MAX_FAILURES, ConnectionError should be raised to trigger reconnect."""
         self.data_source._last_sequence[self.trading_pair] = 100
         self.data_source._resync_failure_count[self.trading_pair] = (
             NonkycAPIOrderBookDataSource.SNAPSHOT_RESYNC_MAX_FAILURES
@@ -518,7 +563,7 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._resync_next_allowed_time[self.trading_pair] = 0
         self._setup_snapshot_queue()
 
-        with self.assertRaises(asyncio.CancelledError):
+        with self.assertRaises(ConnectionError):
             await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
 
         # Failure count was reset
@@ -534,8 +579,49 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._resync_failure_count[self.trading_pair] = 5
         self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
 
-        await self.data_source._on_order_book_ws_interruption(None)
+        await self.data_source._on_order_stream_interruption(None)
 
+        self.assertEqual({}, self.data_source._last_sequence)
+        self.assertEqual({}, self.data_source._resync_pending)
+        self.assertEqual({}, self.data_source._resync_failure_count)
+        self.assertEqual({}, self.data_source._resync_next_allowed_time)
+
+    async def test_listen_for_subscriptions_invokes_interruption_cleanup(self):
+        """Integration test: base class listen_for_subscriptions() should invoke _on_order_stream_interruption."""
+        # Set resync state that should be cleared on interruption
+        self.data_source._last_sequence[self.trading_pair] = 100
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 3
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
+
+        # Mock _connected_websocket_assistant to return a mock ws
+        mock_ws = AsyncMock(spec=WSAssistant)
+        mock_ws.disconnect = AsyncMock()
+
+        # Mock _subscribe_channels to succeed
+        # Mock _process_websocket_messages to raise an exception (simulating disconnect)
+        with patch.object(self.data_source, "_connected_websocket_assistant",
+                         new_callable=AsyncMock, return_value=mock_ws), \
+             patch.object(self.data_source, "_subscribe_channels",
+                         new_callable=AsyncMock), \
+             patch.object(self.data_source, "_process_websocket_messages",
+                         new_callable=AsyncMock, side_effect=Exception("Connection lost")):
+
+            # Run listen_for_subscriptions briefly - it should handle the exception
+            # and call _on_order_stream_interruption in the finally block
+            output_queue = asyncio.Queue()
+            task = asyncio.create_task(
+                self.data_source.listen_for_subscriptions()
+            )
+            # Give it time to run through one iteration
+            await asyncio.sleep(0.5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Verify all resync state was cleared by the interruption hook
         self.assertEqual({}, self.data_source._last_sequence)
         self.assertEqual({}, self.data_source._resync_pending)
         self.assertEqual({}, self.data_source._resync_failure_count)

@@ -1180,7 +1180,7 @@ class MexcExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             "origQty": str(order.amount),
             "executedQty": str(Decimal("0")),
             "cummulativeQuoteQty": str(Decimal("0")),
-            "status": "NEW",
+            "status": "CANCELED",
             "timeInForce": "GTC",
             "type": "LIMIT",
             "side": "BUY"

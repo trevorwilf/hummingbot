@@ -250,11 +250,11 @@ bin/hummingbot_quickstart.py" 2>&1
 # 12a. NonKYC strict live smoke (Phase 7 gate — now fails pytest on FAIL > 0)
 python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_live_api.py -v --tb=short 2>&1
 
-# 12b. NonKYC strict live probe (standalone script from expert reviewer)
-python nonkyc_strict_live_probe.py 2>&1
+# TODO: NonKYC strict live probe — not yet implemented
+# python nonkyc_strict_live_probe.py 2>&1
 
-# 12c. MEXC public probe (standalone script from expert reviewer — no keys needed)
-python mexc_public_probe.py --symbol BTCUSDT 2>&1
+# TODO: MEXC public probe — not yet implemented
+# python mexc_public_probe.py --symbol BTCUSDT 2>&1
 
 # 12d. Makefile release target (all tests including live)
 make test_release 2>&1

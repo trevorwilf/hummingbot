@@ -33,13 +33,14 @@ class TestPhase5CDynamicFees(IsolatedAsyncioWrapperTestCase):
         self.assertGreater(fee.percent, Decimal("0"))
 
     def test_get_fee_uses_computed_maker_rate(self):
-        """Phase 5C: _get_fee should return computed maker rate when available."""
+        """Phase 5C: _get_fee should return computed maker rate when is_maker=True."""
         self.exchange._trading_fees = {
             "maker_fee": Decimal("0.002"),
             "taker_fee": Decimal("0.003"),
         }
         fee = self.exchange._get_fee(
-            "BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY, Decimal("1"))
+            "BTC", "USDT", OrderType.LIMIT, TradeType.BUY, Decimal("1"),
+            is_maker=True)
         self.assertEqual(Decimal("0.002"), fee.percent)
 
     def test_get_fee_uses_computed_taker_rate(self):
@@ -67,7 +68,8 @@ class TestPhase5CDynamicFees(IsolatedAsyncioWrapperTestCase):
         """Phase 5C: If only taker is cached, maker should fall back to defaults."""
         self.exchange._trading_fees = {"taker_fee": Decimal("0.003")}
         fee = self.exchange._get_fee(
-            "BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY, Decimal("1"))
+            "BTC", "USDT", OrderType.LIMIT, TradeType.BUY, Decimal("1"),
+            is_maker=True)
         # maker_fee not in cache -> should fall back to estimate_fee_pct
         # The fee should be the static default, not the taker rate
         self.assertNotEqual(Decimal("0.003"), fee.percent)

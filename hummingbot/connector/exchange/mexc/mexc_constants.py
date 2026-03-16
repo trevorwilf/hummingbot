@@ -69,7 +69,7 @@ WS_ORDER_STATE = {
     2: OrderState.FILLED,
     3: OrderState.PARTIALLY_FILLED,
     4: OrderState.CANCELED,
-    5: OrderState.OPEN,
+    5: OrderState.CANCELED,    # Partially canceled — terminal state
 }
 
 # Websocket event types

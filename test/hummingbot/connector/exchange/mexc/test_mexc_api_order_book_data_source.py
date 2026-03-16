@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -344,8 +345,8 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         msg: OrderBookMessage = await msg_queue.get()
 
-        # update_id should use toVersion for sequencing, not sendTime
-        self.assertEqual(diff_event["publicAggreDepths"]["toVersion"], msg.update_id)
+        # update_id should use toVersion (as int) for sequencing, not sendTime
+        self.assertEqual(int(diff_event["publicAggreDepths"]["toVersion"]), msg.update_id)
 
     @aioresponses()
     async def test_listen_for_order_book_snapshots_cancelled_when_fetching_snapshot(self, mock_api):
@@ -488,3 +489,160 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(
             self._is_logged("ERROR", f"Error unsubscribing from {self.trading_pair}")
         )
+
+    # --- Version continuity tracking tests ---
+
+    def _create_raw_diff_message(self, from_version: str, to_version: str, send_time: str = "1755973885809"):
+        """Helper to create a raw MEXC diff message for testing."""
+        return {
+            "channel": f"spot@public.aggre.depth.v3.api.pb@100ms@{self.ex_trading_pair}",
+            "symbol": self.ex_trading_pair,
+            "sendTime": send_time,
+            "publicAggreDepths": {
+                "bids": [{"price": "100.0", "quantity": "1.0"}],
+                "asks": [{"price": "101.0", "quantity": "1.0"}],
+                "eventType": "spot@public.aggre.depth.v3.api.pb@100ms",
+                "fromVersion": from_version,
+                "toVersion": to_version,
+            }
+        }
+
+    async def test_contiguous_diffs_accepted(self):
+        """Diffs with contiguous fromVersion/toVersion should be accepted."""
+        msg_queue = asyncio.Queue()
+
+        # First diff -- establishes baseline
+        raw1 = self._create_raw_diff_message("100", "105")
+        await self.data_source._parse_order_book_diff_message(raw1, msg_queue)
+        self.assertEqual(1, msg_queue.qsize())
+        self.assertEqual(105, self.data_source._last_to_version[self.trading_pair])
+
+        # Second diff -- contiguous (fromVersion = 106 = last_to + 1)
+        raw2 = self._create_raw_diff_message("106", "110")
+        await self.data_source._parse_order_book_diff_message(raw2, msg_queue)
+        self.assertEqual(2, msg_queue.qsize())
+        self.assertEqual(110, self.data_source._last_to_version[self.trading_pair])
+
+    async def test_version_gap_triggers_resync(self):
+        """A gap in fromVersion should trigger resync and drop the diff."""
+        msg_queue = asyncio.Queue()
+
+        # Establish baseline
+        raw1 = self._create_raw_diff_message("100", "105")
+        await self.data_source._parse_order_book_diff_message(raw1, msg_queue)
+        self.assertEqual(105, self.data_source._last_to_version[self.trading_pair])
+
+        # Mock the snapshot for resync
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 200
+            mock_snap.return_value = mock_snapshot_msg
+
+            # Gap: expected fromVersion=106, got 150
+            raw2 = self._create_raw_diff_message("150", "155")
+            await self.data_source._parse_order_book_diff_message(raw2, msg_queue)
+
+            # Only the first diff should be in the queue (gap diff was dropped)
+            self.assertEqual(1, msg_queue.qsize())
+            # Resync should have been attempted
+            mock_snap.assert_called_once()
+
+    async def test_stale_diff_dropped(self):
+        """Diffs with toVersion <= last_to_version should be dropped."""
+        msg_queue = asyncio.Queue()
+
+        raw1 = self._create_raw_diff_message("100", "105")
+        await self.data_source._parse_order_book_diff_message(raw1, msg_queue)
+
+        # Stale diff (toVersion 103 <= last_to 105)
+        raw2 = self._create_raw_diff_message("99", "103")
+        await self.data_source._parse_order_book_diff_message(raw2, msg_queue)
+
+        # Only the first diff should be accepted
+        self.assertEqual(1, msg_queue.qsize())
+        # No resync triggered
+        self.assertFalse(self.data_source._resync_pending.get(self.trading_pair, False))
+
+    async def test_diffs_dropped_while_resync_pending(self):
+        """While resync_pending is True, all diffs should be dropped."""
+        msg_queue = asyncio.Queue()
+
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 9999
+
+        raw = self._create_raw_diff_message("100", "105")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        self.assertEqual(0, msg_queue.qsize())
+
+    async def test_resync_failure_keeps_pending(self):
+        """Failed resync should keep resync_pending=True and apply backoff."""
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 0
+        self.data_source._resync_next_allowed_time[self.trading_pair] = 0
+
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snap.side_effect = Exception("REST snapshot failed")
+            await self.data_source._attempt_resync(self.trading_pair)
+
+        self.assertTrue(self.data_source._resync_pending[self.trading_pair])
+        self.assertEqual(1, self.data_source._resync_failure_count[self.trading_pair])
+        self.assertGreater(self.data_source._resync_next_allowed_time[self.trading_pair], time.time())
+
+    async def test_max_resync_failures_triggers_reconnect(self):
+        """Exceeding max resync failures should raise ConnectionError."""
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = (
+            self.data_source.SNAPSHOT_RESYNC_MAX_FAILURES
+        )
+        self.data_source._resync_next_allowed_time[self.trading_pair] = 0
+
+        with self.assertRaises(ConnectionError):
+            await self.data_source._attempt_resync(self.trading_pair)
+
+    async def test_successful_resync_clears_state(self):
+        """Successful resync should clear all failure tracking."""
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 3
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
+
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 500
+            mock_snap.return_value = mock_snapshot_msg
+
+            await self.data_source._attempt_resync(self.trading_pair)
+
+        self.assertFalse(self.data_source._resync_pending[self.trading_pair])
+        self.assertEqual(0, self.data_source._resync_failure_count[self.trading_pair])
+        self.assertEqual(500, self.data_source._last_to_version[self.trading_pair])
+
+    async def test_ws_interruption_clears_continuity_state(self):
+        """WebSocket disconnection should clear all version tracking state."""
+        self.data_source._last_to_version[self.trading_pair] = 12345
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 3
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
+
+        await self.data_source._on_order_stream_interruption(None)
+
+        self.assertEqual({}, self.data_source._last_to_version)
+        self.assertEqual({}, self.data_source._resync_pending)
+        self.assertEqual({}, self.data_source._resync_failure_count)
+        self.assertEqual({}, self.data_source._resync_next_allowed_time)
+
+    async def test_resync_retry_on_backoff_elapsed(self):
+        """When resync_pending and backoff has elapsed, next diff should trigger retry."""
+        msg_queue = asyncio.Queue()
+
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 1
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() - 1  # elapsed
+
+        with patch.object(self.data_source, '_attempt_resync', new_callable=AsyncMock) as mock_resync:
+            raw = self._create_raw_diff_message("200", "205")
+            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+            mock_resync.assert_called_once_with(self.trading_pair)
+        # Diff should still be dropped (resync handles it)
+        self.assertEqual(0, msg_queue.qsize())

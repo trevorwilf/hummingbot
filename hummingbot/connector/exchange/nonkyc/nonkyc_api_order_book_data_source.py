@@ -150,8 +150,14 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sequence = int(params.get("sequence", 0))
             last_seq = self._last_sequence.get(trading_pair, 0)
 
-            # If a resync is pending for this pair, drop all diffs until it completes
+            # If a resync is pending for this pair, check if we should retry
             if self._resync_pending.get(trading_pair, False):
+                now = time.time()
+                next_allowed = self._resync_next_allowed_time.get(trading_pair, 0)
+                if now >= next_allowed:
+                    # Retry the snapshot resync
+                    await self._handle_sequence_gap(trading_pair, last_seq, sequence)
+                # Either way, drop this diff
                 return
 
             if sequence <= last_seq:
@@ -188,8 +194,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             self._resync_failure_count[trading_pair] = 0
             self._resync_pending[trading_pair] = False
-            # Raise to trigger the parent's reconnect logic
-            raise asyncio.CancelledError()
+            # Raise ConnectionError to trigger the parent's reconnect logic (not CancelledError which kills the task)
+            raise ConnectionError(f"NonKYC order book resync for {trading_pair} failed {failure_count} consecutive times — triggering reconnect")
 
         self.logger().warning(
             f"Orderbook sequence gap for {trading_pair}: expected {expected_seq + 1}, got {received_seq}. "
@@ -220,6 +226,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raise
         except Exception as e:
             # Snapshot failed — apply exponential backoff
+            # KEEP resync_pending=True so diffs are dropped until successful resync
             self._resync_failure_count[trading_pair] = failure_count + 1
             delay = min(
                 self.SNAPSHOT_RESYNC_INITIAL_DELAY * (self.SNAPSHOT_RESYNC_BACKOFF_FACTOR ** failure_count),
@@ -229,7 +236,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             jitter = delay * random.uniform(0, 0.25)
             next_retry = now + delay + jitter
             self._resync_next_allowed_time[trading_pair] = next_retry
-            self._resync_pending[trading_pair] = False  # Allow diffs to flow again (stale but better than nothing)
+            # _resync_pending stays True — diffs will be dropped until next successful snapshot
 
             self.logger().warning(
                 f"Order book resync for {trading_pair} failed (attempt {failure_count + 1}): {e}. "
@@ -253,7 +260,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 params, time.time(), metadata={"trading_pair": trading_pair})
             message_queue.put_nowait(snapshot_msg)
 
-    async def _on_order_book_ws_interruption(self, websocket_assistant: Optional[WSAssistant]):
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
         """
         Called when the order book WebSocket connection is interrupted.
         Clears all tracking state so the next connection gets a fresh start.
@@ -262,8 +269,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._resync_pending.clear()
         self._resync_failure_count.clear()
         self._resync_next_allowed_time.clear()
-        websocket_assistant and await websocket_assistant.disconnect()
-        self._ws_assistant = None
+        await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""

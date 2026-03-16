@@ -213,7 +213,8 @@ class MexcExchange(ExchangePyBase):
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
             is_auth_required=True)
-        if cancel_result.get("status") == "NEW":
+        status = str(cancel_result.get("status", "")).upper()
+        if status in ("CANCELED", "PARTIALLY_CANCELED"):
             return True
         return False
 
@@ -449,11 +450,11 @@ class MexcExchange(ExchangePyBase):
 
         if order.exchange_order_id is not None:
             exchange_order_id = order.exchange_order_id
-            trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+            exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
             all_fills_response = await self._api_get(
                 path_url=CONSTANTS.MY_TRADES_PATH_URL,
                 params={
-                    "symbol": trading_pair,
+                    "symbol": exchange_symbol,
                     "orderId": exchange_order_id
                 },
                 is_auth_required=True,
@@ -472,7 +473,7 @@ class MexcExchange(ExchangePyBase):
                     trade_id=str(trade["id"]),
                     client_order_id=order.client_order_id,
                     exchange_order_id=exchange_order_id,
-                    trading_pair=trading_pair,
+                    trading_pair=order.trading_pair,  # Use Hummingbot format, NOT exchange symbol
                     fee=fee,
                     fill_base_amount=Decimal(trade["qty"]),
                     fill_quote_amount=Decimal(trade["quoteQty"]),
@@ -484,11 +485,11 @@ class MexcExchange(ExchangePyBase):
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+        exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
         updated_order_data = await self._api_get(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params={
-                "symbol": trading_pair,
+                "symbol": exchange_symbol,
                 "origClientOrderId": tracked_order.client_order_id},
             is_auth_required=True,
             headers={"Content-Type": "application/json"})

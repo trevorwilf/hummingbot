@@ -48,7 +48,7 @@ def build_api_factory(
         rest_pre_processors=[
             TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
         ],
-        ws_post_processors=[MexcPostProcessor]
+        ws_post_processors=[MexcPostProcessor()]
     )
     return api_factory
 
@@ -56,7 +56,7 @@ def build_api_factory(
 def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncThrottler) -> WebAssistantsFactory:
     api_factory = WebAssistantsFactory(
         throttler=throttler,
-        ws_post_processors=[MexcPostProcessor]
+        ws_post_processors=[MexcPostProcessor()]
     )
     return api_factory
 

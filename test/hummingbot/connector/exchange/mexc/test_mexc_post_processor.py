@@ -21,13 +21,15 @@ class TestMexcPostProcessor(unittest.TestCase):
 
     def test_post_processor_passes_dict_through(self):
         """Dict data should pass through unchanged."""
+        processor = MexcPostProcessor()
         data = {"channel": "test", "symbol": "BTCUSDC"}
         response = WSResponse(data=data)
-        result = self._run(MexcPostProcessor.post_process(response))
+        result = self._run(processor.post_process(response))
         self.assertEqual(result.data, {"channel": "test", "symbol": "BTCUSDC"})
 
     def test_post_processor_decodes_protobuf_bytes(self):
         """Serialized protobuf bytes should be decoded to dict."""
+        processor = MexcPostProcessor()
         wrapper = PushDataV3ApiWrapper_pb2.PushDataV3ApiWrapper()
         wrapper.channel = "spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDC"
         wrapper.symbol = "BTCUSDC"
@@ -35,27 +37,30 @@ class TestMexcPostProcessor(unittest.TestCase):
 
         serialized = wrapper.SerializeToString()
         response = WSResponse(data=serialized)
-        result = self._run(MexcPostProcessor.post_process(response))
+        result = self._run(processor.post_process(response))
 
         self.assertIsInstance(result.data, dict)
         self.assertEqual(result.data["channel"], "spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDC")
         self.assertEqual(result.data["symbol"], "BTCUSDC")
 
     def test_post_processor_raises_on_invalid_bytes(self):
-        """Invalid protobuf bytes should raise an exception."""
-        response = WSResponse(data=b"invalid_protobuf_garbage\x00\xff\xfe")
-        # protobuf ParseFromString may not always raise on arbitrary bytes,
-        # but clearly malformed data should fail during parsing or produce empty/wrong result
-        # The post_processor re-raises exceptions
-        try:
-            result = self._run(MexcPostProcessor.post_process(response))
-            # If it didn't raise, verify the result is at least a dict (protobuf may silently parse some bytes)
-            self.assertIsInstance(result.data, dict)
-        except Exception:
-            pass  # Expected — invalid bytes should raise
+        """Truly invalid protobuf bytes should raise an exception."""
+        processor = MexcPostProcessor()
+        # Use bytes that are guaranteed to not be valid protobuf
+        response = WSResponse(data=b"\x00\x01\x02\x03\xff\xfe\xfd")
+        with self.assertRaises(Exception):
+            self._run(processor.post_process(response))
+
+    def test_post_processor_empty_bytes(self):
+        """Empty bytes should produce an empty dict (valid empty protobuf)."""
+        processor = MexcPostProcessor()
+        response = WSResponse(data=b"")
+        result = self._run(processor.post_process(response))
+        self.assertIsInstance(result.data, dict)
 
     def test_post_processor_round_trip_trade_message(self):
         """Realistic trade-channel protobuf message should round-trip correctly."""
+        processor = MexcPostProcessor()
         wrapper = PushDataV3ApiWrapper_pb2.PushDataV3ApiWrapper()
         wrapper.channel = "spot@public.aggre.deals.v3.api.pb@BTCUSDC"
         wrapper.symbol = "BTCUSDC"
@@ -69,7 +74,7 @@ class TestMexcPostProcessor(unittest.TestCase):
 
         serialized = wrapper.SerializeToString()
         response = WSResponse(data=serialized)
-        result = self._run(MexcPostProcessor.post_process(response))
+        result = self._run(processor.post_process(response))
 
         self.assertIsInstance(result.data, dict)
         self.assertEqual(result.data["symbol"], "BTCUSDC")
@@ -82,6 +87,7 @@ class TestMexcPostProcessor(unittest.TestCase):
 
     def test_post_processor_round_trip_depth_message(self):
         """Realistic depth-channel protobuf message should preserve version fields."""
+        processor = MexcPostProcessor()
         wrapper = PushDataV3ApiWrapper_pb2.PushDataV3ApiWrapper()
         wrapper.channel = "spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDC"
         wrapper.symbol = "BTCUSDC"
@@ -102,7 +108,7 @@ class TestMexcPostProcessor(unittest.TestCase):
 
         serialized = wrapper.SerializeToString()
         response = WSResponse(data=serialized)
-        result = self._run(MexcPostProcessor.post_process(response))
+        result = self._run(processor.post_process(response))
 
         self.assertIsInstance(result.data, dict)
         depths = result.data["publicAggreDepths"]

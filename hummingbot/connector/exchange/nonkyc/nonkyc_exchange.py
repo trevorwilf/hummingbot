@@ -55,20 +55,25 @@ class NonkycExchange(ExchangePyBase):
         self._trading_fees_last_computed: float = 0.0
         self._trading_fees_ttl: float = 3600.0  # 1 hour cache TTL
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        self.logger().info(
+            "NonKYC connector supports LIMIT and MARKET order types. "
+            "Post-only/maker-only (LIMIT_MAKER) orders are not supported by this exchange."
+        )
 
     @staticmethod
     def nonkyc_order_type(order_type: OrderType) -> str:
         """
         Map Hummingbot OrderType to NonKYC API type string.
 
-        NOTE: LIMIT_MAKER is mapped to 'limit' because NonKYC does not support
-        a native post-only/maker-only order type. Unlike Binance's LIMIT_MAKER
-        (which rejects if it would take), this limit order CAN cross the spread.
-        The dynamic fee system (Phase 5C) correctly classifies maker/taker fills
-        using the 'triggeredBy' field from trade history.
+        NonKYC does not support a native post-only/maker-only order type.
+        LIMIT_MAKER is rejected with ValueError since it would silently
+        convert to a regular limit order that can cross the spread.
         """
         if order_type == OrderType.LIMIT_MAKER:
-            return "limit"
+            raise ValueError(
+                "NonKYC does not support LIMIT_MAKER (post-only) orders. "
+                "Use OrderType.LIMIT instead. Note: limit orders on NonKYC may take liquidity."
+            )
         return order_type.name.lower()
 
     @staticmethod
@@ -138,7 +143,7 @@ class NonkycExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+        return [OrderType.LIMIT, OrderType.MARKET]
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
@@ -195,7 +200,7 @@ class NonkycExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
-        is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
+        is_maker = is_maker or False
         if self._trading_fees:
             fee_key = "maker_fee" if is_maker else "taker_fee"
             fee_pct = self._trading_fees.get(fee_key)
@@ -225,11 +230,6 @@ class NonkycExchange(ExchangePyBase):
         order_result = None
         amount_str = f"{amount:f}"
         type_str = NonkycExchange.nonkyc_order_type(order_type)
-        if order_type is OrderType.LIMIT_MAKER:
-            self.logger().debug(
-                f"LIMIT_MAKER mapped to 'limit' for NonKYC (no native post-only). "
-                f"Order may take liquidity if price crosses spread."
-            )
         side_str = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
@@ -238,7 +238,7 @@ class NonkycExchange(ExchangePyBase):
                       "quantity": amount_str,
                       "type": type_str,
                       "userProvidedId": order_id}
-        if order_type is OrderType.LIMIT or order_type is OrderType.LIMIT_MAKER:
+        if order_type is OrderType.LIMIT:
             price_str = f"{price:f}"
             api_params["price"] = price_str
 
@@ -459,22 +459,47 @@ class NonkycExchange(ExchangePyBase):
     async def cancel_all_orders_on_exchange(self, trading_pair: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Cancels all open orders on the exchange, optionally filtered by trading pair.
-        Uses the NonKYC /cancelallorders REST endpoint for atomic batch cancellation.
+        NonKYC's /cancelallorders endpoint requires a symbol parameter, so when
+        trading_pair is None, we fan out across all pairs with tracked orders.
 
         :param trading_pair: if provided (Hummingbot format, e.g. 'BTC-USDT'),
-                             only cancel orders for this pair. If None, cancel ALL.
+                             only cancel orders for this pair. If None, cancel all active pairs.
         :return: list of cancelled order data dicts from the exchange
         """
-        api_params = {}
+        results = []
+
         if trading_pair is not None:
-            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-            api_params["symbol"] = symbol
+            result = await self._cancel_all_for_pair(trading_pair)
+            results.extend(result)
+        else:
+            # Fan out across all pairs with active orders
+            active_pairs = set()
+            for order in self._order_tracker.active_orders.values():
+                active_pairs.add(order.trading_pair)
+
+            for pair in active_pairs:
+                try:
+                    result = await self._cancel_all_for_pair(pair)
+                    results.extend(result)
+                except Exception as e:
+                    self.logger().warning(f"Failed to cancel all orders for {pair}: {e}")
+
+        return results
+
+    async def _cancel_all_for_pair(self, trading_pair: str) -> List[Dict[str, Any]]:
+        """Cancel all orders for a specific trading pair."""
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        api_params = {"symbol": symbol}
 
         result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL,
             data=api_params,
             is_auth_required=True,
             limit_id=CONSTANTS.CANCEL_ALL_ORDERS_PATH_URL)
+
+        # Check for error responses (NonKYC can return errors inside HTTP 200)
+        if isinstance(result, dict) and "error" in result:
+            raise IOError(f"Cancel all orders failed for {trading_pair}: {result['error']}")
 
         return result if isinstance(result, list) else [result] if isinstance(result, dict) else []
 
@@ -618,7 +643,19 @@ class NonkycExchange(ExchangePyBase):
 
                     if reportType == "trade":
                         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-                        quote_asset = (message_params.get('symbol').split('/'))[1]
+                        # Prefer deriving quote from tracked order's trading pair (reliable)
+                        # Fall back to parsing the exchange symbol
+                        if tracked_order is not None:
+                            quote_asset = tracked_order.trading_pair.split("-")[1]
+                        else:
+                            symbol = message_params.get('symbol', '')
+                            parts = symbol.split('/') if symbol else []
+                            if len(parts) >= 2:
+                                quote_asset = parts[1]
+                            else:
+                                self.logger().warning(
+                                    f"Could not parse quote asset from symbol '{symbol}' in trade report. Skipping.")
+                                continue
                         if tracked_order is not None:
                             fee_token, fee_amount = self._extract_fee_token_and_amount(message_params, quote_asset)
                             fee = TradeFeeBase.new_spot_fee(
@@ -786,7 +823,7 @@ class NonkycExchange(ExchangePyBase):
                                 order_id=self._exchange_order_ids.get(str(trade["orderid"]), None),
                                 trading_pair=trading_pair,
                                 trade_type=TradeType.BUY if trade["side"].lower() == "buy" else TradeType.SELL,
-                                order_type=OrderType.LIMIT_MAKER if trade["side"].lower() != trade['triggeredBy'].lower() else OrderType.LIMIT,
+                                order_type=OrderType.LIMIT,
                                 price=Decimal(trade["price"]),
                                 amount=Decimal(trade["quantity"]),
                                 trade_fee=DeductedFromReturnsTradeFee(
