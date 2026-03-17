@@ -179,9 +179,66 @@ python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase5d.p
 # Without them, tests skip/warn. With them, failures actually fail pytest.
 python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_live_api.py -v --tb=short 2>&1
 
+# ====== TIER 9.5: EXPERT REVIEW — CONNECTOR BUG FIXES (Mar 2026) ======
+
+# 9.5a. NonKYC Expert Review Fixes (LIMIT_MAKER removal, symbol parsing, cancel fan-out)
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_expert_review_fixes.py -v --tb=short 2>&1
+
+# 9.5b. NonKYC Time Sync Integration (ms provider, auth nonce pipeline)
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_time_sync_integration.py -v --tb=short 2>&1
+
+# 9.5c. NonKYC Auth (unit tests — signing, nonce, headers)
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_auth.py -v --tb=short 2>&1
+
+# 9.5d. NonKYC Exchange (order lifecycle, balances, cancel)
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_exchange.py -v --tb=short 2>&1
+
+# 9.5e. NonKYC Order Book (snapshot/diff/trade message parsing)
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_order_book.py -v --tb=short 2>&1
+
+# 9.5f. NonKYC Bug Fixes (variable naming, order state mapping)
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_bugfixes.py -v --tb=short 2>&1
+
+# 9.5g. NonKYC Phase tests (2, 3, 5a, 5c, 6, 7a, 7b, 7c)
+python -m pytest `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase2_fixes.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase3_optimization.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase5a.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase5c.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase6.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase7a.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase7b.py `
+    test/hummingbot/connector/exchange/nonkyc/test_nonkyc_phase7c.py `
+    -v --tb=short 2>&1
+
+# 9.5h. NonKYC Utils + User Stream Data Source
+python -m pytest test/hummingbot/connector/exchange/nonkyc/test_nonkyc_utils.py test/hummingbot/connector/exchange/nonkyc/test_nonkyc_api_user_stream_data_source.py -v --tb=short 2>&1
+
+# 9.5i. MEXC Expert Review Fixes (cancel status, WS status 5, listen key, TradeUpdate format)
+python -m pytest test/hummingbot/connector/exchange/mexc/test_mexc_expert_review_fixes.py -v --tb=short 2>&1
+
+# 9.5j. MEXC Utils (exchange info validation)
+python -m pytest test/hummingbot/connector/exchange/mexc/test_mexc_utils.py -v --tb=short 2>&1
+
+# 9.5i2. NonKYC standalone auth test (runs outside pytest, verifies signing pipeline)
+python test/hummingbot/connector/exchange/nonkyc/nonkyc_auth_test.py 2>&1
+
+# 9.5j2. Candles Factory (includes NonKYC registration — 4 tests)
+python -m pytest test/hummingbot/data_feed/candles_feed/test_candles_factory.py -v --tb=short 2>&1
+
+# 9.5j3. Market Data Provider (references NonKYC candles)
+python -m pytest test/hummingbot/data_feed/test_market_data_provider.py -v --tb=short 2>&1
+
+# 9.5k. Full NonKYC connector (excluding live_api) — aggregate pass
+python -m pytest test/hummingbot/connector/exchange/nonkyc/ -v --tb=short -m "not live_api" 2>&1
+
+# 9.5l. Full MEXC connector — aggregate pass
+python -m pytest test/hummingbot/connector/exchange/mexc/ -v --tb=short 2>&1
+
+
 # ====== TIER 10: EXPERT REVIEW — BROAD REGRESSION SWEEP ======
 
-# 10a. All files modified or created by the remediation, single run
+# 10a. All files modified or created by remediation + expert reviews, single run
 python -m pytest `
     test/hummingbot/client/test_performance.py `
     test/hummingbot/core/utils/test_kill_switch.py `
@@ -210,7 +267,7 @@ python -m pytest test/hummingbot/remote_iface/ -m "not quarantined and not live_
 
 # ====== TIER 11: EXPERT REVIEW — COVERAGE ON CHANGED FILES ======
 
-# 11a. Coverage on all production files touched by remediation
+# 11a. Coverage on all production files touched by remediation + expert reviews
 python -m coverage run -m pytest `
     test/hummingbot/client/test_performance.py `
     test/hummingbot/core/utils/test_kill_switch.py `
@@ -219,6 +276,7 @@ python -m coverage run -m pytest `
     test/hummingbot/client/command/test_start_command.py `
     test/hummingbot/client/command/test_history_command.py `
     test/hummingbot/connector/exchange/mexc/ `
+    test/hummingbot/connector/exchange/nonkyc/ `
     test/hummingbot/core/data_type/test_retry_backoff_consistency.py `
     test/hummingbot/core/data_type/test_order_book_tracker.py `
     test/hummingbot/core/test_connector_manager.py `
@@ -234,6 +292,16 @@ hummingbot/remote_iface/messages.py,`
 hummingbot/client/command/start_command.py,`
 hummingbot/connector/exchange/mexc/mexc_order_book.py,`
 hummingbot/connector/exchange/mexc/mexc_post_processor.py,`
+hummingbot/connector/exchange/mexc/mexc_exchange.py,`
+hummingbot/connector/exchange/mexc/mexc_constants.py,`
+hummingbot/connector/exchange/mexc/mexc_api_order_book_data_source.py,`
+hummingbot/connector/exchange/mexc/mexc_api_user_stream_data_source.py,`
+hummingbot/connector/exchange/mexc/mexc_web_utils.py,`
+hummingbot/connector/exchange/nonkyc/nonkyc_exchange.py,`
+hummingbot/connector/exchange/nonkyc/nonkyc_auth.py,`
+hummingbot/connector/exchange/nonkyc/nonkyc_web_utils.py,`
+hummingbot/connector/exchange/nonkyc/nonkyc_api_order_book_data_source.py,`
+hummingbot/connector/exchange/nonkyc/nonkyc_api_user_stream_data_source.py,`
 hummingbot/core/connector_manager.py,`
 hummingbot/core/data_type/order_book_tracker.py,`
 hummingbot/core/data_type/order_book_tracker_data_source.py,`

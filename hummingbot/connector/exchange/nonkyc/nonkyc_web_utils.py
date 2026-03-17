@@ -71,10 +71,6 @@ async def get_current_server_time(
         method=RESTMethod.GET,
         throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
     )
-    server_time = float(response["serverTime"])
-
-    # Normalize: if value looks like milliseconds (> year 2001 in ms), convert to seconds
-    if server_time > 1_000_000_000_000:
-        server_time = server_time / 1000.0
-
-    return server_time
+    # Return milliseconds directly -- DO NOT divide by 1000.
+    # TimeSynchronizer expects milliseconds from the time provider.
+    return float(response["serverTime"])

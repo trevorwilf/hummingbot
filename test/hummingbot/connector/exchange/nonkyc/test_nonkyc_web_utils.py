@@ -38,5 +38,5 @@ class NonkycWebUtilsTests(IsolatedAsyncioWrapperTestCase):
 
         result = await web_utils.get_current_server_time()
 
-        # Phase 2 Fix 5: milliseconds are now normalized to seconds
-        self.assertAlmostEqual(1772170404.982, result, places=2)
+        # Must return milliseconds -- TimeSynchronizer expects ms from time provider
+        self.assertEqual(1772170404982.0, result)
