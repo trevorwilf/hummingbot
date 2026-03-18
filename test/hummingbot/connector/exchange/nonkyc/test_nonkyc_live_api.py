@@ -1,10 +1,15 @@
 # -*- coding: ascii -*-
 """
-NonKYC Exchange -- Live API Validation Script
-==============================================
+NonKYC Exchange Contract Probes
+===============================
 Location: test/hummingbot/connector/exchange/nonkyc/test_nonkyc_live_api.py
 
+This file validates the NonKYC REST and WebSocket API contract using direct
+HTTP/WS calls. It does NOT test the production connector pipeline. For true
+connector-path smoke tests, see test_nonkyc_live_connector_smoke.py.
+
 STANDALONE script -- no hummingbot imports required.
+NOTE: This is a contract/probe file, not a connector integration test.
 Works both as:
   - Direct run:  python test_nonkyc_live_api.py
   - Pytest:      pytest test_nonkyc_live_api.py -v
@@ -74,7 +79,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://api.nonkyc.io/api/v2"
-WS_URL = "wss://api.nonkyc.io"
+WS_URL = "wss://ws.nonkyc.io"
 
 # ---------------------------------------------------------------------------
 # Result tracking
@@ -3247,8 +3252,8 @@ def test_7c_post_auth_signature_deterministic():
 
 
 def test_7c_get_auth_param_order_irrelevant():
-    """7C-2: GET auth preserves dict insertion order (matching aiohttp).
-    Slashes in values must NOT be percent-encoded."""
+    """7C-2: GET auth sorts params canonically -- same logical params in
+    different insertion orders produce the same signature."""
     from unittest.mock import MagicMock
     from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
     from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
@@ -3260,16 +3265,23 @@ def test_7c_get_auth_param_order_irrelevant():
     async def _run():
         req_a = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
                             params={"status": "active", "symbol": "BTC/USDT"})
+        req_b = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
+                            params={"symbol": "BTC/USDT", "status": "active"})
         await auth.rest_authenticate(req_a)
-        # Params baked into URL in insertion order, not percent-encoded
+        await auth.rest_authenticate(req_b)
+        # Both should have sorted params
         assert "status=active&symbol=BTC/USDT" in req_a.url, \
-            f"Params not in insertion order: {req_a.url}"
+            f"Params not sorted: {req_a.url}"
+        assert "status=active&symbol=BTC/USDT" in req_b.url, \
+            f"Params not sorted: {req_b.url}"
         assert "%2F" not in req_a.url, f"Slash was percent-encoded: {req_a.url}"
         assert req_a.params is None, "Params should be baked into URL"
-        assert "X-API-SIGN" in req_a.headers
+        # Same signature regardless of insertion order
+        assert req_a.headers["X-API-SIGN"] == req_b.headers["X-API-SIGN"], \
+            "Signatures should match for same logical params"
 
     asyncio.get_event_loop().run_until_complete(_run())
-    result("7C-2: GET auth preserves insertion order, no %2F", True)
+    result("7C-2: GET auth sorted canonical, same signature, no %2F", True)
 
 
 def test_7c_balance_update_event_structure():

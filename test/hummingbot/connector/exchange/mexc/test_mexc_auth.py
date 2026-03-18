@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 from copy import copy
 from unittest import TestCase
 from unittest.mock import MagicMock
@@ -49,3 +50,32 @@ class MexcAuthTests(TestCase):
         self.assertEqual(now * 1e3, configured_request.params["timestamp"])
         self.assertEqual(expected_signature, configured_request.params["signature"])
         self.assertEqual({"X-MEXC-APIKEY": self._api_key, "Content-Type": "application/json"}, configured_request.headers)
+
+    def test_rest_authenticate_post(self):
+        """POST auth re-serializes data as JSON string, not OrderedDict."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        params = {"symbol": "LTCBTC", "side": "BUY", "type": "LIMIT",
+                  "timeInForce": "GTC", "quantity": 1, "price": "0.1"}
+
+        auth = MexcAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.mexc.com/api/v3/order",
+            data=json.dumps(params),
+            is_auth_required=True
+        )
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        # Data must be a string (JSON-serialized), not a dict/OrderedDict
+        self.assertIsInstance(configured_request.data, str)
+
+        # Should be valid JSON
+        parsed = json.loads(configured_request.data)
+        self.assertIn("timestamp", parsed)
+        self.assertIn("signature", parsed)
+
+        # Content-Type must be application/json
+        self.assertEqual("application/json", configured_request.headers["Content-Type"])

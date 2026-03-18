@@ -28,6 +28,18 @@ test_release:
 test_nonkyc_live:
 	pytest -m "live_api" test/hummingbot/connector/exchange/nonkyc/ -v --tb=long
 
+test_nonkyc_unit:
+	pytest test/hummingbot/connector/exchange/nonkyc/ -v -m "not live_api and not quarantined" --tb=short
+
+test_mexc_unit:
+	pytest test/hummingbot/connector/exchange/mexc/ -v -m "not quarantined" --tb=short
+
+test_release_unit:
+	pytest -m "not quarantined and not live_api" test/ -v --tb=long
+
+test_release_live:
+	pytest -m "live_api and not quarantined" test/ -v --tb=long
+
 test_nonkyc:
 	pytest test/hummingbot/connector/exchange/nonkyc/ -v -m "not live_api" \
 

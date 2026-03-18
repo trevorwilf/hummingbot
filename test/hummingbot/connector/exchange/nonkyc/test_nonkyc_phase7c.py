@@ -88,10 +88,11 @@ class TestPostAuthBodyMatchesSignature(_Base):
 
 class TestGetAuthStableWithUnorderedParams(_Base):
     """7C-2: GET requests with identical params in different insertion
-    order produce the same signature."""
+    order produce the same signature (sorted canonical form)."""
 
-    def test_get_params_preserve_insertion_order(self):
-        """GET params are signed in dict insertion order (matching aiohttp).
+    def test_get_params_sorted_canonically(self):
+        """GET params are sorted alphabetically before signing.
+        Same logical params in different orders produce same signature.
         Slashes in values must NOT be percent-encoded."""
         mock_time = MagicMock()
         mock_time.time.return_value = 1700000000.0
@@ -102,13 +103,19 @@ class TestGetAuthStableWithUnorderedParams(_Base):
 
         req_a = RESTRequest(method=RESTMethod.GET, url=url,
                             params={"status": "active", "symbol": "BTC/USDT"}, is_auth_required=True)
+        req_b = RESTRequest(method=RESTMethod.GET, url=url,
+                            params={"symbol": "BTC/USDT", "status": "active"}, is_auth_required=True)
         self.async_run(auth.rest_authenticate(req_a))
+        self.async_run(auth.rest_authenticate(req_b))
 
-        # Params baked into URL, not percent-encoded
+        # Both sorted canonically
         self.assertIn("status=active&symbol=BTC/USDT", req_a.url)
+        self.assertIn("status=active&symbol=BTC/USDT", req_b.url)
         self.assertNotIn("%2F", req_a.url)
         self.assertIsNone(req_a.params)
-        self.assertIn("X-API-SIGN", req_a.headers)
+        self.assertIsNone(req_b.params)
+        # Same signature
+        self.assertEqual(req_a.headers["X-API-SIGN"], req_b.headers["X-API-SIGN"])
 
 
 # =========================================================================
@@ -144,18 +151,30 @@ class TestAlternateFeeAssetHandling(_Base):
 # =========================================================================
 
 class TestWsBalanceUpdateEvent(_Base):
-    """7C-4: A balanceUpdate WS event correctly updates balances."""
+    """7C-4: A balanceUpdate WS event correctly updates balances via production handler."""
 
-    def test_ws_balance_update_incremental(self):
+    def test_ws_balance_update_through_production_handler(self):
+        """Balance update via the actual WS event handler, not manual assignment."""
         # Set initial balances
         self.exchange._account_available_balances["BTC"] = Decimal("1.0")
         self.exchange._account_balances["BTC"] = Decimal("1.5")
 
-        # Simulate what the handler does for balanceUpdate
+        # Create realistic WS event and feed through the ACTUAL production handler
         event = {"method": "balanceUpdate", "params": {"ticker": "BTC", "available": "2.5", "held": "0.3"}}
-        params = event["params"]
-        self.exchange._account_available_balances[params["ticker"]] = Decimal(params["available"])
-        self.exchange._account_balances[params["ticker"]] = Decimal(params["available"]) + Decimal(params["held"])
+
+        # Feed event into the user stream queue and let the listener process it
+        async def run():
+            event_queue = asyncio.Queue()
+            event_queue.put_nowait(event)
+
+            async def mock_iter():
+                while not event_queue.empty():
+                    yield event_queue.get_nowait()
+
+            with patch.object(self.exchange, "_iter_user_event_queue", mock_iter):
+                await self.exchange._user_stream_event_listener()
+
+        self.async_run(run())
 
         self.assertEqual(Decimal("2.5"), self.exchange._account_available_balances["BTC"])
         self.assertEqual(Decimal("2.8"), self.exchange._account_balances["BTC"])
@@ -166,28 +185,60 @@ class TestWsBalanceUpdateEvent(_Base):
 # =========================================================================
 
 class TestWsActiveOrdersSnapshot(_Base):
-    """7C-5: An activeOrders event correctly parses via both result and params keys."""
+    """7C-5: An activeOrders event correctly parses through the production handler."""
 
-    def test_ws_active_orders_via_result_key(self):
+    def test_ws_active_orders_via_result_key_through_handler(self):
+        """Feed activeOrders event through the production listener."""
         event = {"method": "activeOrders", "result": [{"id": "EX1", "status": "Active", "userProvidedId": "T1"}]}
-        orders = event.get("result") or event.get("params") or []
-        self.assertIsInstance(orders, list)
-        self.assertEqual(1, len(orders))
-        self.assertEqual("EX1", orders[0]["id"])
 
-    def test_ws_active_orders_via_params_key(self):
+        async def run():
+            event_queue = asyncio.Queue()
+            event_queue.put_nowait(event)
+
+            async def mock_iter():
+                while not event_queue.empty():
+                    yield event_queue.get_nowait()
+
+            with patch.object(self.exchange, "_iter_user_event_queue", mock_iter):
+                await self.exchange._user_stream_event_listener()
+
+        # Should not crash — handler processes the event
+        self.async_run(run())
+
+    def test_ws_active_orders_via_params_key_through_handler(self):
+        """Feed activeOrders event with params key through the production listener."""
         event = {"method": "activeOrders", "params": [{"id": "EX2", "status": "New", "userProvidedId": "T2"}]}
-        orders = event.get("result") or event.get("params") or []
-        self.assertIsInstance(orders, list)
-        self.assertEqual(1, len(orders))
-        self.assertEqual("EX2", orders[0]["id"])
+
+        async def run():
+            event_queue = asyncio.Queue()
+            event_queue.put_nowait(event)
+
+            async def mock_iter():
+                while not event_queue.empty():
+                    yield event_queue.get_nowait()
+
+            with patch.object(self.exchange, "_iter_user_event_queue", mock_iter):
+                await self.exchange._user_stream_event_listener()
+
+        self.async_run(run())
 
     def test_ws_active_orders_non_list_guarded(self):
+        """Non-list result should be handled gracefully by the production handler."""
         event = {"method": "activeOrders", "result": "not_a_list"}
-        orders = event.get("result") or event.get("params") or []
-        if not isinstance(orders, list):
-            orders = []
-        self.assertEqual([], orders)
+
+        async def run():
+            event_queue = asyncio.Queue()
+            event_queue.put_nowait(event)
+
+            async def mock_iter():
+                while not event_queue.empty():
+                    yield event_queue.get_nowait()
+
+            with patch.object(self.exchange, "_iter_user_event_queue", mock_iter):
+                await self.exchange._user_stream_event_listener()
+
+        # Should not crash
+        self.async_run(run())
 
 
 # =========================================================================

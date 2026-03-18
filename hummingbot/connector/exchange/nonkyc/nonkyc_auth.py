@@ -27,18 +27,19 @@ class NonkycAuth(AuthBase):
             headers.update(request.headers)
 
         if request.method == RESTMethod.GET:
-            # Build the full URL with query params baked in, then sign it.
+            # Build the full URL with query params sorted for canonical form, then sign it.
             #
-            # CRITICAL: Do NOT use urllib.parse.urlencode() here.
-            # urlencode() encodes '/' as '%2F', but aiohttp (via yarl) does NOT
-            # encode '/' in query parameter values. The NonKYC server verifies the
-            # HMAC against the URL it receives (the yarl version), so the signed
-            # URL must be byte-identical to what aiohttp sends.
+            # Params are sorted alphabetically to ensure the same logical request always
+            # produces the same signature, regardless of dict insertion order.
             #
-            # By baking params into request.url and clearing request.params, we
-            # ensure the auth signs EXACTLY the URL the HTTP client transmits.
+            # NOTE: We use manual f-string joining (not urllib.parse.urlencode) because
+            # urlencode() encodes '/' as '%2F', but aiohttp (via yarl) does NOT encode
+            # '/' in query parameter values. The NonKYC server verifies the HMAC against
+            # the URL it receives (the yarl version), so the signed URL must be
+            # byte-identical to what aiohttp sends.
             if request.params:
-                qs_parts = [f"{k}={v}" for k, v in request.params.items()]
+                sorted_params = sorted(request.params.items())
+                qs_parts = [f"{k}={v}" for k, v in sorted_params]
                 request.url = f"{request.url}?{'&'.join(qs_parts)}"
                 request.params = None  # Prevent aiohttp from re-encoding
             headers.update(self.header_for_authentication(data=request.url))

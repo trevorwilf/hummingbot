@@ -411,13 +411,18 @@ class MexcExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
 
     def validate_auth_credentials_present(self, request_call: RequestCall):
+        raw_params = request_call.kwargs["params"]
+        if raw_params is None:
+            raw_data = request_call.kwargs["data"]
+            raw_params = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
         self._validate_auth_credentials_taking_parameters_from_argument(
             request_call_tuple=request_call,
-            params=request_call.kwargs["params"] or request_call.kwargs["data"]
+            params=raw_params
         )
 
     def validate_order_creation_request(self, order: InFlightOrder, request_call: RequestCall):
-        request_data = dict(request_call.kwargs["data"])
+        raw_data = request_call.kwargs["data"]
+        request_data = json.loads(raw_data) if isinstance(raw_data, str) else dict(raw_data)
         self.assertEqual(self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset), request_data["symbol"])
         self.assertEqual(order.trade_type.name.upper(), request_data["side"])
         self.assertEqual(MexcExchange.mexc_order_type(OrderType.LIMIT), request_data["type"])
@@ -1106,7 +1111,8 @@ class MexcExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.async_run_with_timeout(request_sent_event.wait(), timeout=3)
 
         order_request = self._all_executed_requests(mock_api, url)[0]
-        request_data = order_request.kwargs["data"]
+        raw_data = order_request.kwargs["data"]
+        request_data = json.loads(raw_data) if isinstance(raw_data, str) else dict(raw_data)
         self.assertIn(order_id, self.exchange.in_flight_orders)
         self.assertEqual("MARKET", request_data["type"])
         self.assertEqual("BUY", request_data["side"])

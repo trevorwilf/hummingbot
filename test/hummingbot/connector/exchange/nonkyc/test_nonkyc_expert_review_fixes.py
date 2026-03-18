@@ -250,5 +250,64 @@ class TestWsAuthTimeout(unittest.TestCase):
             ))
 
 
+class TestTimeSyncClassifier(unittest.TestCase):
+    """Phase 5: Time-sync classifier should only match time-related errors."""
+
+    def setUp(self):
+        self.exchange = NonkycExchange(
+            nonkyc_api_key="test",
+            nonkyc_api_secret="test",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+
+    def test_time_sync_classifier_matches_nonce_errors(self):
+        """Time-sync classifier triggers on nonce/timestamp errors."""
+        self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Invalid nonce value")))
+        self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Timestamp out of range")))
+        self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Server time drift detected")))
+        self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Clock skew too large")))
+
+    def test_time_sync_classifier_rejects_generic_auth_errors(self):
+        """Time-sync classifier does NOT trigger on generic auth/permissions errors."""
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Unauthorized: invalid API key")))
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Insufficient permissions")))
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Forbidden")))
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(
+            Exception("Invalid signature")))
+
+
+class TestOrderBookDepthAlignment(unittest.TestCase):
+    """Phase 4: Order book snapshot and WS subscription use the same depth constant."""
+
+    def test_orderbook_depth_constant_exists(self):
+        """ORDERBOOK_DEPTH constant should be defined."""
+        self.assertTrue(hasattr(CONSTANTS, 'ORDERBOOK_DEPTH'))
+        self.assertEqual(100, CONSTANTS.ORDERBOOK_DEPTH)
+
+    def test_snapshot_and_ws_use_same_depth(self):
+        """REST snapshot and WS subscription must use the same ORDERBOOK_DEPTH."""
+        from hummingbot.connector.exchange.nonkyc.nonkyc_api_order_book_data_source import NonkycAPIOrderBookDataSource
+        from hummingbot.connector.exchange.nonkyc import nonkyc_web_utils as web_utils
+        import inspect
+
+        # Read the source of _request_order_book_snapshot and _subscribe_channels
+        src_snapshot = inspect.getsource(NonkycAPIOrderBookDataSource._request_order_book_snapshot)
+        src_subscribe = inspect.getsource(NonkycAPIOrderBookDataSource._subscribe_channels)
+        src_resub = inspect.getsource(NonkycAPIOrderBookDataSource.subscribe_to_trading_pair)
+
+        # All should reference CONSTANTS.ORDERBOOK_DEPTH, not hardcoded values
+        self.assertIn("CONSTANTS.ORDERBOOK_DEPTH", src_snapshot)
+        self.assertIn("CONSTANTS.ORDERBOOK_DEPTH", src_subscribe)
+        self.assertIn("CONSTANTS.ORDERBOOK_DEPTH", src_resub)
+
+
 if __name__ == "__main__":
     unittest.main()

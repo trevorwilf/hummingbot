@@ -172,5 +172,97 @@ class TestTradeUpdateTradingPair(unittest.TestCase):
         self.assertNotEqual("BTCUSDT", result[0].trading_pair)
 
 
+class TestPostRequestBodyIsJsonString(unittest.TestCase):
+    """Phase 2 wire-format: POST request.data must be a JSON string after auth."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_post_request_body_is_json_string_not_dict(self):
+        """Verify that after auth, POST request.data is a JSON string,
+        ensuring aiohttp sends JSON body matching the Content-Type header."""
+        import json
+        from hummingbot.connector.exchange.mexc.mexc_auth import MexcAuth
+        from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+
+        mock_time = MagicMock()
+        mock_time.time.return_value = 1234567890.0
+        auth = MexcAuth(api_key="testKey", secret_key="testSecret", time_provider=mock_time)
+
+        params = {"symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT", "quantity": "0.1", "price": "50000"}
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.mexc.com/api/v3/order",
+            data=json.dumps(params),
+            is_auth_required=True
+        )
+        configured = self._run(auth.rest_authenticate(request))
+
+        # 1. request.data is a str
+        self.assertIsInstance(configured.data, str)
+        # 2. json.loads(request.data) succeeds
+        parsed = json.loads(configured.data)
+        # 3. The parsed dict contains timestamp and signature
+        self.assertIn("timestamp", parsed)
+        self.assertIn("signature", parsed)
+
+
+class TestListenKeyRedaction(unittest.TestCase):
+    """Phase 3: Listen key must be redacted in log output."""
+
+    def test_redact_token_normal(self):
+        """Redact helper shows first 4 and last 4 chars."""
+        from hummingbot.connector.exchange.mexc.mexc_api_user_stream_data_source import _redact_token
+        fake_key = "abcdef1234567890abcdef1234567890"
+        redacted = _redact_token(fake_key)
+        self.assertNotEqual(fake_key, redacted)
+        self.assertTrue(redacted.startswith("abcd"))
+        self.assertTrue(redacted.endswith("7890"))
+        self.assertIn("...", redacted)
+
+    def test_redact_token_short(self):
+        """Short tokens are fully masked."""
+        from hummingbot.connector.exchange.mexc.mexc_api_user_stream_data_source import _redact_token
+        self.assertEqual("****", _redact_token("short"))
+        self.assertEqual("****", _redact_token(""))
+        self.assertEqual("****", _redact_token(None))
+
+    def test_listen_key_not_logged_in_plaintext(self):
+        """Verify that the full listen key never appears in log output."""
+        from hummingbot.connector.exchange.mexc.mexc_api_user_stream_data_source import (
+            MexcAPIUserStreamDataSource, _redact_token,
+        )
+        from hummingbot.connector.exchange.mexc.mexc_auth import MexcAuth
+
+        mock_auth = MagicMock(spec=MexcAuth)
+        data_source = MexcAPIUserStreamDataSource(
+            auth=mock_auth,
+            trading_pairs=["BTC-USDT"],
+            connector=MagicMock(),
+            api_factory=MagicMock(),
+        )
+
+        fake_key = "abcdef1234567890abcdef1234567890"
+        data_source._current_listen_key = fake_key
+
+        # Capture log output
+        import logging
+        with self.assertLogs(data_source.logger(), level="INFO") as cm:
+            data_source.logger().info(
+                f"Successfully obtained listen key {_redact_token(fake_key)}"
+            )
+
+        # The full key must not appear in any log message
+        for message in cm.output:
+            self.assertNotIn(fake_key, message)
+            # Redacted form should be present
+            self.assertIn("abcd", message)
+            self.assertIn("7890", message)
+
+
 if __name__ == "__main__":
     unittest.main()

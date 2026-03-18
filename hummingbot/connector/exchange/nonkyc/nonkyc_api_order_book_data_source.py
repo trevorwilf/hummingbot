@@ -69,7 +69,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         params = {
             "symbol": symbol,
-            "limit": "1000"
+            "limit": str(CONSTANTS.ORDERBOOK_DEPTH)
         }
 
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -101,7 +101,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 ob_payload = {
                     "method": CONSTANTS.WS_METHOD_SUBSCRIBE_ORDERBOOK,
-                    "params": {"symbol": symbol, "limit": 100},
+                    "params": {"symbol": symbol, "limit": CONSTANTS.ORDERBOOK_DEPTH},
                     "id": self._next_ws_id()
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=ob_payload)
@@ -309,7 +309,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             ob_payload = {
                 "method": CONSTANTS.WS_METHOD_SUBSCRIBE_ORDERBOOK,
-                "params": {"symbol": symbol, "limit": 100},
+                "params": {"symbol": symbol, "limit": CONSTANTS.ORDERBOOK_DEPTH},
                 "id": self._next_ws_id()
             }
             await self._ws_assistant.send(WSJSONRequest(payload=ob_payload))

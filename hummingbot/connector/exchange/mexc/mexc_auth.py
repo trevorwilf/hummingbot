@@ -24,6 +24,8 @@ class MexcAuth(AuthBase):
         """
         if request.method == RESTMethod.POST:
             request.data = self.add_auth_to_params(params=json.loads(request.data) if request.data is not None else {})
+            # Re-serialize to JSON string to match Content-Type: application/json
+            request.data = json.dumps(request.data)
         else:
             request.params = self.add_auth_to_params(params=request.params)
 

@@ -15,6 +15,13 @@ if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
 
 
+def _redact_token(token: str) -> str:
+    """Redact a token for safe logging, showing only first 4 and last 4 chars."""
+    if token and len(token) > 12:
+        return f"{token[:4]}...{token[-4:]}"
+    return "****"
+
+
 class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
     """
     Manages the user stream connection for MEXC exchange, handling listen key lifecycle
@@ -102,7 +109,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws = await self._get_ws_assistant()
         url = f"{CONSTANTS.WSS_URL.format(self._domain)}?listenKey={self._current_listen_key}"
 
-        self.logger().info(f"Connecting to user stream with listen key {self._current_listen_key}")
+        self.logger().info(f"Connecting to user stream with listen key {_redact_token(self._current_listen_key)}")
         await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
         self.logger().info("Successfully connected to user stream")
 
@@ -198,13 +205,13 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
             )
 
             if "code" in data:
-                self.logger().warning(f"Failed to refresh the listen key {self._current_listen_key}: {data}")
+                self.logger().warning(f"Failed to refresh the listen key {_redact_token(self._current_listen_key)}: {data}")
                 return False
 
         except asyncio.CancelledError:
             raise
         except Exception as exception:
-            self.logger().warning(f"Failed to refresh the listen key {self._current_listen_key}: {exception}")
+            self.logger().warning(f"Failed to refresh the listen key {_redact_token(self._current_listen_key)}: {exception}")
             return False
 
         return True
@@ -232,17 +239,17 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         self._current_listen_key = await self._get_listen_key()
                         self._last_listen_key_ping_ts = now
                         self._listen_key_initialized_event.set()
-                        self.logger().info(f"Successfully obtained listen key {self._current_listen_key}")
+                        self.logger().info(f"Successfully obtained listen key {_redact_token(self._current_listen_key)}")
 
                     # Refresh listen key periodically to prevent expiration
                     if now - self._last_listen_key_ping_ts >= self.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
                         success = await self._ping_listen_key()
                         if success:
-                            self.logger().info(f"Successfully refreshed listen key {self._current_listen_key}")
+                            self.logger().info(f"Successfully refreshed listen key {_redact_token(self._current_listen_key)}")
                             self._last_listen_key_ping_ts = now
                         else:
                             # Ping failed - force obtaining a new key in next iteration
-                            self.logger().error(f"Failed to refresh listen key {self._current_listen_key}. Getting new key...")
+                            self.logger().error(f"Failed to refresh listen key {_redact_token(self._current_listen_key)}. Getting new key...")
                             raise Exception("Listen key refresh failed")
 
                     # Sleep before next check

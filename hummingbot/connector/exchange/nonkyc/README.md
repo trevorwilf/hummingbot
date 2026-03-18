@@ -33,7 +33,7 @@ Rate oracle source: `hummingbot/core/rate_oracle/sources/nonkyc_rate_source.py`
 - **WebSocket**: JSON-RPC 2.0 `login` method with `pKey`, `nonce`, `signature`
 
 ### WebSocket Protocol
-- JSON-RPC 2.0 over `wss://api.nonkyc.io`
+- JSON-RPC 2.0 over `wss://ws.nonkyc.io`
 - All requests include `"id"` field for request-response correlation
 - Server sends `snapshotOrderbook` (full) then `updateOrderbook` (incremental diffs)
 - Sequence numbers for gap detection (string in REST, int in WS -- both handled)

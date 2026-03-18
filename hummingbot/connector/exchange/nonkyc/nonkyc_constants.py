@@ -8,7 +8,9 @@ EXCHANGE_NAME = "nonkyc"
 
 # Base urls
 REST_URL = "https://api.nonkyc.io/api/"
-WS_URL = "wss://api.nonkyc.io"
+# WebSocket endpoint — use the officially documented endpoint.
+# wss://api.nonkyc.io is a known alias that still works but is not documented.
+WS_URL = "wss://ws.nonkyc.io"
 
 API_VERSION = "v2"
 
@@ -57,6 +59,10 @@ DIFF_EVENT_TYPE = "updateOrderbook"
 SNAPSHOT_EVENT_TYPE = "snapshotOrderbook"
 TRADE_EVENT_TYPE = "updateTrades"
 SNAPSHOT_TRADES_EVENT_TYPE = "snapshotTrades"
+
+# Order book depth — used by both REST snapshot and WS subscription.
+# Must be identical so that all snapshot levels are kept fresh by WS diffs.
+ORDERBOOK_DEPTH = 100
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 

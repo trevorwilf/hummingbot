@@ -39,8 +39,8 @@ class NonkycAuthTests(TestCase):
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
         expected_nonce = int(now * 1e3)  # 1234567890000
-        # Params are baked in raw (no urlencode), preserving insertion order
-        full_url = f"{url}?symbol=BTC/USDT&side=buy"
+        # Params are sorted alphabetically then baked in raw (no urlencode)
+        full_url = f"{url}?side=buy&symbol=BTC/USDT"
         expected_message = f"{self._api_key}{full_url}{expected_nonce}"
         expected_signature = self._generate_signature(expected_message)
 
@@ -100,8 +100,8 @@ class NonkycAuthTests(TestCase):
         # URL unchanged, params still None
         self.assertEqual(url, configured_request.url)
 
-    def test_rest_authenticate_get_preserves_insertion_order(self):
-        """Verify params are NOT sorted — insertion order is preserved to match aiohttp."""
+    def test_rest_authenticate_get_sorts_params_canonically(self):
+        """Verify params are sorted alphabetically for canonical signing."""
         now = 1234567890.000
         mock_time_provider = MagicMock()
         mock_time_provider.time.return_value = now
@@ -114,9 +114,44 @@ class NonkycAuthTests(TestCase):
         request = RESTRequest(method=RESTMethod.GET, url=url, params=params, is_auth_required=True)
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
-        # Must be insertion order, NOT alphabetical
-        expected_url = f"{url}?symbol=ARRR/USDT&since=1000"
+        # Must be sorted alphabetically, NOT insertion order
+        expected_url = f"{url}?since=1000&symbol=ARRR/USDT"
         self.assertEqual(expected_url, configured_request.url)
+
+    def test_get_auth_sorted_canonical(self):
+        """Same logical GET params in different insertion orders produce identical signatures."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        req_a = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
+                            params={"status": "active", "symbol": "BTC/USDT"}, is_auth_required=True)
+        req_b = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
+                            params={"symbol": "BTC/USDT", "status": "active"}, is_auth_required=True)
+
+        configured_a = self.async_run_with_timeout(auth.rest_authenticate(req_a))
+        configured_b = self.async_run_with_timeout(auth.rest_authenticate(req_b))
+
+        self.assertEqual(configured_a.headers["X-API-SIGN"], configured_b.headers["X-API-SIGN"])
+        # Verify URL contains sorted params
+        self.assertIn("status=active&symbol=BTC/USDT", configured_a.url)
+        self.assertIn("status=active&symbol=BTC/USDT", configured_b.url)
+
+    def test_get_auth_slash_preserved_in_params(self):
+        """Slash in param values (e.g., BTC/USDT) is NOT percent-encoded."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = NonkycAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        req = RESTRequest(method=RESTMethod.GET, url="https://api.nonkyc.io/api/v2/account/orders",
+                          params={"symbol": "BTC/USDT"}, is_auth_required=True)
+        configured = self.async_run_with_timeout(auth.rest_authenticate(req))
+        self.assertIn("BTC/USDT", configured.url)
+        self.assertNotIn("%2F", configured.url)
 
     def test_rest_authenticate_post(self):
         now = 1234567890.000

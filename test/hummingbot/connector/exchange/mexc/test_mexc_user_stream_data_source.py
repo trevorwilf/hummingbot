@@ -177,7 +177,8 @@ class MexcUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._current_listen_key = self.listen_key
         result: bool = await self.data_source._ping_listen_key()
 
-        self.assertTrue(self._is_logged("WARNING", f"Failed to refresh the listen key {self.listen_key}: "
+        from hummingbot.connector.exchange.mexc.mexc_api_user_stream_data_source import _redact_token
+        self.assertTrue(self._is_logged("WARNING", f"Failed to refresh the listen key {_redact_token(self.listen_key)}: "
                                                    f"{self._error_response()}"))
         self.assertFalse(result)
 
@@ -227,7 +228,8 @@ class MexcUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         await self.resume_test_event.wait()
 
-        self.assertTrue(self._is_logged("INFO", f"Successfully refreshed listen key {self.listen_key}"))
+        from hummingbot.connector.exchange.mexc.mexc_api_user_stream_data_source import _redact_token
+        self.assertTrue(self._is_logged("INFO", f"Successfully refreshed listen key {_redact_token(self.listen_key)}"))
         self.assertGreater(self.data_source._last_listen_key_ping_ts, 0)
 
     async def test_ensure_listen_key_task_running(self):

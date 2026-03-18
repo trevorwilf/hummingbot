@@ -154,8 +154,8 @@ class NonkycExchange(ExchangePyBase):
         is_time_related = any(phrase in error_description for phrase in [
             "nonce",
             "timestamp",
-            "signature",
-            "unauthorized",
+            "time",
+            "clock",
         ])
         return is_time_related
 
