@@ -141,3 +141,30 @@ class TestMexcSpotCandles(TestCandlesBase):
             "code": 0,
             "msg": "spot@public.kline.v3.api@BTCUSDT"
         }
+
+    def test_api_factory_uses_post_processor_instance(self):
+        """Verify MexcSpotCandles creates its API factory with a MexcPostProcessor INSTANCE, not the class."""
+        from hummingbot.connector.exchange.mexc.mexc_post_processor import MexcPostProcessor
+        candles = MexcSpotCandles(trading_pair="BTC-USDT", interval="5m")
+        ws_post_processors = candles._api_factory._ws_post_processors
+        self.assertGreater(len(ws_post_processors), 0, "Expected at least one WS post-processor")
+        for proc in ws_post_processors:
+            self.assertFalse(
+                isinstance(proc, type),
+                f"ws_post_processors contains a class ({proc}) instead of an instance. "
+                f"Use MexcPostProcessor() not MexcPostProcessor."
+            )
+            self.assertIsInstance(proc, MexcPostProcessor)
+
+    def test_post_processor_can_process_response(self):
+        """Verify the post-processor instance can actually call post_process without TypeError."""
+        from unittest.mock import MagicMock
+        candles = MexcSpotCandles(trading_pair="BTC-USDT", interval="5m")
+        proc = candles._api_factory._ws_post_processors[0]
+        mock_response = MagicMock()
+        mock_response.data = '{"d": "compressed_data"}'
+        try:
+            asyncio.get_event_loop().run_until_complete(proc.post_process(mock_response))
+        except TypeError as e:
+            if "missing 1 required positional argument" in str(e):
+                self.fail(f"Post-processor is a class, not instance: {e}")

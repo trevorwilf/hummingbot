@@ -22,7 +22,7 @@ class MexcSpotCandles(CandlesBase):
     def __init__(self, trading_pair: str, interval: str = "1m", max_records: int = 150):
         super().__init__(trading_pair, interval, max_records)
         async_throttler = AsyncThrottler(rate_limits=self.rate_limits)
-        self._api_factory = WebAssistantsFactory(throttler=async_throttler, ws_post_processors=[MexcPostProcessor])
+        self._api_factory = WebAssistantsFactory(throttler=async_throttler, ws_post_processors=[MexcPostProcessor()])
 
     @property
     def name(self):

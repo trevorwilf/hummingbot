@@ -172,8 +172,8 @@ class TestTradeUpdateTradingPair(unittest.TestCase):
         self.assertNotEqual("BTCUSDT", result[0].trading_pair)
 
 
-class TestPostRequestBodyIsJsonString(unittest.TestCase):
-    """Phase 2 wire-format: POST request.data must be a JSON string after auth."""
+class TestPostRequestBodyMovedToParams(unittest.TestCase):
+    """Fix 2: POST body params must be moved to query string for MEXC/Binance-compatible signing."""
 
     def _run(self, coro):
         loop = asyncio.new_event_loop()
@@ -182,9 +182,8 @@ class TestPostRequestBodyIsJsonString(unittest.TestCase):
         finally:
             loop.close()
 
-    def test_post_request_body_is_json_string_not_dict(self):
-        """Verify that after auth, POST request.data is a JSON string,
-        ensuring aiohttp sends JSON body matching the Content-Type header."""
+    def test_post_body_moved_to_query_params(self):
+        """Verify that after auth, POST body is cleared and params are in query string."""
         import json
         from hummingbot.connector.exchange.mexc.mexc_auth import MexcAuth
         from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
@@ -202,13 +201,13 @@ class TestPostRequestBodyIsJsonString(unittest.TestCase):
         )
         configured = self._run(auth.rest_authenticate(request))
 
-        # 1. request.data is a str
-        self.assertIsInstance(configured.data, str)
-        # 2. json.loads(request.data) succeeds
-        parsed = json.loads(configured.data)
-        # 3. The parsed dict contains timestamp and signature
-        self.assertIn("timestamp", parsed)
-        self.assertIn("signature", parsed)
+        # Body must be cleared — all params in query string
+        self.assertIsNone(configured.data)
+        # Query params should contain original body fields plus auth
+        self.assertEqual("BTCUSDT", configured.params["symbol"])
+        self.assertEqual("BUY", configured.params["side"])
+        self.assertIn("timestamp", configured.params)
+        self.assertIn("signature", configured.params)
 
 
 class TestListenKeyRedaction(unittest.TestCase):

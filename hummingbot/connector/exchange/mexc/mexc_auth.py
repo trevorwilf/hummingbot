@@ -18,21 +18,43 @@ class MexcAuth(AuthBase):
 
     async def rest_authenticate(self, request: RESTRequest) -> RESTRequest:
         """
-        Adds the server time and the signature to the request, required for authenticated interactions. It also adds
-        the required parameter in the request header.
-        :param request: the request to be configured for authenticated interaction
+        Adds the server time and the signature to the request, required for
+        authenticated interactions.  It also adds the required parameter in
+        the request header.
+
+        MEXC (Binance-compatible) expects ALL signed parameters — including
+        timestamp and signature — in the **query string**, regardless of
+        HTTP method.  The request body (if any) is NOT included in the
+        signature computation for this exchange.
         """
-        if request.method == RESTMethod.POST:
-            request.data = self.add_auth_to_params(params=json.loads(request.data) if request.data is not None else {})
-            # Re-serialize to JSON string to match Content-Type: application/json
-            request.data = json.dumps(request.data)
-        else:
-            request.params = self.add_auth_to_params(params=request.params)
+        # Merge any existing params with auth fields
+        params = dict(request.params or {})
+
+        # For POST/PUT/DELETE with a body, the body content must also be
+        # included in the params that get signed.  However, for MEXC the
+        # standard pattern is: body params go into the query string for
+        # signing, and the body itself is left empty.
+        if request.data is not None:
+            body = request.data
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except (ValueError, TypeError):
+                    body = {}
+            if isinstance(body, dict):
+                params.update(body)
+            # Clear the body — everything goes in query string
+            request.data = None
+
+        request.params = self.add_auth_to_params(params=params)
 
         headers = {}
         if request.headers is not None:
             headers.update(request.headers)
         headers.update(self.header_for_authentication())
+        # Remove Content-Type: application/json when body is empty
+        if request.data is None:
+            headers.pop("Content-Type", None)
         request.headers = headers
 
         return request
@@ -57,7 +79,7 @@ class MexcAuth(AuthBase):
         return request_params
 
     def header_for_authentication(self) -> Dict[str, str]:
-        return {"X-MEXC-APIKEY": self.api_key, "Content-Type": "application/json"}
+        return {"X-MEXC-APIKEY": self.api_key}
 
     def _generate_signature(self, params: Dict[str, Any]) -> str:
 

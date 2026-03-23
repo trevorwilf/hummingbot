@@ -688,6 +688,11 @@ class NonkycExchange(ExchangePyBase):
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
 
+                # NOTE: subscribeBalances / currentBalances / balanceUpdate are undocumented
+                # NonKYC WS methods. They work as of 2026-03, but are not in the official
+                # WS API docs. If they stop working, the connector falls back to REST
+                # balance polling via _update_balances() which runs on the standard
+                # polling loop. See also: _subscribe_channels() in user stream data source.
                 elif event_type == "currentBalances":
                     balance_entries = event_message.get("result", [])
                     for balance_entry in balance_entries:

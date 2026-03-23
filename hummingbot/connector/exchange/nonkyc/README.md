@@ -46,6 +46,11 @@ Rate oracle source: `hummingbot/core/rate_oracle/sources/nonkyc_rate_source.py`
   limit orders on NonKYC may cross the spread and take liquidity.
 - Maker/taker classification uses the `triggeredBy` field from trade history
 
+### Private WebSocket Methods
+- `subscribeReports` -- order lifecycle events (documented)
+- `subscribeBalances` -- real-time balance updates (**undocumented** -- may change without notice;
+  connector falls back to REST balance polling if unavailable)
+
 ### Balance Fields
 - `available` = free for new orders
 - `held` = locked in open orders

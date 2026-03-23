@@ -218,10 +218,14 @@ class PositionExecutor(ExecutorBase):
         :return: The trade pnl percentage.
         """
         if self.open_filled_amount != Decimal("0") and self.close_type not in [CloseType.FAILED, CloseType.POSITION_HOLD]:
+            entry = self.entry_price
+            close = self.close_price
+            if not (self._is_valid_price(entry) and close.is_finite()):
+                return Decimal("0")
             if self.config.side == TradeType.BUY:
-                return (self.close_price - self.entry_price) / self.entry_price
+                return (close - entry) / entry
             else:
-                return (self.entry_price - self.close_price) / self.entry_price
+                return (entry - close) / entry
         else:
             return Decimal("0")
 
@@ -257,7 +261,12 @@ class PositionExecutor(ExecutorBase):
 
         :return: The net pnl percentage.
         """
-        return self.net_pnl_quote / self.open_filled_amount_quote if self.open_filled_amount_quote != Decimal("0") else Decimal("0")
+        if self.open_filled_amount_quote != Decimal("0"):
+            net_quote = self.net_pnl_quote
+            if not net_quote.is_finite():
+                return Decimal("0")
+            return net_quote / self.open_filled_amount_quote
+        return Decimal("0")
 
     @property
     def end_time(self) -> Optional[float]:
@@ -527,6 +536,11 @@ class PositionExecutor(ExecutorBase):
         if self._take_profit_limit_order and self._take_profit_limit_order.order and self._take_profit_limit_order.order.is_open:
             self.cancel_take_profit()
 
+    @staticmethod
+    def _is_valid_price(value: Decimal) -> bool:
+        """Check if a Decimal value is finite and usable for trading calculations."""
+        return value.is_finite() and value > Decimal("0")
+
     def control_stop_loss(self):
         """
         This method is responsible for controlling the stop loss. If the net pnl percentage is less than the stop loss
@@ -535,6 +549,13 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         if self.config.triple_barrier_config.stop_loss:
+            current_price = self.current_market_price
+            if not self._is_valid_price(current_price):
+                self.logger().debug(
+                    f"Skipping stop-loss check: market price is unavailable "
+                    f"(NaN/non-finite) for {self.config.trading_pair}"
+                )
+                return
             if self.net_pnl_pct <= -self.config.triple_barrier_config.stop_loss:
                 self.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
 
@@ -548,6 +569,13 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         if self.config.triple_barrier_config.take_profit:
+            current_price = self.current_market_price
+            if not self._is_valid_price(current_price):
+                self.logger().debug(
+                    f"Skipping take-profit check: market price is unavailable "
+                    f"(NaN/non-finite) for {self.config.trading_pair}"
+                )
+                return
             if self.config.triple_barrier_config.take_profit_order_type.is_limit_type():
                 is_within_activation_bounds = self._is_within_activation_bounds(
                     self.take_profit_price, self.close_order_side,

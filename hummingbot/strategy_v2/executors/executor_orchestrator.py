@@ -546,7 +546,7 @@ class ExecutorOrchestrator:
                 f"{a.executor_config.trading_pair} {a.executor_config.side.name} {a.executor_config.amount}"
                 for a in dropped_actions
             )
-            self.logger().info(
+            self.logger().debug(
                 f"Budget preflight: dropped {len(dropped_actions)} action(s) due to insufficient balance: "
                 f"[{dropped_summary}]"
             )

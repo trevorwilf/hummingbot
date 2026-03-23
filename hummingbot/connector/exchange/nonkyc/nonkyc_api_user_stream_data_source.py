@@ -58,13 +58,20 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await websocket_assistant.send(subscribe_user_orders_request)
         self.logger().info("Subscribed to user orders")
 
-        subscribe_user_balance_request: WSJSONRequest = WSJSONRequest(payload={
-            "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_BALANCE,
-            "params": {},
-            "id": self._next_ws_id()
-        })
-        await websocket_assistant.send(subscribe_user_balance_request)
-        self.logger().info("Subscribed to user balance")
+        # Balance updates -- undocumented API, subscribe but don't fail if rejected
+        try:
+            subscribe_user_balance_request: WSJSONRequest = WSJSONRequest(payload={
+                "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_BALANCE,
+                "params": {},
+                "id": self._next_ws_id()
+            })
+            await websocket_assistant.send(subscribe_user_balance_request)
+            self.logger().info("Subscribed to user balance (note: undocumented API method)")
+        except Exception as e:
+            self.logger().warning(
+                f"Failed to subscribe to balance updates (undocumented API): {e}. "
+                f"Balances will be updated via REST polling after order events."
+            )
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:
