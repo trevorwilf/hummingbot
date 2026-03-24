@@ -284,6 +284,45 @@ class MarketMakingControllerBase(ControllerBase):
         )
         return seed_amount
 
+    def _get_active_order_price_bounds(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """
+        Returns (highest_active_buy_price, lowest_active_sell_price) from executors
+        that are active and trading.
+        """
+        highest_buy = None
+        lowest_sell = None
+        for executor in self.executors_info:
+            if not (executor.is_active and executor.is_trading):
+                continue
+            level_id = executor.custom_info.get("level_id", "")
+            avg_price = executor.custom_info.get("current_position_average_price")
+            if avg_price is None:
+                continue
+            avg_price = Decimal(str(avg_price))
+            if level_id.startswith("buy"):
+                if highest_buy is None or avg_price > highest_buy:
+                    highest_buy = avg_price
+            elif level_id.startswith("sell"):
+                if lowest_sell is None or avg_price < lowest_sell:
+                    lowest_sell = avg_price
+        return highest_buy, lowest_sell
+
+    def _get_reserved_base_for_close(self) -> Decimal:
+        """
+        For spot: sum amounts of active buy trading executors (they will need to sell base when closing).
+        """
+        reserved = Decimal("0")
+        for executor in self.executors_info:
+            if not (executor.is_active and executor.is_trading):
+                continue
+            level_id = executor.custom_info.get("level_id", "")
+            if level_id.startswith("buy"):
+                try:
+                    reserved += executor.config.amount
+                except AttributeError:
+                    pass
+        return reserved
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Determine actions based on the provided executor handler report.
@@ -308,9 +347,24 @@ class MarketMakingControllerBase(ControllerBase):
             return [position_rebalance_action]
 
         # Only create normal market making levels if no rebalance action was produced
+        highest_buy, lowest_sell = self._get_active_order_price_bounds()
         levels_to_execute = self.get_levels_to_execute()
         for level_id in levels_to_execute:
             price, amount = self.get_price_and_amount(level_id)
+            trade_type = self.get_trade_type_from_level_id(level_id)
+
+            # Cross-order prevention: skip orders that would cross existing positions
+            if trade_type == TradeType.SELL and highest_buy is not None and price <= highest_buy:
+                self.logger().warning(
+                    f"Skipping {level_id}: sell price {price:.6f} <= highest active buy {highest_buy:.6f}"
+                )
+                continue
+            if trade_type == TradeType.BUY and lowest_sell is not None and price >= lowest_sell:
+                self.logger().warning(
+                    f"Skipping {level_id}: buy price {price:.6f} >= lowest active sell {lowest_sell:.6f}"
+                )
+                continue
+
             executor_config = self.get_executor_config(level_id, price, amount)
             if executor_config is not None:
                 create_actions.append(CreateExecutorAction(
@@ -403,13 +457,55 @@ class MarketMakingControllerBase(ControllerBase):
                             if self.get_level_id_from_side(TradeType.SELL, level) not in active_levels_ids]
         return buy_ids_missing + sell_ids_missing
 
+    def _check_sell_side_inventory(self):
+        """Emit a one-time warning if base inventory is insufficient for sell-side quoting."""
+        try:
+            reference_price = Decimal(self.processed_data.get("reference_price", "0"))
+            if reference_price <= 0:
+                return
+
+            _, sell_amounts_quote = self.config.get_spreads_and_amounts_in_quote(TradeType.SELL)
+            if not sell_amounts_quote:
+                return
+
+            required_base = sum(
+                Decimal(str(a)) / reference_price for a in sell_amounts_quote
+            )
+
+            base_asset = self.config.trading_pair.split("-")[0]
+            available = Decimal("0")
+
+            connectors = getattr(self.market_data_provider, 'connectors', None)
+            if connectors and self.config.connector_name in connectors:
+                connector = connectors[self.config.connector_name]
+                available = connector.available_balances.get(base_asset, Decimal("0"))
+            elif hasattr(self.market_data_provider, 'get_connector'):
+                connector = self.market_data_provider.get_connector(self.config.connector_name)
+                available = connector.available_balances.get(base_asset, Decimal("0"))
+
+            if required_base > 0 and available < required_base * Decimal("0.5"):
+                self.logger().warning(
+                    f"UNDER-SEEDED: {self.config.trading_pair} has {available:.4f} {base_asset} "
+                    f"available but needs ~{required_base:.4f} for sell-side quoting. "
+                    f"skip_rebalance=true, so sell orders may fail with insufficient funds. "
+                    f"Consider pre-funding or enabling rebalance."
+                )
+        except Exception as e:
+            self.logger().debug(f"Could not check sell-side inventory: {e}")
+
     def check_position_rebalance(self) -> Optional[CreateExecutorAction]:
         """
         Check if position needs rebalancing and create OrderExecutor to acquire missing base asset.
         Only applies to spot trading (not perpetual contracts).
         """
-        # Skip position rebalancing for perpetual contracts
-        if "_perpetual" in self.config.connector_name or "reference_price" not in self.processed_data or self.config.skip_rebalance:
+        if "_perpetual" in self.config.connector_name or "reference_price" not in self.processed_data:
+            return None
+
+        # Startup health check: warn if under-seeded for sell side with rebalance disabled
+        if self.config.skip_rebalance:
+            if not getattr(self, '_under_seeded_warning_emitted', False):
+                self._check_sell_side_inventory()
+                self._under_seeded_warning_emitted = True
             return None
 
         active_rebalance = self.filter_executors(

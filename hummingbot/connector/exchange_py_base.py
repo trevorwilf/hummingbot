@@ -499,11 +499,33 @@ class ExchangePyBase(ExchangeBase, ABC):
         exception: Exception,
         **kwargs,
     ):
+        # Classify the error for a more helpful operator message
+        error_str = str(exception).lower()
+        if any(term in error_str for term in ("insufficient", "20001", "not enough", "balance")):
+            classification = "Insufficient funds"
+        elif any(term in error_str for term in ("invalid content", "700013", "content type")):
+            classification = "Request format/content-type mismatch"
+        elif any(term in error_str for term in ("rate limit", "429", "too many", "too frequent")):
+            classification = "Rate limited by exchange"
+        elif any(term in error_str for term in ("401", "403", "invalid api", "invalid key",
+                                                  "authentication", "unauthorized", "forbidden")):
+            classification = "Authentication failure — check API key and permissions"
+        elif any(term in error_str for term in ("500", "502", "503", "504", "server error",
+                                                  "internal error", "bad gateway")):
+            classification = "Exchange server error (5xx) — retry may succeed"
+        elif any(term in error_str for term in ("timeout", "timed out", "connection")):
+            classification = "Network timeout or connection error"
+        else:
+            classification = "Check API key and network connection"
+
         self.logger().network(
             f"Error submitting {trade_type.name.lower()} {order_type.name.upper()} order to {self.name_cap} for "
             f"{amount} {trading_pair} {price}.",
             exc_info=True,
-            app_warning_msg=f"Failed to submit {trade_type.name.upper()} order to {self.name_cap}. Check API key and network connection."
+            app_warning_msg=(
+                f"Failed to submit {trade_type.name.upper()} order to {self.name_cap}. "
+                f"{classification}."
+            )
         )
         self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
 

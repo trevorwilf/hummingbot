@@ -55,13 +55,14 @@ class MexcAuth(AuthBase):
         if request.headers is not None:
             headers.update(request.headers)
         headers.update(self.header_for_authentication())
-        # MEXC requires a valid Content-Type even when the body is empty.
-        # Since we moved body params to query string, use form-urlencoded
-        # for non-GET requests with empty body; keep JSON only for actual JSON body.
-        if request.method == RESTMethod.GET:
+        # Content-Type rules (verified against live MEXC API 2026-03-24):
+        # - Empty body (GET, or POST/PUT/DELETE with params in QS): omit Content-Type.
+        #   MEXC rejects "application/x-www-form-urlencoded" on endpoints like
+        #   userDataStream, but accepts omitted CT or "application/json".
+        #   Safest: omit entirely when no body.
+        # - Non-empty body: use application/json.
+        if request.data is None:
             headers.pop("Content-Type", None)
-        elif request.data is None:
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
         else:
             headers["Content-Type"] = "application/json"
         request.headers = headers

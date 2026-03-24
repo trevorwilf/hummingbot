@@ -114,7 +114,47 @@ Run-Test "Regression sweep (MEXC + NonKYC unit tests)" `
     "python -m pytest $MEXC/ $NONKYC/ --ignore=$MEXC/test_mexc_live_api.py --ignore=$NONKYC/test_nonkyc_live_api.py --ignore=$NONKYC/test_nonkyc_live_connector_smoke.py --ignore=$NONKYC/nonkyc_auth_test.py -m 'not live_api and not quarantined' --tb=line -q --timeout=60"
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 9: SUMMARY
+# SECTION 10: MEXC Listen Key Content-Type Fix (RCA Fix 1)
+# ═════════════════════════════════════════════════════════════════════════════
+Run-Test "MEXC Listen Key CT fix (omit Content-Type on empty body)" `
+    "$PYTEST_V $MEXC/test_mexc_listen_key_fix.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 11: PositionExecutor TP Retry Fix (RCA Fix 2)
+# ═════════════════════════════════════════════════════════════════════════════
+$PE = "test/hummingbot/strategy_v2/executors/position_executor"
+Run-Test "PositionExecutor TP retry increment fix" `
+    "$PYTEST_V $PE/test_tp_retry_fix.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 12: PositionExecutor Deferred Close Fix (RCA Fix 3)
+# ═════════════════════════════════════════════════════════════════════════════
+Run-Test "PositionExecutor deferred close after cancel fix" `
+    "$PYTEST_V $PE/test_deferred_close_fix.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 13: Controller Cross-Order Prevention (RCA Fix 4)
+# ═════════════════════════════════════════════════════════════════════════════
+Run-Test "Controller cross-order prevention + under-seeded warning" `
+    "$PYTEST_V test/hummingbot/strategy_v2/controllers/test_cross_order_prevention.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 14: Error Classification Fix (RCA Fix 5)
+# ═════════════════════════════════════════════════════════════════════════════
+Run-Test "exchange_py_base error classification" `
+    "$PYTEST_V test/hummingbot/connector/test_exchange_py_base_error_classification.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 15: PositionExecutor + Controller Regression (RCA)
+# ═════════════════════════════════════════════════════════════════════════════
+Run-Test "PositionExecutor full regression" `
+    "$PYTEST_V $PE/test_position_executor.py"
+
+Run-Test "MarketMakingControllerBase full regression" `
+    "$PYTEST_V test/hummingbot/strategy_v2/controllers/test_market_making_controller_base.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 16: SUMMARY
 # ═════════════════════════════════════════════════════════════════════════════
 $TotalElapsed = [math]::Round(((Get-Date) - $ScriptStart).TotalSeconds)
 

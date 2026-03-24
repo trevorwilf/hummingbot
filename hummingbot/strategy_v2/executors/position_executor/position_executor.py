@@ -66,6 +66,9 @@ class PositionExecutor(ExecutorBase):
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
         self._max_retries = max_retries
+        self._pending_close_after_cancel: bool = False
+        self._pending_close_price: Decimal = Decimal("NaN")
+        self._pending_close_timestamp: Optional[float] = None
 
     @property
     def is_perpetual(self) -> bool:
@@ -331,6 +334,14 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         self.close_timestamp = self._strategy.current_timestamp
+        if self._pending_close_after_cancel and self._pending_close_timestamp:
+            elapsed = self._strategy.current_timestamp - self._pending_close_timestamp
+            if elapsed > 15.0:
+                self.logger().warning(
+                    f"Executor {self.config.id}: cancel not confirmed after {elapsed:.0f}s, "
+                    f"placing close order with current balance"
+                )
+                self._place_close_order_now(self._pending_close_price)
         if self.all_orders_completed():
             if self.close_type == CloseType.POSITION_HOLD:
                 if self._open_order and self._open_order.is_filled:
@@ -483,11 +494,40 @@ class PositionExecutor(ExecutorBase):
         the open filled amount and the close filled amount is greater than the minimum order size, it places the close
         order. It also cancels the open orders.
 
+        For spot positions, if there are open orders to cancel (open order or TP limit order),
+        the close order is deferred until the cancel is confirmed, so that released inventory
+        is available for the close order.
+
         :param close_type: The type of the close order.
         :param price: The price to be used in the close order.
         :return: None
         """
+        has_open_orders_to_cancel = (
+            (self._open_order and self._open_order.order and self._open_order.order.is_open) or
+            (self._take_profit_limit_order and self._take_profit_limit_order.order
+             and self._take_profit_limit_order.order.is_open)
+        )
         self.cancel_open_orders()
+        self.close_type = close_type
+        self.close_timestamp = self._strategy.current_timestamp
+        self._status = RunnableStatus.SHUTTING_DOWN
+
+        if has_open_orders_to_cancel and not self.is_perpetual:
+            self._pending_close_after_cancel = True
+            self._pending_close_price = price
+            self._pending_close_timestamp = self._strategy.current_timestamp
+            self.logger().info(
+                f"Executor {self.config.id}: deferring close order until cancel releases inventory"
+            )
+            return
+        self._place_close_order_now(price)
+
+    def _place_close_order_now(self, price: Decimal = Decimal("NaN")):
+        """
+        Actually place the close order. Extracted from place_close_order_and_cancel_open_orders
+        so it can be called either immediately or after a deferred cancel confirmation.
+        """
+        self._pending_close_after_cancel = False
         close_amount = self.amount_to_close
         # For spot positions, cap close amount to available balance to prevent
         # "Insufficient funds" retry storms when balance < theoretical position size.
@@ -509,7 +549,7 @@ class PositionExecutor(ExecutorBase):
                     if Decimal("0") < max_base < close_amount:
                         close_amount = connector.quantize_order_amount(
                             self.config.trading_pair, max_base)
-        if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+        if close_amount >= self.trading_rules.min_order_size and self.close_type != CloseType.POSITION_HOLD:
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
@@ -521,9 +561,13 @@ class PositionExecutor(ExecutorBase):
             )
             self._close_order = TrackedOrder(order_id=order_id)
             self.logger().debug(f"Executor ID: {self.config.id} - Placing close order {order_id} --> Filled amount: {self.open_filled_amount}")
-        self.close_type = close_type
-        self.close_timestamp = self._strategy.current_timestamp
-        self._status = RunnableStatus.SHUTTING_DOWN
+
+    def _has_pending_cancels(self) -> bool:
+        if self._open_order and self._open_order.order and self._open_order.order.is_open:
+            return True
+        if self._take_profit_limit_order and self._take_profit_limit_order.order and self._take_profit_limit_order.order.is_open:
+            return True
+        return False
 
     def cancel_open_orders(self):
         """
@@ -721,6 +765,12 @@ class PositionExecutor(ExecutorBase):
             self._failed_orders.append(self._take_profit_limit_order)
             self._take_profit_limit_order = None
 
+        if self._pending_close_after_cancel and not self._has_pending_cancels():
+            self.logger().info(
+                f"Executor {self.config.id}: cancel confirmed, placing deferred close order"
+            )
+            self._place_close_order_now(self._pending_close_price)
+
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         """
         This method is responsible for processing the order failed event. Here we will add the InFlightOrder to the
@@ -740,6 +790,7 @@ class PositionExecutor(ExecutorBase):
             self._failed_orders.append(self._take_profit_limit_order)
             self._take_profit_limit_order = None
             self.logger().error(f"Take profit order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
+            self._current_retries += 1
 
     def get_custom_info(self) -> Dict:
         return {
