@@ -55,16 +55,17 @@ class MexcAuth(AuthBase):
         if request.headers is not None:
             headers.update(request.headers)
         headers.update(self.header_for_authentication())
-        # Content-Type rules (verified against live MEXC API 2026-03-24):
-        # - Empty body (GET, or POST/PUT/DELETE with params in QS): omit Content-Type.
-        #   MEXC rejects "application/x-www-form-urlencoded" on endpoints like
-        #   userDataStream, but accepts omitted CT or "application/json".
-        #   Safest: omit entirely when no body.
-        # - Non-empty body: use application/json.
-        if request.data is None:
-            headers.pop("Content-Type", None)
-        else:
-            headers["Content-Type"] = "application/json"
+        # Content-Type: always set to application/json.
+        #
+        # Why not omit it when body is empty?  Hummingbot uses aiohttp, which
+        # silently injects a default Content-Type (e.g. application/octet-stream)
+        # when no explicit header is provided.  MEXC rejects that default on
+        # endpoints like userDataStream with error 700013 "Invalid content Type."
+        #
+        # Verified against live MEXC API (2026-03-24): application/json is
+        # accepted on all POST/PUT/DELETE endpoints regardless of whether a
+        # body is present, including userDataStream, order, and account endpoints.
+        headers["Content-Type"] = "application/json"
         request.headers = headers
 
         logger.debug(

@@ -41,7 +41,7 @@ class TestMexcListenKeyFix(TestCase):
         self.assertIn("X-MEXC-APIKEY", result.headers)
         self.assertIn("timestamp", result.params)
         self.assertIn("signature", result.params)
-        self.assertNotIn("Content-Type", result.headers)
+        self.assertEqual("application/json", result.headers["Content-Type"])
 
     def test_auth_omits_content_type_for_empty_body_put(self):
         """PUT /userDataStream with listenKey in params must NOT have Content-Type."""
@@ -56,7 +56,7 @@ class TestMexcListenKeyFix(TestCase):
         self.assertIn("X-MEXC-APIKEY", result.headers)
         self.assertIn("timestamp", result.params)
         self.assertIn("signature", result.params)
-        self.assertNotIn("Content-Type", result.headers)
+        self.assertEqual("application/json", result.headers["Content-Type"])
 
     def test_auth_omits_content_type_for_empty_body_delete(self):
         """DELETE /userDataStream must NOT have Content-Type."""
@@ -71,7 +71,7 @@ class TestMexcListenKeyFix(TestCase):
         self.assertIn("X-MEXC-APIKEY", result.headers)
         self.assertIn("timestamp", result.params)
         self.assertIn("signature", result.params)
-        self.assertNotIn("Content-Type", result.headers)
+        self.assertEqual("application/json", result.headers["Content-Type"])
 
     def test_auth_omits_content_type_for_order_post(self):
         """POST /order with body params moved to QS must NOT have Content-Type."""
@@ -88,7 +88,7 @@ class TestMexcListenKeyFix(TestCase):
         self.assertEqual("BTCUSDT", result.params["symbol"])
         self.assertIn("timestamp", result.params)
         self.assertIn("signature", result.params)
-        self.assertNotIn("Content-Type", result.headers)
+        self.assertEqual("application/json", result.headers["Content-Type"])
 
     def test_auth_preserves_signing_for_all_endpoints(self):
         """All authenticated endpoints must have timestamp and signature in params."""
@@ -115,4 +115,4 @@ class TestMexcListenKeyFix(TestCase):
             is_auth_required=True,
         )
         result = self._run(self.auth.rest_authenticate(request))
-        self.assertNotIn("Content-Type", result.headers)
+        self.assertEqual("application/json", result.headers["Content-Type"])

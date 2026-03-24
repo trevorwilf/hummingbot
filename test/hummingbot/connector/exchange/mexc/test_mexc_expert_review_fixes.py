@@ -208,8 +208,8 @@ class TestPostRequestBodyMovedToParams(unittest.TestCase):
         self.assertEqual("BUY", configured.params["side"])
         self.assertIn("timestamp", configured.params)
         self.assertIn("signature", configured.params)
-        # Content-Type should be omitted since body is None (params moved to QS)
-        self.assertNotIn("Content-Type", configured.headers)
+        # Content-Type should be application/json (always set for aiohttp compatibility)
+        self.assertEqual("application/json", configured.headers["Content-Type"])
 
 
 class TestListenKeyRedaction(unittest.TestCase):
