@@ -199,10 +199,15 @@ if ($HaveNonkycKeys) {
     Run-Test "NonKYC Live: test_nonkyc_live_api.py" `
         "$PYTEST_V $NONKYC/test_nonkyc_live_api.py"
 
+    Run-Test "NonKYC Live: test_nonkyc_live_connector_smoke.py" `
+        "$PYTEST_V $NONKYC/test_nonkyc_live_connector_smoke.py"
+
     Run-Test "NonKYC Live: nonkyc_auth_test.py (standalone)" `
         "python $NONKYC/nonkyc_auth_test.py"
 } else {
     Run-Skip "NonKYC Live: test_nonkyc_live_api.py" `
+        "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
+    Run-Skip "NonKYC Live: test_nonkyc_live_connector_smoke.py" `
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
     Run-Skip "NonKYC Live: nonkyc_auth_test.py (standalone)" `
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
@@ -265,8 +270,8 @@ Write-Host ""
 Write-Host "  SECTION 8: MEXC CONNECTOR - AGGREGATE PASS" -ForegroundColor Magenta
 Write-Host ""
 
-Run-Test "MEXC: aggregate directory pass" `
-    "$PYTEST $MEXC/ -v --tb=short --timeout=60"
+Run-Test "MEXC: aggregate directory pass (excluding live tests)" `
+    "$PYTEST $MEXC/ --ignore=$MEXC/test_mexc_live_api.py -v --tb=short --timeout=60 -m 'not live_api'"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 9: MEXC LIVE / AUTHENTICATED TESTS (conditional)
@@ -289,6 +294,16 @@ if ($HaveMexcKeys) {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 9b: MEXC PUBLIC CONTRACT SMOKE (always runs, no auth needed)
+# ═════════════════════════════════════════════════════════════════════════════
+Write-Host ""
+Write-Host "  SECTION 9b: MEXC PUBLIC CONTRACT SMOKE" -ForegroundColor Magenta
+Write-Host ""
+
+Run-Test "MEXC Public: test_mexc_public_contract_smoke.py" `
+    "$PYTEST_V $MEXC/test_mexc_public_contract_smoke.py"
+
 # SECTION 10: STRATEGY & EXECUTOR TESTS
 # ═════════════════════════════════════════════════════════════════════════════
 Write-Host ""

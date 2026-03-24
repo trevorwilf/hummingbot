@@ -211,10 +211,15 @@ if [ "$HAVE_NONKYC_KEYS" = true ]; then
     run_test "NonKYC Live: test_nonkyc_live_api.py" \
         "$PYTEST_V $NONKYC/test_nonkyc_live_api.py"
 
+    run_test "NonKYC Live: test_nonkyc_live_connector_smoke.py" \
+        "$PYTEST_V $NONKYC/test_nonkyc_live_connector_smoke.py"
+
     run_test "NonKYC Live: nonkyc_auth_test.py (standalone)" \
         "python $NONKYC/nonkyc_auth_test.py"
 else
     run_skip "NonKYC Live: test_nonkyc_live_api.py" \
+        "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
+    run_skip "NonKYC Live: test_nonkyc_live_connector_smoke.py" \
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
     run_skip "NonKYC Live: nonkyc_auth_test.py (standalone)" \
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
@@ -283,8 +288,8 @@ echo "║  SECTION 8: MEXC CONNECTOR — AGGREGATE PASS                 ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
-run_test "MEXC: aggregate directory pass" \
-    "$PYTEST $MEXC/ -v --tb=short --timeout=60"
+run_test "MEXC: aggregate directory pass (excluding live tests)" \
+    "$PYTEST $MEXC/ --ignore=$MEXC/test_mexc_live_api.py -v --tb=short --timeout=60 -m 'not live_api'"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 9: MEXC LIVE / AUTHENTICATED TESTS (conditional)
@@ -309,6 +314,18 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 9b: MEXC PUBLIC CONTRACT SMOKE (always runs, no auth needed)
+# ═════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║  SECTION 9b: MEXC PUBLIC CONTRACT SMOKE                     ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+echo ""
+
+run_test "MEXC Public: test_mexc_public_contract_smoke.py" \
+    "$PYTEST_V $MEXC/test_mexc_public_contract_smoke.py"
+
 # SECTION 10: STRATEGY & EXECUTOR TESTS
 # ═════════════════════════════════════════════════════════════════════════════
 echo ""

@@ -45,6 +45,23 @@ class MexcExchange(ExchangePyBase):
         self._last_trades_poll_mexc_timestamp = 1.0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
+    @property
+    def ready(self) -> bool:
+        is_ready = super().ready
+        if not is_ready:
+            self._log_readiness_status()
+        return is_ready
+
+    def _log_readiness_status(self):
+        """Log detailed readiness status for debugging connector startup issues."""
+        status = self.status_dict
+        not_ready = {k: v for k, v in status.items() if not v}
+        if not_ready:
+            self.logger().debug(
+                f"MEXC readiness check — NOT READY. False conditions: {list(not_ready.keys())}. "
+                f"Full status: {status}"
+            )
+
     @staticmethod
     def mexc_order_type(order_type: OrderType) -> str:
         return order_type.name.upper()

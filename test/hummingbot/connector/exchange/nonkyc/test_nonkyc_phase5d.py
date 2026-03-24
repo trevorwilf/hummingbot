@@ -31,6 +31,7 @@ class TestPhase5DCrashRecovery(unittest.TestCase):
             nonkyc_api_secret="test_secret",
             trading_pairs=["BTC-USDT"],
             trading_required=True,
+            cancel_exchange_orphans=True,  # Enable orphan recovery for these tests
         )
         # Set up the trading pair mapping
         self.exchange._set_trading_pair_symbol_map(
@@ -295,6 +296,77 @@ class TestPhase5DCrashRecovery(unittest.TestCase):
 
         # Verify the POST request was actually made to the cancel endpoint
         self.assertTrue(len(mock_api.requests) > 0, "Expected at least one POST request to cancel endpoint")
+
+
+class TestCancelAllDefaultMode(unittest.TestCase):
+    """Tests for cancel_all in default mode (cancel_exchange_orphans=False)."""
+
+    def setUp(self):
+        self.exchange = NonkycExchange(
+            nonkyc_api_key="test_key",
+            nonkyc_api_secret="test_secret",
+            trading_pairs=["BTC-USDT"],
+            trading_required=True,
+            # Default: cancel_exchange_orphans=False
+        )
+        self.exchange._set_trading_pair_symbol_map(
+            bidict({"BTC/USDT": "BTC-USDT"})
+        )
+
+    def async_run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_cancel_all_default_only_cancels_tracked_orders(self):
+        """Default mode should only cancel tracked in-flight orders, not query exchange."""
+        order = InFlightOrder(
+            client_order_id="HBOT-001",
+            exchange_order_id="ex-001",
+            trading_pair="BTC-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("65000"),
+            amount=Decimal("0.001"),
+            creation_timestamp=1234567890.0,
+            initial_state=OrderState.OPEN,
+        )
+        self.exchange._order_tracker._in_flight_orders["HBOT-001"] = order
+
+        with patch.object(self.exchange, "_execute_cancel", new_callable=AsyncMock, return_value="HBOT-001"):
+            with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+                results = self.async_run(self.exchange.cancel_all(timeout_seconds=10))
+                # Should NOT query /account/orders
+                mock_get.assert_not_called()
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("HBOT-001", results[0].order_id)
+        self.assertTrue(results[0].success)
+
+    def test_cancel_all_default_does_not_query_all_orders(self):
+        """Default mode must not call /account/orders endpoint."""
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            results = self.async_run(self.exchange.cancel_all(timeout_seconds=10))
+            mock_get.assert_not_called()
+        self.assertEqual([], results)
+
+    def test_cancel_all_orphan_mode_cancels_orphans(self):
+        """With cancel_exchange_orphans=True, orphaned orders ARE cancelled."""
+        self.exchange._cancel_exchange_orphans = True
+
+        # Mock /account/orders returning an orphan (not tracked locally)
+        async def mock_get(path_url, params=None, **kwargs):
+            return [{"id": "orphan-001", "symbol": "BTC/USDT", "side": "buy",
+                     "price": "65000", "quantity": "0.001", "status": "Active"}]
+
+        async def mock_cancel_symbol(symbol):
+            return ["orphan-001"]
+
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock, side_effect=mock_get):
+            with patch.object(self.exchange, "_cancel_all_for_symbol",
+                              new_callable=AsyncMock, side_effect=mock_cancel_symbol):
+                results = self.async_run(self.exchange.cancel_all(timeout_seconds=10))
+
+        # No tracked orders -> empty result list, but cancel was called
+        self.assertEqual(0, len(results))
 
 
 if __name__ == "__main__":

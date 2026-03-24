@@ -44,12 +44,14 @@ class NonkycExchange(ExchangePyBase):
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 cancel_exchange_orphans: bool = False,
                  ):
         self.api_key = nonkyc_api_key
         self.secret_key = nonkyc_api_secret
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._cancel_exchange_orphans = cancel_exchange_orphans
         self._last_trades_poll_nonkyc_timestamp = 1.0
         self._trading_fees: Dict[str, Decimal] = {}
         self._trading_fees_last_computed: float = 0.0
@@ -282,18 +284,30 @@ class NonkycExchange(ExchangePyBase):
 
     async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
         """
-        Cancel all open orders on the exchange using batch /cancelallorders per symbol.
+        Cancel open orders, with two modes controlled by ``_cancel_exchange_orphans``.
 
-        This overrides the base class implementation to:
-        1. Query the exchange for ALL active orders (catches orphans after crash)
-        2. Use batch /cancelallorders per symbol (efficient: 1 call per pair, not 1 per order)
-        3. Log orphan detection (orders on exchange but not in local tracker)
+        **Default mode** (``_cancel_exchange_orphans=False``):
+            Only cancels orders tracked by this bot instance, individually via
+            ``_cancel_all_fallback()``.  Does NOT query ``/account/orders`` or call
+            ``/cancelallorders``.  Safe for shared API keys where multiple bots or
+            manual trades coexist on the same account.
+
+        **Orphan-recovery mode** (``_cancel_exchange_orphans=True``):
+            Queries the exchange for ALL active orders, detects orphans (orders
+            present on the exchange but not tracked locally), and batch-cancels per
+            symbol via ``/cancelallorders``.  Only enable this with a dedicated API
+            key that is not shared with other sessions.
 
         :param timeout_seconds: maximum time to wait for cancel operations
         :return: list of CancellationResult for each tracked order
         """
         # Collect locally tracked incomplete orders for result reporting
         tracked_orders = {o.client_order_id: o for o in self.in_flight_orders.values() if not o.is_done}
+
+        # Default safe mode: only cancel orders this bot instance is tracking
+        if not self._cancel_exchange_orphans:
+            return await self._cancel_all_fallback(timeout_seconds, tracked_orders)
+
         tracked_exchange_ids = {o.exchange_order_id for o in tracked_orders.values() if o.exchange_order_id}
 
         results = []
@@ -569,15 +583,26 @@ class NonkycExchange(ExchangePyBase):
 
             maker_rates = []
             taker_rates = []
+            alt_fee_skipped = 0
+            zero_fee_skipped = 0
 
             for trade in all_trades:
                 try:
                     fee = Decimal(str(trade.get("fee", "0")))
+
+                    # Skip trades with alternate fee assets — fee is denominated
+                    # in a different asset, making percentage calculation invalid
+                    alt_fee_asset = trade.get("alternateFeeAsset")
+                    if alt_fee_asset:
+                        alt_fee_skipped += 1
+                        continue
+
                     quantity = Decimal(str(trade.get("quantity", "0")))
                     price = Decimal(str(trade.get("price", "0")))
                     notional = quantity * price
 
                     if notional <= 0 or fee <= 0:
+                        zero_fee_skipped += 1
                         continue
 
                     fee_rate = fee / notional
@@ -616,7 +641,10 @@ class NonkycExchange(ExchangePyBase):
                     parts.append(f"maker={computed_maker:.6f} (default={default_maker:.6f}, {len(maker_rates)} trades)")
                 if computed_taker is not None:
                     parts.append(f"taker={computed_taker:.6f} (default={default_taker:.6f}, {len(taker_rates)} trades)")
-                self.logger().info(f"Dynamic fee rates computed from trade history: {', '.join(parts)}")
+                self.logger().info(
+                    f"Dynamic fee rates computed from trade history: {', '.join(parts)} "
+                    f"(skipped: {alt_fee_skipped} alt-fee, {zero_fee_skipped} zero-fee)"
+                )
 
         except asyncio.CancelledError:
             raise

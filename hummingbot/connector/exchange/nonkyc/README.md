@@ -75,6 +75,9 @@ Rate oracle source: `hummingbot/core/rate_oracle/sources/nonkyc_rate_source.py`
 5. **No native stop-loss/take-profit**: Only `limit` and `market` order types
 6. **Order book recovery**: Diffs are dropped during resync (not applied to stale books).
    After max resync failures, a `ConnectionError` triggers WebSocket reconnect.
+7. **Shared-account safety**: By default, `cancel_all()` only cancels orders tracked by this bot instance.
+   Set `cancel_exchange_orphans: true` in config to also detect and cancel orphaned orders from other
+   sessions sharing the same API key. Only enable with a dedicated API key.
 
 ## Running Tests
 

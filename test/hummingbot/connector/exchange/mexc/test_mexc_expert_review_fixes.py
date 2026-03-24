@@ -208,6 +208,8 @@ class TestPostRequestBodyMovedToParams(unittest.TestCase):
         self.assertEqual("BUY", configured.params["side"])
         self.assertIn("timestamp", configured.params)
         self.assertIn("signature", configured.params)
+        # Content-Type should be form-urlencoded since body was moved to params
+        self.assertEqual("application/x-www-form-urlencoded", configured.headers.get("Content-Type"))
 
 
 class TestListenKeyRedaction(unittest.TestCase):

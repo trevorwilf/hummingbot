@@ -142,3 +142,73 @@ class TestPhase5CDynamicFees(IsolatedAsyncioWrapperTestCase):
 
         # Average of 0.002 and 0.004 = 0.003
         self.assertEqual(Decimal("0.003"), self.exchange._trading_fees["maker_fee"])
+
+    async def test_update_trading_fees_skips_alternate_fee_asset_trades(self):
+        """All trades with alternateFeeAsset should be skipped, leaving _trading_fees empty."""
+        mock_trades = [
+            {
+                "side": "Buy", "triggeredBy": "sell",  # maker
+                "fee": "0.5", "quantity": "10", "price": "0.1",
+                "alternateFeeAsset": "NKYC", "alternateFee": "0.5",
+            },
+            {
+                "side": "Sell", "triggeredBy": "sell",  # taker
+                "fee": "0.5", "quantity": "10", "price": "0.1",
+                "alternateFeeAsset": "NKYC", "alternateFee": "0.5",
+            },
+        ]
+        self.exchange._trading_fees_last_computed = 0
+        with patch.object(self.exchange, '_api_get', new_callable=AsyncMock, return_value=mock_trades):
+            await self.exchange._update_trading_fees()
+
+        # All trades skipped — no fee rates computed
+        self.assertNotIn("maker_fee", self.exchange._trading_fees)
+        self.assertNotIn("taker_fee", self.exchange._trading_fees)
+
+    async def test_update_trading_fees_mixed_normal_and_alternate_trades(self):
+        """Only normal trades should be used; alternate-fee trades are skipped."""
+        mock_trades = [
+            {
+                "side": "Buy", "triggeredBy": "sell",  # maker — normal
+                "fee": "0.002", "quantity": "10", "price": "0.1",
+            },
+            {
+                "side": "Buy", "triggeredBy": "sell",  # maker — alternate fee (skipped)
+                "fee": "0.5", "quantity": "10", "price": "0.1",
+                "alternateFeeAsset": "NKYC", "alternateFee": "0.5",
+            },
+            {
+                "side": "Sell", "triggeredBy": "sell",  # taker — normal
+                "fee": "0.003", "quantity": "10", "price": "0.1",
+            },
+        ]
+        self.exchange._trading_fees_last_computed = 0
+        with patch.object(self.exchange, '_api_get', new_callable=AsyncMock, return_value=mock_trades):
+            await self.exchange._update_trading_fees()
+
+        # Only normal trades used
+        self.assertEqual(Decimal("0.002"), self.exchange._trading_fees["maker_fee"])
+        self.assertEqual(Decimal("0.003"), self.exchange._trading_fees["taker_fee"])
+
+    async def test_update_trading_fees_all_alternate_trades_preserves_existing_cache(self):
+        """If all trades have alternateFeeAsset, existing cached fees should be preserved."""
+        # Pre-populate cache
+        self.exchange._trading_fees = {
+            "maker_fee": Decimal("0.001"),
+            "taker_fee": Decimal("0.002"),
+        }
+        self.exchange._trading_fees_last_computed = 0
+
+        mock_trades = [
+            {
+                "side": "Buy", "triggeredBy": "sell",
+                "fee": "0.5", "quantity": "10", "price": "0.1",
+                "alternateFeeAsset": "NKYC", "alternateFee": "0.5",
+            },
+        ]
+        with patch.object(self.exchange, '_api_get', new_callable=AsyncMock, return_value=mock_trades):
+            await self.exchange._update_trading_fees()
+
+        # Original cached values should still be there
+        self.assertEqual(Decimal("0.001"), self.exchange._trading_fees["maker_fee"])
+        self.assertEqual(Decimal("0.002"), self.exchange._trading_fees["taker_fee"])

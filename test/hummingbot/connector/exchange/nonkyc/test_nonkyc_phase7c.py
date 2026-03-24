@@ -336,6 +336,9 @@ class TestCancelAllDeterministicOrder(_Base):
     """7C-8: cancel_all processes symbols in sorted order (7A-3 fix)."""
 
     def test_cancel_all_processes_symbols_in_sorted_order(self):
+        # Enable orphan recovery mode for this test (tests exchange-query behavior)
+        self.exchange._cancel_exchange_orphans = True
+
         # Set up 3 trading pairs
         self.exchange._set_trading_pair_symbol_map(bidict({
             "ZEC/USDT": "ZEC-USDT",

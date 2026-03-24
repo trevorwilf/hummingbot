@@ -1,9 +1,12 @@
 import hashlib
 import hmac
 import json
+import logging
 from collections import OrderedDict
 from typing import Any, Dict
 from urllib.parse import urlencode
+
+logger = logging.getLogger(__name__)
 
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
@@ -52,10 +55,24 @@ class MexcAuth(AuthBase):
         if request.headers is not None:
             headers.update(request.headers)
         headers.update(self.header_for_authentication())
-        # Remove Content-Type: application/json when body is empty
-        if request.data is None:
+        # MEXC requires a valid Content-Type even when the body is empty.
+        # Since we moved body params to query string, use form-urlencoded
+        # for non-GET requests with empty body; keep JSON only for actual JSON body.
+        if request.method == RESTMethod.GET:
             headers.pop("Content-Type", None)
+        elif request.data is None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            headers["Content-Type"] = "application/json"
         request.headers = headers
+
+        logger.debug(
+            f"MEXC auth: method={request.method.name}, "
+            f"url={request.url}, "
+            f"has_body={request.data is not None}, "
+            f"has_params={bool(request.params)}, "
+            f"content_type={request.headers.get('Content-Type', 'NONE')}"
+        )
 
         return request
 

@@ -49,6 +49,8 @@ class MexcAuthTests(TestCase):
             hashlib.sha256).hexdigest()
         self.assertEqual(now * 1e3, configured_request.params["timestamp"])
         self.assertEqual(expected_signature, configured_request.params["signature"])
+        # GET requests should not have Content-Type
+        self.assertNotIn("Content-Type", configured_request.headers)
         self.assertEqual({"X-MEXC-APIKEY": self._api_key}, configured_request.headers)
 
     def test_rest_authenticate_post_moves_body_to_params(self):
@@ -115,8 +117,8 @@ class MexcAuthTests(TestCase):
         self.assertIn("signature", configured_request.params)
         self.assertIn("timestamp", configured_request.params)
 
-    def test_no_content_type_json_when_body_empty(self):
-        """When body is cleared, Content-Type: application/json should not be present."""
+    def test_post_empty_body_has_form_urlencoded_content_type(self):
+        """POST with empty body should have Content-Type: application/x-www-form-urlencoded (MEXC requires it)."""
         now = 1234567890.000
         mock_time_provider = MagicMock()
         mock_time_provider.time.return_value = now
@@ -130,6 +132,87 @@ class MexcAuthTests(TestCase):
         )
         configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
 
-        # Content-Type should be removed when body is empty
-        self.assertNotIn("Content-Type", configured_request.headers)
+        # POST with empty body must have form-urlencoded (not removed, not JSON)
+        self.assertEqual("application/x-www-form-urlencoded", configured_request.headers["Content-Type"])
         self.assertIsNone(configured_request.data)
+
+    def test_post_user_data_stream_retains_content_type(self):
+        """Authenticated POST to /userDataStream with no body must have Content-Type."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = MexcAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.mexc.com/api/v3/userDataStream",
+            is_auth_required=True,
+        )
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        self.assertEqual("application/x-www-form-urlencoded", configured_request.headers["Content-Type"])
+
+    def test_put_user_data_stream_keepalive_retains_content_type(self):
+        """Authenticated PUT to /userDataStream with listenKey must have Content-Type."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = MexcAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+        request = RESTRequest(
+            method=RESTMethod.PUT,
+            url="https://api.mexc.com/api/v3/userDataStream",
+            params={"listenKey": "some_listen_key_value"},
+            is_auth_required=True,
+        )
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        self.assertEqual("application/x-www-form-urlencoded", configured_request.headers["Content-Type"])
+
+    def test_get_request_no_content_type(self):
+        """GET requests should have Content-Type removed."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+
+        auth = MexcAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+        request = RESTRequest(
+            method=RESTMethod.GET,
+            url="https://api.mexc.com/api/v3/account",
+            headers={"Content-Type": "application/json"},
+            is_auth_required=True,
+        )
+        configured_request = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        self.assertNotIn("Content-Type", configured_request.headers)
+
+    def test_auth_serialization_matrix(self):
+        """Matrix test: correct Content-Type for each HTTP method × body combination."""
+        now = 1234567890.000
+        mock_time_provider = MagicMock()
+        mock_time_provider.time.return_value = now
+        auth = MexcAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
+
+        cases = [
+            # (method, data, expected_content_type_or_absent)
+            (RESTMethod.GET, None, None),  # GET: no Content-Type
+            (RESTMethod.POST, None, "application/x-www-form-urlencoded"),  # POST empty body
+            (RESTMethod.POST, json.dumps({"symbol": "BTCUSDT"}), "application/x-www-form-urlencoded"),  # POST body moved to params
+            (RESTMethod.PUT, None, "application/x-www-form-urlencoded"),  # PUT empty body
+            (RESTMethod.DELETE, None, "application/x-www-form-urlencoded"),  # DELETE empty body
+        ]
+
+        for method, data, expected_ct in cases:
+            request = RESTRequest(
+                method=method,
+                url="https://api.mexc.com/api/v3/test",
+                data=data,
+                is_auth_required=True,
+            )
+            result = self.async_run_with_timeout(auth.rest_authenticate(request))
+            if expected_ct is None:
+                self.assertNotIn("Content-Type", result.headers,
+                                 f"Method {method.name}: Content-Type should be absent")
+            else:
+                self.assertEqual(expected_ct, result.headers.get("Content-Type"),
+                                 f"Method {method.name}: wrong Content-Type")

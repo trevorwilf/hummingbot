@@ -6,6 +6,11 @@ end-to-end behavior against the live exchange. They are NOT part of the
 per-PR blocking lane.
 
 Markers: live_api (requires NONKYC_API_KEY and NONKYC_API_SECRET env vars)
+
+Event loop note: Uses a class-level shared event loop to avoid aiohttp
+session/connector binding issues between tests. Each test creates a fresh
+NonkycExchange instance but shares the same event loop so cached aiohttp
+sessions don't reference a closed loop.
 """
 import asyncio
 import os
@@ -22,23 +27,28 @@ pytestmark = pytest.mark.live_api
 class TestNonkycLiveConnectorSmoke(unittest.TestCase):
     """Smoke tests using the real connector pipeline."""
 
-    def setUp(self):
-        self.api_key = os.environ.get("NONKYC_API_KEY")
-        self.api_secret = os.environ.get("NONKYC_API_SECRET")
-        if not self.api_key or not self.api_secret:
-            pytest.skip("NONKYC_API_KEY and NONKYC_API_SECRET required")
+    @classmethod
+    def setUpClass(cls):
+        cls.api_key = os.environ.get("NONKYC_API_KEY")
+        cls.api_secret = os.environ.get("NONKYC_API_SECRET")
+        if not cls.api_key or not cls.api_secret:
+            raise unittest.SkipTest("NONKYC_API_KEY and NONKYC_API_SECRET required")
+        cls.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(cls.loop)
 
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, 'loop') and cls.loop and not cls.loop.is_closed():
+            cls.loop.run_until_complete(cls.loop.shutdown_asyncgens())
+            cls.loop.close()
+
+    def setUp(self):
         self.exchange = NonkycExchange(
             nonkyc_api_key=self.api_key,
             nonkyc_api_secret=self.api_secret,
             trading_pairs=["BTC-USDT"],
             trading_required=False,
         )
-        self.loop = asyncio.new_event_loop()
-
-    def tearDown(self):
-        if hasattr(self, 'loop') and self.loop:
-            self.loop.close()
 
     def _run(self, coro):
         return self.loop.run_until_complete(asyncio.wait_for(coro, timeout=30))
@@ -80,8 +90,10 @@ class TestNonkycLiveConnectorSmoke(unittest.TestCase):
             return data
 
         result = self._run(fetch_ob())
-        self.assertIn("ask", result)
-        self.assertIn("bid", result)
+        self.assertIn("asks", result)
+        self.assertIn("bids", result)
+        self.assertIsInstance(result["asks"], list)
+        self.assertIsInstance(result["bids"], list)
 
     def test_authenticated_balance_fetch(self):
         """Connector fetches real balances via the production auth path."""

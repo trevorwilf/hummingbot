@@ -54,6 +54,13 @@ class NonkycConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
+    cancel_exchange_orphans: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": lambda cm: "Cancel orphaned exchange orders on recovery? (only enable with dedicated API key) (True/False)",
+            "prompt_on_new": False,
+        }
+    )
     model_config = ConfigDict(title="nonkyc")
 
 
