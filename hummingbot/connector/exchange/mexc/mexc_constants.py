@@ -50,6 +50,10 @@ ONE_DAY = 86400
 
 MAX_REQUEST = 5000
 
+# MEXC Spot V3: order placement and cancellation share a 12 req/sec UID bucket
+ORDER_RATE_LIMIT_ID = "MEXC_ORDER_RATE"
+ORDER_RATE_LIMIT_PER_SECOND = 12
+
 # Order States
 ORDER_STATE = {
     "PENDING": OrderState.PENDING_CREATE,
@@ -86,6 +90,7 @@ WS_CONNECTION_TIME_INTERVAL = 20
 RATE_LIMITS = [
     RateLimit(limit_id=IP_REQUEST_WEIGHT, limit=20000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=UID_REQUEST_WEIGHT, limit=240000, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=ORDER_RATE_LIMIT_ID, limit=ORDER_RATE_LIMIT_PER_SECOND, time_interval=1),
     # Weighted Limits
     RateLimit(limit_id=TICKER_PRICE_CHANGE_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 1)]),
@@ -108,7 +113,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=MY_TRADES_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(UID_REQUEST_WEIGHT, 10)]),
     RateLimit(limit_id=ORDER_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(UID_REQUEST_WEIGHT, 2)])
+              linked_limits=[LinkedLimitWeightPair(UID_REQUEST_WEIGHT, 2), LinkedLimitWeightPair(ORDER_RATE_LIMIT_ID, 1)])
 ]
 
 ORDER_NOT_EXIST_ERROR_CODE = -2013

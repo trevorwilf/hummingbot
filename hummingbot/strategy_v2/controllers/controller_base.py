@@ -204,6 +204,7 @@ class ControllerBase(RunnableBase):
         self.processed_data = {}
         self.executors_update_event = asyncio.Event()
         self.executors_info_queue = asyncio.Queue()
+        self._startup_gate: Optional[asyncio.Event] = None
 
     def start(self):
         """
@@ -215,6 +216,9 @@ class ControllerBase(RunnableBase):
             self.executors_update_event.set()
             safe_ensure_future(self.control_loop())
         self.initialize_candles()
+
+    def set_startup_gate(self, gate: asyncio.Event):
+        self._startup_gate = gate
 
     def initialize_candles(self):
         """
@@ -258,6 +262,9 @@ class ControllerBase(RunnableBase):
 
     async def control_task(self):
         if self.market_data_provider.ready and self.executors_update_event.is_set():
+            # Wait for startup gate before emitting any executor actions
+            if self._startup_gate is not None and not self._startup_gate.is_set():
+                return
             await self.update_processed_data()
             executor_actions: List[ExecutorAction] = self.determine_executor_actions()
             if len(executor_actions) > 0:

@@ -53,6 +53,7 @@ class NonkycExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._cancel_exchange_orphans = cancel_exchange_orphans
         self._last_trades_poll_nonkyc_timestamp = 1.0
+        self._balance_ws_confirmed: bool = False
         self._trading_fees: Dict[str, Decimal] = {}
         self._trading_fees_last_computed: float = 0.0
         self._trading_fees_ttl: float = 3600.0  # 1 hour cache TTL
@@ -722,6 +723,11 @@ class NonkycExchange(ExchangePyBase):
                 # balance polling via _update_balances() which runs on the standard
                 # polling loop. See also: _subscribe_channels() in user stream data source.
                 elif event_type == "currentBalances":
+                    if not self._balance_ws_confirmed:
+                        self.logger().info(
+                            "NonKYC private balance WebSocket: CONFIRMED (received currentBalances snapshot)"
+                        )
+                        self._balance_ws_confirmed = True
                     balance_entries = event_message.get("result", [])
                     for balance_entry in balance_entries:
                         asset_name = balance_entry["ticker"]

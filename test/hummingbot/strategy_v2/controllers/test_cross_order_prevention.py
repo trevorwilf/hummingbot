@@ -218,7 +218,7 @@ class TestUnderSeededWarning(IsolatedAsyncioWrapperTestCase):
 
         with self.assertLogs(self.controller.logger(), level="WARNING") as cm:
             self.controller.check_position_rebalance()
-        self.assertTrue(any("UNDER-SEEDED" in msg for msg in cm.output))
+        self.assertTrue(any("SHORTFALL" in msg for msg in cm.output))
 
     def test_under_seeded_warning_only_once(self):
         """Warning should only be emitted once."""
@@ -233,7 +233,7 @@ class TestUnderSeededWarning(IsolatedAsyncioWrapperTestCase):
         with patch.object(self.controller.logger(), 'warning') as mock_warn:
             self.controller.check_position_rebalance()
             for call in mock_warn.call_args_list:
-                self.assertNotIn("UNDER-SEEDED", str(call))
+                self.assertNotIn("SHORTFALL", str(call))
 
     def test_no_warning_for_perpetual(self):
         """Perpetual connector should never get under-seeded warning."""

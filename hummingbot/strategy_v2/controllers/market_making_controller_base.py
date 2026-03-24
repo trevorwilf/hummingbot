@@ -323,6 +323,43 @@ class MarketMakingControllerBase(ControllerBase):
                     pass
         return reserved
 
+    def get_spendable_sell_base_inventory(self) -> Decimal:
+        """
+        Compute how much base asset is available for new sell orders.
+        Returns the available base balance minus any base already committed
+        by active sell executors.
+        """
+        base_asset = self.config.trading_pair.split("-")[0]
+        available_base = Decimal("0")
+
+        try:
+            connectors = getattr(self.market_data_provider, 'connectors', None)
+            if connectors and isinstance(connectors, dict) and self.config.connector_name in connectors:
+                connector = connectors[self.config.connector_name]
+                raw = connector.available_balances.get(base_asset, Decimal("0"))
+                available_base = Decimal(str(raw))
+            elif hasattr(self.market_data_provider, 'get_connector'):
+                connector = self.market_data_provider.get_connector(self.config.connector_name)
+                raw = connector.available_balances.get(base_asset, Decimal("0"))
+                available_base = Decimal(str(raw))
+        except Exception as e:
+            self.logger().debug(f"Could not query {base_asset} balance: {e}")
+            return Decimal("0")
+
+        # Subtract base already committed by active sell executors
+        reserved_sell_base = Decimal("0")
+        for executor in self.executors_info:
+            if not (executor.is_active and executor.is_trading):
+                continue
+            level_id = executor.custom_info.get("level_id", "")
+            if level_id.startswith("sell"):
+                try:
+                    reserved_sell_base += executor.config.amount
+                except AttributeError:
+                    pass
+
+        return max(Decimal("0"), available_base - reserved_sell_base)
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Determine actions based on the provided executor handler report.
@@ -337,33 +374,69 @@ class MarketMakingControllerBase(ControllerBase):
     def create_actions_proposal(self) -> List[ExecutorAction]:
         """
         Create actions proposal based on the current state of the controller.
+        Sell-side orders are clipped to available base inventory to prevent
+        silent drops by the budget preflight.
         """
         create_actions = []
 
         # Check if we need to rebalance position first
         position_rebalance_action = self.check_position_rebalance()
         if position_rebalance_action is not None:
-            # Rebalance is EXCLUSIVE — do not create PMM levels in the same cycle
             return [position_rebalance_action]
 
-        # Only create normal market making levels if no rebalance action was produced
         highest_buy, lowest_sell = self._get_active_order_price_bounds()
         levels_to_execute = self.get_levels_to_execute()
+
+        # Pre-compute spendable sell-side base inventory for clip logic (spot only)
+        is_spot = "_perpetual" not in self.config.connector_name
+        spendable_sell_base = self.get_spendable_sell_base_inventory() if is_spot else Decimal("0")
+        initial_spendable = spendable_sell_base
+
         for level_id in levels_to_execute:
             price, amount = self.get_price_and_amount(level_id)
             trade_type = self.get_trade_type_from_level_id(level_id)
 
-            # Cross-order prevention: skip orders that would cross existing positions
+            # Cross-order prevention (deduplicated — warn once per level)
             if trade_type == TradeType.SELL and highest_buy is not None and price <= highest_buy:
-                self.logger().warning(
-                    f"Skipping {level_id}: sell price {price:.6f} <= highest active buy {highest_buy:.6f}"
-                )
+                if not getattr(self, '_cross_order_warned', {}).get(level_id):
+                    self.logger().warning(
+                        f"Skipping {level_id}: sell price {price:.6f} <= highest active buy {highest_buy:.6f}"
+                    )
+                    if not hasattr(self, '_cross_order_warned'):
+                        self._cross_order_warned = {}
+                    self._cross_order_warned[level_id] = True
                 continue
-            if trade_type == TradeType.BUY and lowest_sell is not None and price >= lowest_sell:
-                self.logger().warning(
-                    f"Skipping {level_id}: buy price {price:.6f} >= lowest active sell {lowest_sell:.6f}"
-                )
+            elif trade_type == TradeType.BUY and lowest_sell is not None and price >= lowest_sell:
+                if not getattr(self, '_cross_order_warned', {}).get(level_id):
+                    self.logger().warning(
+                        f"Skipping {level_id}: buy price {price:.6f} >= lowest active sell {lowest_sell:.6f}"
+                    )
+                    if not hasattr(self, '_cross_order_warned'):
+                        self._cross_order_warned = {}
+                    self._cross_order_warned[level_id] = True
                 continue
+            else:
+                if hasattr(self, '_cross_order_warned') and level_id in self._cross_order_warned:
+                    del self._cross_order_warned[level_id]
+
+            # Sell-side inventory clipping (spot only)
+            if trade_type == TradeType.SELL and "_perpetual" not in self.config.connector_name:
+                if spendable_sell_base <= Decimal("0"):
+                    self.logger().warning(
+                        f"Skipping {level_id}: no spendable base remaining for sell-side quoting. "
+                        f"Initial spendable was {initial_spendable:.8f} {self.config.trading_pair.split('-')[0]}"
+                    )
+                    continue
+
+                clipped_amount = min(amount, spendable_sell_base)
+                if clipped_amount < amount:
+                    self.logger().warning(
+                        f"Clipping {level_id}: sell amount {amount:.8f} -> {clipped_amount:.8f} "
+                        f"(spendable base: {spendable_sell_base:.8f} "
+                        f"{self.config.trading_pair.split('-')[0]})"
+                    )
+                amount = clipped_amount
+                spendable_sell_base -= amount
 
             executor_config = self.get_executor_config(level_id, price, amount)
             if executor_config is not None:
@@ -483,12 +556,21 @@ class MarketMakingControllerBase(ControllerBase):
                 connector = self.market_data_provider.get_connector(self.config.connector_name)
                 available = connector.available_balances.get(base_asset, Decimal("0"))
 
-            if required_base > 0 and available < required_base * Decimal("0.5"):
+            if required_base > 0 and available < required_base:
+                deficit_pct = ((required_base - available) / required_base * Decimal("100")).quantize(Decimal("0.1"))
                 self.logger().warning(
-                    f"UNDER-SEEDED: {self.config.trading_pair} has {available:.4f} {base_asset} "
-                    f"available but needs ~{required_base:.4f} for sell-side quoting. "
-                    f"skip_rebalance=true, so sell orders may fail with insufficient funds. "
-                    f"Consider pre-funding or enabling rebalance."
+                    f"SELL-SIDE INVENTORY SHORTFALL: {self.config.trading_pair} has "
+                    f"{available:.8f} {base_asset} available but needs {required_base:.8f} "
+                    f"for configured sell-side quoting (deficit: {deficit_pct}%). "
+                    f"skip_rebalance={self.config.skip_rebalance}. "
+                    f"Sell orders may be clipped or skipped. "
+                    f"Consider reducing total_amount_quote, pre-funding {base_asset}, "
+                    f"or enabling rebalance."
+                )
+            elif required_base > 0:
+                self.logger().info(
+                    f"Sell-side inventory OK: {self.config.trading_pair} has "
+                    f"{available:.8f} {base_asset} available, needs {required_base:.8f}"
                 )
         except Exception as e:
             self.logger().debug(f"Could not check sell-side inventory: {e}")

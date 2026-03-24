@@ -463,6 +463,13 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         )
         config_kwargs.update(config_overrides)
         config = MarketMakingControllerConfigBase(**config_kwargs)
+        # Provide a connector mock with ample balances for sell-side clipping
+        mock_connector = MagicMock()
+        mock_connector.available_balances = {
+            config.trading_pair.split("-")[0]: Decimal("10000"),
+            config.trading_pair.split("-")[1]: Decimal("10000"),
+        }
+        self.mock_market_data_provider.connectors = {config.connector_name: mock_connector}
         controller = MarketMakingControllerBase(
             config=config,
             market_data_provider=self.mock_market_data_provider,

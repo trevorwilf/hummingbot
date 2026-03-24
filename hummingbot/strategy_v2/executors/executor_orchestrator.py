@@ -528,9 +528,25 @@ class ExecutorOrchestrator:
                             price=price,
                         )
 
-                    adjusted = budget_checker.adjust_candidate_and_lock_available_collateral(candidate, all_or_none=True)
+                    # For spot orders, allow partial resize. For perpetual, keep all_or_none.
+                    use_all_or_none = is_perpetual
+                    adjusted = budget_checker.adjust_candidate_and_lock_available_collateral(
+                        candidate, all_or_none=use_all_or_none)
                     if adjusted.amount == Decimal("0"):
                         dropped_actions.append(action)
+                        self.logger().warning(
+                            f"BUDGET PREFLIGHT DROP: {config.trading_pair} {config.side.name} "
+                            f"amount={config.amount} price={price} on {connector_name} — "
+                            f"insufficient balance, order dropped entirely"
+                        )
+                    elif adjusted.amount != config.amount:
+                        self.logger().warning(
+                            f"BUDGET PREFLIGHT RESIZE: {config.trading_pair} {config.side.name} "
+                            f"amount {config.amount} -> {adjusted.amount} on {connector_name} — "
+                            f"resized due to insufficient balance"
+                        )
+                        config.amount = adjusted.amount
+                        surviving_actions.append(action)
                     else:
                         surviving_actions.append(action)
                 except Exception as e:
@@ -553,16 +569,45 @@ class ExecutorOrchestrator:
 
         return surviving_actions
 
+    def _log_balance_snapshot(self, connector_name: str, trading_pair: str, context: str):
+        """Log a complete balance snapshot for the given connector and trading pair."""
+        try:
+            connector = self.strategy.connectors.get(connector_name)
+            if connector is None:
+                return
+            base_asset, quote_asset = trading_pair.split("-")
+            avail_base = connector.available_balances.get(base_asset, Decimal("0"))
+            total_base = connector.get_balance(base_asset) if hasattr(connector, 'get_balance') else avail_base
+            avail_quote = connector.available_balances.get(quote_asset, Decimal("0"))
+            total_quote = connector.get_balance(quote_asset) if hasattr(connector, 'get_balance') else avail_quote
+            self.logger().info(
+                f"[BALANCE {context}] {connector_name} {trading_pair}: "
+                f"{base_asset} avail={avail_base:.8f} total={total_base:.8f} | "
+                f"{quote_asset} avail={avail_quote:.8f} total={total_quote:.8f}"
+            )
+        except Exception as e:
+            self.logger().debug(f"[BALANCE {context}] Failed to log: {e}")
+
     def create_executor(self, action: CreateExecutorAction):
         """
         Create an executor based on the configuration in the action.
         """
         controller_id = action.controller_id
         executor_config = action.executor_config
-
-        # For now, we replace the controller ID in the executor config with the actual controller object to mantain
-        # compa
         executor_config.controller_id = controller_id
+
+        # Log balance BEFORE order placement
+        connector_name = getattr(executor_config, 'connector_name', None)
+        trading_pair = getattr(executor_config, 'trading_pair', None)
+        side = getattr(executor_config, 'side', None)
+        amount = getattr(executor_config, 'amount', None)
+        price = getattr(executor_config, 'entry_price', None) or getattr(executor_config, 'price', None)
+        if connector_name and trading_pair:
+            self.logger().info(
+                f"[ORDER PRE] Creating {side.name if side else '?'} order: "
+                f"{amount} {trading_pair} @ {price} on {connector_name}"
+            )
+            self._log_balance_snapshot(connector_name, trading_pair, "PRE-ORDER")
 
         executor_class = self._executor_mapping.get(executor_config.type)
         if executor_class is not None:
@@ -577,7 +622,11 @@ class ExecutorOrchestrator:
 
         executor.start()
         self.active_executors[controller_id].append(executor)
-        # MarketsRecorder.get_instance().store_or_update_executor(executor)
+
+        # Log balance AFTER order placement
+        if connector_name and trading_pair:
+            self._log_balance_snapshot(connector_name, trading_pair, "POST-ORDER")
+
         self.logger().debug(f"Created {type(executor).__name__} for controller {controller_id}")
 
     def stop_executor(self, action: StopExecutorAction):

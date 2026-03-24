@@ -66,11 +66,15 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 "id": self._next_ws_id()
             })
             await websocket_assistant.send(subscribe_user_balance_request)
-            self.logger().info("NonKYC private balance WebSocket: ENABLED (real-time balance updates active)")
+            self.logger().info(
+                "NonKYC private balance WebSocket: subscription REQUESTED "
+                "(undocumented method — will confirm on first balance event, "
+                "REST polling active as fallback)"
+            )
         except Exception as e:
             self.logger().warning(
-                f"NonKYC private balance WebSocket: UNAVAILABLE (undocumented method rejected). "
-                f"Falling back to REST polling for balance updates."
+                f"NonKYC private balance WebSocket: UNAVAILABLE (subscription request failed: {e}). "
+                f"Using REST polling for balance updates."
             )
 
     async def _get_ws_assistant(self) -> WSAssistant:

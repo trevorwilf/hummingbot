@@ -288,6 +288,7 @@ class StrategyV2Base(StrategyPyBase):
             initial_positions_by_controller=self._collect_initial_positions()
         )
         self._wallet_balances_seeded: bool = False
+        self._startup_gate = asyncio.Event()  # Controllers wait on this before emitting actions
 
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
@@ -326,9 +327,16 @@ class StrategyV2Base(StrategyPyBase):
                     # check_position_rebalance() would see empty positions_held and
                     # fire a spurious buy order on the first tick.
                     self.update_executors_info()
+                # Release startup gate once seeding is done (or was not needed)
+                if self._wallet_balances_seeded and not self._startup_gate.is_set():
+                    self.logger().info("Startup gate: wallet seeding complete, releasing controllers for trading")
+                    self._startup_gate.set()
                 executor_actions: List[ExecutorAction] = self.determine_executor_actions()
                 for action in executor_actions:
                     self.executor_orchestrator.execute_action(action)
+
+    def is_startup_ready(self) -> bool:
+        return self._startup_gate.is_set()
 
     async def on_stop(self):
         """
@@ -634,6 +642,7 @@ class StrategyV2Base(StrategyPyBase):
 
         # Start controllers
         for controller in self.controllers.values():
+            controller.set_startup_gate(self._startup_gate)
             controller.start()
 
     def apply_initial_setting(self):
@@ -719,6 +728,18 @@ class StrategyV2Base(StrategyPyBase):
                     f"Wallet seed failed for {controller_id}: {e}", exc_info=True
                 )
                 controller._wallet_balance_seeded = True  # Don't retry on error
+
+        # Emit startup summary for each controller
+        for controller_id, controller in self.controllers.items():
+            config = controller.config
+            self.logger().info(
+                f"[STARTUP SUMMARY] Controller {controller_id}: "
+                f"pair={getattr(config, 'trading_pair', 'N/A')}, "
+                f"connector={getattr(config, 'connector_name', 'N/A')}, "
+                f"use_wallet_balance={getattr(config, 'use_wallet_balance', False)}, "
+                f"skip_rebalance={getattr(config, 'skip_rebalance', False)}, "
+                f"total_amount_quote={getattr(config, 'total_amount_quote', 'N/A')}"
+            )
 
     def initialize_controllers(self):
         """

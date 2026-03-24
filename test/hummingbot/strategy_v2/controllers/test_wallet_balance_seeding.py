@@ -557,10 +557,12 @@ class TestOnTickRefreshAfterSeed(IsolatedAsyncioWrapperTestCase):
         """Build a mock strategy that tracks call order."""
         from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 
+        import asyncio as _asyncio
         strategy = MagicMock(spec=StrategyV2Base)
         strategy.controllers = {"ctrl1": MagicMock()}
         strategy._is_stop_triggered = False
         strategy._wallet_balances_seeded = False
+        strategy._startup_gate = _asyncio.Event()
 
         # Track call order
         call_log = []
