@@ -14,6 +14,7 @@ from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 
 
 class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
@@ -53,6 +54,10 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.resume_test_event = asyncio.Event()
 
         self.connector._set_trading_pair_symbol_map(bidict({self.ex_trading_pair: self.trading_pair}))
+
+        # Pre-establish bridge so existing diff tests work without needing snapshot first
+        self.data_source._snapshot_version[self.trading_pair] = 0
+        self.data_source._bridge_established[self.trading_pair] = True
 
     def tearDown(self) -> None:
         self.listening_task and self.listening_task.cancel()
@@ -589,16 +594,22 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, self.data_source._resync_failure_count[self.trading_pair])
         self.assertGreater(self.data_source._resync_next_allowed_time[self.trading_pair], time.time())
 
-    async def test_max_resync_failures_triggers_reconnect(self):
-        """Exceeding max resync failures should raise ConnectionError."""
+    async def test_max_resync_failures_disconnects_ws(self):
+        """Exceeding max resync failures should disconnect WS instead of raising."""
         self.data_source._resync_pending[self.trading_pair] = True
         self.data_source._resync_failure_count[self.trading_pair] = (
             self.data_source.SNAPSHOT_RESYNC_MAX_FAILURES
         )
         self.data_source._resync_next_allowed_time[self.trading_pair] = 0
 
-        with self.assertRaises(ConnectionError):
-            await self.data_source._attempt_resync(self.trading_pair)
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        # Should NOT raise — should disconnect instead
+        await self.data_source._attempt_resync(self.trading_pair)
+
+        mock_ws.disconnect.assert_called_once()
+        self.assertFalse(self.data_source._resync_pending.get(self.trading_pair, False))
 
     async def test_successful_resync_clears_state(self):
         """Successful resync should clear all failure tracking."""
@@ -646,3 +657,55 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             mock_resync.assert_called_once_with(self.trading_pair)
         # Diff should still be dropped (resync handles it)
         self.assertEqual(0, msg_queue.qsize())
+
+    # --- Snapshot bridge validation tests ---
+
+    async def test_bridge_validation_accepts_valid_bridge(self):
+        """Diff bridging the snapshot version should be accepted."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 100
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("98", "102")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        self.assertEqual(1, msg_queue.qsize())
+        self.assertTrue(self.data_source._bridge_established[self.trading_pair])
+
+    async def test_bridge_validation_rejects_stale_diff(self):
+        """Diff with toVersion < snapshot version should be dropped."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 100
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("90", "95")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        self.assertEqual(0, msg_queue.qsize())
+        self.assertFalse(self.data_source._bridge_established[self.trading_pair])
+
+    async def test_bridge_validation_reinitializes_on_gap(self):
+        """Diff with fromVersion > snapshot version should trigger resync."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 100
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("105", "110")
+
+        with patch.object(self.data_source, '_initiate_resync', new_callable=AsyncMock) as mock_resync:
+            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+            mock_resync.assert_called_once_with(self.trading_pair)
+
+        self.assertEqual(0, msg_queue.qsize())
+
+    async def test_bridge_state_cleared_on_interruption(self):
+        """Stream interruption should clear all bridge tracking state."""
+        self.data_source._bridge_established[self.trading_pair] = True
+        self.data_source._snapshot_version[self.trading_pair] = 100
+        self.data_source._last_to_version[self.trading_pair] = 200
+
+        await self.data_source._on_order_stream_interruption(None)
+
+        self.assertEqual({}, self.data_source._bridge_established)
+        self.assertEqual({}, self.data_source._snapshot_version)
+        self.assertEqual({}, self.data_source._last_to_version)

@@ -49,6 +49,10 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._resync_pending: Dict[str, bool] = {}
         self._resync_failure_count: Dict[str, int] = {}
         self._resync_next_allowed_time: Dict[str, float] = {}
+        # Snapshot bridge validation
+        self._snapshot_version: Dict[str, int] = {}
+        self._bridge_established: Dict[str, bool] = {}
+        self._stream_generation: int = 0
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -132,6 +136,9 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             snapshot_timestamp,
             metadata={"trading_pair": trading_pair}
         )
+        # Store snapshot version for bridge validation
+        self._snapshot_version[trading_pair] = snapshot_msg.update_id
+        self._bridge_established[trading_pair] = False
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
@@ -165,8 +172,34 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         to_version = order_book_message.update_id
         last_to = self._last_to_version.get(trading_pair)
 
-        # If we don't have continuity state yet (first diff after startup/reconnect),
-        # accept the diff and start tracking
+        # Bridge validation: first diff after startup/reconnect must bridge the snapshot
+        if not self._bridge_established.get(trading_pair, False):
+            snapshot_ver = self._snapshot_version.get(trading_pair)
+            if snapshot_ver is None:
+                return  # No snapshot yet — drop diff
+
+            if to_version < snapshot_ver:
+                return  # Stale diff from before snapshot — drop
+
+            if from_version is not None and from_version > snapshot_ver:
+                self.logger().warning(
+                    f"MEXC bridge gap for {trading_pair}: snapshot_version={snapshot_ver}, "
+                    f"first diff fromVersion={from_version}. Reinitializing."
+                )
+                await self._initiate_resync(trading_pair)
+                return
+
+            # Bridge condition met: fromVersion <= snapshot_ver <= toVersion
+            self._bridge_established[trading_pair] = True
+            self._last_to_version[trading_pair] = to_version
+            message_queue.put_nowait(order_book_message)
+            self.logger().info(
+                f"MEXC order book bridge established for {trading_pair}: "
+                f"snapshot_ver={snapshot_ver}, bridge=[{from_version},{to_version}]"
+            )
+            return
+
+        # If no continuity baseline yet (bridge was established but no diffs tracked), accept
         if last_to is None:
             self._last_to_version[trading_pair] = to_version
             message_queue.put_nowait(order_book_message)
@@ -204,18 +237,20 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         failure_count = self._resync_failure_count.get(trading_pair, 0)
 
-        # Check if max failures exceeded -- trigger reconnect
+        # Check if max failures exceeded -- trigger reconnect via explicit disconnect
         if failure_count >= self.SNAPSHOT_RESYNC_MAX_FAILURES:
             self.logger().warning(
                 f"MEXC order book resync for {trading_pair} failed "
-                f"{failure_count} consecutive times. Triggering WebSocket reconnect."
+                f"{failure_count} consecutive times. Forcing WebSocket disconnect."
             )
             self._resync_failure_count[trading_pair] = 0
             self._resync_pending[trading_pair] = False
-            raise ConnectionError(
-                f"MEXC order book resync for {trading_pair} failed "
-                f"{failure_count} times -- triggering reconnect"
-            )
+            if self._ws_assistant is not None:
+                try:
+                    await self._ws_assistant.disconnect()
+                except Exception:
+                    self.logger().debug("Error disconnecting WS during max resync", exc_info=True)
+            return  # listen_for_subscriptions will handle reconnect
 
         self.logger().info(
             f"MEXC order book resync for {trading_pair} "
@@ -275,10 +310,13 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
         """Clear all continuity tracking state on websocket interruption."""
+        self._stream_generation += 1
         self._last_to_version.clear()
         self._resync_pending.clear()
         self._resync_failure_count.clear()
         self._resync_next_allowed_time.clear()
+        self._snapshot_version.clear()
+        self._bridge_established.clear()
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:

@@ -37,6 +37,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         self._last_sequence: Dict[str, int] = {}
         self._ws_request_id: int = 0  # JSON-RPC 2.0 request id counter
+        self._stream_generation: int = 0
 
     def _next_ws_id(self) -> int:
         """Returns the next JSON-RPC 2.0 request id."""
@@ -133,6 +134,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        gen_before = self._stream_generation
         if "result" not in raw_message:
             params = raw_message.get("params", {})
             symbol = params.get("symbol")
@@ -141,12 +143,13 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             last_seq = self._last_sequence.get(trading_pair, 0)
 
             if sequence <= last_seq:
-                # Duplicate or stale message, skip
                 return
 
             if last_seq > 0 and sequence > last_seq + 1:
-                # Gap detected — reconnect websocket for clean resync
                 await self._handle_sequence_gap(trading_pair, last_seq, sequence)
+                return
+
+            if self._stream_generation != gen_before:
                 return
 
             self._last_sequence[trading_pair] = sequence
@@ -155,35 +158,24 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(order_book_message)
 
     async def _handle_sequence_gap(self, trading_pair: str, expected_seq: int, received_seq: int):
-        """
-        Handle an order book sequence gap by triggering a full WebSocket reconnect.
-
-        The NonKYC REST order book snapshot uses a different sequence space than the
-        WebSocket diff stream.  Attempting to use the REST snapshot sequence as a
-        resume baseline for the WS diff stream causes an infinite resync loop.
-
-        The correct recovery is:
-        1. Log the gap
-        2. Clear local sequence tracking
-        3. Raise ConnectionError to trigger the parent class's reconnect logic
-        4. On reconnect, the WS will deliver a fresh snapshotOrderbook with the
-           correct sequence baseline, and diffs resume normally.
-        """
         self.logger().warning(
             f"Orderbook sequence gap for {trading_pair}: expected {expected_seq + 1}, "
-            f"got {received_seq}. Triggering WebSocket reconnect for clean resync."
+            f"got {received_seq}. Forcing WebSocket disconnect for clean resync."
         )
-        # Clear all sequence tracking for this pair -- fresh start on reconnect
         self._last_sequence.pop(trading_pair, None)
-
-        raise ConnectionError(
-            f"NonKYC order book sequence gap for {trading_pair}: "
-            f"expected {expected_seq + 1}, got {received_seq} -- reconnecting"
-        )
+        self._stream_generation += 1
+        if self._ws_assistant is not None:
+            try:
+                await self._ws_assistant.disconnect()
+            except Exception:
+                self.logger().debug("Error disconnecting WS during gap recovery", exc_info=True)
 
     async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
+        gen_before = self._stream_generation
         # Handle pre-parsed OrderBookMessage from REST resync path
         if isinstance(raw_message, OrderBookMessage):
+            if self._stream_generation != gen_before:
+                return
             self._last_sequence[raw_message.trading_pair] = int(raw_message.update_id)
             message_queue.put_nowait(raw_message)
             return
@@ -196,11 +188,29 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._last_sequence[trading_pair] = sequence
             snapshot_msg: OrderBookMessage = NonkycOrderBook.snapshot_message_from_exchange(
                 params, time.time(), metadata={"trading_pair": trading_pair})
+            if self._stream_generation != gen_before:
+                return
             message_queue.put_nowait(snapshot_msg)
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
+        self._stream_generation += 1
         self._last_sequence.clear()
+        self._drain_public_message_queues()
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
+
+    def _drain_public_message_queues(self):
+        for key in [self._diff_messages_queue_key, self._snapshot_messages_queue_key]:
+            q = self._message_queue.get(key)
+            if q is not None:
+                drained = 0
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                        drained += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if drained > 0:
+                    self.logger().info(f"Drained {drained} stale messages from {key} queue")
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         channel = ""

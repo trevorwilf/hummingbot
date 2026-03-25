@@ -180,8 +180,10 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(CONSTANTS.TRADE_EVENT_TYPE, channel)
 
     async def test_sequence_gap_triggers_reconnect(self):
-        """Sequence gap raises ConnectionError to trigger WS reconnect instead of REST resync."""
+        """Sequence gap disconnects WS for clean resync instead of raising ConnectionError."""
         self.data_source._last_sequence[self.trading_pair] = 100
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
 
         msg_queue = asyncio.Queue()
         raw_message = {
@@ -196,11 +198,13 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             },
         }
 
-        with self.assertRaises(ConnectionError):
-            await self.data_source._parse_order_book_diff_message(raw_message, msg_queue)
+        await self.data_source._parse_order_book_diff_message(raw_message, msg_queue)
 
         # Verify warning was logged
         self.assertTrue(self.is_logged("WARNING", "sequence gap"))
+        mock_ws.disconnect.assert_called_once()
+        self.assertNotIn(self.trading_pair, self.data_source._last_sequence)
+        self.assertEqual(1, self.data_source._stream_generation)
 
     async def test_duplicate_sequence_skipped(self):
         self.data_source._last_sequence[self.trading_pair] = 100
@@ -314,29 +318,34 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE] = snapshot_queue
         return snapshot_queue
 
-    async def test_sequence_gap_raises_connection_error(self):
-        """When a sequence gap is detected, ConnectionError should be raised to trigger reconnect."""
+    async def test_sequence_gap_disconnects_ws(self):
+        """When a sequence gap is detected, WS should be disconnected for clean resync."""
         self.data_source._last_sequence[self.trading_pair] = 100
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
         msg_queue = asyncio.Queue()
 
-        with self.assertRaises(ConnectionError):
-            await self.data_source._parse_order_book_diff_message(
-                self._make_diff_message(105), msg_queue
-            )
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(105), msg_queue
+        )
         # Sequence tracking should be cleared for this pair
         self.assertNotIn(self.trading_pair, self.data_source._last_sequence)
+        mock_ws.disconnect.assert_called_once()
+        self.assertEqual(1, self.data_source._stream_generation)
 
     async def test_no_rest_snapshot_on_gap(self):
         """Verify that _request_order_book_snapshot is NOT called on sequence gap."""
         self.data_source._last_sequence[self.trading_pair] = 100
         self.data_source._request_order_book_snapshot = AsyncMock()
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
 
-        with self.assertRaises(ConnectionError):
-            await self.data_source._parse_order_book_diff_message(
-                self._make_diff_message(105), asyncio.Queue()
-            )
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(105), asyncio.Queue()
+        )
 
         self.data_source._request_order_book_snapshot.assert_not_called()
+        mock_ws.disconnect.assert_called_once()
 
     async def test_duplicate_sequence_is_dropped(self):
         """Messages with sequence <= last seen should be silently dropped."""
@@ -364,25 +373,30 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         Replay the exact production failure pattern:
         - last WS diff seq = 3441
         - incoming diff seq = 3443 (gap of 1)
-        - Should trigger reconnect, NOT try REST snapshot
+        - Should trigger disconnect, NOT try REST snapshot
         """
         self.data_source._last_sequence[self.trading_pair] = 3441
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
 
-        with self.assertRaises(ConnectionError):
-            await self.data_source._parse_order_book_diff_message(
-                self._make_diff_message(3443), asyncio.Queue()
-            )
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(3443), asyncio.Queue()
+        )
 
-        # After reconnect, sequence tracking should be cleared
+        # After disconnect, sequence tracking should be cleared
         self.assertNotIn(self.trading_pair, self.data_source._last_sequence)
+        mock_ws.disconnect.assert_called_once()
+        self.assertEqual(1, self.data_source._stream_generation)
 
     async def test_ws_interruption_clears_sequence_state(self):
-        """WebSocket interruption should clear sequence tracking."""
+        """WebSocket interruption should clear sequence tracking and increment generation."""
         self.data_source._last_sequence[self.trading_pair] = 100
+        gen_before = self.data_source._stream_generation
 
         await self.data_source._on_order_stream_interruption(None)
 
         self.assertEqual({}, self.data_source._last_sequence)
+        self.assertEqual(gen_before + 1, self.data_source._stream_generation)
 
     async def test_listen_for_subscriptions_invokes_interruption_cleanup(self):
         """Integration test: base class listen_for_subscriptions() should invoke _on_order_stream_interruption."""
@@ -409,3 +423,79 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
                 pass
 
         self.assertEqual({}, self.data_source._last_sequence)
+
+    async def test_stream_generation_increments_on_gap(self):
+        """Stream generation counter should increment each time a gap is detected."""
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        self.assertEqual(0, self.data_source._stream_generation)
+
+        # First gap
+        self.data_source._last_sequence[self.trading_pair] = 100
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(105), asyncio.Queue()
+        )
+        self.assertEqual(1, self.data_source._stream_generation)
+
+        # Second gap
+        self.data_source._last_sequence[self.trading_pair] = 200
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(210), asyncio.Queue()
+        )
+        self.assertEqual(2, self.data_source._stream_generation)
+
+    async def test_queue_drained_on_interruption(self):
+        """Stale messages in diff and snapshot queues should be drained on stream interruption."""
+        diff_queue = asyncio.Queue()
+        snapshot_queue = asyncio.Queue()
+        self.data_source._message_queue[CONSTANTS.DIFF_EVENT_TYPE] = diff_queue
+        self.data_source._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE] = snapshot_queue
+
+        # Put some stale messages
+        for i in range(5):
+            diff_queue.put_nowait(f"stale_diff_{i}")
+        for i in range(3):
+            snapshot_queue.put_nowait(f"stale_snapshot_{i}")
+
+        await self.data_source._on_order_stream_interruption(None)
+
+        self.assertTrue(diff_queue.empty())
+        self.assertTrue(snapshot_queue.empty())
+        self.assertTrue(self.is_logged("INFO", "Drained 5 stale messages"))
+        self.assertTrue(self.is_logged("INFO", "Drained 3 stale messages"))
+
+    async def test_stale_diff_rejected_after_generation_change(self):
+        """A diff message should be rejected if generation changes during processing (gap detected)."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        msg_queue = asyncio.Queue()
+
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        # Trigger a gap - this will bump generation and disconnect
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(105), msg_queue
+        )
+
+        # Queue should be empty - the diff after gap detection is not enqueued
+        self.assertTrue(msg_queue.empty())
+        # Generation was incremented
+        self.assertEqual(1, self.data_source._stream_generation)
+
+    async def test_generation_tracked_across_interruptions(self):
+        """Stream generation should monotonically increase across interruptions."""
+        self.assertEqual(0, self.data_source._stream_generation)
+
+        await self.data_source._on_order_stream_interruption(None)
+        self.assertEqual(1, self.data_source._stream_generation)
+
+        await self.data_source._on_order_stream_interruption(None)
+        self.assertEqual(2, self.data_source._stream_generation)
+
+        # Gap detection also increments
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+        self.data_source._last_sequence[self.trading_pair] = 100
+        await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
+        self.assertEqual(3, self.data_source._stream_generation)

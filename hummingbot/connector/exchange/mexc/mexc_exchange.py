@@ -177,7 +177,9 @@ class MexcExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
-        is_maker = order_type is OrderType.LIMIT_MAKER
+        # Honor explicit is_maker if provided; otherwise infer from order type
+        if is_maker is None:
+            is_maker = order_type is OrderType.LIMIT_MAKER
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _place_order(self,
@@ -345,9 +347,17 @@ class MexcExchange(ExchangePyBase):
 
     def _create_order_update_with_order_status_data(self, order_status: Dict[str, Any], order: InFlightOrder):
         client_order_id = str(order_status.get("clientId", ""))
+        # Prefer sendTime (event time) over createTime (order creation time).
+        # sendTime is the top-level field in WS order events; createTime is when the order was placed.
+        # For REST responses, use updateTime if available, then createTime as fallback.
+        timestamp_ms = (
+            order_status.get("sendTime")
+            or order_status.get("updateTime")
+            or order_status.get("createTime")
+        )
         order_update = OrderUpdate(
             trading_pair=order.trading_pair,
-            update_timestamp=float(order_status["createTime"]) * 1e-3,
+            update_timestamp=float(timestamp_ms) * 1e-3,
             new_state=CONSTANTS.WS_ORDER_STATE[order_status["status"]],
             client_order_id=client_order_id,
             exchange_order_id=str(order_status["id"]),

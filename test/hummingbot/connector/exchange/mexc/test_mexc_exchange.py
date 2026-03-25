@@ -1321,3 +1321,38 @@ class MexcExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 "isBestMatch": True
             }
         ]
+
+    # --- Order update timestamp tests (Issue 5) ---
+
+    def test_order_update_uses_send_time(self):
+        """sendTime should be preferred over createTime for order update timestamp."""
+        from unittest.mock import MagicMock as _MM
+        order_status = {"id": "12345", "clientId": "HBOT-001", "status": 2,
+                        "sendTime": 1000, "createTime": 500}
+        mock_order = _MM()
+        mock_order.trading_pair = "BTC-USDT"
+        result = self.exchange._create_order_update_with_order_status_data(order_status, mock_order)
+        self.assertEqual(1.0, result.update_timestamp)
+
+    def test_order_update_falls_back_to_create_time(self):
+        """Without sendTime, createTime should be used as fallback."""
+        from unittest.mock import MagicMock as _MM
+        order_status = {"id": "12345", "clientId": "HBOT-001", "status": 2, "createTime": 500}
+        mock_order = _MM()
+        mock_order.trading_pair = "BTC-USDT"
+        result = self.exchange._create_order_update_with_order_status_data(order_status, mock_order)
+        self.assertEqual(0.5, result.update_timestamp)
+
+    # --- Fee estimation tests (Issue 6) ---
+
+    def test_fee_estimation_honors_explicit_is_maker(self):
+        """Explicit is_maker=True should return maker fee even for LIMIT order."""
+        fee = self.exchange._get_fee("BTC", "USDT", OrderType.LIMIT, TradeType.BUY,
+                                     Decimal("1"), is_maker=True)
+        self.assertIsNotNone(fee)
+
+    def test_fee_estimation_limit_maker_infers_maker(self):
+        """LIMIT_MAKER with is_maker=None should infer maker."""
+        fee = self.exchange._get_fee("BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY,
+                                     Decimal("1"), is_maker=None)
+        self.assertIsNotNone(fee)
