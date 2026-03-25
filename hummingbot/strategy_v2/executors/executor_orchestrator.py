@@ -155,6 +155,12 @@ class ExecutorOrchestrator:
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
+    def _log_event(self, event_name: str, **kwargs):
+        import json, time
+        event = {"timestamp": time.time(), "event_name": event_name}
+        event.update(kwargs)
+        self.logger().info(f"[EVENT] {json.dumps(event, default=str)}")
+
     def __init__(self,
                  strategy: "StrategyV2Base",
                  executors_update_interval: float = 1.0,

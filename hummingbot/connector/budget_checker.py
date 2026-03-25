@@ -1,8 +1,11 @@
+import logging
 import typing
 from collections import defaultdict
 from copy import copy
 from decimal import Decimal
 from typing import Dict, List
+
+logger = logging.getLogger(__name__)
 
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 
@@ -96,8 +99,19 @@ class BudgetChecker:
         """
         order_candidate = self.populate_collateral_entries(order_candidate)
         available_balances = self._get_available_balances(order_candidate)
+
+        logger.debug(
+            f"BudgetChecker: pair={order_candidate.trading_pair} "
+            f"side={order_candidate.order_side.name} amount={order_candidate.amount} "
+            f"price={order_candidate.price} available={dict(available_balances)}"
+        )
+
         order_candidate.adjust_from_balances(available_balances)
         if order_candidate.resized:
+            logger.debug(
+                f"BudgetChecker RESIZED: pair={order_candidate.trading_pair} "
+                f"side={order_candidate.order_side.name} all_or_none={all_or_none}"
+            )
             if all_or_none:
                 order_candidate.set_to_zero()
             else:

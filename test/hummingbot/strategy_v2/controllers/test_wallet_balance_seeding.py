@@ -312,6 +312,7 @@ class TestSeedWalletBalances(IsolatedAsyncioWrapperTestCase):
         strategy.market_data_provider = MagicMock(spec=MarketDataProvider)
         strategy.executor_orchestrator = MagicMock()
         strategy._wallet_balances_seeded = False
+        strategy._current_cycle_id = "test_cycle"
         strategy.logger = MagicMock(return_value=MagicMock())
         # Bind the real method to our mock
         strategy._seed_wallet_balances = StrategyV2Base._seed_wallet_balances.__get__(strategy)

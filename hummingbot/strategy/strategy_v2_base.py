@@ -289,6 +289,7 @@ class StrategyV2Base(StrategyPyBase):
         )
         self._wallet_balances_seeded: bool = False
         self._startup_gate = asyncio.Event()  # Controllers wait on this before emitting actions
+        self._current_cycle_id: str = ""
 
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
@@ -316,6 +317,8 @@ class StrategyV2Base(StrategyPyBase):
         Simple scripts override this method for custom logic.
         """
         if self.controllers:
+            import time as _tick_time
+            self._current_cycle_id = str(int(_tick_time.time() * 1000))
             self.update_executors_info()
             self.update_controllers_configs()
             if self.market_data_provider.ready and not self._is_stop_triggered:
@@ -645,6 +648,18 @@ class StrategyV2Base(StrategyPyBase):
             controller.set_startup_gate(self._startup_gate)
             controller.start()
 
+        self.logger().info(
+            f"=== STRATEGY STARTED === controllers={list(self.controllers.keys())} "
+            f"connectors={list(self.connectors.keys())} "
+            f"wallet_seeded={self._wallet_balances_seeded}"
+        )
+
+    def _log_event(self, event_name: str, **kwargs):
+        import json, time
+        event = {"timestamp": time.time(), "event_name": event_name, "cycle_id": getattr(self, '_current_cycle_id', '')}
+        event.update(kwargs)
+        self.logger().info(f"[EVENT] {json.dumps(event, default=str)}")
+
     def apply_initial_setting(self):
         """
         Apply initial settings for the strategy, such as setting position mode and leverage for all connectors.
@@ -681,6 +696,10 @@ class StrategyV2Base(StrategyPyBase):
         and injects min(available, required) as a PositionHold in the orchestrator.
         """
         self._wallet_balances_seeded = True  # Set first to avoid re-entry
+
+        self.logger().info(
+            f"[cycle={self._current_cycle_id}] Wallet seed pass starting"
+        )
 
         for controller_id, controller in self.controllers.items():
             config = controller.config

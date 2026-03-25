@@ -101,6 +101,15 @@ class StartCommand(GatewayChainApiManager):
                      override_log_level=log_level.upper() if log_level else None,
                      strategy_file_path=self.strategy_file_name)
 
+        import logging as _logging
+        _strategy_log = _logging.getLogger("hummingbot.strategy_v2")
+        _strategy_log.info(
+            f"=== LOGGING INITIALIZED === "
+            f"strategy={self.strategy_file_name} | "
+            f"strategy_v2.level={_logging.getLevelName(_strategy_log.getEffectiveLevel())} | "
+            f"handlers={[h.__class__.__name__ for h in _strategy_log.handlers]}"
+        )
+
         # If macOS, disable App Nap.
         if platform.system() == "Darwin":
             import appnope

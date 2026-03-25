@@ -731,9 +731,15 @@ class NonkycExchange(ExchangePyBase):
                     balance_entries = event_message.get("result", [])
                     for balance_entry in balance_entries:
                         asset_name = balance_entry["ticker"]
-                        # WS uses 'ticker' not 'asset'; same fields: available + held (pending excluded)
                         free_balance = Decimal(balance_entry["available"])
                         total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
+                        old_free = self._account_available_balances.get(asset_name, Decimal("0"))
+                        old_total = self._account_balances.get(asset_name, Decimal("0"))
+                        if free_balance != old_free or total_balance != old_total:
+                            self.logger().debug(
+                                f"NonKYC balance delta: source=currentBalances asset={asset_name} "
+                                f"free {old_free}->{free_balance} total {old_total}->{total_balance}"
+                            )
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
 
@@ -743,9 +749,14 @@ class NonkycExchange(ExchangePyBase):
                         self.logger().warning("Received balanceUpdate with empty params, skipping.")
                         continue
                     asset_name = balance_entry["ticker"]
-                    # Incremental balance update -- same formula: available + held (pending excluded)
                     free_balance = Decimal(balance_entry["available"])
                     total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
+                    old_free = self._account_available_balances.get(asset_name, Decimal("0"))
+                    old_total = self._account_balances.get(asset_name, Decimal("0"))
+                    self.logger().debug(
+                        f"NonKYC balance delta: source=balanceUpdate asset={asset_name} "
+                        f"free {old_free}->{free_balance} total {old_total}->{total_balance}"
+                    )
                     self._account_available_balances[asset_name] = free_balance
                     self._account_balances[asset_name] = total_balance
 

@@ -379,6 +379,12 @@ class MarketMakingControllerBase(ControllerBase):
         """
         create_actions = []
 
+        self.logger().debug(
+            f"Action proposal: controller={self.config.id} pair={self.config.trading_pair} "
+            f"ref_price={self.processed_data.get('reference_price', 'N/A')} "
+            f"spread_mult={self.processed_data.get('spread_multiplier', 'N/A')}"
+        )
+
         # Check if we need to rebalance position first
         position_rebalance_action = self.check_position_rebalance()
         if position_rebalance_action is not None:
@@ -444,6 +450,13 @@ class MarketMakingControllerBase(ControllerBase):
                     controller_id=self.config.id,
                     executor_config=executor_config
                 ))
+
+        buy_count = sum(1 for a in create_actions if hasattr(a, 'executor_config') and a.executor_config.side == TradeType.BUY)
+        sell_count = sum(1 for a in create_actions if hasattr(a, 'executor_config') and a.executor_config.side == TradeType.SELL)
+        self.logger().info(
+            f"Action proposal result: controller={self.config.id} "
+            f"total_actions={len(create_actions)} buys={buy_count} sells={sell_count}"
+        )
         return create_actions
 
     def get_levels_to_execute(self) -> List[str]:

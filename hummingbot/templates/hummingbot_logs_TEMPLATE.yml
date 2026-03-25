@@ -1,15 +1,18 @@
 ---
 version: 1
-template_version: 12
+template_version: 13
 
 formatters:
     simple:
         format: "%(asctime)s - %(process)d - %(name)s - %(levelname)s - %(message)s"
+    forensic:
+        format: "%(asctime)s - %(process)d - %(name)s:%(funcName)s:%(lineno)d - %(levelname)s - %(message)s"
+        datefmt: "%Y-%m-%dT%H:%M:%S"
 
 handlers:
     console:
         class: hummingbot.logger.cli_handler.CLIHandler
-        level: DEBUG
+        level: INFO
         formatter: simple
         stream: ext://sys.stdout
     console_warning:
@@ -30,7 +33,16 @@ handlers:
         encoding: utf8
         when: "D"
         interval: 1
-        backupCount: 7
+        backupCount: 14
+    forensic_file_handler:
+        class: logging.handlers.TimedRotatingFileHandler
+        level: DEBUG
+        formatter: forensic
+        filename: $PROJECT_DIR/logs/forensics_$STRATEGY_FILE_PATH.log
+        encoding: utf8
+        when: "D"
+        interval: 1
+        backupCount: 30
     "null":
         class: logging.NullHandler
         level: DEBUG
@@ -66,6 +78,60 @@ loggers:
         propagate: false
         handlers: [console, file_handler]
         mqtt: true
+
+    # ---- strategy_v2 instrumentation (forensic-enabled) ----
+    hummingbot.strategy.strategy_v2_base:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+    hummingbot.strategy_v2:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+    hummingbot.strategy_v2.controllers:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+    hummingbot.strategy_v2.executors:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+
+    # ---- budget / balance instrumentation ----
+    hummingbot.connector.budget_checker:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+    hummingbot.connector.client_order_tracker:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+
+    # ---- connector-specific forensic logging ----
+    hummingbot.connector.exchange.nonkyc:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+    hummingbot.connector.exchange.mexc:
+        level: DEBUG
+        propagate: false
+        handlers: [console_info, file_handler, forensic_file_handler]
+        mqtt: true
+
+    # ---- throttler / transport (forensic only) ----
+    hummingbot.core.api_throttler:
+        level: DEBUG
+        propagate: false
+        handlers: [file_handler, forensic_file_handler]
+        mqtt: false
+
     hummingbot.core.event.event_reporter:
         level: EVENT_LOG
         propagate: false

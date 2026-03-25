@@ -897,8 +897,8 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         controller.executors_info = []
         self.mock_market_data_provider.time.return_value = current_time
 
-        # The logger is from RunnableBase: logging.getLogger(__name__) in runnable_base.py
-        logger = logging.getLogger("hummingbot.strategy_v2.runnable_base")
+        # The logger uses HummingbotLogger.logger_name_for_class(cls) which includes the class name
+        logger = logging.getLogger("hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerBase")
         with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
             with self.assertLogs(logger, level="DEBUG") as log:
                 controller.check_position_rebalance()
@@ -920,7 +920,7 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
             "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("5.0"), "buy_0")
         controller.executors_info = [real_exec]
 
-        logger = logging.getLogger("hummingbot.strategy_v2.runnable_base")
+        logger = logging.getLogger("hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerBase")
         with self.assertLogs(logger, level="DEBUG") as log:
             controller.get_inflight_buy_base_amount()
 
