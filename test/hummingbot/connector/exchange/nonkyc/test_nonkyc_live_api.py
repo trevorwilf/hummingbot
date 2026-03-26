@@ -2673,7 +2673,7 @@ def test_7a_post_auth_body_minified():
     req = RESTRequest(method=RESTMethod.POST,
                       url="https://api.nonkyc.io/api/v2/createorder",
                       data=json.dumps(body), is_auth_required=True)
-    configured = asyncio.get_event_loop().run_until_complete(auth.rest_authenticate(req))
+    configured = asyncio.run(auth.rest_authenticate(req))
 
     has_no_spaces = ": " not in configured.data and ", " not in configured.data
     result("7A-1: POST body is minified after auth", has_no_spaces, configured.data[:80])
@@ -2701,9 +2701,11 @@ def test_7a_get_auth_sorted_params():
     req_b = RESTRequest(method=RESTMethod.GET, url=url,
                         params={"symbol": "BTC/USDT", "status": "active"}, is_auth_required=True)
 
-    loop = asyncio.get_event_loop()
-    cfg_a = loop.run_until_complete(auth.rest_authenticate(req_a))
-    cfg_b = loop.run_until_complete(auth.rest_authenticate(req_b))
+    async def _authenticate_both():
+        a = await auth.rest_authenticate(req_a)
+        b = await auth.rest_authenticate(req_b)
+        return a, b
+    cfg_a, cfg_b = asyncio.run(_authenticate_both())
 
     same_sig = cfg_a.headers["X-API-SIGN"] == cfg_b.headers["X-API-SIGN"]
     result("7A-2: GET params sorted -- signatures match", same_sig,
@@ -3147,7 +3149,7 @@ def test_7b_live_ws_public_with_id():
             return responses
 
     try:
-        responses = asyncio.get_event_loop().run_until_complete(_ws_test())
+        responses = asyncio.run(_ws_test())
     except (OSError, Exception) as e:
         err_str = str(e)
         if "getaddrinfo" in err_str or "Network is unreachable" in err_str or "Connection refused" in err_str:
@@ -3208,7 +3210,7 @@ def test_7b_live_ws_auth_with_id(api_key=None, api_secret=None):
             except _asyncio.TimeoutError:
                 return None
 
-    resp = asyncio.get_event_loop().run_until_complete(_ws_auth_test())
+    resp = asyncio.run(_ws_auth_test())
 
     if resp:
         auth_ok = resp.get("result") is True
@@ -3247,7 +3249,7 @@ def test_7c_post_auth_signature_deterministic():
         assert len(req1.headers["X-API-SIGN"]) == 64  # SHA256 hex
         assert req1.headers["X-API-SIGN"] == req2.headers["X-API-SIGN"]
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     result("7C-1: POST auth signature deterministic", True)
 
 
@@ -3280,7 +3282,7 @@ def test_7c_get_auth_param_order_irrelevant():
         assert req_a.headers["X-API-SIGN"] == req_b.headers["X-API-SIGN"], \
             "Signatures should match for same logical params"
 
-    asyncio.get_event_loop().run_until_complete(_run())
+    asyncio.run(_run())
     result("7C-2: GET auth sorted canonical, same signature, no %2F", True)
 
 
