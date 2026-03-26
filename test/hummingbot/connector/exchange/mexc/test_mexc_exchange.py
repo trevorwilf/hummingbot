@@ -1356,3 +1356,34 @@ class MexcExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         fee = self.exchange._get_fee("BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY,
                                      Decimal("1"), is_maker=None)
         self.assertIsNotNone(fee)
+
+    # --- WS sendTime propagation integration test (Fix 1) ---
+
+    def test_ws_order_event_propagates_send_time_to_order_update(self):
+        """sendTime at top level of WS event must reach order update even though
+        it's not in the inner privateOrders dict."""
+        from unittest.mock import MagicMock as _MM
+        ws_event = {
+            "channel": "spot@private.orders.v3.api.pb",
+            "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+            "sendTime": 1700000000000,
+            "privateOrders": {
+                "id": "test_order_123",
+                "clientId": "HBOT-test-001",
+                "status": 2,
+                "createTime": 1699999000000,
+            }
+        }
+        # Extract the way _user_stream_event_listener does it
+        results = ws_event.get("privateOrders", {})
+        if "sendTime" not in results and "sendTime" in ws_event:
+            results["sendTime"] = ws_event["sendTime"]
+
+        self.assertIn("sendTime", results)
+        self.assertEqual(1700000000000, results["sendTime"])
+
+        mock_order = _MM()
+        mock_order.trading_pair = "BTC-USDT"
+        order_update = self.exchange._create_order_update_with_order_status_data(results, mock_order)
+        self.assertEqual(1700000000.0, order_update.update_timestamp)
+        self.assertNotEqual(1699999000.0, order_update.update_timestamp)

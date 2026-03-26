@@ -398,6 +398,73 @@ def test_ws_invalid_subscription():
     asyncio.get_event_loop().run_until_complete(_test())
 
 
+def test_ws_protobuf_trade_stream():
+    """Production protobuf trade channel returns decodable data."""
+    if websockets is None:
+        if pytest is not None:
+            pytest.skip("websockets not installed")
+        return
+
+    async def _test():
+        from hummingbot.connector.exchange.mexc.mexc_constants import (
+            WSS_URL, DEFAULT_DOMAIN, PUBLIC_TRADES_ENDPOINT_NAME
+        )
+        uri = WSS_URL.format(DEFAULT_DOMAIN)
+        channel = f"{PUBLIC_TRADES_ENDPOINT_NAME}@100ms@BTCUSDT"
+        async with websockets.connect(uri, close_timeout=5) as ws:
+            await ws.send(json.dumps({
+                "method": "SUBSCRIPTION",
+                "params": [channel],
+                "id": 1
+            }))
+            for _ in range(5):
+                response = await asyncio.wait_for(ws.recv(), timeout=15)
+                if isinstance(response, bytes):
+                    # Got protobuf binary data — this proves the channel works
+                    assert len(response) > 0
+                    return
+                else:
+                    data = json.loads(response)
+                    if "code" in data and data["code"] == 0:
+                        continue
+            pytest.fail("Did not receive protobuf binary data within 5 messages")
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
+def test_ws_protobuf_depth_stream():
+    """Production protobuf depth channel returns decodable data."""
+    if websockets is None:
+        if pytest is not None:
+            pytest.skip("websockets not installed")
+        return
+
+    async def _test():
+        from hummingbot.connector.exchange.mexc.mexc_constants import (
+            WSS_URL, DEFAULT_DOMAIN, PUBLIC_DIFF_ENDPOINT_NAME
+        )
+        uri = WSS_URL.format(DEFAULT_DOMAIN)
+        channel = f"{PUBLIC_DIFF_ENDPOINT_NAME}@100ms@BTCUSDT"
+        async with websockets.connect(uri, close_timeout=5) as ws:
+            await ws.send(json.dumps({
+                "method": "SUBSCRIPTION",
+                "params": [channel],
+                "id": 1
+            }))
+            for _ in range(5):
+                response = await asyncio.wait_for(ws.recv(), timeout=15)
+                if isinstance(response, bytes):
+                    assert len(response) > 0
+                    return
+                else:
+                    data = json.loads(response)
+                    if "code" in data and data["code"] == 0:
+                        continue
+            pytest.fail("Did not receive protobuf binary data within 5 messages")
+
+    asyncio.get_event_loop().run_until_complete(_test())
+
+
 # =============================================================================
 # TIER 1c: CONNECTOR INTEGRATION (uses hummingbot imports, still no auth)
 # =============================================================================
@@ -501,7 +568,7 @@ def test_auth_my_trades():
     assert isinstance(r.json(), list)
 
 
-def test_auth_bad_key_rejected():
+def test_invalid_key_rejected():
     """Using a fake API key should return 401 or signature error, not 500."""
     params = _mexc_sign({}, "fake_secret_key_12345")
     headers = _mexc_auth_headers("fake_api_key_12345")
@@ -592,10 +659,10 @@ def _run_standalone():
 
     # Always run bad-key test
     try:
-        test_auth_bad_key_rejected()
-        result("auth_bad_key_rejected", True)
+        test_invalid_key_rejected()
+        result("invalid_key_rejected", True)
     except Exception as e:
-        result("auth_bad_key_rejected", False, str(e))
+        result("invalid_key_rejected", False, str(e))
 
     print()
     print(f"Results: {_passed} passed, {_failed} failed")

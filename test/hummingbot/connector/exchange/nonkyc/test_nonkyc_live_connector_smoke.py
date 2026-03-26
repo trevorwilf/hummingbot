@@ -141,5 +141,66 @@ class TestNonkycLiveConnectorSmoke(unittest.TestCase):
         self.assertIsInstance(result, list)
 
 
+@pytest.mark.live_api
+class TestNonkycPublicWsSmoke(unittest.TestCase):
+    """Public WebSocket smoke tests — no API keys required."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(cls.loop)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, 'loop') and cls.loop and not cls.loop.is_closed():
+            cls.loop.run_until_complete(cls.loop.shutdown_asyncgens())
+            cls.loop.close()
+
+    def _run(self, coro):
+        return self.loop.run_until_complete(asyncio.wait_for(coro, timeout=30))
+
+    def test_public_ws_orderbook_snapshot(self):
+        """Connect to NonKYC WS and receive an orderbook snapshot."""
+        import websockets
+        import json as _json
+
+        async def check():
+            async with websockets.connect("wss://ws.nonkyc.io") as ws:
+                sub = {"method": "subscribeOrderbook", "params": {"symbol": "BTC/USDT"}, "id": 1}
+                await ws.send(_json.dumps(sub))
+                for _ in range(10):
+                    msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                    data = _json.loads(msg)
+                    if data.get("method") == "snapshotOrderbook":
+                        return data
+                return None
+
+        result = self._run(check())
+        self.assertIsNotNone(result, "Did not receive orderbook snapshot")
+        params = result.get("params", {})
+        self.assertIn("asks", params)
+        self.assertIn("bids", params)
+        self.assertIn("sequence", params)
+
+    def test_public_ws_trade_stream(self):
+        """Connect to NonKYC WS and receive ticker events."""
+        import websockets
+        import json as _json
+
+        async def check():
+            async with websockets.connect("wss://ws.nonkyc.io") as ws:
+                sub = {"method": "subscribeTicker", "params": {"symbol": "BTC/USDT"}, "id": 1}
+                await ws.send(_json.dumps(sub))
+                for _ in range(10):
+                    msg = await asyncio.wait_for(ws.recv(), timeout=15)
+                    data = _json.loads(msg)
+                    if data.get("method") == "ticker":
+                        return data
+                return None
+
+        result = self._run(check())
+        self.assertIsNotNone(result, "Did not receive ticker event")
+
+
 if __name__ == "__main__":
     unittest.main()

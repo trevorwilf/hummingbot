@@ -207,9 +207,13 @@ echo "║  SECTION 5: NONKYC LIVE API TESTS                           ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
 
+# Always run public NonKYC live tests (Tier 1 + Tier 5 don't need keys)
+run_test "NonKYC Live: test_nonkyc_live_api.py (public tests)" \
+    "$PYTEST_V $NONKYC/test_nonkyc_live_api.py -k 'not auth'"
+
 if [ "$HAVE_NONKYC_KEYS" = true ]; then
-    run_test "NonKYC Live: test_nonkyc_live_api.py" \
-        "$PYTEST_V $NONKYC/test_nonkyc_live_api.py"
+    run_test "NonKYC Live: test_nonkyc_live_api.py (authenticated tests)" \
+        "$PYTEST_V $NONKYC/test_nonkyc_live_api.py -k 'auth'"
 
     run_test "NonKYC Live: test_nonkyc_live_connector_smoke.py" \
         "$PYTEST_V $NONKYC/test_nonkyc_live_connector_smoke.py"
@@ -217,7 +221,7 @@ if [ "$HAVE_NONKYC_KEYS" = true ]; then
     run_test "NonKYC Live: nonkyc_auth_test.py (standalone)" \
         "python $NONKYC/nonkyc_auth_test.py"
 else
-    run_skip "NonKYC Live: test_nonkyc_live_api.py" \
+    run_skip "NonKYC Live: authenticated tests" \
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
     run_skip "NonKYC Live: test_nonkyc_live_connector_smoke.py" \
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
@@ -433,8 +437,8 @@ if [ ${#FAILED_SECTIONS[@]} -gt 0 ]; then
     echo ""
 fi
 
-echo "  NonKYC live tests: $([ "$HAVE_NONKYC_KEYS" = true ] && echo 'RAN' || echo 'SKIPPED')"
-echo "  MEXC live tests:   $([ "$HAVE_MEXC_KEYS" = true ] && echo 'RAN' || echo 'SKIPPED (no live tests exist yet)')"
+echo "  NonKYC live tests: $([ "$HAVE_NONKYC_KEYS" = true ] && echo 'RAN (public + authenticated)' || echo 'RAN (public only)')"
+echo "  MEXC live tests:   $([ "$HAVE_MEXC_KEYS" = true ] && echo 'RAN (public + authenticated)' || echo 'RAN (public only)')"
 echo ""
 echo "  Completed at: $(date)"
 echo ""

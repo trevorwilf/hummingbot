@@ -73,8 +73,9 @@ Rate oracle source: `hummingbot/core/rate_oracle/sources/nonkyc_rate_source.py`
 4. **Cancel by symbol required**: `/cancelallorders` requires a `symbol` parameter.
    When `cancel_all_orders_on_exchange(None)` is called, it fans out across all pairs with active orders.
 5. **No native stop-loss/take-profit**: Only `limit` and `market` order types
-6. **Order book recovery**: Diffs are dropped during resync (not applied to stale books).
-   After max resync failures, a `ConnectionError` triggers WebSocket reconnect.
+6. **Order book recovery**: On sequence gap detection, the connector forces a WebSocket disconnect
+   to trigger clean reconnect via `listen_for_subscriptions()`. Stream generation tracking ensures
+   stale diffs from the old connection are discarded. Message queues are drained on interruption.
 7. **Shared-account safety**: By default, `cancel_all()` only cancels orders tracked by this bot instance.
    Set `cancel_exchange_orphans: true` in config to also detect and cancel orphaned orders from other
    sessions sharing the same API key. Only enable with a dedicated API key.

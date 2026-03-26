@@ -195,9 +195,13 @@ Write-Host ""
 Write-Host "  SECTION 5: NONKYC LIVE API TESTS" -ForegroundColor Magenta
 Write-Host ""
 
+# Always run public NonKYC live tests (Tier 1 + Tier 5 don't need keys)
+Run-Test "NonKYC Live: test_nonkyc_live_api.py (public tests)" `
+    "$PYTEST_V $NONKYC/test_nonkyc_live_api.py -k 'not auth'"
+
 if ($HaveNonkycKeys) {
-    Run-Test "NonKYC Live: test_nonkyc_live_api.py" `
-        "$PYTEST_V $NONKYC/test_nonkyc_live_api.py"
+    Run-Test "NonKYC Live: test_nonkyc_live_api.py (authenticated tests)" `
+        "$PYTEST_V $NONKYC/test_nonkyc_live_api.py -k 'auth'"
 
     Run-Test "NonKYC Live: test_nonkyc_live_connector_smoke.py" `
         "$PYTEST_V $NONKYC/test_nonkyc_live_connector_smoke.py"
@@ -205,7 +209,7 @@ if ($HaveNonkycKeys) {
     Run-Test "NonKYC Live: nonkyc_auth_test.py (standalone)" `
         "python $NONKYC/nonkyc_auth_test.py"
 } else {
-    Run-Skip "NonKYC Live: test_nonkyc_live_api.py" `
+    Run-Skip "NonKYC Live: authenticated tests" `
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
     Run-Skip "NonKYC Live: test_nonkyc_live_connector_smoke.py" `
         "Set NONKYC_API_KEY and NONKYC_API_SECRET to enable"
@@ -400,8 +404,8 @@ if ($script:FailedSections.Count -gt 0) {
     Write-Host ""
 }
 
-$nonkycStatus = if ($HaveNonkycKeys) { "RAN" } else { "SKIPPED" }
-$mexcStatus = if ($HaveMexcKeys) { "RAN" } else { "SKIPPED (no live tests exist yet)" }
+$nonkycStatus = if ($HaveNonkycKeys) { "RAN (public + authenticated)" } else { "RAN (public only)" }
+$mexcStatus = if ($HaveMexcKeys) { "RAN (public + authenticated)" } else { "RAN (public only)" }
 Write-Host "  NonKYC live tests: $nonkycStatus"
 Write-Host "  MEXC live tests:   $mexcStatus"
 Write-Host ""

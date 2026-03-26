@@ -290,6 +290,10 @@ class MexcExchange(ExchangePyBase):
                     self._process_trade_message(results)
                 elif channel == CONSTANTS.USER_ORDERS_ENDPOINT_NAME:
                     results: Dict[str, Any] = event_message.get("privateOrders", {})
+                    # Inject top-level sendTime into inner dict so order update
+                    # creator can prefer it over createTime
+                    if "sendTime" not in results and "sendTime" in event_message:
+                        results["sendTime"] = event_message["sendTime"]
                     self._process_order_message(results)
                 elif channel == CONSTANTS.USER_BALANCE_ENDPOINT_NAME:
                     results: Dict[str, Any] = event_message.get("privateAccount", {})

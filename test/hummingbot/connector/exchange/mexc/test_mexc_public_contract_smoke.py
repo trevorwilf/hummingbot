@@ -99,7 +99,8 @@ class TestMexcPublicContractSmoke(unittest.TestCase):
         import websockets
 
         async def connect():
-            uri = "wss://wbs.mexc.com/ws"
+            from hummingbot.connector.exchange.mexc.mexc_constants import WSS_URL, DEFAULT_DOMAIN
+            uri = WSS_URL.format(DEFAULT_DOMAIN)
             async with websockets.connect(uri) as ws:
                 # Subscribe to BTC/USDT trades
                 sub_msg = {
