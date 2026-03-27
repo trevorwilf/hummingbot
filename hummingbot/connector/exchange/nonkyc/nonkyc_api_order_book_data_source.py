@@ -22,6 +22,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     ONE_HOUR = 60 * 60
     RESYNC_MAX_FAILURES = 3
     RESYNC_TIMEOUT = 30.0
+    GAP_TOLERANCE = 2  # Accept gaps of 1-2 missed notifications without resubscribing
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -43,6 +44,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._resync_pending: Dict[str, bool] = {}
         self._resync_pending_since: Dict[str, float] = {}
         self._resync_failure_count: Dict[str, int] = {}
+        self._last_diff_timestamp: Dict[str, float] = {}
 
     def _next_ws_id(self) -> int:
         """Returns the next JSON-RPC 2.0 request id."""
@@ -129,6 +131,27 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         return snapshot_msg
 
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Suppresses the base class's timeout-driven REST snapshot injection.
+
+        The base class fetches a REST snapshot after FULL_ORDER_BOOK_RESET_DELTA_SECONDS
+        with no snapshot event. For NonKYC, REST and WS order book sequences are in different
+        number spaces (~71x ratio), so injecting a REST snapshot into the tracker corrupts
+        the local order book via restore_from_snapshot_and_diffs bisect_right mismatch.
+
+        NonKYC handles all snapshot recovery via WS snapshotOrderbook messages.
+        """
+        message_queue = self._message_queue[self._snapshot_messages_queue_key]
+        while True:
+            try:
+                snapshot_event = await message_queue.get()
+                await self._parse_order_book_snapshot_message(raw_message=snapshot_event, message_queue=output)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error when processing public order book snapshots from exchange")
+
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if "result" not in raw_message:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
@@ -171,13 +194,26 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return
 
             if last_seq > 0 and sequence > last_seq + 1:
-                await self._handle_sequence_gap(trading_pair, last_seq, sequence)
-                return
+                gap_size = sequence - last_seq - 1
+                if gap_size <= self.GAP_TOLERANCE:
+                    last_diff_ts = self._last_diff_timestamp.get(trading_pair, 0)
+                    time_since = time.time() - last_diff_ts if last_diff_ts > 0 else -1
+                    self.logger().info(
+                        f"ORDERBOOK_GAP_EVENT: pair={trading_pair} "
+                        f"prev_seq={last_seq} recv_seq={sequence} gap={gap_size} "
+                        f"time_since_last={time_since:.1f}s gen={self._stream_generation} "
+                        f"action=accepted_within_tolerance"
+                    )
+                    # Accept the diff — minor gaps self-correct on L2 books
+                else:
+                    await self._handle_sequence_gap(trading_pair, last_seq, sequence)
+                    return
 
             if self._stream_generation != gen_before:
                 return
 
             self._last_sequence[trading_pair] = sequence
+            self._last_diff_timestamp[trading_pair] = time.time()
             order_book_message: OrderBookMessage = NonkycOrderBook.diff_message_from_exchange(
                 raw_message, time.time(), {"trading_pair": trading_pair})
             message_queue.put_nowait(order_book_message)
@@ -193,10 +229,14 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         gap_size = received_seq - expected_seq - 1
         failure_count = self._resync_failure_count.get(trading_pair, 0)
+        last_diff_ts = self._last_diff_timestamp.get(trading_pair, 0)
+        time_since = time.time() - last_diff_ts if last_diff_ts > 0 else -1
         self.logger().warning(
-            f"Orderbook sequence gap for {trading_pair}: expected {expected_seq + 1}, "
-            f"got {received_seq} (gap={gap_size}). "
-            f"Resyncing via WS resubscribe (attempt {failure_count + 1}/{self.RESYNC_MAX_FAILURES})."
+            f"ORDERBOOK_GAP_EVENT: pair={trading_pair} "
+            f"prev_seq={expected_seq} recv_seq={received_seq} gap={gap_size} "
+            f"time_since_last={time_since:.1f}s gen={self._stream_generation} "
+            f"resync_attempt={failure_count + 1}/{self.RESYNC_MAX_FAILURES} "
+            f"action=ws_resubscribe"
         )
 
         self._resync_pending[trading_pair] = True
@@ -303,6 +343,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
         self._stream_generation += 1
         self._last_sequence.clear()
+        self._last_diff_timestamp.clear()
         self._resync_pending.clear()
         self._resync_pending_since.clear()
         self._resync_failure_count.clear()

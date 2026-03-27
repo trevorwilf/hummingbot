@@ -193,7 +193,7 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         # Verify WS send was called (unsubscribe + resubscribe = 2 calls)
         self.assertEqual(2, mock_ws.send.call_count)
         # Verify warning was logged
-        self.assertTrue(self.is_logged("WARNING", "sequence gap"))
+        self.assertTrue(self.is_logged("WARNING", "ORDERBOOK_GAP_EVENT"))
         # Verify WS resubscribe info logged
         self.assertTrue(self.is_logged("INFO", "WS resubscribe sent"))
         # WS should NOT have been disconnected
@@ -376,27 +376,26 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(queue.empty())
         self.assertEqual(101, self.data_source._last_sequence[self.trading_pair])
 
-    async def test_replay_rest_vs_ws_sequence_mismatch(self):
+    async def test_replay_production_single_step_gap_accepted(self):
         """
-        Replay the exact production failure pattern:
-        - last WS diff seq = 3441
-        - incoming diff seq = 3443 (gap of 1)
-        - Should trigger WS resubscribe, NOT REST snapshot or WS disconnect
+        Replay production pattern: last=3441, incoming=3443 (gap of 1).
+        With GAP_TOLERANCE=2, this is accepted without resubscribe.
         """
         self.data_source._last_sequence[self.trading_pair] = 3441
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
+        msg_queue = asyncio.Queue()
 
         await self.data_source._parse_order_book_diff_message(
-            self._make_diff_message(3443), asyncio.Queue()
+            self._make_diff_message(3443), msg_queue
         )
 
-        # WS resubscribe should have been sent (2 messages)
-        self.assertEqual(2, mock_ws.send.call_count)
-        # WS should NOT be disconnected
+        # Gap of 1 is within tolerance — diff should be ACCEPTED
+        self.assertFalse(msg_queue.empty())
+        self.assertEqual(3443, self.data_source._last_sequence[self.trading_pair])
+        # No WS resubscribe for minor gap
+        mock_ws.send.assert_not_called()
         mock_ws.disconnect.assert_not_called()
-        # Resync pending, awaiting fresh WS snapshot
-        self.assertTrue(self.data_source._resync_pending.get(self.trading_pair, False))
 
     async def test_ws_interruption_clears_sequence_state(self):
         """WebSocket interruption should clear sequence tracking and increment generation."""
@@ -561,3 +560,144 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual({}, self.data_source._resync_pending)
         self.assertEqual({}, self.data_source._resync_pending_since)
         self.assertEqual({}, self.data_source._resync_failure_count)
+        self.assertEqual({}, self.data_source._last_diff_timestamp)
+
+    # --- Bug 1: Suppress timeout REST snapshot injection ---
+
+    async def test_listen_for_order_book_snapshots_processes_ws_snapshots(self):
+        """Override should process WS snapshot messages from the queue."""
+        output = asyncio.Queue()
+        raw_snapshot = {
+            "jsonrpc": "2.0",
+            "method": "snapshotOrderbook",
+            "params": {
+                "symbol": self.ex_trading_pair,
+                "sequence": 55000,
+                "asks": [{"price": "100", "quantity": "1"}],
+                "bids": [{"price": "99", "quantity": "1"}],
+            },
+        }
+
+        # Put a snapshot in the internal queue
+        snapshot_queue = self._setup_snapshot_queue()
+        snapshot_queue.put_nowait(raw_snapshot)
+
+        # Start the listener as a task, let it process one message
+        task = asyncio.create_task(
+            self.data_source.listen_for_order_book_snapshots(asyncio.get_event_loop(), output)
+        )
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # The processed snapshot should be in the output queue
+        self.assertFalse(output.empty())
+        # Sequence should be set from WS snapshot
+        self.assertEqual(55000, self.data_source._last_sequence[self.trading_pair])
+
+    async def test_timeout_rest_snapshot_not_injected(self):
+        """Override should NOT call _request_order_book_snapshot even when queue is empty."""
+        output = asyncio.Queue()
+
+        with patch.object(self.data_source, '_request_order_book_snapshot',
+                          new_callable=AsyncMock) as mock_rest:
+            task = asyncio.create_task(
+                self.data_source.listen_for_order_book_snapshots(asyncio.get_event_loop(), output)
+            )
+            await asyncio.sleep(0.5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            mock_rest.assert_not_called()
+
+    # --- Bug 2: Gap tolerance ---
+
+    async def test_minor_gap_accepted_within_tolerance(self):
+        """Gap of 1 (sequence 102 after 100) should be accepted without resubscribe."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(102), msg_queue
+        )
+
+        # Diff should be accepted
+        self.assertFalse(msg_queue.empty())
+        self.assertEqual(102, self.data_source._last_sequence[self.trading_pair])
+        # No WS resubscribe should have been triggered
+        mock_ws.send.assert_not_called()
+        # Should log the minor gap
+        self.assertTrue(self.is_logged("INFO", "ORDERBOOK_GAP_EVENT"))
+        self.assertTrue(self.is_logged("INFO", "accepted_within_tolerance"))
+
+    async def test_gap_at_tolerance_boundary_accepted(self):
+        """Gap of 2 (exactly at GAP_TOLERANCE) should be accepted."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(103), msg_queue
+        )
+
+        self.assertFalse(msg_queue.empty())
+        self.assertEqual(103, self.data_source._last_sequence[self.trading_pair])
+        mock_ws.send.assert_not_called()
+
+    async def test_gap_beyond_tolerance_triggers_resubscribe(self):
+        """Gap of 3 (beyond GAP_TOLERANCE) should trigger WS resubscribe."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(104), msg_queue
+        )
+
+        # Diff should NOT be enqueued
+        self.assertTrue(msg_queue.empty())
+        # WS resubscribe should have been triggered
+        self.assertEqual(2, mock_ws.send.call_count)
+
+    # --- Bug 3: Structured telemetry ---
+
+    async def test_structured_gap_telemetry_logged(self):
+        """Gap event log should contain ORDERBOOK_GAP_EVENT prefix and structured fields."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        self.data_source._last_diff_timestamp[self.trading_pair] = time.time() - 5.0
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        # Trigger a gap beyond tolerance → goes through _handle_sequence_gap
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(110), asyncio.Queue()
+        )
+
+        self.assertTrue(self.is_logged("WARNING", "ORDERBOOK_GAP_EVENT"))
+        self.assertTrue(self.is_logged("WARNING", "action=ws_resubscribe"))
+
+    async def test_last_diff_timestamp_tracked(self):
+        """Accepted diffs should update _last_diff_timestamp."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(101), msg_queue
+        )
+
+        self.assertIn(self.trading_pair, self.data_source._last_diff_timestamp)
+        self.assertGreater(self.data_source._last_diff_timestamp[self.trading_pair], 0)
+
+        # Interruption should clear it
+        await self.data_source._on_order_stream_interruption(None)
+        self.assertEqual({}, self.data_source._last_diff_timestamp)
