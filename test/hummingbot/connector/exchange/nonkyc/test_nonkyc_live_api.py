@@ -3288,6 +3288,7 @@ def test_7c_get_auth_param_order_irrelevant():
 
 def test_7c_balance_update_event_structure():
     """7C-4: Verify WS balanceUpdate event has expected fields."""
+    asyncio.set_event_loop(asyncio.new_event_loop())  # Ensure loop exists for OrderBookTracker
     from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
     from decimal import Decimal
 
@@ -3350,6 +3351,7 @@ def test_7c_trading_fees_edge_case_zero_notional():
 
 def test_7c_sequence_cleanup_on_unsubscribe():
     """7C-15: Unsubscribing removes pair from _last_sequence dict."""
+    asyncio.set_event_loop(asyncio.new_event_loop())  # Ensure loop exists for OrderBookTracker
     from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
     from hummingbot.connector.exchange.nonkyc.nonkyc_api_order_book_data_source import NonkycAPIOrderBookDataSource
     from hummingbot.connector.exchange.nonkyc import nonkyc_web_utils as web_utils

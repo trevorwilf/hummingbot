@@ -20,6 +20,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     TRADE_STREAM_ID = 1
     DIFF_STREAM_ID = 2
     ONE_HOUR = 60 * 60
+    SNAPSHOT_RESYNC_MAX_FAILURES = 3
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -38,6 +39,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._last_sequence: Dict[str, int] = {}
         self._ws_request_id: int = 0  # JSON-RPC 2.0 request id counter
         self._stream_generation: int = 0
+        self._resync_pending: Dict[str, bool] = {}
+        self._resync_failure_count: Dict[str, int] = {}
 
     def _next_ws_id(self) -> int:
         """Returns the next JSON-RPC 2.0 request id."""
@@ -139,6 +142,10 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             params = raw_message.get("params", {})
             symbol = params.get("symbol")
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+
+            if self._resync_pending.get(trading_pair, False):
+                return
+
             sequence = int(params.get("sequence", 0))
             last_seq = self._last_sequence.get(trading_pair, 0)
 
@@ -158,17 +165,41 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(order_book_message)
 
     async def _handle_sequence_gap(self, trading_pair: str, expected_seq: int, received_seq: int):
+        gap_size = received_seq - expected_seq - 1
+        failure_count = self._resync_failure_count.get(trading_pair, 0)
         self.logger().warning(
             f"Orderbook sequence gap for {trading_pair}: expected {expected_seq + 1}, "
-            f"got {received_seq}. Forcing WebSocket disconnect for clean resync."
+            f"got {received_seq} (gap={gap_size}). "
+            f"Fetching REST snapshot (attempt {failure_count + 1}/{self.SNAPSHOT_RESYNC_MAX_FAILURES})."
         )
-        self._last_sequence.pop(trading_pair, None)
-        self._stream_generation += 1
-        if self._ws_assistant is not None:
-            try:
-                await self._ws_assistant.disconnect()
-            except Exception:
-                self.logger().debug("Error disconnecting WS during gap recovery", exc_info=True)
+        self._resync_pending[trading_pair] = True
+        try:
+            snapshot_msg = await self._order_book_snapshot(trading_pair)
+            snapshot_queue = self._message_queue.get(self._snapshot_messages_queue_key)
+            if snapshot_queue is not None:
+                snapshot_queue.put_nowait(snapshot_msg)
+            self._last_sequence[trading_pair] = int(snapshot_msg.update_id)
+            self._resync_pending[trading_pair] = False
+            self._resync_failure_count[trading_pair] = 0
+            self.logger().info(f"Orderbook resync for {trading_pair} succeeded. New sequence base: {snapshot_msg.update_id}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._resync_failure_count[trading_pair] = failure_count + 1
+            self._resync_pending[trading_pair] = False
+            if failure_count + 1 >= self.SNAPSHOT_RESYNC_MAX_FAILURES:
+                self.logger().warning(f"Orderbook resync for {trading_pair} failed {failure_count + 1} times: {e}. Forcing WS disconnect.")
+                self._resync_failure_count[trading_pair] = 0
+                self._last_sequence.pop(trading_pair, None)
+                self._stream_generation += 1
+                if self._ws_assistant is not None:
+                    try:
+                        await self._ws_assistant.disconnect()
+                    except Exception:
+                        self.logger().debug("Error disconnecting WS during max resync", exc_info=True)
+            else:
+                self.logger().warning(f"Orderbook resync for {trading_pair} failed: {e}. Will retry on next gap.")
+                self._last_sequence.pop(trading_pair, None)
 
     async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
         gen_before = self._stream_generation
@@ -195,6 +226,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
         self._stream_generation += 1
         self._last_sequence.clear()
+        self._resync_pending.clear()
+        self._resync_failure_count.clear()
         self._drain_public_message_queues()
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
 

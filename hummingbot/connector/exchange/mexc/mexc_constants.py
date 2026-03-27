@@ -87,21 +87,26 @@ USER_TRADES_ENDPOINT_NAME = "spot@private.deals.v3.api.pb"
 USER_ORDERS_ENDPOINT_NAME = "spot@private.orders.v3.api.pb"
 USER_BALANCE_ENDPOINT_NAME = "spot@private.account.v3.api.pb"
 WS_CONNECTION_TIME_INTERVAL = 20
+# ============================================================================
+# RATE LIMITS — Last verified against MEXC Spot V3 docs: 2026-03-26
+# Run test_mexc_rate_limit_contract.py to detect drift.
+# If MEXC updates weights, update here and bump the date.
+# ============================================================================
 RATE_LIMITS = [
     RateLimit(limit_id=IP_REQUEST_WEIGHT, limit=20000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=UID_REQUEST_WEIGHT, limit=240000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ORDER_RATE_LIMIT_ID, limit=ORDER_RATE_LIMIT_PER_SECOND, time_interval=1),
-    # Weighted Limits
+    # Weighted Limits (weights from MEXC Spot V3 docs, verified 2026-03-26)
     RateLimit(limit_id=TICKER_PRICE_CHANGE_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=TICKER_BOOK_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 2)]),
+              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 10)]),
     RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 10)]),
+              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 25)]),
     RateLimit(limit_id=SUPPORTED_SYMBOL_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 10)]),
+              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=SNAPSHOT_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
-              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 50)]),
+              linked_limits=[LinkedLimitWeightPair(IP_REQUEST_WEIGHT, 3)]),
     RateLimit(limit_id=MEXC_USER_STREAM_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(UID_REQUEST_WEIGHT, 1)]),
     RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,

@@ -196,7 +196,7 @@ echo "╚═══════════════════════�
 echo ""
 
 run_test "NonKYC: aggregate directory pass (excluding live tests)" \
-    "$PYTEST $NONKYC/ --ignore=$NONKYC/test_nonkyc_live_api.py --ignore=$NONKYC/test_nonkyc_live_connector_smoke.py --ignore=$NONKYC/nonkyc_auth_test.py -v --tb=short --timeout=60"
+    "$PYTEST $NONKYC/ --ignore=$NONKYC/test_nonkyc_live_api.py --ignore=$NONKYC/test_nonkyc_live_connector_smoke.py --ignore=$NONKYC/nonkyc_auth_test.py -m 'not live_api' -v --tb=short --timeout=60"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 5: NONKYC LIVE API TESTS (conditional)
@@ -329,6 +329,15 @@ echo ""
 
 run_test "MEXC Public: test_mexc_public_contract_smoke.py" \
     "$PYTEST_V $MEXC/test_mexc_public_contract_smoke.py"
+
+run_test "MEXC Public: test_mexc_live_connector_smoke.py" \
+    "$PYTEST_V $MEXC/test_mexc_live_connector_smoke.py"
+
+run_test "MEXC Contract: test_mexc_rate_limit_contract.py" \
+    "$PYTEST_V $MEXC/test_mexc_rate_limit_contract.py"
+
+run_test "NonKYC Public: test_nonkyc_public_connector_smoke.py" \
+    "$PYTEST_V $NONKYC/test_nonkyc_public_connector_smoke.py"
 
 # SECTION 10: STRATEGY & EXECUTOR TESTS
 # ═════════════════════════════════════════════════════════════════════════════

@@ -230,16 +230,16 @@ class TestWsAuthTimeout(unittest.TestCase):
             connector=MagicMock(),
             api_factory=MagicMock(),
         )
-        # Override base_timeout to be very short for testing
-        mock_ws = AsyncMock()
+        # Custom fake WS that blocks forever — avoids AsyncMock RuntimeWarning
+        class SilentWebSocket:
+            async def send(self, msg):
+                pass
 
-        # Make iter_messages block forever (silent socket)
-        async def forever_iter():
-            await asyncio.sleep(3600)
-            yield  # Never reached
+            async def iter_messages(self):
+                await asyncio.sleep(3600)
+                yield  # pragma: no cover — never reached
 
-        mock_ws.iter_messages.return_value = forever_iter()
-        mock_ws.send = AsyncMock()
+        mock_ws = SilentWebSocket()
 
         # The method should raise TimeoutError or IOError, NOT block forever
         with self.assertRaises((asyncio.TimeoutError, IOError)):

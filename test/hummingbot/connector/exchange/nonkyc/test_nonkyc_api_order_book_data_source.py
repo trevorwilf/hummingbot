@@ -179,32 +179,38 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         channel = self.data_source._channel_originating_message(event_message)
         self.assertEqual(CONSTANTS.TRADE_EVENT_TYPE, channel)
 
-    async def test_sequence_gap_triggers_reconnect(self):
-        """Sequence gap disconnects WS for clean resync instead of raising ConnectionError."""
+    async def test_sequence_gap_triggers_rest_resync(self):
+        """Sequence gap should fetch REST snapshot instead of disconnecting WS."""
         self.data_source._last_sequence[self.trading_pair] = 100
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
+        snapshot_queue = self._setup_snapshot_queue()
+
+        # Mock REST snapshot
+        mock_snapshot_msg = MagicMock(spec=OrderBookMessage)
+        mock_snapshot_msg.update_id = 110
+        mock_snapshot_msg.trading_pair = self.trading_pair
+        self.data_source._order_book_snapshot = AsyncMock(return_value=mock_snapshot_msg)
 
         msg_queue = asyncio.Queue()
-        raw_message = {
-            "jsonrpc": "2.0",
-            "method": "updateOrderbook",
-            "params": {
-                "asks": [{"price": "67883.06", "quantity": "0.010917"}],
-                "bids": [{"price": "67679.55", "quantity": "0.000422"}],
-                "symbol": self.ex_trading_pair,
-                "timestamp": 1772170410000,
-                "sequence": 105,
-            },
-        }
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(105), msg_queue
+        )
 
-        await self.data_source._parse_order_book_diff_message(raw_message, msg_queue)
-
+        # Verify REST snapshot was called
+        self.data_source._order_book_snapshot.assert_called_once_with(self.trading_pair)
         # Verify warning was logged
         self.assertTrue(self.is_logged("WARNING", "sequence gap"))
-        mock_ws.disconnect.assert_called_once()
-        self.assertNotIn(self.trading_pair, self.data_source._last_sequence)
-        self.assertEqual(1, self.data_source._stream_generation)
+        # Verify resync succeeded
+        self.assertTrue(self.is_logged("INFO", "resync for COINALPHA-HBOT succeeded"))
+        # WS should NOT have been disconnected
+        mock_ws.disconnect.assert_not_called()
+        # Generation should NOT have incremented
+        self.assertEqual(0, self.data_source._stream_generation)
+        # Sequence should be updated to snapshot's update_id
+        self.assertEqual(110, self.data_source._last_sequence[self.trading_pair])
+        # Snapshot should be in queue
+        self.assertFalse(snapshot_queue.empty())
 
     async def test_duplicate_sequence_skipped(self):
         self.data_source._last_sequence[self.trading_pair] = 100
@@ -318,34 +324,43 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._message_queue[CONSTANTS.SNAPSHOT_EVENT_TYPE] = snapshot_queue
         return snapshot_queue
 
-    async def test_sequence_gap_disconnects_ws(self):
-        """When a sequence gap is detected, WS should be disconnected for clean resync."""
+    async def test_sequence_gap_fetches_rest_snapshot(self):
+        """When a sequence gap is detected, REST snapshot should be fetched."""
         self.data_source._last_sequence[self.trading_pair] = 100
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
-        msg_queue = asyncio.Queue()
+        snapshot_queue = self._setup_snapshot_queue()
 
+        mock_snapshot_msg = MagicMock(spec=OrderBookMessage)
+        mock_snapshot_msg.update_id = 110
+        mock_snapshot_msg.trading_pair = self.trading_pair
+        self.data_source._order_book_snapshot = AsyncMock(return_value=mock_snapshot_msg)
+
+        msg_queue = asyncio.Queue()
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(105), msg_queue
         )
-        # Sequence tracking should be cleared for this pair
-        self.assertNotIn(self.trading_pair, self.data_source._last_sequence)
-        mock_ws.disconnect.assert_called_once()
-        self.assertEqual(1, self.data_source._stream_generation)
+        # Sequence should be updated from snapshot
+        self.assertEqual(110, self.data_source._last_sequence[self.trading_pair])
+        # WS should NOT be disconnected on successful resync
+        mock_ws.disconnect.assert_not_called()
+        self.assertEqual(0, self.data_source._stream_generation)
 
-    async def test_no_rest_snapshot_on_gap(self):
-        """Verify that _request_order_book_snapshot is NOT called on sequence gap."""
+    async def test_rest_snapshot_called_on_gap(self):
+        """Verify that _order_book_snapshot IS called on sequence gap."""
         self.data_source._last_sequence[self.trading_pair] = 100
-        self.data_source._request_order_book_snapshot = AsyncMock()
-        mock_ws = AsyncMock(spec=WSAssistant)
-        self.data_source._ws_assistant = mock_ws
+        snapshot_queue = self._setup_snapshot_queue()
+
+        mock_snapshot_msg = MagicMock(spec=OrderBookMessage)
+        mock_snapshot_msg.update_id = 110
+        mock_snapshot_msg.trading_pair = self.trading_pair
+        self.data_source._order_book_snapshot = AsyncMock(return_value=mock_snapshot_msg)
 
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(105), asyncio.Queue()
         )
 
-        self.data_source._request_order_book_snapshot.assert_not_called()
-        mock_ws.disconnect.assert_called_once()
+        self.data_source._order_book_snapshot.assert_called_once_with(self.trading_pair)
 
     async def test_duplicate_sequence_is_dropped(self):
         """Messages with sequence <= last seen should be silently dropped."""
@@ -373,20 +388,27 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         Replay the exact production failure pattern:
         - last WS diff seq = 3441
         - incoming diff seq = 3443 (gap of 1)
-        - Should trigger disconnect, NOT try REST snapshot
+        - Should trigger REST resync, NOT WS disconnect
         """
         self.data_source._last_sequence[self.trading_pair] = 3441
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
+        snapshot_queue = self._setup_snapshot_queue()
+
+        mock_snapshot_msg = MagicMock(spec=OrderBookMessage)
+        mock_snapshot_msg.update_id = 3500
+        mock_snapshot_msg.trading_pair = self.trading_pair
+        self.data_source._order_book_snapshot = AsyncMock(return_value=mock_snapshot_msg)
 
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(3443), asyncio.Queue()
         )
 
-        # After disconnect, sequence tracking should be cleared
-        self.assertNotIn(self.trading_pair, self.data_source._last_sequence)
-        mock_ws.disconnect.assert_called_once()
-        self.assertEqual(1, self.data_source._stream_generation)
+        # After REST resync, sequence should be updated from snapshot
+        self.assertEqual(3500, self.data_source._last_sequence[self.trading_pair])
+        # WS should NOT be disconnected
+        mock_ws.disconnect.assert_not_called()
+        self.assertEqual(0, self.data_source._stream_generation)
 
     async def test_ws_interruption_clears_sequence_state(self):
         """WebSocket interruption should clear sequence tracking and increment generation."""
@@ -424,26 +446,33 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual({}, self.data_source._last_sequence)
 
-    async def test_stream_generation_increments_on_gap(self):
-        """Stream generation counter should increment each time a gap is detected."""
+    async def test_stream_generation_stable_on_successful_resync(self):
+        """Stream generation should NOT increment when REST resync succeeds."""
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
+        self._setup_snapshot_queue()
+
+        mock_snapshot_msg = MagicMock(spec=OrderBookMessage)
+        mock_snapshot_msg.update_id = 110
+        mock_snapshot_msg.trading_pair = self.trading_pair
+        self.data_source._order_book_snapshot = AsyncMock(return_value=mock_snapshot_msg)
 
         self.assertEqual(0, self.data_source._stream_generation)
 
-        # First gap
+        # First gap - REST resync succeeds
         self.data_source._last_sequence[self.trading_pair] = 100
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(105), asyncio.Queue()
         )
-        self.assertEqual(1, self.data_source._stream_generation)
+        self.assertEqual(0, self.data_source._stream_generation)
 
-        # Second gap
+        # Second gap - REST resync succeeds again
+        mock_snapshot_msg.update_id = 220
         self.data_source._last_sequence[self.trading_pair] = 200
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(210), asyncio.Queue()
         )
-        self.assertEqual(2, self.data_source._stream_generation)
+        self.assertEqual(0, self.data_source._stream_generation)
 
     async def test_queue_drained_on_interruption(self):
         """Stale messages in diff and snapshot queues should be drained on stream interruption."""
@@ -466,21 +495,24 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(self.is_logged("INFO", "Drained 3 stale messages"))
 
     async def test_stale_diff_rejected_after_generation_change(self):
-        """A diff message should be rejected if generation changes during processing (gap detected)."""
+        """A diff message should be rejected if generation changes during processing (resync failure path)."""
         self.data_source._last_sequence[self.trading_pair] = 100
         msg_queue = asyncio.Queue()
 
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
 
-        # Trigger a gap - this will bump generation and disconnect
+        # Force REST resync to fail enough times to trigger WS disconnect
+        self.data_source._resync_failure_count[self.trading_pair] = 2  # at max-1
+        self.data_source._order_book_snapshot = AsyncMock(side_effect=Exception("REST failed"))
+
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(105), msg_queue
         )
 
         # Queue should be empty - the diff after gap detection is not enqueued
         self.assertTrue(msg_queue.empty())
-        # Generation was incremented
+        # Generation was incremented (because resync failed 3 times)
         self.assertEqual(1, self.data_source._stream_generation)
 
     async def test_generation_tracked_across_interruptions(self):
@@ -493,9 +525,64 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         await self.data_source._on_order_stream_interruption(None)
         self.assertEqual(2, self.data_source._stream_generation)
 
-        # Gap detection also increments
-        mock_ws = AsyncMock(spec=WSAssistant)
-        self.data_source._ws_assistant = mock_ws
+        # Successful REST resync does NOT increment generation
+        self._setup_snapshot_queue()
+        mock_snapshot_msg = MagicMock(spec=OrderBookMessage)
+        mock_snapshot_msg.update_id = 110
+        mock_snapshot_msg.trading_pair = self.trading_pair
+        self.data_source._order_book_snapshot = AsyncMock(return_value=mock_snapshot_msg)
         self.data_source._last_sequence[self.trading_pair] = 100
         await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
-        self.assertEqual(3, self.data_source._stream_generation)
+        self.assertEqual(2, self.data_source._stream_generation)
+
+    async def test_repeated_resync_failures_disconnect_ws(self):
+        """After SNAPSHOT_RESYNC_MAX_FAILURES failed REST resyncs, WS should be disconnected."""
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        self.data_source._order_book_snapshot = AsyncMock(side_effect=Exception("REST failed"))
+
+        # First failure (attempt 1/3) - should NOT disconnect WS
+        self.data_source._last_sequence[self.trading_pair] = 100
+        await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
+        mock_ws.disconnect.assert_not_called()
+        self.assertEqual(0, self.data_source._stream_generation)
+        self.assertEqual(1, self.data_source._resync_failure_count[self.trading_pair])
+
+        # Second failure (attempt 2/3) - should NOT disconnect WS
+        self.data_source._last_sequence[self.trading_pair] = 100
+        await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
+        mock_ws.disconnect.assert_not_called()
+        self.assertEqual(0, self.data_source._stream_generation)
+        self.assertEqual(2, self.data_source._resync_failure_count[self.trading_pair])
+
+        # Third failure (attempt 3/3) - SHOULD disconnect WS
+        self.data_source._last_sequence[self.trading_pair] = 100
+        await self.data_source._handle_sequence_gap(self.trading_pair, 100, 105)
+        mock_ws.disconnect.assert_called_once()
+        self.assertEqual(1, self.data_source._stream_generation)
+        # Failure count should be reset after disconnect
+        self.assertEqual(0, self.data_source._resync_failure_count[self.trading_pair])
+
+    async def test_resync_pending_drops_diffs(self):
+        """While a REST resync is pending, incoming diffs should be silently dropped."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        self.data_source._resync_pending[self.trading_pair] = True
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(101), msg_queue
+        )
+
+        # Message should be dropped while resync is pending
+        self.assertTrue(msg_queue.empty())
+
+    async def test_interruption_clears_resync_state(self):
+        """WS interruption should clear resync pending and failure count state."""
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 2
+
+        await self.data_source._on_order_stream_interruption(None)
+
+        self.assertEqual({}, self.data_source._resync_pending)
+        self.assertEqual({}, self.data_source._resync_failure_count)

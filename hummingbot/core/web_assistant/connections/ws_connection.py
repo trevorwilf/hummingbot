@@ -108,7 +108,7 @@ class WSConnection:
         return msg
 
     async def _check_msg_closed_type(self, msg: Optional[aiohttp.WSMessage]) -> Optional[aiohttp.WSMessage]:
-        if msg is not None and msg.type in [aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE]:
+        if msg is not None and msg.type in [aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING]:
             if self._connected:
                 close_code = self._connection.close_code
                 await self.disconnect()
@@ -145,10 +145,12 @@ class WSConnection:
     def _build_resp(msg: aiohttp.WSMessage) -> WSResponse:
         if msg.type == aiohttp.WSMsgType.BINARY:
             data = msg.data
-        else:
+        elif msg.type == aiohttp.WSMsgType.TEXT:
             try:
                 data = msg.json()
-            except JSONDecodeError:
+            except (JSONDecodeError, TypeError):
                 data = msg.data
+        else:
+            data = msg.data
         response = WSResponse(data)
         return response

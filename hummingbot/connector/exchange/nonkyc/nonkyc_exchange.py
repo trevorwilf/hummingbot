@@ -54,6 +54,8 @@ class NonkycExchange(ExchangePyBase):
         self._cancel_exchange_orphans = cancel_exchange_orphans
         self._last_trades_poll_nonkyc_timestamp = 1.0
         self._balance_ws_confirmed: bool = False
+        self._balance_ws_subscription_time: Optional[float] = None
+        BALANCE_WS_HEALTH_TIMEOUT = 60.0
         self._trading_fees: Dict[str, Decimal] = {}
         self._trading_fees_last_computed: float = 0.0
         self._trading_fees_ttl: float = 3600.0  # 1 hour cache TTL
@@ -222,6 +224,10 @@ class NonkycExchange(ExchangePyBase):
         fee_amount = trade_data.get("fee") or trade_data.get("tradeFee", "0")
         return quote_asset, Decimal(str(fee_amount))
 
+    # NOTE: The connector reports accurate available/held balances. However, position
+    # executors that create exit orders (take-profit/stop-loss) must size them from
+    # connector-reported *spendable free* balance, not the nominal filled quantity.
+    # See RCA report 2026-03-26 Issue 5 for details.
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -661,9 +667,23 @@ class NonkycExchange(ExchangePyBase):
         stream data source. It keeps reading events from the queue until the task is interrupted.
         The events received are balance updates, order updates and trade events.
         """
+        # Start balance WS health timer
+        if self._balance_ws_subscription_time is None:
+            self._balance_ws_subscription_time = time.time()
         async for event_message in self._iter_user_event_queue():
             event_type = None
             try:
+                # Balance WS health check — warn if subscription sent but no events received
+                if (self._balance_ws_subscription_time is not None
+                        and not self._balance_ws_confirmed
+                        and time.time() - self._balance_ws_subscription_time > 60.0):
+                    self.logger().warning(
+                        "NonKYC private balance WebSocket: UNCONFIRMED after 60s. "
+                        "Undocumented method may not be available. "
+                        "REST polling remains the source of truth for balance updates."
+                    )
+                    self._balance_ws_subscription_time = None  # Don't warn again
+
                 event_type = event_message.get("method")
                 if event_type == "report":
                     message_params = event_message.get('params', {})

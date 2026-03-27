@@ -709,3 +709,53 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual({}, self.data_source._bridge_established)
         self.assertEqual({}, self.data_source._snapshot_version)
         self.assertEqual({}, self.data_source._last_to_version)
+
+    async def test_bridge_validation_accepts_n_plus_1(self):
+        """fromVersion = snapshot_version + 1 is the ideal bridge — must NOT trigger resync."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 100
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("101", "101")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        self.assertEqual(1, msg_queue.qsize())
+        self.assertTrue(self.data_source._bridge_established[self.trading_pair])
+
+    async def test_bridge_validation_drops_equal_to_version(self):
+        """Diff with toVersion == snapshot_version should be dropped (no new info)."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 100
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("98", "100")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        self.assertEqual(0, msg_queue.qsize())
+        self.assertFalse(self.data_source._bridge_established[self.trading_pair])
+
+    async def test_bridge_validation_gap_at_n_plus_2(self):
+        """fromVersion = snapshot_version + 2 means one update was missed — should resync."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 100
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("102", "105")
+
+        with patch.object(self.data_source, '_initiate_resync', new_callable=AsyncMock) as mock_resync:
+            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+            mock_resync.assert_called_once_with(self.trading_pair)
+
+        self.assertEqual(0, msg_queue.qsize())
+
+    async def test_bridge_replay_production_n_plus_1(self):
+        """Replay exact production pattern: snapshot=2030475362, first diff fromVersion=2030475363."""
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = 2030475362
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("2030475363", "2030475363")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        self.assertEqual(1, msg_queue.qsize(), "N+1 diff should be accepted")
+        self.assertTrue(self.data_source._bridge_established[self.trading_pair])

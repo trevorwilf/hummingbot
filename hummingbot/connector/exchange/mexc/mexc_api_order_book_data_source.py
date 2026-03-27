@@ -30,6 +30,9 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
     SNAPSHOT_RESYNC_BACKOFF_FACTOR = 2.0
     SNAPSHOT_RESYNC_MAX_DELAY = 60.0
 
+    # Snapshot depth — MEXC documents 5000 for full local-book maintenance.
+    SNAPSHOT_DEPTH = 5000
+
     _logger: Optional[HummingbotLogger] = None
 
     def __init__(self,
@@ -69,7 +72,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         params = {
             "symbol": await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "limit": "1000"
+            "limit": str(self.SNAPSHOT_DEPTH)
         }
 
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -178,18 +181,18 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if snapshot_ver is None:
                 return  # No snapshot yet — drop diff
 
-            if to_version < snapshot_ver:
-                return  # Stale diff from before snapshot — drop
+            if to_version <= snapshot_ver:
+                return  # Stale diff at or before snapshot — drop (MEXC docs step 5)
 
-            if from_version is not None and from_version > snapshot_ver:
+            if from_version is not None and from_version > snapshot_ver + 1:
                 self.logger().warning(
                     f"MEXC bridge gap for {trading_pair}: snapshot_version={snapshot_ver}, "
-                    f"first diff fromVersion={from_version}. Reinitializing."
+                    f"first diff fromVersion={from_version} (> {snapshot_ver + 1}). Reinitializing."
                 )
                 await self._initiate_resync(trading_pair)
                 return
 
-            # Bridge condition met: fromVersion <= snapshot_ver <= toVersion
+            # Bridge condition met: fromVersion <= snapshot_ver + 1 and toVersion > snapshot_ver
             self._bridge_established[trading_pair] = True
             self._last_to_version[trading_pair] = to_version
             message_queue.put_nowait(order_book_message)
