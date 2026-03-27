@@ -20,7 +20,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     TRADE_STREAM_ID = 1
     DIFF_STREAM_ID = 2
     ONE_HOUR = 60 * 60
-    SNAPSHOT_RESYNC_MAX_FAILURES = 3
+    RESYNC_MAX_FAILURES = 3
+    RESYNC_TIMEOUT = 30.0
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -40,6 +41,7 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ws_request_id: int = 0  # JSON-RPC 2.0 request id counter
         self._stream_generation: int = 0
         self._resync_pending: Dict[str, bool] = {}
+        self._resync_pending_since: Dict[str, float] = {}
         self._resync_failure_count: Dict[str, int] = {}
 
     def _next_ws_id(self) -> int:
@@ -144,6 +146,22 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
 
             if self._resync_pending.get(trading_pair, False):
+                pending_since = self._resync_pending_since.get(trading_pair, 0)
+                if pending_since > 0 and (time.time() - pending_since) > self.RESYNC_TIMEOUT:
+                    self.logger().warning(
+                        f"Orderbook resync for {trading_pair} timed out after "
+                        f"{self.RESYNC_TIMEOUT}s. Forcing full WS reconnect."
+                    )
+                    self._resync_pending[trading_pair] = False
+                    self._resync_pending_since.pop(trading_pair, None)
+                    self._resync_failure_count[trading_pair] = 0
+                    self._last_sequence.pop(trading_pair, None)
+                    self._stream_generation += 1
+                    if self._ws_assistant is not None:
+                        try:
+                            await self._ws_assistant.disconnect()
+                        except Exception:
+                            self.logger().debug("Error disconnecting WS during resync timeout", exc_info=True)
                 return
 
             sequence = int(params.get("sequence", 0))
@@ -165,30 +183,68 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(order_book_message)
 
     async def _handle_sequence_gap(self, trading_pair: str, expected_seq: int, received_seq: int):
+        """
+        Handle a detected sequence gap by resubscribing on the WebSocket.
+
+        CRITICAL FIX: NonKYC's REST API /market/orderbook returns sequence numbers
+        in a completely different number space than the WebSocket API. REST sequences
+        are ~60-70x smaller. The old approach of fetching a REST snapshot caused an
+        infinite resync loop. The fix: unsubscribe + resubscribe on the WS.
+        """
         gap_size = received_seq - expected_seq - 1
         failure_count = self._resync_failure_count.get(trading_pair, 0)
         self.logger().warning(
             f"Orderbook sequence gap for {trading_pair}: expected {expected_seq + 1}, "
             f"got {received_seq} (gap={gap_size}). "
-            f"Fetching REST snapshot (attempt {failure_count + 1}/{self.SNAPSHOT_RESYNC_MAX_FAILURES})."
+            f"Resyncing via WS resubscribe (attempt {failure_count + 1}/{self.RESYNC_MAX_FAILURES})."
         )
+
         self._resync_pending[trading_pair] = True
+        self._resync_pending_since[trading_pair] = time.time()
+        self._last_sequence.pop(trading_pair, None)
+
         try:
-            snapshot_msg = await self._order_book_snapshot(trading_pair)
-            snapshot_queue = self._message_queue.get(self._snapshot_messages_queue_key)
-            if snapshot_queue is not None:
-                snapshot_queue.put_nowait(snapshot_msg)
-            self._last_sequence[trading_pair] = int(snapshot_msg.update_id)
-            self._resync_pending[trading_pair] = False
-            self._resync_failure_count[trading_pair] = 0
-            self.logger().info(f"Orderbook resync for {trading_pair} succeeded. New sequence base: {snapshot_msg.update_id}")
+            if self._ws_assistant is None:
+                raise RuntimeError("WebSocket not connected")
+
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+            # Step 1: Unsubscribe from orderbook
+            unsub_payload = {
+                "method": CONSTANTS.WS_METHOD_UNSUBSCRIBE_ORDERBOOK,
+                "params": {"symbol": symbol},
+                "id": self._next_ws_id()
+            }
+            await self._ws_assistant.send(WSJSONRequest(payload=unsub_payload))
+
+            # Brief pause to let the server process the unsubscribe
+            await asyncio.sleep(0.2)
+
+            # Step 2: Resubscribe — server will send a fresh snapshotOrderbook
+            resub_payload = {
+                "method": CONSTANTS.WS_METHOD_SUBSCRIBE_ORDERBOOK,
+                "params": {"symbol": symbol, "limit": CONSTANTS.ORDERBOOK_DEPTH},
+                "id": self._next_ws_id()
+            }
+            await self._ws_assistant.send(WSJSONRequest(payload=resub_payload))
+
+            self.logger().info(
+                f"Orderbook resync for {trading_pair}: WS resubscribe sent. "
+                f"Awaiting fresh snapshot."
+            )
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self._resync_failure_count[trading_pair] = failure_count + 1
             self._resync_pending[trading_pair] = False
-            if failure_count + 1 >= self.SNAPSHOT_RESYNC_MAX_FAILURES:
-                self.logger().warning(f"Orderbook resync for {trading_pair} failed {failure_count + 1} times: {e}. Forcing WS disconnect.")
+            self._resync_pending_since.pop(trading_pair, None)
+
+            if failure_count + 1 >= self.RESYNC_MAX_FAILURES:
+                self.logger().warning(
+                    f"Orderbook WS resync for {trading_pair} failed "
+                    f"{failure_count + 1} times: {e}. Forcing full WS reconnect."
+                )
                 self._resync_failure_count[trading_pair] = 0
                 self._last_sequence.pop(trading_pair, None)
                 self._stream_generation += 1
@@ -196,37 +252,59 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     try:
                         await self._ws_assistant.disconnect()
                     except Exception:
-                        self.logger().debug("Error disconnecting WS during max resync", exc_info=True)
+                        self.logger().debug("Error disconnecting WS during max resync failure", exc_info=True)
             else:
-                self.logger().warning(f"Orderbook resync for {trading_pair} failed: {e}. Will retry on next gap.")
+                self.logger().warning(
+                    f"Orderbook WS resync for {trading_pair} failed: {e}. "
+                    f"Will retry on next gap."
+                )
                 self._last_sequence.pop(trading_pair, None)
 
     async def _parse_order_book_snapshot_message(self, raw_message, message_queue: asyncio.Queue):
         gen_before = self._stream_generation
-        # Handle pre-parsed OrderBookMessage from REST resync path
+        # Handle pre-parsed OrderBookMessage (from base class initial REST snapshot path)
         if isinstance(raw_message, OrderBookMessage):
             if self._stream_generation != gen_before:
                 return
-            self._last_sequence[raw_message.trading_pair] = int(raw_message.update_id)
+            # NOTE: The REST snapshot sequence is in a different number space than WS.
+            # We intentionally do NOT set _last_sequence here for the REST path.
+            # The first WS snapshotOrderbook will set _last_sequence correctly.
             message_queue.put_nowait(raw_message)
             return
-        # Original dict-based parsing for WebSocket messages
+
+        # WebSocket snapshot (snapshotOrderbook) — authoritative sequence source
         if "result" not in raw_message:
             params = raw_message.get("params", {})
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(
                 symbol=params.get("symbol"))
             sequence = int(params.get("sequence", 0))
+
+            # Set the sequence from the WS snapshot — this is the correct number space
             self._last_sequence[trading_pair] = sequence
+
             snapshot_msg: OrderBookMessage = NonkycOrderBook.snapshot_message_from_exchange(
                 params, time.time(), metadata={"trading_pair": trading_pair})
+
             if self._stream_generation != gen_before:
                 return
+
             message_queue.put_nowait(snapshot_msg)
+
+            # If this snapshot arrived as part of a resync, clear the pending flag
+            if self._resync_pending.get(trading_pair, False):
+                self._resync_pending[trading_pair] = False
+                self._resync_pending_since.pop(trading_pair, None)
+                self._resync_failure_count[trading_pair] = 0
+                self.logger().info(
+                    f"Orderbook resync for {trading_pair} completed via WS snapshot. "
+                    f"New sequence base: {sequence}"
+                )
 
     async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant] = None):
         self._stream_generation += 1
         self._last_sequence.clear()
         self._resync_pending.clear()
+        self._resync_pending_since.clear()
         self._resync_failure_count.clear()
         self._drain_public_message_queues()
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
