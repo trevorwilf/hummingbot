@@ -22,7 +22,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
     ONE_HOUR = 60 * 60
     RESYNC_MAX_FAILURES = 3
     RESYNC_TIMEOUT = 30.0
-    GAP_TOLERANCE = 2  # Accept gaps of 1-2 missed notifications without resubscribing
+    REORDER_BUFFER_TIMEOUT = 2.0  # seconds to wait for out-of-order messages
+    REORDER_BUFFER_MAX_SIZE = 50  # max buffered messages per pair before forced resync
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -45,6 +46,9 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._resync_pending_since: Dict[str, float] = {}
         self._resync_failure_count: Dict[str, int] = {}
         self._last_diff_timestamp: Dict[str, float] = {}
+        # Reorder buffer: handles out-of-order WS message delivery
+        self._reorder_buffer: Dict[str, Dict[int, tuple]] = {}  # pair -> {sequence: (raw_message, timestamp)}
+        self._reorder_timer_start: Dict[str, float] = {}  # pair -> when buffer started filling
 
     def _next_ws_id(self) -> int:
         """Returns the next JSON-RPC 2.0 request id."""
@@ -179,6 +183,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     self._resync_pending_since.pop(trading_pair, None)
                     self._resync_failure_count[trading_pair] = 0
                     self._last_sequence.pop(trading_pair, None)
+                    self._reorder_buffer.pop(trading_pair, None)
+                    self._reorder_timer_start.pop(trading_pair, None)
                     self._stream_generation += 1
                     if self._ws_assistant is not None:
                         try:
@@ -190,33 +196,87 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sequence = int(params.get("sequence", 0))
             last_seq = self._last_sequence.get(trading_pair, 0)
 
+            # Late arrival or duplicate
             if sequence <= last_seq:
+                # Check if it fills a gap in the reorder buffer
+                if trading_pair in self._reorder_buffer and sequence not in self._reorder_buffer[trading_pair]:
+                    self._reorder_buffer[trading_pair][sequence] = (raw_message, time.time())
+                    await self._flush_reorder_buffer(trading_pair, message_queue)
                 return
 
-            if last_seq > 0 and sequence > last_seq + 1:
-                gap_size = sequence - last_seq - 1
-                if gap_size <= self.GAP_TOLERANCE:
-                    last_diff_ts = self._last_diff_timestamp.get(trading_pair, 0)
-                    time_since = time.time() - last_diff_ts if last_diff_ts > 0 else -1
-                    self.logger().info(
-                        f"ORDERBOOK_GAP_EVENT: pair={trading_pair} "
-                        f"prev_seq={last_seq} recv_seq={sequence} gap={gap_size} "
-                        f"time_since_last={time_since:.1f}s gen={self._stream_generation} "
-                        f"action=accepted_within_tolerance"
-                    )
-                    # Accept the diff — minor gaps self-correct on L2 books
-                else:
-                    await self._handle_sequence_gap(trading_pair, last_seq, sequence)
+            # Contiguous — apply immediately
+            if sequence == last_seq + 1 or last_seq == 0:
+                if self._stream_generation != gen_before:
                     return
-
-            if self._stream_generation != gen_before:
+                self._last_sequence[trading_pair] = sequence
+                self._last_diff_timestamp[trading_pair] = time.time()
+                order_book_message: OrderBookMessage = NonkycOrderBook.diff_message_from_exchange(
+                    raw_message, time.time(), {"trading_pair": trading_pair})
+                message_queue.put_nowait(order_book_message)
+                # Flush any buffered messages that are now contiguous
+                await self._flush_reorder_buffer(trading_pair, message_queue)
                 return
 
-            self._last_sequence[trading_pair] = sequence
-            self._last_diff_timestamp[trading_pair] = time.time()
-            order_book_message: OrderBookMessage = NonkycOrderBook.diff_message_from_exchange(
-                raw_message, time.time(), {"trading_pair": trading_pair})
+            # Forward gap — buffer and wait for out-of-order messages
+            if trading_pair not in self._reorder_buffer:
+                self._reorder_buffer[trading_pair] = {}
+                self._reorder_timer_start[trading_pair] = time.time()
+            self._reorder_buffer[trading_pair][sequence] = (raw_message, time.time())
+
+            # Check buffer size cap
+            if len(self._reorder_buffer[trading_pair]) > self.REORDER_BUFFER_MAX_SIZE:
+                self.logger().warning(
+                    f"ORDERBOOK_REORDER_BUFFER: pair={trading_pair} buffer size "
+                    f"{len(self._reorder_buffer[trading_pair])} exceeds max "
+                    f"{self.REORDER_BUFFER_MAX_SIZE}. Triggering resync."
+                )
+                self._reorder_buffer.pop(trading_pair, None)
+                self._reorder_timer_start.pop(trading_pair, None)
+                await self._handle_sequence_gap(trading_pair, last_seq, sequence)
+                return
+
+            # Check if buffer has timed out
+            elapsed = time.time() - self._reorder_timer_start.get(trading_pair, time.time())
+            if elapsed > self.REORDER_BUFFER_TIMEOUT:
+                self.logger().warning(
+                    f"ORDERBOOK_REORDER_TIMEOUT: pair={trading_pair} "
+                    f"prev_seq={last_seq} buffered_seqs={sorted(self._reorder_buffer[trading_pair].keys())} "
+                    f"elapsed={elapsed:.1f}s. Missing messages truly lost — triggering resync."
+                )
+                self._reorder_buffer.pop(trading_pair, None)
+                self._reorder_timer_start.pop(trading_pair, None)
+                await self._handle_sequence_gap(trading_pair, last_seq, sequence)
+                return
+
+    async def _flush_reorder_buffer(self, trading_pair: str, message_queue: asyncio.Queue):
+        """Apply all contiguous messages from the reorder buffer."""
+        buffer = self._reorder_buffer.get(trading_pair, {})
+        if not buffer:
+            return
+
+        last_seq = self._last_sequence.get(trading_pair, 0)
+        applied = 0
+        while last_seq + 1 in buffer:
+            next_seq = last_seq + 1
+            raw_msg, _ = buffer.pop(next_seq)
+            order_book_message = NonkycOrderBook.diff_message_from_exchange(
+                raw_msg, time.time(), {"trading_pair": trading_pair})
             message_queue.put_nowait(order_book_message)
+            self._last_sequence[trading_pair] = next_seq
+            self._last_diff_timestamp[trading_pair] = time.time()
+            last_seq = next_seq
+            applied += 1
+
+        if applied > 0:
+            self.logger().debug(
+                f"NonKYC reorder buffer: flushed {applied} messages for {trading_pair}, "
+                f"sequence now at {last_seq}"
+            )
+
+        # If buffer is now empty, clear timer
+        if not buffer:
+            self._reorder_buffer.pop(trading_pair, None)
+            self._reorder_timer_start.pop(trading_pair, None)
 
     async def _handle_sequence_gap(self, trading_pair: str, expected_seq: int, received_seq: int):
         """
@@ -347,6 +407,8 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._resync_pending.clear()
         self._resync_pending_since.clear()
         self._resync_failure_count.clear()
+        self._reorder_buffer.clear()
+        self._reorder_timer_start.clear()
         self._drain_public_message_queues()
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
 

@@ -1235,7 +1235,9 @@ class AbstractExchangeConnectorTests:
             self.assertFalse(order.is_filled)
             self.assertFalse(order.is_done)
 
-            self.assertEqual(1, self.exchange._order_tracker._order_not_found_records[order.client_order_id])
+            # Fix 3: HTTP errors (e.g. 401) should NOT increment the not-found counter.
+            # Only exchange-specific "order not found" responses should increment it.
+            self.assertEqual(0, self.exchange._order_tracker._order_not_found_records.get(order.client_order_id, 0))
 
         @aioresponses()
         async def test_update_order_status_when_order_has_not_changed_and_one_partial_fill(self, mock_api):

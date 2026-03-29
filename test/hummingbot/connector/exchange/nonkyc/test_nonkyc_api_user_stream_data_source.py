@@ -212,3 +212,39 @@ class NonkycAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         mock_ws.disconnect.assert_called_once()
         self.assertIsNone(self.data_source._ws_assistant)
+
+    async def test_balance_ws_disabled_skips_subscription(self):
+        """Fix 5: ENABLE_BALANCE_WS=False should skip balance WS subscription."""
+        self.connector.ENABLE_BALANCE_WS = False
+        mock_ws = AsyncMock(spec=WSAssistant)
+        sent_messages = []
+
+        async def capture_send(request):
+            sent_messages.append(request.payload)
+
+        mock_ws.send.side_effect = capture_send
+
+        await self.data_source._subscribe_channels(mock_ws)
+
+        # Only the order subscription should be sent, NOT the balance subscription
+        self.assertEqual(1, len(sent_messages))
+        self.assertEqual(CONSTANTS.WS_METHOD_SUBSCRIBE_USER_ORDERS, sent_messages[0]["method"])
+        self.assertTrue(self.is_logged("INFO", "DISABLED by ENABLE_BALANCE_WS flag"))
+
+    async def test_balance_ws_enabled_sends_subscription(self):
+        """Fix 5: ENABLE_BALANCE_WS=True (default) should send balance WS subscription."""
+        self.connector.ENABLE_BALANCE_WS = True
+        mock_ws = AsyncMock(spec=WSAssistant)
+        sent_messages = []
+
+        async def capture_send(request):
+            sent_messages.append(request.payload)
+
+        mock_ws.send.side_effect = capture_send
+
+        await self.data_source._subscribe_channels(mock_ws)
+
+        # Both orders and balance subscriptions should be sent
+        self.assertEqual(2, len(sent_messages))
+        self.assertEqual(CONSTANTS.WS_METHOD_SUBSCRIBE_USER_ORDERS, sent_messages[0]["method"])
+        self.assertEqual(CONSTANTS.WS_METHOD_SUBSCRIBE_USER_BALANCE, sent_messages[1]["method"])

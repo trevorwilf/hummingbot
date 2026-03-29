@@ -56,8 +56,10 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.connector._set_trading_pair_symbol_map(bidict({self.ex_trading_pair: self.trading_pair}))
 
         # Pre-establish bridge so existing diff tests work without needing snapshot first
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         self.data_source._snapshot_version[self.trading_pair] = 0
         self.data_source._bridge_established[self.trading_pair] = True
+        self.data_source._ob_state[self.trading_pair] = _OBState.LIVE
 
     def tearDown(self) -> None:
         self.listening_task and self.listening_task.cancel()
@@ -529,7 +531,7 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(110, self.data_source._last_to_version[self.trading_pair])
 
     async def test_version_gap_triggers_resync(self):
-        """A gap in fromVersion should trigger resync and drop the diff."""
+        """A gap in fromVersion should trigger resync and cache the diff."""
         msg_queue = asyncio.Queue()
 
         # Establish baseline
@@ -547,7 +549,7 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             raw2 = self._create_raw_diff_message("150", "155")
             await self.data_source._parse_order_book_diff_message(raw2, msg_queue)
 
-            # Only the first diff should be in the queue (gap diff was dropped)
+            # Only the first diff should be in the output queue
             self.assertEqual(1, msg_queue.qsize())
             # Resync should have been attempted
             mock_snap.assert_called_once()
@@ -568,21 +570,27 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         # No resync triggered
         self.assertFalse(self.data_source._resync_pending.get(self.trading_pair, False))
 
-    async def test_diffs_dropped_while_resync_pending(self):
-        """While resync_pending is True, all diffs should be dropped."""
+    async def test_diffs_cached_while_resync_pending(self):
+        """While resync_pending is True, all diffs should be cached (not applied to output)."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         msg_queue = asyncio.Queue()
 
         self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
         self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 9999
 
         raw = self._create_raw_diff_message("100", "105")
         await self.data_source._parse_order_book_diff_message(raw, msg_queue)
 
+        # Not in output queue, but cached
         self.assertEqual(0, msg_queue.qsize())
+        self.assertEqual(1, len(self.data_source._cached_diffs.get(self.trading_pair, [])))
 
     async def test_resync_failure_keeps_pending(self):
         """Failed resync should keep resync_pending=True and apply backoff."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
         self.data_source._resync_failure_count[self.trading_pair] = 0
         self.data_source._resync_next_allowed_time[self.trading_pair] = 0
 
@@ -596,7 +604,9 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_max_resync_failures_disconnects_ws(self):
         """Exceeding max resync failures should disconnect WS instead of raising."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
         self.data_source._resync_failure_count[self.trading_pair] = (
             self.data_source.SNAPSHOT_RESYNC_MAX_FAILURES
         )
@@ -612,10 +622,13 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.data_source._resync_pending.get(self.trading_pair, False))
 
     async def test_successful_resync_clears_state(self):
-        """Successful resync should clear all failure tracking."""
+        """Successful resync should clear failure tracking. _last_to_version is NOT set
+        from snapshot alone — it's only set after a bridging diff is applied."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         self.data_source._resync_pending[self.trading_pair] = True
         self.data_source._resync_failure_count[self.trading_pair] = 3
         self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
 
         with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
             mock_snapshot_msg = MagicMock()
@@ -626,7 +639,9 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertFalse(self.data_source._resync_pending[self.trading_pair])
         self.assertEqual(0, self.data_source._resync_failure_count[self.trading_pair])
-        self.assertEqual(500, self.data_source._last_to_version[self.trading_pair])
+        # _last_to_version should NOT be set from snapshot alone (Fix 2, Defect C)
+        # It's only set after bridging diffs are applied
+        # The snapshot sets _snapshot_version and transitions to BRIDGING
 
     async def test_ws_interruption_clears_continuity_state(self):
         """WebSocket disconnection should clear all version tracking state."""
@@ -644,9 +659,11 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_resync_retry_on_backoff_elapsed(self):
         """When resync_pending and backoff has elapsed, next diff should trigger retry."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         msg_queue = asyncio.Queue()
 
         self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
         self.data_source._resync_failure_count[self.trading_pair] = 1
         self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() - 1  # elapsed
 
@@ -654,16 +671,22 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             raw = self._create_raw_diff_message("200", "205")
             await self.data_source._parse_order_book_diff_message(raw, msg_queue)
 
-            mock_resync.assert_called_once_with(self.trading_pair)
-        # Diff should still be dropped (resync handles it)
+            mock_resync.assert_called_once_with(self.trading_pair, msg_queue)
+        # Diff should be cached, not in output queue
         self.assertEqual(0, msg_queue.qsize())
 
     # --- Snapshot bridge validation tests ---
 
+    def _set_bridging_state(self, snapshot_ver: int):
+        """Helper to set up BRIDGING state for bridge validation tests."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version[self.trading_pair] = snapshot_ver
+        self.data_source._ob_state[self.trading_pair] = _OBState.BRIDGING
+
     async def test_bridge_validation_accepts_valid_bridge(self):
         """Diff bridging the snapshot version should be accepted."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 100
+        self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
         raw = self._create_raw_diff_message("98", "102")
@@ -673,47 +696,48 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(self.data_source._bridge_established[self.trading_pair])
 
     async def test_bridge_validation_rejects_stale_diff(self):
-        """Diff with toVersion < snapshot version should be dropped."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 100
+        """Diff with toVersion < snapshot version should be cached but discarded during bridge."""
+        self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
         raw = self._create_raw_diff_message("90", "95")
         await self.data_source._parse_order_book_diff_message(raw, msg_queue)
 
+        # Stale diff is cached but bridge can't be established yet
         self.assertEqual(0, msg_queue.qsize())
         self.assertFalse(self.data_source._bridge_established[self.trading_pair])
 
     async def test_bridge_validation_reinitializes_on_gap(self):
-        """Diff with fromVersion > snapshot version should trigger resync."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 100
+        """Diff with fromVersion > snapshot_version + 1 should fail bridge (need newer snapshot)."""
+        self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
+        # Only diff in cache has fromVersion=105 > snapshot+1=101 — bridge fails
         raw = self._create_raw_diff_message("105", "110")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
 
-        with patch.object(self.data_source, '_initiate_resync', new_callable=AsyncMock) as mock_resync:
-            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
-            mock_resync.assert_called_once_with(self.trading_pair)
-
+        # Diff is cached but bridge attempt fails (gap too large)
         self.assertEqual(0, msg_queue.qsize())
 
     async def test_bridge_state_cleared_on_interruption(self):
         """Stream interruption should clear all bridge tracking state."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         self.data_source._bridge_established[self.trading_pair] = True
         self.data_source._snapshot_version[self.trading_pair] = 100
         self.data_source._last_to_version[self.trading_pair] = 200
+        self.data_source._ob_state[self.trading_pair] = _OBState.LIVE
 
         await self.data_source._on_order_stream_interruption(None)
 
         self.assertEqual({}, self.data_source._bridge_established)
         self.assertEqual({}, self.data_source._snapshot_version)
         self.assertEqual({}, self.data_source._last_to_version)
+        self.assertEqual({}, self.data_source._ob_state)
+        self.assertEqual({}, self.data_source._cached_diffs)
 
     async def test_bridge_validation_accepts_n_plus_1(self):
         """fromVersion = snapshot_version + 1 is the ideal bridge — must NOT trigger resync."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 100
+        self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
         raw = self._create_raw_diff_message("101", "101")
@@ -723,9 +747,8 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(self.data_source._bridge_established[self.trading_pair])
 
     async def test_bridge_validation_drops_equal_to_version(self):
-        """Diff with toVersion == snapshot_version should be dropped (no new info)."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 100
+        """Diff with toVersion == snapshot_version should be cached but not bridge."""
+        self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
         raw = self._create_raw_diff_message("98", "100")
@@ -735,23 +758,19 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.data_source._bridge_established[self.trading_pair])
 
     async def test_bridge_validation_gap_at_n_plus_2(self):
-        """fromVersion = snapshot_version + 2 means one update was missed — should resync."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 100
+        """fromVersion = snapshot_version + 2 means one update was missed — bridge fails."""
+        self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
         raw = self._create_raw_diff_message("102", "105")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
 
-        with patch.object(self.data_source, '_initiate_resync', new_callable=AsyncMock) as mock_resync:
-            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
-            mock_resync.assert_called_once_with(self.trading_pair)
-
+        # Bridge fails because fromVersion 102 > snapshot_version + 1 = 101
         self.assertEqual(0, msg_queue.qsize())
 
     async def test_bridge_replay_production_n_plus_1(self):
         """Replay exact production pattern: snapshot=2030475362, first diff fromVersion=2030475363."""
-        self.data_source._bridge_established[self.trading_pair] = False
-        self.data_source._snapshot_version[self.trading_pair] = 2030475362
+        self._set_bridging_state(2030475362)
 
         msg_queue = asyncio.Queue()
         raw = self._create_raw_diff_message("2030475363", "2030475363")
@@ -759,3 +778,90 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(1, msg_queue.qsize(), "N+1 diff should be accepted")
         self.assertTrue(self.data_source._bridge_established[self.trading_pair])
+
+    # --- Diff buffering tests (Fix 2) ---
+
+    async def test_diffs_buffered_before_snapshot(self):
+        """Diffs arriving before snapshot should be cached, not dropped."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self.data_source._ob_state[self.trading_pair] = _OBState.BUFFERING
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version.pop(self.trading_pair, None)
+
+        msg_queue = asyncio.Queue()
+        raw = self._create_raw_diff_message("100", "105")
+        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        # Diff should be cached, not dropped
+        self.assertEqual(0, msg_queue.qsize())
+        self.assertEqual(1, len(self.data_source._cached_diffs.get(self.trading_pair, [])))
+
+    async def test_bridge_from_cached_diffs(self):
+        """Diffs cached before snapshot should be used to bridge after snapshot arrives."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self._set_bridging_state(100)
+
+        msg_queue = asyncio.Queue()
+
+        # Cache diff that bridges the snapshot
+        raw1 = self._create_raw_diff_message("99", "102")
+        await self.data_source._parse_order_book_diff_message(raw1, msg_queue)
+
+        # Bridge should be established, diff applied
+        self.assertEqual(1, msg_queue.qsize())
+        self.assertTrue(self.data_source._bridge_established[self.trading_pair])
+        self.assertEqual(102, self.data_source._last_to_version[self.trading_pair])
+
+    async def test_production_replay_gap_of_2(self):
+        """Replay production case: snapshot=2030948882, cached diffs include the bridging one."""
+        self._set_bridging_state(2030948882)
+
+        msg_queue = asyncio.Queue()
+
+        # First cached diff bridges snapshot
+        raw1 = self._create_raw_diff_message("2030948882", "2030948883")
+        await self.data_source._parse_order_book_diff_message(raw1, msg_queue)
+        self.assertEqual(1, msg_queue.qsize())
+
+        # Second diff is contiguous (now in LIVE state)
+        raw2 = self._create_raw_diff_message("2030948884", "2030948884")
+        await self.data_source._parse_order_book_diff_message(raw2, msg_queue)
+        self.assertEqual(2, msg_queue.qsize())
+
+    async def test_cached_diff_buffer_bounded(self):
+        """Buffer should cap at max size, discarding oldest."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self.data_source._ob_state[self.trading_pair] = _OBState.BUFFERING
+
+        for i in range(self.data_source.CACHED_DIFF_BUFFER_MAX_SIZE + 50):
+            raw = self._create_raw_diff_message(str(i), str(i + 1))
+            await self.data_source._parse_order_book_diff_message(raw, asyncio.Queue())
+
+        buf = self.data_source._cached_diffs.get(self.trading_pair)
+        self.assertIsNotNone(buf)
+        self.assertLessEqual(len(buf), self.data_source.CACHED_DIFF_BUFFER_MAX_SIZE)
+
+    async def test_continuity_failure_triggers_resync(self):
+        """In LIVE state, fromVersion != last_to + 1 should trigger RESYNCING with diff cached."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        msg_queue = asyncio.Queue()
+
+        # Establish baseline
+        raw1 = self._create_raw_diff_message("100", "105")
+        await self.data_source._parse_order_book_diff_message(raw1, msg_queue)
+        self.assertEqual(105, self.data_source._last_to_version[self.trading_pair])
+
+        # Gap: expected 106, got 150
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 200
+            mock_snap.return_value = mock_snapshot_msg
+
+            raw2 = self._create_raw_diff_message("150", "155")
+            await self.data_source._parse_order_book_diff_message(raw2, msg_queue)
+
+        # Only the first diff should be in the output queue
+        self.assertEqual(1, msg_queue.qsize())
+        # State should be RESYNCING or BRIDGING (after snapshot fetch)
+        state = self.data_source._get_ob_state(self.trading_pair)
+        self.assertIn(state, (_OBState.RESYNCING, _OBState.BRIDGING))

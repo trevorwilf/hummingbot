@@ -179,11 +179,15 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         channel = self.data_source._channel_originating_message(event_message)
         self.assertEqual(CONSTANTS.TRADE_EVENT_TYPE, channel)
 
-    async def test_sequence_gap_triggers_ws_resubscribe(self):
-        """Sequence gap should send WS unsubscribe + resubscribe, not REST snapshot."""
+    async def test_sequence_gap_triggers_ws_resubscribe_after_timeout(self):
+        """After reorder buffer timeout, gap should send WS unsubscribe + resubscribe."""
         self.data_source._last_sequence[self.trading_pair] = 100
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
+
+        # Simulate expired reorder buffer
+        self.data_source._reorder_buffer[self.trading_pair] = {}
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time() - 3.0
 
         msg_queue = asyncio.Queue()
         await self.data_source._parse_order_book_diff_message(
@@ -193,6 +197,7 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         # Verify WS send was called (unsubscribe + resubscribe = 2 calls)
         self.assertEqual(2, mock_ws.send.call_count)
         # Verify warning was logged
+        self.assertTrue(self.is_logged("WARNING", "ORDERBOOK_REORDER_TIMEOUT"))
         self.assertTrue(self.is_logged("WARNING", "ORDERBOOK_GAP_EVENT"))
         # Verify WS resubscribe info logged
         self.assertTrue(self.is_logged("INFO", "WS resubscribe sent"))
@@ -376,10 +381,10 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(queue.empty())
         self.assertEqual(101, self.data_source._last_sequence[self.trading_pair])
 
-    async def test_replay_production_single_step_gap_accepted(self):
+    async def test_replay_production_single_step_gap_buffered(self):
         """
         Replay production pattern: last=3441, incoming=3443 (gap of 1).
-        With GAP_TOLERANCE=2, this is accepted without resubscribe.
+        With reorder buffer, 3443 is buffered (waiting for 3442).
         """
         self.data_source._last_sequence[self.trading_pair] = 3441
         mock_ws = AsyncMock(spec=WSAssistant)
@@ -390,10 +395,10 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             self._make_diff_message(3443), msg_queue
         )
 
-        # Gap of 1 is within tolerance — diff should be ACCEPTED
-        self.assertFalse(msg_queue.empty())
-        self.assertEqual(3443, self.data_source._last_sequence[self.trading_pair])
-        # No WS resubscribe for minor gap
+        # Should be buffered, not yet applied
+        self.assertTrue(msg_queue.empty())
+        self.assertIn(3443, self.data_source._reorder_buffer.get(self.trading_pair, {}))
+        # No WS resubscribe yet — waiting for out-of-order message
         mock_ws.send.assert_not_called()
         mock_ws.disconnect.assert_not_called()
 
@@ -440,8 +445,11 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(0, self.data_source._stream_generation)
 
-        # Gap triggers WS resubscribe (not WS disconnect)
+        # Simulate expired reorder buffer so gap triggers resync
         self.data_source._last_sequence[self.trading_pair] = 100
+        self.data_source._reorder_buffer[self.trading_pair] = {}
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time() - 3.0
+
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(105), asyncio.Queue()
         )
@@ -481,6 +489,10 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         # Force WS resync to fail enough times to trigger WS disconnect
         self.data_source._resync_failure_count[self.trading_pair] = 2  # at max-1
+
+        # Simulate expired reorder buffer so gap triggers resync immediately
+        self.data_source._reorder_buffer[self.trading_pair] = {}
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time() - 3.0
 
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(105), msg_queue
@@ -616,58 +628,176 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
             mock_rest.assert_not_called()
 
-    # --- Bug 2: Gap tolerance ---
+    # --- Reorder buffer tests (replaces GAP_TOLERANCE) ---
 
-    async def test_minor_gap_accepted_within_tolerance(self):
-        """Gap of 1 (sequence 102 after 100) should be accepted without resubscribe."""
+    async def test_reorder_buffer_handles_swap(self):
+        """Send seq 102, then 101 (after last_seq=100). Both applied in correct order."""
         self.data_source._last_sequence[self.trading_pair] = 100
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
         msg_queue = asyncio.Queue()
 
+        # 102 arrives first (out of order) — buffered
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(102), msg_queue
         )
+        # 102 should be buffered, not yet in queue
+        self.assertTrue(msg_queue.empty())
+        self.assertIn(102, self.data_source._reorder_buffer.get(self.trading_pair, {}))
 
-        # Diff should be accepted
-        self.assertFalse(msg_queue.empty())
+        # 101 arrives — contiguous with last_seq=100, triggers flush of 102
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(101), msg_queue
+        )
+
+        # Both should be in queue in correct order
+        self.assertEqual(2, msg_queue.qsize())
+        msg1 = msg_queue.get_nowait()
+        msg2 = msg_queue.get_nowait()
+        self.assertEqual(101, msg1.update_id)
+        self.assertEqual(102, msg2.update_id)
         self.assertEqual(102, self.data_source._last_sequence[self.trading_pair])
-        # No WS resubscribe should have been triggered
+        # No WS resubscribe needed
         mock_ws.send.assert_not_called()
-        # Should log the minor gap
-        self.assertTrue(self.is_logged("INFO", "ORDERBOOK_GAP_EVENT"))
-        self.assertTrue(self.is_logged("INFO", "accepted_within_tolerance"))
 
-    async def test_gap_at_tolerance_boundary_accepted(self):
-        """Gap of 2 (exactly at GAP_TOLERANCE) should be accepted."""
+    async def test_reorder_buffer_flushes_on_contiguous(self):
+        """Send seq 103, then 101, then 102 (after last_seq=100). All applied in order."""
         self.data_source._last_sequence[self.trading_pair] = 100
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
         msg_queue = asyncio.Queue()
 
+        # 103 arrives first — buffered
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(103), msg_queue
         )
+        self.assertTrue(msg_queue.empty())
 
-        self.assertFalse(msg_queue.empty())
+        # 101 arrives — contiguous, applied immediately, but 102 still missing
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(101), msg_queue
+        )
+        self.assertEqual(1, msg_queue.qsize())
+        self.assertEqual(101, self.data_source._last_sequence[self.trading_pair])
+
+        # 102 arrives — contiguous with last_seq=101, flushes 103
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(102), msg_queue
+        )
+        self.assertEqual(3, msg_queue.qsize())
         self.assertEqual(103, self.data_source._last_sequence[self.trading_pair])
-        mock_ws.send.assert_not_called()
 
-    async def test_gap_beyond_tolerance_triggers_resubscribe(self):
-        """Gap of 3 (beyond GAP_TOLERANCE) should trigger WS resubscribe."""
+    async def test_reorder_buffer_timeout_triggers_resync(self):
+        """Buffer timeout should trigger resync when messages are truly lost."""
         self.data_source._last_sequence[self.trading_pair] = 100
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
         msg_queue = asyncio.Queue()
 
+        # Simulate a buffered message with expired timer
+        self.data_source._reorder_buffer[self.trading_pair] = {}
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time() - 3.0  # >2s ago
+
         await self.data_source._parse_order_book_diff_message(
-            self._make_diff_message(104), msg_queue
+            self._make_diff_message(105), msg_queue
         )
 
-        # Diff should NOT be enqueued
+        # Should have triggered resync (WS resubscribe)
         self.assertTrue(msg_queue.empty())
+        self.assertEqual(2, mock_ws.send.call_count)
+        # Buffer should be cleared
+        self.assertNotIn(self.trading_pair, self.data_source._reorder_buffer)
+
+    async def test_stale_duplicate_diff_dropped(self):
+        """sequence <= last_seq with no active buffer should be silently dropped."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(99), msg_queue
+        )
+        self.assertTrue(msg_queue.empty())
+
+    async def test_contiguous_sequence_applied_immediately(self):
+        """sequence == last_seq + 1 should be applied without buffering."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        msg_queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(101), msg_queue
+        )
+
+        self.assertFalse(msg_queue.empty())
+        self.assertEqual(101, self.data_source._last_sequence[self.trading_pair])
+        # No buffer created
+        self.assertNotIn(self.trading_pair, self.data_source._reorder_buffer)
+
+    async def test_reorder_buffer_size_cap(self):
+        """Exceeding max buffer size should trigger resync."""
+        self.data_source._last_sequence[self.trading_pair] = 100
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+
+        # Pre-fill buffer to max size
+        self.data_source._reorder_buffer[self.trading_pair] = {
+            i: (self._make_diff_message(i), time.time())
+            for i in range(102, 102 + self.data_source.REORDER_BUFFER_MAX_SIZE + 1)
+        }
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time()
+
+        msg_queue = asyncio.Queue()
+        # Adding one more should trigger resync
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(200), msg_queue
+        )
+
         # WS resubscribe should have been triggered
         self.assertEqual(2, mock_ws.send.call_count)
+        # Buffer should be cleared
+        self.assertNotIn(self.trading_pair, self.data_source._reorder_buffer)
+
+    async def test_reorder_buffer_cleared_on_interruption(self):
+        """_on_order_stream_interruption should clear reorder buffer state."""
+        self.data_source._reorder_buffer[self.trading_pair] = {
+            102: (self._make_diff_message(102), time.time()),
+        }
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time()
+
+        await self.data_source._on_order_stream_interruption(None)
+
+        self.assertEqual({}, self.data_source._reorder_buffer)
+        self.assertEqual({}, self.data_source._reorder_timer_start)
+
+    async def test_production_replay_out_of_order(self):
+        """Replay exact live pattern: last_seq=72270, receive 72272, then 72271, then 72273."""
+        self.data_source._last_sequence[self.trading_pair] = 72270
+        mock_ws = AsyncMock(spec=WSAssistant)
+        self.data_source._ws_assistant = mock_ws
+        msg_queue = asyncio.Queue()
+
+        # 72272 arrives first (gap of 1)
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(72272), msg_queue
+        )
+        self.assertTrue(msg_queue.empty())  # buffered
+
+        # 72271 arrives (fills the gap)
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(72271), msg_queue
+        )
+        # Both should be applied: 72271 contiguous, flushes 72272
+        self.assertEqual(2, msg_queue.qsize())
+        self.assertEqual(72272, self.data_source._last_sequence[self.trading_pair])
+
+        # 72273 arrives (contiguous)
+        await self.data_source._parse_order_book_diff_message(
+            self._make_diff_message(72273), msg_queue
+        )
+        self.assertEqual(3, msg_queue.qsize())
+        self.assertEqual(72273, self.data_source._last_sequence[self.trading_pair])
+
+        # No WS resubscribe needed — all messages delivered, just reordered
+        mock_ws.send.assert_not_called()
 
     # --- Bug 3: Structured telemetry ---
 
@@ -678,7 +808,11 @@ class NonkycAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         mock_ws = AsyncMock(spec=WSAssistant)
         self.data_source._ws_assistant = mock_ws
 
-        # Trigger a gap beyond tolerance → goes through _handle_sequence_gap
+        # Simulate expired reorder buffer so gap triggers resync
+        self.data_source._reorder_buffer[self.trading_pair] = {}
+        self.data_source._reorder_timer_start[self.trading_pair] = time.time() - 3.0
+
+        # Trigger a gap → goes through reorder timeout → _handle_sequence_gap
         await self.data_source._parse_order_book_diff_message(
             self._make_diff_message(110), asyncio.Queue()
         )

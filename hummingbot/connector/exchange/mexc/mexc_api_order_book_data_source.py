@@ -1,6 +1,8 @@
 import asyncio
+import enum
 import random
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.mexc import mexc_constants as CONSTANTS, mexc_web_utils as web_utils
@@ -16,6 +18,14 @@ if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
 
 
+class _OBState(enum.Enum):
+    """Order book sync state per trading pair."""
+    BUFFERING = "BUFFERING"    # WS connected, caching diffs, waiting for snapshot
+    BRIDGING = "BRIDGING"      # snapshot received, trying to bridge from cached diffs
+    LIVE = "LIVE"              # bridge established, applying diffs with strict continuity
+    RESYNCING = "RESYNCING"    # continuity lost, re-fetching snapshot (diffs still cached)
+
+
 class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
     HEARTBEAT_TIME_INTERVAL = 30.0
     TRADE_STREAM_ID = 1
@@ -29,6 +39,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
     SNAPSHOT_RESYNC_INITIAL_DELAY = 2.0
     SNAPSHOT_RESYNC_BACKOFF_FACTOR = 2.0
     SNAPSHOT_RESYNC_MAX_DELAY = 60.0
+    CACHED_DIFF_BUFFER_MAX_SIZE = 1000
 
     # Snapshot depth — MEXC documents 5000 for full local-book maintenance.
     SNAPSHOT_DEPTH = 5000
@@ -56,6 +67,9 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._snapshot_version: Dict[str, int] = {}
         self._bridge_established: Dict[str, bool] = {}
         self._stream_generation: int = 0
+        # Diff buffering state machine
+        self._ob_state: Dict[str, _OBState] = {}
+        self._cached_diffs: Dict[str, deque] = {}  # pair -> deque of (from_ver, to_ver, OrderBookMessage)
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -141,8 +155,68 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         # Store snapshot version for bridge validation
         self._snapshot_version[trading_pair] = snapshot_msg.update_id
+        # Transition to BRIDGING — try to bridge from cached diffs
+        self._ob_state[trading_pair] = _OBState.BRIDGING
         self._bridge_established[trading_pair] = False
         return snapshot_msg
+
+    def _get_ob_state(self, trading_pair: str) -> _OBState:
+        return self._ob_state.get(trading_pair, _OBState.BUFFERING)
+
+    def _cache_diff(self, trading_pair: str, from_version, to_version, order_book_message: OrderBookMessage):
+        """Cache a diff message for later bridging. Enforces max buffer size."""
+        if trading_pair not in self._cached_diffs:
+            self._cached_diffs[trading_pair] = deque()
+        buf = self._cached_diffs[trading_pair]
+        buf.append((from_version, to_version, order_book_message))
+        # Enforce max size — discard oldest if exceeded
+        while len(buf) > self.CACHED_DIFF_BUFFER_MAX_SIZE:
+            buf.popleft()
+
+    def _try_bridge_from_cache(self, trading_pair: str, message_queue: asyncio.Queue) -> bool:
+        """
+        Try to bridge from cached diffs after snapshot.
+        Returns True if bridge was established, False otherwise.
+        """
+        snapshot_ver = self._snapshot_version.get(trading_pair)
+        if snapshot_ver is None:
+            return False
+
+        buf = self._cached_diffs.get(trading_pair, deque())
+
+        # Discard diffs where toVersion <= lastUpdateId (MEXC docs step 5)
+        while buf and buf[0][1] <= snapshot_ver:
+            buf.popleft()
+
+        if not buf:
+            return False  # No diffs to bridge with yet
+
+        first_from, first_to, first_msg = buf[0]
+        # Check bridge condition: fromVersion <= lastUpdateId + 1
+        if first_from is not None and first_from > snapshot_ver + 1:
+            # Gap between snapshot and first cached diff — need newer snapshot
+            return False
+
+        # Bridge established! Apply all cached diffs sequentially
+        self._bridge_established[trading_pair] = True
+        self._ob_state[trading_pair] = _OBState.LIVE
+        applied = 0
+        while buf:
+            fv, tv, msg = buf.popleft()
+            if tv <= snapshot_ver:
+                continue  # skip stale
+            self._last_to_version[trading_pair] = tv
+            message_queue.put_nowait(msg)
+            applied += 1
+
+        self.logger().info(
+            f"MEXC order book bridge established for {trading_pair}: "
+            f"snapshot_ver={snapshot_ver}, applied {applied} cached diffs, "
+            f"last_to_version={self._last_to_version.get(trading_pair)}"
+        )
+        # Clear the cache
+        self._cached_diffs.pop(trading_pair, None)
+        return True
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         if "code" not in raw_message:
@@ -163,46 +237,33 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raw_message, timestamp=float(raw_message['sendTime']),
             metadata={"trading_pair": trading_pair})
 
-        # If resync is pending, check if retry is due; either way drop this diff
-        if self._resync_pending.get(trading_pair, False):
-            now = time.time()
-            next_allowed = self._resync_next_allowed_time.get(trading_pair, 0)
-            if now >= next_allowed:
-                await self._attempt_resync(trading_pair)
-            return
-
         from_version = order_book_message.content.get("first_update_id")
         to_version = order_book_message.update_id
-        last_to = self._last_to_version.get(trading_pair)
 
-        # Bridge validation: first diff after startup/reconnect must bridge the snapshot
-        if not self._bridge_established.get(trading_pair, False):
-            snapshot_ver = self._snapshot_version.get(trading_pair)
-            if snapshot_ver is None:
-                return  # No snapshot yet — drop diff
+        state = self._get_ob_state(trading_pair)
 
-            if to_version <= snapshot_ver:
-                return  # Stale diff at or before snapshot — drop (MEXC docs step 5)
+        # BUFFERING or RESYNCING: cache the diff instead of dropping it
+        if state in (_OBState.BUFFERING, _OBState.RESYNCING):
+            self._cache_diff(trading_pair, from_version, to_version, order_book_message)
 
-            if from_version is not None and from_version > snapshot_ver + 1:
-                self.logger().warning(
-                    f"MEXC bridge gap for {trading_pair}: snapshot_version={snapshot_ver}, "
-                    f"first diff fromVersion={from_version} (> {snapshot_ver + 1}). Reinitializing."
-                )
-                await self._initiate_resync(trading_pair)
-                return
-
-            # Bridge condition met: fromVersion <= snapshot_ver + 1 and toVersion > snapshot_ver
-            self._bridge_established[trading_pair] = True
-            self._last_to_version[trading_pair] = to_version
-            message_queue.put_nowait(order_book_message)
-            self.logger().info(
-                f"MEXC order book bridge established for {trading_pair}: "
-                f"snapshot_ver={snapshot_ver}, bridge=[{from_version},{to_version}]"
-            )
+            # If RESYNCING, check if retry is due
+            if state == _OBState.RESYNCING:
+                now = time.time()
+                next_allowed = self._resync_next_allowed_time.get(trading_pair, 0)
+                if now >= next_allowed:
+                    await self._attempt_resync(trading_pair, message_queue)
             return
 
-        # If no continuity baseline yet (bridge was established but no diffs tracked), accept
+        # BRIDGING: cache the diff and try to bridge
+        if state == _OBState.BRIDGING:
+            self._cache_diff(trading_pair, from_version, to_version, order_book_message)
+            self._try_bridge_from_cache(trading_pair, message_queue)
+            return
+
+        # LIVE: enforce strict continuity
+        last_to = self._last_to_version.get(trading_pair)
+
+        # If no continuity baseline yet, accept
         if last_to is None:
             self._last_to_version[trading_pair] = to_version
             message_queue.put_nowait(order_book_message)
@@ -211,7 +272,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Check continuity: fromVersion must equal last_toVersion + 1
         if from_version is not None and from_version != last_to + 1:
             if to_version <= last_to:
-                # Stale/duplicate diff -- just drop it
+                # Stale/duplicate diff — just drop it
                 return
 
             self.logger().warning(
@@ -219,28 +280,35 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 f"expected fromVersion={last_to + 1}, got {from_version}. "
                 f"Triggering REST snapshot resync."
             )
-            await self._initiate_resync(trading_pair)
+            await self._initiate_resync(trading_pair, from_version, to_version, order_book_message)
             return
 
-        # Continuity is valid -- accept the diff and update tracking
+        # Continuity is valid — accept the diff and update tracking
         self._last_to_version[trading_pair] = to_version
         message_queue.put_nowait(order_book_message)
 
-    async def _initiate_resync(self, trading_pair: str):
+    async def _initiate_resync(self, trading_pair: str,
+                               from_version=None, to_version=None,
+                               order_book_message: Optional[OrderBookMessage] = None):
         """Mark a pair as needing resync and attempt the first snapshot fetch."""
+        self._ob_state[trading_pair] = _OBState.RESYNCING
         self._resync_pending[trading_pair] = True
+        self._bridge_established[trading_pair] = False
+        # Start caching diffs from the one that triggered resync
+        if order_book_message is not None:
+            self._cache_diff(trading_pair, from_version, to_version, order_book_message)
         await self._attempt_resync(trading_pair)
 
-    async def _attempt_resync(self, trading_pair: str):
+    async def _attempt_resync(self, trading_pair: str, message_queue: Optional[asyncio.Queue] = None):
         """
         Attempt to fetch a fresh REST snapshot and apply it.
         On failure, apply exponential backoff and keep resync_pending=True
-        so diffs continue to be dropped.
+        so diffs continue to be cached.
         On max failures, trigger a full websocket reconnect.
         """
         failure_count = self._resync_failure_count.get(trading_pair, 0)
 
-        # Check if max failures exceeded -- trigger reconnect via explicit disconnect
+        # Check if max failures exceeded — trigger reconnect via explicit disconnect
         if failure_count >= self.SNAPSHOT_RESYNC_MAX_FAILURES:
             self.logger().warning(
                 f"MEXC order book resync for {trading_pair} failed "
@@ -248,6 +316,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             self._resync_failure_count[trading_pair] = 0
             self._resync_pending[trading_pair] = False
+            self._cached_diffs.pop(trading_pair, None)
             if self._ws_assistant is not None:
                 try:
                     await self._ws_assistant.disconnect()
@@ -265,24 +334,32 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
             snapshot_queue.put_nowait(snapshot_msg)
 
-            # Update continuity tracking from fresh snapshot
-            self._last_to_version[trading_pair] = snapshot_msg.update_id
+            # Try to bridge from cached diffs
+            if message_queue is not None:
+                bridged = self._try_bridge_from_cache(trading_pair, message_queue)
+            else:
+                bridged = False
 
-            # Success -- reset failure state
+            if not bridged:
+                # No cached diffs bridge yet — state is BRIDGING,
+                # future diffs will be cached and tried
+                pass
+
+            # Success — reset failure state
             self._resync_failure_count[trading_pair] = 0
             self._resync_next_allowed_time[trading_pair] = 0
             self._resync_pending[trading_pair] = False
 
             self.logger().info(
                 f"MEXC order book resync for {trading_pair} succeeded. "
-                f"New version base: {snapshot_msg.update_id}"
+                f"Snapshot version: {snapshot_msg.update_id}, bridged={bridged}"
             )
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Snapshot failed -- apply exponential backoff
-            # Keep resync_pending=True so diffs are dropped
+            # Snapshot failed — apply exponential backoff
+            # Keep resync_pending=True so diffs are cached
             self._resync_failure_count[trading_pair] = failure_count + 1
             delay = min(
                 self.SNAPSHOT_RESYNC_INITIAL_DELAY * (self.SNAPSHOT_RESYNC_BACKOFF_FACTOR ** failure_count),
@@ -320,6 +397,8 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._resync_next_allowed_time.clear()
         self._snapshot_version.clear()
         self._bridge_established.clear()
+        self._ob_state.clear()
+        self._cached_diffs.clear()
         await super()._on_order_stream_interruption(websocket_assistant=websocket_assistant)
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:

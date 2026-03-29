@@ -27,6 +27,7 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
         super().__init__()
         self._auth: NonkycAuth = auth
+        self._connector = connector
         self._domain = domain
         self._api_factory = api_factory
         self._ws_request_id: int = 100  # Start at 100 to distinguish from order book ids in logs
@@ -59,23 +60,30 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self.logger().info("Subscribed to user orders")
 
         # Balance updates -- undocumented API, subscribe but don't fail if rejected
-        try:
-            subscribe_user_balance_request: WSJSONRequest = WSJSONRequest(payload={
-                "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_BALANCE,
-                "params": {},
-                "id": self._next_ws_id()
-            })
-            await websocket_assistant.send(subscribe_user_balance_request)
+        enable_balance_ws = getattr(self._connector, 'ENABLE_BALANCE_WS', True)
+        if not enable_balance_ws:
             self.logger().info(
-                "NonKYC private balance WebSocket: subscription REQUESTED "
-                "(undocumented method — will confirm on first balance event, "
-                "REST polling active as fallback)"
+                "NonKYC private balance WebSocket: DISABLED by ENABLE_BALANCE_WS flag. "
+                "Using REST polling for balance updates."
             )
-        except Exception as e:
-            self.logger().warning(
-                f"NonKYC private balance WebSocket: UNAVAILABLE (subscription request failed: {e}). "
-                f"Using REST polling for balance updates."
-            )
+        else:
+            try:
+                subscribe_user_balance_request: WSJSONRequest = WSJSONRequest(payload={
+                    "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_BALANCE,
+                    "params": {},
+                    "id": self._next_ws_id()
+                })
+                await websocket_assistant.send(subscribe_user_balance_request)
+                self.logger().info(
+                    "NonKYC private balance WebSocket: subscription REQUESTED "
+                    "(undocumented method — will confirm on first balance event, "
+                    "REST polling active as fallback)"
+                )
+            except Exception as e:
+                self.logger().warning(
+                    f"NonKYC private balance WebSocket: UNAVAILABLE (subscription request failed: {e}). "
+                    f"Using REST polling for balance updates."
+                )
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:

@@ -33,6 +33,7 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 class NonkycExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    ENABLE_BALANCE_WS = True  # Set to False to disable undocumented balance WS subscription
 
     web_utils = web_utils
 

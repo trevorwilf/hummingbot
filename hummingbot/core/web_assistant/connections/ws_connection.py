@@ -30,7 +30,7 @@ class WSConnection:
     async def connect(
         self,
         ws_url: str,
-        ping_timeout: float = 10,
+        ping_timeout: float = 10,  # kept for API compat, no longer used as aiohttp heartbeat
         message_timeout: Optional[float] = None,
         ws_headers: Optional[Dict] = {},
         max_msg_size: Optional[int] = None
@@ -40,7 +40,7 @@ class WSConnection:
             ws_url,
             headers=ws_headers,
             autoping=False,
-            heartbeat=ping_timeout,
+            heartbeat=None,
             max_msg_size=max_msg_size,
         )
         self._message_timeout = message_timeout

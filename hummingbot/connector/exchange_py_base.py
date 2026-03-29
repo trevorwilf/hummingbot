@@ -1017,22 +1017,17 @@ class ExchangePyBase(ExchangeBase, ABC):
                 )
 
     async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
-        try:
-            raise error
-        except asyncio.TimeoutError:
-            self.logger().debug(
-                f"Tracked order {order.client_order_id} does not have an exchange id. "
-                f"Attempting fetch in next polling interval."
-            )
-            await self._order_tracker.process_order_not_found(order.client_order_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as request_error:
+        is_not_found = self._is_order_not_found_during_status_update_error(status_update_exception=error)
+        if is_not_found:
             self.logger().warning(
-                f"Error fetching status update for the active order {order.client_order_id}: {request_error}.",
+                f"Order {order.client_order_id} not found on exchange during status update."
             )
-            self.logger().debug(f"Order {order.client_order_id} not found counter: {self._order_tracker._order_not_found_records.get(order.client_order_id, 0)}")
             await self._order_tracker.process_order_not_found(order.client_order_id)
+        else:
+            self.logger().warning(
+                f"Error fetching status update for the active order {order.client_order_id}: {error}.",
+            )
+            # Do NOT increment not-found counter for transport/network errors
 
     async def _handle_update_error_for_lost_order(self, order: InFlightOrder, error: Exception):
         is_not_found = self._is_order_not_found_during_status_update_error(status_update_exception=error)

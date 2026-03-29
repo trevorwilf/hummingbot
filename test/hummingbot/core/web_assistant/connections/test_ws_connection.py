@@ -282,3 +282,58 @@ class WSConnectionTest(IsolatedAsyncioWrapperTestCase):
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
 
         self.assertNotEqual(0, self.ws_connection.last_recv_time)
+
+    @patch("aiohttp.client.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def test_connect_does_not_pass_heartbeat_to_aiohttp(self, ws_connect_mock):
+        """Fix 1: heartbeat must be None — aiohttp's internal PING/PONG is disabled."""
+        ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
+
+        await self.ws_connection.connect(self.ws_url, ping_timeout=30)
+
+        ws_connect_mock.assert_called_once()
+        call_kwargs = ws_connect_mock.call_args[1]
+        self.assertIsNone(call_kwargs.get("heartbeat"),
+                          "heartbeat should be None, not the ping_timeout value")
+        self.assertFalse(call_kwargs.get("autoping"),
+                         "autoping should be False — manual PING/PONG handling")
+
+    @patch("aiohttp.client.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def test_server_ping_gets_pong_reply(self, ws_connect_mock):
+        """Fix 1: Server-originated PING frames must get PONG replies via _check_msg_ping_type."""
+        ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
+        await self.ws_connection.connect(self.ws_url)
+
+        ping_data = b"server-ping-data"
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            ws_connect_mock.return_value, message=ping_data, message_type=aiohttp.WSMsgType.PING
+        )
+        data = {"one": 1}
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            ws_connect_mock.return_value, message=json.dumps(data)
+        )
+
+        response = await self.ws_connection.receive()
+
+        # PING should have been consumed, PONG sent, and next TEXT message returned
+        ws_connect_mock.return_value.pong.assert_called_once()
+        self.assertEqual(data, response.data)
+
+    @patch("aiohttp.client.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def test_pong_frames_are_silently_consumed(self, ws_connect_mock):
+        """Fix 1: PONG frames must not propagate as messages to callers."""
+        ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
+        await self.ws_connection.connect(self.ws_url)
+
+        # Add a PONG then a real message
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            ws_connect_mock.return_value, message="", message_type=aiohttp.WSMsgType.PONG
+        )
+        data = {"two": 2}
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            ws_connect_mock.return_value, message=json.dumps(data)
+        )
+
+        response = await self.ws_connection.receive()
+
+        # PONG consumed, next message returned
+        self.assertEqual(data, response.data)
