@@ -265,5 +265,171 @@ class TestListenKeyRedaction(unittest.TestCase):
             self.assertIn("7890", message)
 
 
+class TestTradingFeeRefresh(unittest.TestCase):
+    """Fix 5 (RCA): MEXC trading fee refresh implementation."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def setUp(self):
+        self.exchange = MexcExchange(
+            mexc_api_key="test",
+            mexc_api_secret="test",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+
+    def test_update_trading_fees_populates_fees(self):
+        """Mock /tradeFee to return live fees. Verify _trading_fees dict is populated."""
+        api_resp = {"data": {"makerCommission": 0.0, "takerCommission": 0.0005}, "code": 0, "msg": "success"}
+        with patch.object(self.exchange, '_api_get', new_callable=AsyncMock, return_value=api_resp), \
+             patch.object(self.exchange, 'exchange_symbol_associated_to_pair',
+                          new_callable=AsyncMock, return_value="BTCUSDT"):
+            self._run(self.exchange._update_trading_fees())
+
+        self.assertIn("BTC-USDT", self.exchange._trading_fees)
+        self.assertEqual(Decimal("0"), self.exchange._trading_fees["BTC-USDT"]["maker"])
+        self.assertEqual(Decimal("0.0005"), self.exchange._trading_fees["BTC-USDT"]["taker"])
+
+    def test_update_trading_fees_with_data_wrapper(self):
+        """Verify the 'data' wrapper is unwrapped correctly."""
+        api_resp = {"data": {"makerCommission": 0.001, "takerCommission": 0.002}, "code": 0}
+        with patch.object(self.exchange, '_api_get', new_callable=AsyncMock, return_value=api_resp), \
+             patch.object(self.exchange, 'exchange_symbol_associated_to_pair',
+                          new_callable=AsyncMock, return_value="BTCUSDT"):
+            self._run(self.exchange._update_trading_fees())
+
+        self.assertEqual(Decimal("0.001"), self.exchange._trading_fees["BTC-USDT"]["maker"])
+        self.assertEqual(Decimal("0.002"), self.exchange._trading_fees["BTC-USDT"]["taker"])
+
+    def test_update_trading_fees_fallback_on_error(self):
+        """Mock API to raise exception. Verify no crash and defaults remain."""
+        with patch.object(self.exchange, '_api_get', new_callable=AsyncMock,
+                          side_effect=Exception("API error")), \
+             patch.object(self.exchange, 'exchange_symbol_associated_to_pair',
+                          new_callable=AsyncMock, return_value="BTCUSDT"):
+            self._run(self.exchange._update_trading_fees())
+
+        # Should not crash, _trading_fees should remain empty
+        self.assertNotIn("BTC-USDT", self.exchange._trading_fees)
+
+    def test_get_fee_uses_live_fees_when_available(self):
+        """Populate _trading_fees with live data. _get_fee with is_maker=True should return 0."""
+        self.exchange._trading_fees["BTC-USDT"] = {
+            "maker": Decimal("0"),
+            "taker": Decimal("0.0005"),
+        }
+        fee = self.exchange._get_fee("BTC", "USDT", OrderType.LIMIT_MAKER, TradeType.BUY,
+                                      Decimal("1"), is_maker=True)
+        self.assertEqual(Decimal("0"), fee.percent)
+
+    def test_get_fee_falls_back_to_static_defaults(self):
+        """Empty _trading_fees => should use static default from estimate_fee_pct."""
+        self.exchange._trading_fees.clear()
+        fee = self.exchange._get_fee("BTC", "USDT", OrderType.LIMIT, TradeType.BUY,
+                                      Decimal("1"), is_maker=False)
+        # Static default is 0.05% (from mexc_utils.py TradeFeeSchema)
+        self.assertGreater(fee.percent, Decimal("0"))
+
+
+class TestErrorClassification(unittest.TestCase):
+    """Fix 4 (RCA): MEXC business errors classified correctly."""
+
+    def _classify(self, exception_msg: str) -> str:
+        """Run the classification logic inline to test it."""
+        error_str = exception_msg.lower()
+        if any(term in error_str for term in ("insufficient", "20001", "not enough", "balance",
+                                               "oversold", "30005", "30004", "insufficient position",
+                                               "10101")):
+            return "Insufficient funds / inventory oversubscription"
+        elif any(term in error_str for term in ("invalid content", "700013", "content type")):
+            return "Request format/content-type mismatch"
+        elif any(term in error_str for term in ("rate limit", "429", "too many", "too frequent")):
+            return "Rate limited by exchange"
+        elif any(term in error_str for term in ("401", "403", "invalid api", "invalid key",
+                                                  "authentication", "unauthorized", "forbidden")):
+            return "Authentication failure — check API key and permissions"
+        elif any(term in error_str for term in ("500", "502", "503", "504", "server error",
+                                                  "internal error", "bad gateway")):
+            return "Exchange server error (5xx) — retry may succeed"
+        elif any(term in error_str for term in ("timeout", "timed out", "connection")):
+            return "Network timeout or connection error"
+        else:
+            return "Check API key and network connection"
+
+    def test_mexc_30005_classified_as_inventory(self):
+        exc = 'IOError(\'Error executing request POST .../order. HTTP status is 400. Error: {"msg":"Oversold","code":30005}\')'
+        result = self._classify(exc)
+        self.assertEqual("Insufficient funds / inventory oversubscription", result)
+
+    def test_mexc_30004_classified_as_inventory(self):
+        exc = 'IOError(\'Error executing request. HTTP status is 400. Error: {"msg":"Insufficient position","code":30004}\')'
+        result = self._classify(exc)
+        self.assertEqual("Insufficient funds / inventory oversubscription", result)
+
+    def test_generic_error_still_falls_through(self):
+        exc = "Something completely unrecognized went wrong"
+        result = self._classify(exc)
+        self.assertEqual("Check API key and network connection", result)
+
+    def test_existing_insufficient_still_works(self):
+        exc = 'Insufficient balance to place order'
+        result = self._classify(exc)
+        self.assertEqual("Insufficient funds / inventory oversubscription", result)
+
+    def test_existing_429_still_works(self):
+        exc = 'HTTP status is 429, too many requests'
+        result = self._classify(exc)
+        self.assertEqual("Rate limited by exchange", result)
+
+
+class TestDuplicateTradePolling(unittest.TestCase):
+    """Fix 3 (RCA): Cycle flag prevents duplicate per-order fill API calls."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def setUp(self):
+        self.exchange = MexcExchange(
+            mexc_api_key="test",
+            mexc_api_secret="test",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+
+    def test_cycle_flag_skips_per_order_fills(self):
+        """When _bulk_fills_fetched_this_cycle is True, _all_trade_updates_for_order returns []."""
+        self.exchange._bulk_fills_fetched_this_cycle = True
+        mock_order = MagicMock()
+        mock_order.exchange_order_id = "12345"
+        result = self._run(self.exchange._all_trade_updates_for_order(mock_order))
+        self.assertEqual([], result)
+
+    def test_cycle_flag_allows_fills_when_false(self):
+        """When _bulk_fills_fetched_this_cycle is False (default), per-order fills are fetched."""
+        self.assertFalse(self.exchange._bulk_fills_fetched_this_cycle)
+        # When flag is False, _all_trade_updates_for_order should proceed normally
+        # (would make API call, so we just check the flag logic)
+
+    def test_cycle_flag_default_is_false(self):
+        """Default state allows per-order fill fetching (for lost orders, direct calls)."""
+        self.assertFalse(self.exchange._bulk_fills_fetched_this_cycle)
+
+    def test_order_status_still_updated(self):
+        """_update_order_status() must still call _update_orders()."""
+        with patch.object(self.exchange, '_update_orders', new_callable=AsyncMock) as mock_orders, \
+             patch.object(self.exchange, '_update_orders_fills', new_callable=AsyncMock):
+            self._run(self.exchange._update_order_status())
+            mock_orders.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

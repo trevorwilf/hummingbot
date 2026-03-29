@@ -501,8 +501,10 @@ class ExchangePyBase(ExchangeBase, ABC):
     ):
         # Classify the error for a more helpful operator message
         error_str = str(exception).lower()
-        if any(term in error_str for term in ("insufficient", "20001", "not enough", "balance")):
-            classification = "Insufficient funds"
+        if any(term in error_str for term in ("insufficient", "20001", "not enough", "balance",
+                                               "oversold", "30005", "30004", "insufficient position",
+                                               "10101")):
+            classification = "Insufficient funds / inventory oversubscription"
         elif any(term in error_str for term in ("invalid content", "700013", "content type")):
             classification = "Request format/content-type mismatch"
         elif any(term in error_str for term in ("rate limit", "429", "too many", "too frequent")):
@@ -524,7 +526,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             exc_info=True,
             app_warning_msg=(
                 f"Failed to submit {trade_type.name.upper()} order to {self.name_cap}. "
-                f"{classification}."
+                f"{classification}. Exchange response: {str(exception)[:200]}"
             )
         )
         self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)

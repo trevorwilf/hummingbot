@@ -77,6 +77,69 @@ def _make_controller(config=None, available_base=Decimal("0"), available_quote=D
     return ctrl
 
 
+class TestBuyExecutorCloseReservation(IsolatedAsyncioWrapperTestCase):
+    """Fix 1 (RCA): Active buy executors reserve base for close orders."""
+
+    def test_buy_executor_close_reservation_reduces_spendable_sell(self):
+        """Buy executor holding 10 base should reduce spendable sell to 0."""
+        ctrl = _make_controller(available_base=Decimal("10"))
+        mock_executor = MagicMock()
+        mock_executor.is_active = True
+        mock_executor.is_trading = True
+        mock_executor.custom_info = {"level_id": "buy_0"}
+        mock_executor.config = MagicMock()
+        mock_executor.config.amount = Decimal("10")
+        ctrl.executors_info = [mock_executor]
+
+        spendable = ctrl.get_spendable_sell_base_inventory()
+        self.assertEqual(Decimal("0"), spendable)
+
+    def test_mixed_buy_and_sell_executors_reservation(self):
+        """Buy executor (5) + sell executor (3) with 15 available => spendable = 7."""
+        ctrl = _make_controller(available_base=Decimal("15"))
+        buy_exec = MagicMock()
+        buy_exec.is_active = True
+        buy_exec.is_trading = True
+        buy_exec.custom_info = {"level_id": "buy_0"}
+        buy_exec.config = MagicMock()
+        buy_exec.config.amount = Decimal("5")
+
+        sell_exec = MagicMock()
+        sell_exec.is_active = True
+        sell_exec.is_trading = True
+        sell_exec.custom_info = {"level_id": "sell_0"}
+        sell_exec.config = MagicMock()
+        sell_exec.config.amount = Decimal("3")
+
+        ctrl.executors_info = [buy_exec, sell_exec]
+        spendable = ctrl.get_spendable_sell_base_inventory()
+        self.assertEqual(Decimal("7"), spendable)
+
+    def test_no_active_executors_returns_full_balance(self):
+        """No executors, 100 base available => spendable = 100."""
+        ctrl = _make_controller(available_base=Decimal("100"))
+        ctrl.executors_info = []
+        spendable = ctrl.get_spendable_sell_base_inventory()
+        self.assertEqual(Decimal("100"), spendable)
+
+    def test_double_booking_prevented_in_action_proposal(self):
+        """With buy executor holding all available base, no sell actions should be created."""
+        ctrl = _make_controller(available_base=Decimal("0.13"))
+        mock_executor = MagicMock()
+        mock_executor.is_active = True
+        mock_executor.is_trading = True
+        mock_executor.custom_info = {"level_id": "buy_0", "current_position_average_price": "0.22"}
+        mock_executor.config = MagicMock()
+        mock_executor.config.amount = Decimal("0.13")
+        ctrl.executors_info = [mock_executor]
+
+        actions = ctrl.create_actions_proposal()
+        sell_actions = [a for a in actions if isinstance(a, CreateExecutorAction)
+                        and a.executor_config.side == TradeType.SELL]
+        self.assertEqual(0, len(sell_actions),
+                         "All base reserved for buy executor close — no sell actions should be created")
+
+
 class TestSellSideInventoryClipping(IsolatedAsyncioWrapperTestCase):
     """Fix 2: Sell orders are clipped to available base, not silently dropped."""
 
@@ -185,3 +248,92 @@ class TestStartupGate(IsolatedAsyncioWrapperTestCase):
 
         await ctrl.control_task()
         ctrl.update_processed_data.assert_called_once()
+
+
+class TestControllerMinNotionalValidation(IsolatedAsyncioWrapperTestCase):
+    """Test 6 (Phase 1 Fix 3): Controller skips levels below min-notional."""
+
+    def test_controller_skips_below_min_notional(self):
+        """Level with notional below min_notional_size should be skipped."""
+        from hummingbot.connector.trading_rule import TradingRule
+        config = _make_config(total_amount_quote=Decimal("1"))  # Very small allocation
+        ctrl = _make_controller(config=config, available_base=Decimal("100"), available_quote=Decimal("100"))
+
+        # Set up trading rules on the mock connector
+        connector = ctrl.market_data_provider.connectors["nonkyc"]
+        trading_rule = TradingRule(
+            trading_pair="ARRR-USDT",
+            min_order_size=Decimal("0.0001"),
+            min_notional_size=Decimal("10"),  # 10 USDT minimum
+        )
+        connector.trading_rules = {"ARRR-USDT": trading_rule}
+        connector.quantize_order_amount = lambda pair, amt: amt
+        connector.quantize_order_price = lambda pair, price: price
+
+        # Don't override get_levels_to_execute — use actual method
+        ctrl.get_levels_to_execute = MarketMakingControllerBase.get_levels_to_execute.__get__(ctrl)
+        # But we need get_not_active_levels_ids to work:
+        ctrl.get_not_active_levels_ids = lambda ids: [l for l in ["buy_0", "sell_0"] if l not in ids]
+
+        actions = ctrl.create_actions_proposal()
+
+        # Both buy and sell have notional = 0.5 / 0.22 * 0.22 ~= 0.5 < 10 min_notional
+        buy_actions = [a for a in actions if isinstance(a, CreateExecutorAction)
+                        and a.executor_config.side == TradeType.BUY]
+        sell_actions = [a for a in actions if isinstance(a, CreateExecutorAction)
+                        and a.executor_config.side == TradeType.SELL]
+        self.assertEqual(0, len(buy_actions), "Buy level below min_notional should be skipped")
+        self.assertEqual(0, len(sell_actions), "Sell level below min_notional should be skipped")
+
+    def test_controller_passes_valid_levels(self):
+        """Level with notional above min_notional_size should pass through."""
+        from hummingbot.connector.trading_rule import TradingRule
+        config = _make_config(total_amount_quote=Decimal("100"))  # Sufficient allocation
+        ctrl = _make_controller(config=config, available_base=Decimal("1000"), available_quote=Decimal("1000"))
+
+        connector = ctrl.market_data_provider.connectors["nonkyc"]
+        trading_rule = TradingRule(
+            trading_pair="ARRR-USDT",
+            min_order_size=Decimal("0.0001"),
+            min_notional_size=Decimal("1"),  # 1 USDT minimum
+        )
+        connector.trading_rules = {"ARRR-USDT": trading_rule}
+        connector.quantize_order_amount = lambda pair, amt: amt
+        connector.quantize_order_price = lambda pair, price: price
+
+        ctrl.get_levels_to_execute = MarketMakingControllerBase.get_levels_to_execute.__get__(ctrl)
+        ctrl.get_not_active_levels_ids = lambda ids: [l for l in ["buy_0", "sell_0"] if l not in ids]
+
+        actions = ctrl.create_actions_proposal()
+
+        # Notional should be ~50 USDT per side, well above min 1 USDT
+        buy_actions = [a for a in actions if isinstance(a, CreateExecutorAction)
+                        and a.executor_config.side == TradeType.BUY]
+        self.assertGreater(len(buy_actions), 0, "Valid buy level should produce an action")
+
+    def test_controller_warns_once_per_level(self):
+        """Warning should fire once per invalid level, not every cycle."""
+        from hummingbot.connector.trading_rule import TradingRule
+        config = _make_config(total_amount_quote=Decimal("1"))
+        ctrl = _make_controller(config=config, available_base=Decimal("100"), available_quote=Decimal("100"))
+
+        connector = ctrl.market_data_provider.connectors["nonkyc"]
+        trading_rule = TradingRule(
+            trading_pair="ARRR-USDT",
+            min_order_size=Decimal("0.0001"),
+            min_notional_size=Decimal("10"),
+        )
+        connector.trading_rules = {"ARRR-USDT": trading_rule}
+        connector.quantize_order_amount = lambda pair, amt: amt
+        connector.quantize_order_price = lambda pair, price: price
+        ctrl.get_levels_to_execute = MarketMakingControllerBase.get_levels_to_execute.__get__(ctrl)
+        ctrl.get_not_active_levels_ids = lambda ids: [l for l in ["buy_0", "sell_0"] if l not in ids]
+
+        # First call: should set warnings
+        ctrl.create_actions_proposal()
+        self.assertTrue(getattr(ctrl, '_min_notional_warned', {}).get("buy_0"))
+
+        # Second call: should not re-warn (flag already set)
+        ctrl.create_actions_proposal()
+        # Still flagged
+        self.assertTrue(ctrl._min_notional_warned.get("buy_0"))

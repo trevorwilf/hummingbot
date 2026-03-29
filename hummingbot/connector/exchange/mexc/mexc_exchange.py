@@ -43,6 +43,7 @@ class MexcExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_trades_poll_mexc_timestamp = 1.0
+        self._bulk_fills_fetched_this_cycle: bool = False
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -180,6 +181,15 @@ class MexcExchange(ExchangePyBase):
         # Honor explicit is_maker if provided; otherwise infer from order type
         if is_maker is None:
             is_maker = order_type is OrderType.LIMIT_MAKER
+
+        # Check live-fetched fees first (populated by _update_trading_fees)
+        trading_pair = f"{base_currency}-{quote_currency}"
+        if trading_pair in self._trading_fees:
+            fee_info = self._trading_fees[trading_pair]
+            percent = fee_info["maker"] if is_maker else fee_info["taker"]
+            return DeductedFromReturnsTradeFee(percent=percent)
+
+        # Fall back to static defaults
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _place_order(self,
@@ -259,14 +269,48 @@ class MexcExchange(ExchangePyBase):
         return retval
 
     async def _status_polling_loop_fetch_updates(self):
+        self._bulk_fills_fetched_this_cycle = True
         await self._update_order_fills_from_trades()
         await super()._status_polling_loop_fetch_updates()
+        self._bulk_fills_fetched_this_cycle = False
 
     async def _update_trading_fees(self):
         """
-        Update fees information from the exchange
+        Fetch live maker/taker fees from MEXC /api/v3/tradeFee.
+        Response format (verified 2026-03-29):
+        {"data": {"makerCommission": 0.0, "takerCommission": 0.0005}, "code": 0, "msg": "success"}
+        NOTE: Requires symbol param, one call per trading pair.
         """
-        pass
+        try:
+            for trading_pair in self.trading_pairs:
+                symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                resp = await self._api_get(
+                    path_url=CONSTANTS.TRADE_FEE_PATH_URL,
+                    params={"symbol": symbol},
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.TRADE_FEE_PATH_URL,
+                    headers={"Content-Type": "application/json"})
+
+                # Response has a "data" wrapper: {"data": {"makerCommission": 0.0, ...}, "code": 0}
+                fee_data = resp
+                if isinstance(resp, dict) and "data" in resp:
+                    fee_data = resp["data"]
+
+                maker = Decimal(str(fee_data.get("makerCommission", "0.0005")))
+                taker = Decimal(str(fee_data.get("takerCommission", "0.0005")))
+
+                self._trading_fees[trading_pair] = {
+                    "maker": maker,
+                    "taker": taker,
+                }
+                self.logger().debug(
+                    f"MEXC fee update: {trading_pair} maker={maker} taker={taker}")
+        except Exception as e:
+            self.logger().network(
+                "Error updating trading fees from MEXC.",
+                exc_info=True,
+                app_warning_msg=f"Could not fetch trading fees from {self.name}. Using defaults."
+            )
 
     async def _user_stream_event_listener(self):
         """
@@ -477,6 +521,13 @@ class MexcExchange(ExchangePyBase):
                         self.logger().info(f"Recreating missing trade in TradeFill: {trade}")
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        # Skip per-order fill fetching if bulk _update_order_fills_from_trades()
+        # already ran this cycle (prevents duplicate /myTrades API calls).
+        # The flag is cleared after the polling cycle, so lost order updates
+        # (which run separately) still get their fills fetched correctly.
+        if self._bulk_fills_fetched_this_cycle:
+            return []
+
         trade_updates = []
 
         if order.exchange_order_id is not None:

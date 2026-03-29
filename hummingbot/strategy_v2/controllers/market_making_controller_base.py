@@ -358,7 +358,17 @@ class MarketMakingControllerBase(ControllerBase):
                 except AttributeError:
                     pass
 
-        return max(Decimal("0"), available_base - reserved_sell_base)
+        # Subtract base reserved for active buy executors' close orders
+        # (they will need to sell base when taking profit or stopping loss)
+        reserved_close_base = self._get_reserved_base_for_close()
+
+        spendable = available_base - reserved_sell_base - reserved_close_base
+        self.logger().debug(
+            f"Spendable sell inventory: available={available_base:.8f} "
+            f"reserved_sell={reserved_sell_base:.8f} reserved_close={reserved_close_base:.8f} "
+            f"spendable={max(Decimal('0'), spendable):.8f} {base_asset}"
+        )
+        return max(Decimal("0"), spendable)
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
@@ -444,6 +454,48 @@ class MarketMakingControllerBase(ControllerBase):
                 amount = clipped_amount
                 spendable_sell_base -= amount
 
+            # Min-notional / min-order-size pre-validation
+            trading_rules = self._get_trading_rules()
+            if trading_rules is not None:
+                connectors = getattr(self.market_data_provider, 'connectors', None)
+                if connectors and self.config.connector_name in connectors:
+                    connector = connectors[self.config.connector_name]
+                    q_amount = connector.quantize_order_amount(self.config.trading_pair, amount)
+                    q_price = connector.quantize_order_price(self.config.trading_pair, price)
+                else:
+                    q_amount = amount
+                    q_price = price
+
+                notional = q_amount * q_price
+                if q_amount < trading_rules.min_order_size:
+                    if not getattr(self, '_min_size_warned', {}).get(level_id):
+                        self.logger().warning(
+                            f"Skipping {level_id}: amount {q_amount} < min_order_size "
+                            f"{trading_rules.min_order_size} for {self.config.trading_pair}. "
+                            f"Increase total_amount_quote or adjust level percentages."
+                        )
+                        if not hasattr(self, '_min_size_warned'):
+                            self._min_size_warned = {}
+                        self._min_size_warned[level_id] = True
+                    continue
+                elif trading_rules.min_notional_size > 0 and notional < trading_rules.min_notional_size:
+                    if not getattr(self, '_min_notional_warned', {}).get(level_id):
+                        self.logger().warning(
+                            f"Skipping {level_id}: notional {notional:.8f} < min_notional_size "
+                            f"{trading_rules.min_notional_size} for {self.config.trading_pair}. "
+                            f"Increase total_amount_quote or adjust level percentages."
+                        )
+                        if not hasattr(self, '_min_notional_warned'):
+                            self._min_notional_warned = {}
+                        self._min_notional_warned[level_id] = True
+                    continue
+                else:
+                    # Clear warning flags if the level becomes valid (price moved)
+                    if hasattr(self, '_min_size_warned') and level_id in self._min_size_warned:
+                        del self._min_size_warned[level_id]
+                    if hasattr(self, '_min_notional_warned') and level_id in self._min_notional_warned:
+                        del self._min_notional_warned[level_id]
+
             executor_config = self.get_executor_config(level_id, price, amount)
             if executor_config is not None:
                 create_actions.append(CreateExecutorAction(
@@ -459,12 +511,52 @@ class MarketMakingControllerBase(ControllerBase):
         )
         return create_actions
 
+    def _get_trading_rules(self):
+        """Retrieve TradingRule for the configured pair, or None if unavailable."""
+        try:
+            connectors = getattr(self.market_data_provider, 'connectors', None)
+            if connectors and isinstance(connectors, dict) and self.config.connector_name in connectors:
+                connector = connectors[self.config.connector_name]
+                rules = getattr(connector, 'trading_rules', None)
+                if rules is not None and isinstance(rules, dict):
+                    rule = rules.get(self.config.trading_pair)
+                    # Verify it has the expected attributes (not a mock)
+                    if rule is not None and hasattr(rule, 'min_order_size') and hasattr(rule, 'min_notional_size'):
+                        try:
+                            # Quick sanity check — these must be Decimal-like
+                            _ = rule.min_order_size >= 0
+                            return rule
+                        except (TypeError, AttributeError):
+                            pass
+            elif hasattr(self.market_data_provider, 'get_connector'):
+                connector = self.market_data_provider.get_connector(self.config.connector_name)
+                rules = getattr(connector, 'trading_rules', None)
+                if rules is not None and isinstance(rules, dict):
+                    return rules.get(self.config.trading_pair)
+        except Exception:
+            pass
+        return None
+
     def get_levels_to_execute(self) -> List[str]:
         working_levels = self.filter_executors(
             executors=self.executors_info,
             filter_func=lambda x: x.is_active or (x.close_type == CloseType.STOP_LOSS and self.market_data_provider.time() - x.close_timestamp < self.config.cooldown_time)
         )
         working_levels_ids = [executor.custom_info["level_id"] for executor in working_levels]
+
+        # Suppress levels where the most recent executor had a terminal failure
+        # (will be retried after executor_refresh_time when price may have changed)
+        recently_failed = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: not x.is_active and x.close_type == CloseType.FAILED
+                and x.custom_info.get("terminal_failure_reason")
+                and self.market_data_provider.time() - x.close_timestamp < self.config.executor_refresh_time
+        )
+        for executor in recently_failed:
+            level_id = executor.custom_info.get("level_id")
+            if level_id and level_id not in working_levels_ids:
+                working_levels_ids.append(level_id)
+
         return self.get_not_active_levels_ids(working_levels_ids)
 
     def stop_actions_proposal(self) -> List[ExecutorAction]:

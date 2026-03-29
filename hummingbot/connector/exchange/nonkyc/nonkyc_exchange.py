@@ -33,7 +33,9 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 class NonkycExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
-    ENABLE_BALANCE_WS = True  # Set to False to disable undocumented balance WS subscription
+    ENABLE_BALANCE_WS = True  # Undocumented WS methods (subscribeBalances/currentBalances/balanceUpdate).
+                               # Confirmed working 2026-03-29. Auto-disables if no response within 60s.
+                               # unsubscribeBalances does NOT exist (404). Do not attempt to unsubscribe.
 
     web_utils = web_utils
 
@@ -54,6 +56,7 @@ class NonkycExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._cancel_exchange_orphans = cancel_exchange_orphans
         self._last_trades_poll_nonkyc_timestamp = 1.0
+        self._bulk_fills_fetched_this_cycle: bool = False
         self._balance_ws_confirmed: bool = False
         self._balance_ws_subscription_time: Optional[float] = None
         BALANCE_WS_HEALTH_TIMEOUT = 60.0
@@ -553,8 +556,10 @@ class NonkycExchange(ExchangePyBase):
         return retval
 
     async def _status_polling_loop_fetch_updates(self):
+        self._bulk_fills_fetched_this_cycle = True
         await self._update_order_fills_from_trades()
         await super()._status_polling_loop_fetch_updates()
+        self._bulk_fills_fetched_this_cycle = False
 
     async def _update_trading_fees(self):
         """
@@ -679,10 +684,11 @@ class NonkycExchange(ExchangePyBase):
                         and not self._balance_ws_confirmed
                         and time.time() - self._balance_ws_subscription_time > 60.0):
                     self.logger().warning(
-                        "NonKYC private balance WebSocket: UNCONFIRMED after 60s. "
-                        "Undocumented method may not be available. "
-                        "REST polling remains the source of truth for balance updates."
+                        "NonKYC private balance WebSocket: NO CONFIRMATION received within 60s. "
+                        "Auto-disabling undocumented balance WS for this session. "
+                        "REST polling will handle balance updates."
                     )
+                    self.ENABLE_BALANCE_WS = False  # Prevent re-subscription on WS reconnect
                     self._balance_ws_subscription_time = None  # Don't warn again
 
                 event_type = event_message.get("method")
@@ -774,10 +780,11 @@ class NonkycExchange(ExchangePyBase):
                     total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
                     old_free = self._account_available_balances.get(asset_name, Decimal("0"))
                     old_total = self._account_balances.get(asset_name, Decimal("0"))
-                    self.logger().debug(
-                        f"NonKYC balance delta: source=balanceUpdate asset={asset_name} "
-                        f"free {old_free}->{free_balance} total {old_total}->{total_balance}"
-                    )
+                    if free_balance != old_free or total_balance != old_total:
+                        self.logger().debug(
+                            f"NonKYC balance delta: source=balanceUpdate asset={asset_name} "
+                            f"free {old_free}->{free_balance} total {old_total}->{total_balance}"
+                        )
                     self._account_available_balances[asset_name] = free_balance
                     self._account_balances[asset_name] = total_balance
 
@@ -905,6 +912,13 @@ class NonkycExchange(ExchangePyBase):
                         self.logger().info(f"Recreating missing trade in TradeFill: {trade}")
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        # Skip per-order fill fetching if bulk _update_order_fills_from_trades()
+        # already ran this cycle (prevents duplicate /account/trades API calls).
+        # The flag is cleared after the polling cycle, so lost order updates
+        # (which run separately) still get their fills fetched correctly.
+        if self._bulk_fills_fetched_this_cycle:
+            return []
+
         trade_updates = []
 
         if order.exchange_order_id is not None:

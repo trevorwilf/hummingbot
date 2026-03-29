@@ -106,8 +106,10 @@ RAW_REQUESTS = "RAW_REQUESTS"
 # ============================================================================
 # RATE LIMITS -- ESTIMATED VALUES
 # ============================================================================
-# NonKYC does not publish rate limit documentation. These values are
-# conservative estimates based on observed behavior during development.
+# NonKYC does not publish rate limit documentation or return rate limit headers.
+# Live testing (2026-03-29) showed 25+ rapid requests succeeded without throttling.
+# These conservative estimates should be safe. If you observe 429s, reduce the limits.
+# Private endpoints may have stricter unpublished limits than public ones.
 #
 # If you encounter HTTP 429 ("Too Many Requests") errors in hummingbot logs:
 #   1. Reduce MAX_REQUEST (e.g., from 5000 to 2000)

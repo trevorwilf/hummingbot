@@ -26,6 +26,14 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 class PositionExecutor(ExecutorBase):
     _logger = None
 
+    # Terminal (non-retriable) failure patterns from ExchangePyBase local validation
+    # These are deterministic rejections that will never succeed on retry
+    _TERMINAL_ERROR_PATTERNS = (
+        "lower than minimum notional size",
+        "lower than minimum order size",
+        "is not in the list of supported order types",
+    )
+
     @classmethod
     def logger(cls) -> HummingbotLogger:
         if cls._logger is None:
@@ -66,6 +74,7 @@ class PositionExecutor(ExecutorBase):
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
         self._max_retries = max_retries
+        self._terminal_failure_reason: Optional[str] = None
         self._pending_close_after_cancel: bool = False
         self._pending_close_price: Decimal = Decimal("NaN")
         self._pending_close_timestamp: Optional[float] = None
@@ -310,11 +319,11 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         if self.status == RunnableStatus.RUNNING:
+            self.evaluate_max_retries()  # Check BEFORE attempting new orders
             self.control_open_order()
             self.control_barriers()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
-        self.evaluate_max_retries()
 
     def all_orders_completed(self):
         """
@@ -395,7 +404,7 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        if self._current_retries > self._max_retries:
+        if self._current_retries >= self._max_retries:
             self.close_type = CloseType.FAILED
             self.stop()
 
@@ -549,7 +558,13 @@ class PositionExecutor(ExecutorBase):
                     if Decimal("0") < max_base < close_amount:
                         close_amount = connector.quantize_order_amount(
                             self.config.trading_pair, max_base)
-        if close_amount >= self.trading_rules.min_order_size and self.close_type != CloseType.POSITION_HOLD:
+        close_notional = close_amount * (
+            price if not price.is_nan() and price > 0
+            else self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        )
+        if (close_amount >= self.trading_rules.min_order_size
+                and (close_notional >= self.trading_rules.min_notional_size or self.trading_rules.min_notional_size == 0)
+                and self.close_type != CloseType.POSITION_HOLD):
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
@@ -561,6 +576,16 @@ class PositionExecutor(ExecutorBase):
             )
             self._close_order = TrackedOrder(order_id=order_id)
             self.logger().debug(f"Executor ID: {self.config.id} - Placing close order {order_id} --> Filled amount: {self.open_filled_amount}")
+        elif close_amount > 0 and self.close_type != CloseType.POSITION_HOLD:
+            self.logger().warning(
+                f"Executor {self.config.id}: close order amount {close_amount} / notional ~{close_notional:.8f} "
+                f"below exchange minimums (min_size={self.trading_rules.min_order_size}, "
+                f"min_notional={self.trading_rules.min_notional_size}). "
+                f"Treating as dust remainder."
+            )
+            self.close_type = CloseType.FAILED
+            self._terminal_failure_reason = "Close order below exchange minimums (dust remainder)"
+            self.stop()
 
     def _has_pending_cancels(self) -> bool:
         if self._open_order and self._open_order.order and self._open_order.order.is_open:
@@ -646,14 +671,68 @@ class PositionExecutor(ExecutorBase):
 
     def place_take_profit_limit_order(self):
         """
-        This method is responsible for placing the take profit limit order.
-
-        :return: None
+        Place the take profit limit order, capped to available balance for spot.
         """
+        amount = self.amount_to_close
+
+        # For spot positions, cap to available balance (mirrors _place_close_order_now logic)
+        if not self.is_perpetual:
+            connector = self.connectors[self.config.connector_name]
+            if self.close_order_side == TradeType.SELL:
+                base_asset = self.config.trading_pair.split("-")[0]
+                available = connector.available_balances.get(base_asset, Decimal("0"))
+                if available <= Decimal("0"):
+                    self.logger().warning(
+                        f"Executor {self.config.id}: TP sell deferred — no {base_asset} available "
+                        f"(needed {amount}, available {available}). Will retry on next cycle."
+                    )
+                    return
+                if available < amount:
+                    amount = connector.quantize_order_amount(self.config.trading_pair, available)
+                    self.logger().info(
+                        f"Executor {self.config.id}: TP sell capped {self.amount_to_close} -> {amount} "
+                        f"(available {base_asset}: {available})"
+                    )
+            else:
+                quote_asset = self.config.trading_pair.split("-")[1]
+                available_quote = connector.available_balances.get(quote_asset, Decimal("0"))
+                mid_price = self.get_price(
+                    self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+                if mid_price > Decimal("0"):
+                    max_base = available_quote / mid_price
+                    if max_base <= Decimal("0"):
+                        self.logger().warning(
+                            f"Executor {self.config.id}: TP buy deferred — insufficient {quote_asset} "
+                            f"(needed ~{amount * mid_price}, available {available_quote}). Will retry on next cycle."
+                        )
+                        return
+                    if max_base < amount:
+                        amount = connector.quantize_order_amount(self.config.trading_pair, max_base)
+                        self.logger().info(
+                            f"Executor {self.config.id}: TP buy capped {self.amount_to_close} -> {amount} "
+                            f"(available {quote_asset}: {available_quote})"
+                        )
+
+        if amount < self.trading_rules.min_order_size:
+            self.logger().warning(
+                f"Executor {self.config.id}: TP order amount {amount} below min order size "
+                f"{self.trading_rules.min_order_size}. Deferring to next cycle."
+            )
+            return
+
+        # Check min notional
+        tp_notional = amount * self.take_profit_price
+        if self.trading_rules.min_notional_size > 0 and tp_notional < self.trading_rules.min_notional_size:
+            self.logger().warning(
+                f"Executor {self.config.id}: TP order notional {tp_notional:.8f} below min notional "
+                f"{self.trading_rules.min_notional_size}. Deferring to next cycle."
+            )
+            return
+
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
-            amount=self.amount_to_close,
+            amount=amount,
             price=self.take_profit_price,
             order_type=self.config.triple_barrier_config.take_profit_order_type,
             position_action=PositionAction.CLOSE,
@@ -771,26 +850,68 @@ class PositionExecutor(ExecutorBase):
             )
             self._place_close_order_now(self._pending_close_price)
 
+    def _is_terminal_failure(self, event: MarketOrderFailureEvent) -> bool:
+        """Check if an order failure is terminal (will never succeed on retry)."""
+        if event.error_message:
+            error_msg_lower = event.error_message.lower()
+            return any(pattern in error_msg_lower for pattern in self._TERMINAL_ERROR_PATTERNS)
+        return False
+
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         """
-        This method is responsible for processing the order failed event. Here we will add the InFlightOrder to the
-        failed orders list.
+        Process order failed event. Terminal failures (local validation rejections)
+        are not retried. Transient failures increment retry counter.
         """
+        is_terminal = self._is_terminal_failure(event)
+
         if self._open_order and event.order_id == self._open_order.order_id:
             self._failed_orders.append(self._open_order)
             self._open_order = None
-            self.logger().error(f"Open order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
-            self._current_retries += 1
+            if is_terminal:
+                self.logger().warning(
+                    f"Open order permanently failed for {event.order_id}: "
+                    f"{event.error_message}. Will not retry."
+                )
+                self._terminal_failure_reason = event.error_message
+                self._current_retries = self._max_retries
+            else:
+                self._current_retries += 1
+                self.logger().error(
+                    f"Open order failed {event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
         elif self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
-            self.logger().error(f"Close order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
-            self._current_retries += 1
+            if is_terminal:
+                self.logger().warning(
+                    f"Close order permanently failed for {event.order_id}: "
+                    f"{event.error_message}. Will not retry."
+                )
+                self._terminal_failure_reason = event.error_message
+                self._current_retries = self._max_retries
+            else:
+                self._current_retries += 1
+                self.logger().error(
+                    f"Close order failed {event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
         elif self._take_profit_limit_order and event.order_id == self._take_profit_limit_order.order_id:
             self._failed_orders.append(self._take_profit_limit_order)
             self._take_profit_limit_order = None
-            self.logger().error(f"Take profit order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
-            self._current_retries += 1
+            if is_terminal:
+                self.logger().warning(
+                    f"Close order permanently failed for {event.order_id}: "
+                    f"{event.error_message}. Will not retry."
+                )
+                self._terminal_failure_reason = event.error_message
+                self._current_retries = self._max_retries
+            else:
+                self._current_retries += 1
+                self.logger().error(
+                    f"Take profit order failed {event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
 
     def get_custom_info(self) -> Dict:
         return {
@@ -803,6 +924,7 @@ class PositionExecutor(ExecutorBase):
             "open_order_last_update": self._open_order.last_update_timestamp if self._open_order else None,
             "order_ids": [order.order_id for order in [self._open_order, self._close_order, self._take_profit_limit_order] if order],
             "held_position_orders": self._held_position_orders,
+            "terminal_failure_reason": self._terminal_failure_reason,
         }
 
     def to_format_status(self, scale=1.0):
