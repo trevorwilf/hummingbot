@@ -1,3 +1,4 @@
+import time as _time
 from decimal import Decimal
 from typing import List, Optional, Tuple, Union
 
@@ -233,8 +234,20 @@ class MarketMakingControllerBase(ControllerBase):
         self.config = config
         self._last_rebalance_attempt_timestamp: float = 0.0
         self._wallet_balance_seeded: bool = False
+        self._startup_logged: bool = False
+        self._last_ob_diff_uid: int = 0
+        self._last_ob_change_time: float = _time.time()
         self.market_data_provider.initialize_rate_sources([ConnectorPair(
             connector_name=config.connector_name, trading_pair=config.trading_pair)])
+        self.logger().info(
+            f"Controller initialized: id={self.config.id} "
+            f"connector={self.config.connector_name} pair={self.config.trading_pair} "
+            f"buy_levels={len(self.config.buy_spreads)} sell_levels={len(self.config.sell_spreads)} "
+            f"total_amount_quote={getattr(self.config, 'total_amount_quote', 'N/A')} "
+            f"use_wallet_balance={getattr(self.config, 'use_wallet_balance', 'N/A')} "
+            f"skip_rebalance={getattr(self.config, 'skip_rebalance', 'N/A')} "
+            f"refresh_time={getattr(self.config, 'executor_refresh_time', 'N/A')}s"
+        )
 
     def compute_wallet_seed_amount(self, reference_price: Decimal) -> Decimal:
         """
@@ -286,19 +299,25 @@ class MarketMakingControllerBase(ControllerBase):
 
     def _get_active_order_price_bounds(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         """
-        Returns (highest_active_buy_price, lowest_active_sell_price) from executors
-        that are active and trading.
+        Returns (highest_active_buy_price, lowest_active_sell_price) from
+        all active executors with a known quote price — including those with
+        unfilled resting orders (is_trading=False).
         """
         highest_buy = None
         lowest_sell = None
         for executor in self.executors_info:
-            if not (executor.is_active and executor.is_trading):
+            if not executor.is_active:
                 continue
+            # Include all active executors with a known quote price,
+            # not just those with fills (is_trading). An unfilled resting
+            # order still occupies a price level.
             level_id = executor.custom_info.get("level_id", "")
             avg_price = executor.custom_info.get("current_position_average_price")
             if avg_price is None:
                 continue
             avg_price = Decimal(str(avg_price))
+            if avg_price <= Decimal("0"):
+                continue
             if level_id.startswith("buy"):
                 if highest_buy is None or avg_price > highest_buy:
                     highest_buy = avg_price
@@ -307,27 +326,19 @@ class MarketMakingControllerBase(ControllerBase):
                     lowest_sell = avg_price
         return highest_buy, lowest_sell
 
-    def _get_reserved_base_for_close(self) -> Decimal:
-        """
-        For spot: sum amounts of active buy trading executors (they will need to sell base when closing).
-        """
-        reserved = Decimal("0")
-        for executor in self.executors_info:
-            if not (executor.is_active and executor.is_trading):
-                continue
-            level_id = executor.custom_info.get("level_id", "")
-            if level_id.startswith("buy"):
-                try:
-                    reserved += executor.config.amount
-                except AttributeError:
-                    pass
-        return reserved
-
     def get_spendable_sell_base_inventory(self) -> Decimal:
         """
-        Compute how much base asset is available for new sell orders.
-        Returns the available base balance minus any base already committed
-        by active sell executors.
+        Compute how much base asset is available for new sell entry orders.
+
+        available_balances already represents FREE balance (exchange subtracts
+        held collateral for open orders). We only need to additionally reserve
+        base for buy-side executors that have filled base inventory but do NOT
+        yet have a resting close-side sell order on the exchange — that base
+        appears in 'available' but is logically committed to a future TP/SL sell.
+
+        We do NOT subtract:
+        - Active sell executor amounts (exchange already holds that base)
+        - Buy executor amounts with an open TP sell order (exchange already holds that base)
         """
         base_asset = self.config.trading_pair.split("-")[0]
         available_base = Decimal("0")
@@ -346,28 +357,39 @@ class MarketMakingControllerBase(ControllerBase):
             self.logger().debug(f"Could not query {base_asset} balance: {e}")
             return Decimal("0")
 
-        # Subtract base already committed by active sell executors
-        reserved_sell_base = Decimal("0")
+        # Only reserve base for buy-side executors with filled inventory
+        # that don't yet have a resting close-side sell order
+        additional_reserve = Decimal("0")
         for executor in self.executors_info:
             if not (executor.is_active and executor.is_trading):
                 continue
             level_id = executor.custom_info.get("level_id", "")
-            if level_id.startswith("sell"):
-                try:
-                    reserved_sell_base += executor.config.amount
-                except AttributeError:
-                    pass
+            if not level_id.startswith("buy"):
+                continue
 
-        # Subtract base reserved for active buy executors' close orders
-        # (they will need to sell base when taking profit or stopping loss)
-        reserved_close_base = self._get_reserved_base_for_close()
+            has_open_close_order = executor.custom_info.get("has_open_close_order", False)
+            close_order_side = executor.custom_info.get("close_order_side")
 
-        spendable = available_base - reserved_sell_base - reserved_close_base
-        self.logger().debug(
-            f"Spendable sell inventory: available={available_base:.8f} "
-            f"reserved_sell={reserved_sell_base:.8f} reserved_close={reserved_close_base:.8f} "
+            # Only reserve if: this is a buy executor, its close side is SELL,
+            # it has filled base, and there's no resting TP sell on the exchange
+            if close_order_side == TradeType.SELL and not has_open_close_order:
+                amount_to_close = Decimal(str(executor.custom_info.get("amount_to_close", "0")))
+                if amount_to_close > Decimal("0"):
+                    additional_reserve += amount_to_close
+
+        spendable = available_base - additional_reserve
+        log_msg = (
+            f"Spendable sell inventory: controller={self.config.id} "
+            f"available_base={available_base:.8f} "
+            f"additional_reserve={additional_reserve:.8f} "
             f"spendable={max(Decimal('0'), spendable):.8f} {base_asset}"
         )
+        if spendable <= Decimal("0"):
+            self.logger().warning(log_msg + " [EXHAUSTED]")
+        elif available_base > 0 and spendable < available_base * Decimal("0.5"):
+            self.logger().info(log_msg + " [CONSTRAINED]")
+        else:
+            self.logger().debug(log_msg)
         return max(Decimal("0"), spendable)
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
@@ -389,11 +411,85 @@ class MarketMakingControllerBase(ControllerBase):
         """
         create_actions = []
 
+        # First-cycle startup balance log
+        if not self._startup_logged:
+            self._startup_logged = True
+            try:
+                base, quote = self.config.trading_pair.split("-")
+                connectors = getattr(self.market_data_provider, 'connectors', None)
+                if connectors and self.config.connector_name in connectors:
+                    connector = connectors[self.config.connector_name]
+                    self.logger().info(
+                        f"First cycle for {self.config.id}: "
+                        f"{base} avail={connector.available_balances.get(base, 0):.8f} "
+                        f"total={connector.get_balance(base):.8f} | "
+                        f"{quote} avail={connector.available_balances.get(quote, 0):.8f} "
+                        f"total={connector.get_balance(quote):.8f}"
+                    )
+            except Exception:
+                pass
+
         self.logger().debug(
             f"Action proposal: controller={self.config.id} pair={self.config.trading_pair} "
             f"ref_price={self.processed_data.get('reference_price', 'N/A')} "
             f"spread_mult={self.processed_data.get('spread_multiplier', 'N/A')}"
         )
+
+        # Market data freshness check (LOG 12)
+        try:
+            connectors = getattr(self.market_data_provider, 'connectors', None)
+            if connectors and self.config.connector_name in connectors:
+                connector = connectors[self.config.connector_name]
+                ob = connector.get_order_book(self.config.trading_pair)
+                if ob and hasattr(ob, 'last_diff_uid'):
+                    current_uid = ob.last_diff_uid
+                    if current_uid != self._last_ob_diff_uid:
+                        self._last_ob_diff_uid = current_uid
+                        self._last_ob_change_time = _time.time()
+                    else:
+                        age_seconds = _time.time() - self._last_ob_change_time
+                        if age_seconds > 30:
+                            self.logger().warning(
+                                f"STALE MARKET DATA: controller={self.config.id} "
+                                f"orderbook last updated {age_seconds:.0f}s ago "
+                                f"(threshold: 30s). Quoting on potentially stale prices."
+                            )
+        except Exception:
+            pass  # Best effort — don't break quoting
+
+        # Per-controller executor inventory summary
+        try:
+            active_buys = []
+            active_sells = []
+            for executor in self.executors_info:
+                if not executor.is_active:
+                    continue
+                level_id = executor.custom_info.get("level_id", "")
+                if level_id.startswith("buy"):
+                    active_buys.append(executor)
+                elif level_id.startswith("sell"):
+                    active_sells.append(executor)
+
+            if active_buys or active_sells:
+                buy_total = sum(
+                    getattr(e.config, 'amount', Decimal("0"))
+                    for e in active_buys
+                    if hasattr(e, 'config') and e.config is not None
+                )
+                sell_total = sum(
+                    getattr(e.config, 'amount', Decimal("0"))
+                    for e in active_sells
+                    if hasattr(e, 'config') and e.config is not None
+                )
+                buy_trading = sum(1 for e in active_buys if e.is_trading)
+                sell_trading = sum(1 for e in active_sells if e.is_trading)
+                self.logger().debug(
+                    f"Executor inventory: controller={self.config.id} "
+                    f"buys={len(active_buys)}({buy_trading} trading, ~{buy_total:.4f} qty) "
+                    f"sells={len(active_sells)}({sell_trading} trading, ~{sell_total:.4f} qty)"
+                )
+        except Exception:
+            pass  # Logging must never break proposal flow
 
         # Check if we need to rebalance position first
         position_rebalance_action = self.check_position_rebalance()
@@ -416,7 +512,8 @@ class MarketMakingControllerBase(ControllerBase):
             if trade_type == TradeType.SELL and highest_buy is not None and price <= highest_buy:
                 if not getattr(self, '_cross_order_warned', {}).get(level_id):
                     self.logger().warning(
-                        f"Skipping {level_id}: sell price {price:.6f} <= highest active buy {highest_buy:.6f}"
+                        f"Skipping {level_id}: controller={self.config.id} "
+                        f"sell price {price:.6f} <= highest active buy {highest_buy:.6f}"
                     )
                     if not hasattr(self, '_cross_order_warned'):
                         self._cross_order_warned = {}
@@ -425,7 +522,8 @@ class MarketMakingControllerBase(ControllerBase):
             elif trade_type == TradeType.BUY and lowest_sell is not None and price >= lowest_sell:
                 if not getattr(self, '_cross_order_warned', {}).get(level_id):
                     self.logger().warning(
-                        f"Skipping {level_id}: buy price {price:.6f} >= lowest active sell {lowest_sell:.6f}"
+                        f"Skipping {level_id}: controller={self.config.id} "
+                        f"buy price {price:.6f} >= lowest active sell {lowest_sell:.6f}"
                     )
                     if not hasattr(self, '_cross_order_warned'):
                         self._cross_order_warned = {}
@@ -438,19 +536,38 @@ class MarketMakingControllerBase(ControllerBase):
             # Sell-side inventory clipping (spot only)
             if trade_type == TradeType.SELL and "_perpetual" not in self.config.connector_name:
                 if spendable_sell_base <= Decimal("0"):
-                    self.logger().warning(
-                        f"Skipping {level_id}: no spendable base remaining for sell-side quoting. "
-                        f"Initial spendable was {initial_spendable:.8f} {self.config.trading_pair.split('-')[0]}"
-                    )
+                    if not getattr(self, '_clip_exhausted_warned', {}).get(level_id):
+                        self.logger().warning(
+                            f"Skipping {level_id}: controller={self.config.id} "
+                            f"no spendable base remaining for sell-side quoting. "
+                            f"Initial spendable was {initial_spendable:.8f} {self.config.trading_pair.split('-')[0]}"
+                        )
+                        if not hasattr(self, '_clip_exhausted_warned'):
+                            self._clip_exhausted_warned = {}
+                        self._clip_exhausted_warned[level_id] = True
                     continue
 
                 clipped_amount = min(amount, spendable_sell_base)
                 if clipped_amount < amount:
-                    self.logger().warning(
-                        f"Clipping {level_id}: sell amount {amount:.8f} -> {clipped_amount:.8f} "
-                        f"(spendable base: {spendable_sell_base:.8f} "
-                        f"{self.config.trading_pair.split('-')[0]})"
-                    )
+                    # Deduplicate: only warn if the clipping state changed
+                    last_clip = getattr(self, '_last_clip_state', {}).get(level_id)
+                    clip_key = (str(amount), str(clipped_amount), str(spendable_sell_base))
+                    if last_clip != clip_key:
+                        self.logger().warning(
+                            f"Clipping {level_id}: controller={self.config.id} "
+                            f"sell amount {amount:.8f} -> {clipped_amount:.8f} "
+                            f"(spendable base: {spendable_sell_base:.8f} "
+                            f"{self.config.trading_pair.split('-')[0]})"
+                        )
+                        if not hasattr(self, '_last_clip_state'):
+                            self._last_clip_state = {}
+                        self._last_clip_state[level_id] = clip_key
+                else:
+                    # Clipping resolved — clear state so it can warn again if it recurs
+                    if hasattr(self, '_last_clip_state') and level_id in self._last_clip_state:
+                        del self._last_clip_state[level_id]
+                    if hasattr(self, '_clip_exhausted_warned') and level_id in self._clip_exhausted_warned:
+                        del self._clip_exhausted_warned[level_id]
                 amount = clipped_amount
                 spendable_sell_base -= amount
 

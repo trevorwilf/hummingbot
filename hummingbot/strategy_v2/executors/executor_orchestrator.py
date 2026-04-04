@@ -437,21 +437,67 @@ class ExecutorOrchestrator:
     def execute_actions(self, actions: List[ExecutorAction]):
         """
         Execute a list of actions in the correct order:
-        1. StopExecutorAction — free collateral from outgoing executors first
+        1. StopExecutorAction — initiate executor shutdown (NOTE: this is async —
+           it sets SHUTTING_DOWN but does NOT synchronously cancel orders or
+           release collateral on the exchange)
         2. StoreExecutorAction — persist completed executors
-        3. CreateExecutorAction — create new executors after budget preflight
+        3. CreateExecutorAction — create new executors, but DEFER any that
+           conflict with same-cycle stops to avoid collateral contention
         """
         stop_actions = [a for a in actions if isinstance(a, StopExecutorAction)]
         store_actions = [a for a in actions if isinstance(a, StoreExecutorAction)]
         create_actions = [a for a in actions if isinstance(a, CreateExecutorAction)]
+
+        # Build set of (connector, pair, side) tuples being stopped this cycle
+        stopped_keys = set()
+        for action in stop_actions:
+            controller_id = action.controller_id
+            executor = next(
+                (e for e in self.active_executors.get(controller_id, [])
+                 if e.config.id == action.executor_id),
+                None
+            )
+            if executor is not None:
+                try:
+                    key = (
+                        executor.config.connector_name,
+                        executor.config.trading_pair,
+                        executor.config.side
+                    )
+                    stopped_keys.add(key)
+                except AttributeError:
+                    pass
 
         for action in stop_actions:
             self.execute_action(action)
         for action in store_actions:
             self.execute_action(action)
 
-        # Run batch budget preflight before creating executors
-        surviving_creates = self._preflight_budget_check(create_actions)
+        # Separate creates into immediate vs deferred
+        immediate_creates = []
+        deferred_creates = []
+        for action in create_actions:
+            try:
+                key = (
+                    action.executor_config.connector_name,
+                    action.executor_config.trading_pair,
+                    action.executor_config.side
+                )
+                if key in stopped_keys:
+                    deferred_creates.append(action)
+                else:
+                    immediate_creates.append(action)
+            except AttributeError:
+                immediate_creates.append(action)
+
+        if deferred_creates:
+            self.logger().info(
+                f"Deferred {len(deferred_creates)} create action(s) due to same-cycle "
+                f"stop on same connector/pair/side (will re-propose next cycle)"
+            )
+
+        # Only run budget preflight on non-deferred creates
+        surviving_creates = self._preflight_budget_check(immediate_creates)
         for action in surviving_creates:
             self.execute_action(action)
 
@@ -541,13 +587,15 @@ class ExecutorOrchestrator:
                     if adjusted.amount == Decimal("0"):
                         dropped_actions.append(action)
                         self.logger().warning(
-                            f"BUDGET PREFLIGHT DROP: {config.trading_pair} {config.side.name} "
+                            f"BUDGET PREFLIGHT DROP: controller={action.controller_id} "
+                            f"pair={config.trading_pair} side={config.side.name} "
                             f"amount={config.amount} price={price} on {connector_name} — "
                             f"insufficient balance, order dropped entirely"
                         )
                     elif adjusted.amount != config.amount:
                         self.logger().warning(
-                            f"BUDGET PREFLIGHT RESIZE: {config.trading_pair} {config.side.name} "
+                            f"BUDGET PREFLIGHT RESIZE: controller={action.controller_id} "
+                            f"pair={config.trading_pair} side={config.side.name} "
                             f"amount {config.amount} -> {adjusted.amount} on {connector_name} — "
                             f"resized due to insufficient balance"
                         )
@@ -565,7 +613,7 @@ class ExecutorOrchestrator:
 
         if dropped_actions:
             dropped_summary = ", ".join(
-                f"{a.executor_config.trading_pair} {a.executor_config.side.name} {a.executor_config.amount}"
+                f"{a.controller_id}:{a.executor_config.trading_pair} {a.executor_config.side.name} {a.executor_config.amount}"
                 for a in dropped_actions
             )
             self.logger().warning(
@@ -610,7 +658,7 @@ class ExecutorOrchestrator:
         price = getattr(executor_config, 'entry_price', None) or getattr(executor_config, 'price', None)
         if connector_name and trading_pair:
             self.logger().info(
-                f"[ORDER PRE] Creating {side.name if side else '?'} order: "
+                f"[ORDER PRE] controller={controller_id} Creating {side.name if side else '?'} order: "
                 f"{amount} {trading_pair} @ {price} on {connector_name}"
             )
             self._log_balance_snapshot(connector_name, trading_pair, "PRE-ORDER")

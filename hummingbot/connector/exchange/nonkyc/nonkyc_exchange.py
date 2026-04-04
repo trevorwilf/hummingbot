@@ -63,11 +63,68 @@ class NonkycExchange(ExchangePyBase):
         self._trading_fees: Dict[str, Decimal] = {}
         self._trading_fees_last_computed: float = 0.0
         self._trading_fees_ttl: float = 3600.0  # 1 hour cache TTL
+        self._pre_adjusted_assets: Dict[str, float] = {}  # asset -> timestamp of last pre-adjust
+        self._ws_reconnect_count: int = 0
+        self._ws_reconnect_count_since_log: int = 0
+        self._last_balance_health_log: float = 0.0
+        self._api_latency_samples: Dict[str, list] = {}  # endpoint -> list of recent latencies (ms)
+        self._api_latency_max_samples: int = 100
+        self._error_counters: Dict[str, int] = {
+            "order_reject_insufficient": 0,
+            "order_reject_other": 0,
+            "rest_5xx": 0,
+            "rest_timeout": 0,
+            "ws_reconnect": 0,
+            "balance_poll_failure": 0,
+        }
+        self._error_counters_last_reset: float = time.time()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.logger().info(
             "NonKYC connector supports LIMIT and MARKET order types. "
             "Post-only/maker-only (LIMIT_MAKER) orders are not supported by this exchange."
         )
+
+    def _reset_balance_ws_state(self):
+        """
+        Reset balance WebSocket confirmation state for a new session.
+        Called on WS reconnect to ensure the watchdog can re-evaluate.
+        """
+        was_confirmed = self._balance_ws_confirmed
+        self._balance_ws_confirmed = False
+        self._balance_ws_subscription_time = time.time()
+        if was_confirmed:
+            self.logger().info(
+                "Balance WS state reset for new session — awaiting re-confirmation"
+            )
+
+    def _record_api_latency(self, endpoint: str, latency_ms: float):
+        if endpoint not in self._api_latency_samples:
+            self._api_latency_samples[endpoint] = []
+        samples = self._api_latency_samples[endpoint]
+        samples.append(latency_ms)
+        if len(samples) > self._api_latency_max_samples:
+            samples.pop(0)
+
+    def _increment_error(self, category: str):
+        if category in self._error_counters:
+            self._error_counters[category] += 1
+
+    def _get_and_reset_error_summary(self) -> str:
+        elapsed = time.time() - self._error_counters_last_reset
+        non_zero = {k: v for k, v in self._error_counters.items() if v > 0}
+        summary = f"Errors ({elapsed:.0f}s window): "
+        if non_zero:
+            summary += ", ".join(f"{k}={v}" for k, v in non_zero.items())
+        else:
+            summary += "none"
+        for k in self._error_counters:
+            self._error_counters[k] = 0
+        self._error_counters_last_reset = time.time()
+        return summary
+
+    def _log_order_lifecycle(self, order_id: str, stage: str, details: str = ""):
+        """Structured order lifecycle log for easy tracing."""
+        self.logger().info(f"[ORDER {order_id}] {stage}{' — ' + details if details else ''}")
 
     @staticmethod
     def nonkyc_order_type(order_type: OrderType) -> str:
@@ -255,14 +312,30 @@ class NonkycExchange(ExchangePyBase):
             price_str = f"{price:f}"
             api_params["price"] = price_str
 
+        t_start = time.monotonic()
         try:
             order_result = await self._api_post(
                 path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
                 data=api_params,
                 is_auth_required=True)
+            t_elapsed = (time.monotonic() - t_start) * 1000
             o_id = str(order_result["id"])
             transact_time = order_result["createdAt"] * 1e-3
+            self._record_api_latency("createorder", t_elapsed)
+            self.logger().debug(
+                f"REST latency: createorder {trading_pair} {trade_type.name} -> "
+                f"{t_elapsed:.0f}ms (id={o_id})"
+            )
+            if t_elapsed > 2000:
+                self.logger().warning(
+                    f"REST SLOW: createorder {trading_pair} took {t_elapsed:.0f}ms "
+                    f"(threshold: 2000ms)"
+                )
+            self._log_order_lifecycle(order_id, "PLACED",
+                f"{trade_type.name} {amount} {trading_pair} @ {price} -> exch_id={o_id}")
         except IOError as e:
+            t_elapsed = (time.monotonic() - t_start) * 1000
+            self._record_api_latency("createorder", t_elapsed)
             error_description = str(e)
             is_server_overloaded = ("503" in error_description
                                     and "Unknown error, please check your request or try again later." in error_description)
@@ -272,6 +345,117 @@ class NonkycExchange(ExchangePyBase):
             else:
                 raise
         return o_id, transact_time
+
+    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        """
+        Override to locally pre-adjust available balance immediately after order
+        placement succeeds, closing the ~1s race window before the WS balanceUpdate
+        arrives. All controllers reading available_balances will see the adjusted
+        value immediately. The WS balanceUpdate overwrites with the real exchange
+        value when it arrives.
+        """
+        exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
+
+        # If we reach here, the exchange accepted the order and is holding collateral.
+        # Locally mirror that hold so other strategies/controllers see it immediately.
+        try:
+            base_asset, quote_asset = order.trading_pair.split("-")
+
+            if order.trade_type == TradeType.SELL:
+                # Sell order: exchange holds base asset
+                current = self._account_available_balances.get(base_asset, Decimal("0"))
+                adjusted = max(Decimal("0"), current - order.amount)
+                if adjusted != current:
+                    self.logger().debug(
+                        f"Local balance pre-adjust: SELL {order.amount} {base_asset}, "
+                        f"available {current} -> {adjusted} (pending WS confirmation)"
+                    )
+                    self._account_available_balances[base_asset] = adjusted
+                    self._pre_adjusted_assets[base_asset] = time.time()
+            else:
+                # Buy order: exchange holds quote asset (amount * price)
+                current = self._account_available_balances.get(quote_asset, Decimal("0"))
+                hold_amount = order.amount * order.price
+                adjusted = max(Decimal("0"), current - hold_amount)
+                if adjusted != current:
+                    self.logger().debug(
+                        f"Local balance pre-adjust: BUY {hold_amount} {quote_asset}, "
+                        f"available {current} -> {adjusted} (pending WS confirmation)"
+                    )
+                    self._account_available_balances[quote_asset] = adjusted
+                    self._pre_adjusted_assets[quote_asset] = time.time()
+        except Exception as e:
+            # Never let balance bookkeeping break order flow
+            self.logger().warning(f"Local balance pre-adjust failed (non-fatal): {repr(e)}")
+
+        return exchange_order_id
+
+    def _on_order_failure(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Optional[Decimal],
+        exception: Exception,
+        **kwargs,
+    ):
+        # Classify and count for error summary
+        error_str = str(exception).lower()
+        if "insufficient" in error_str or "20001" in str(exception):
+            self._increment_error("order_reject_insufficient")
+            classification = "Insufficient funds"
+        elif any(t in error_str for t in ("500", "502", "503", "504", "server error")):
+            self._increment_error("rest_5xx")
+            classification = "Exchange server error"
+        elif any(t in error_str for t in ("timeout", "timed out")):
+            self._increment_error("rest_timeout")
+            classification = "Timeout"
+        else:
+            self._increment_error("order_reject_other")
+            classification = "Other"
+
+        self._log_order_lifecycle(order_id, "REJECTED", f"{classification}: {str(exception)[:150]}")
+
+        super()._on_order_failure(
+            order_id=order_id, trading_pair=trading_pair, amount=amount,
+            trade_type=trade_type, order_type=order_type, price=price,
+            exception=exception, **kwargs,
+        )
+        # Emit detailed balance context for insufficient-funds failures
+        if "insufficient" in error_str or "20001" in str(exception):
+            try:
+                base_asset, quote_asset = trading_pair.split("-")
+                avail_base = self._account_available_balances.get(base_asset, Decimal("0"))
+                total_base = self._account_balances.get(base_asset, Decimal("0"))
+                held_base = total_base - avail_base
+                avail_quote = self._account_available_balances.get(quote_asset, Decimal("0"))
+                total_quote = self._account_balances.get(quote_asset, Decimal("0"))
+
+                active_sell_count = 0
+                active_buy_count = 0
+                total_sell_held = Decimal("0")
+                total_buy_held = Decimal("0")
+                for oid, tracked in self._order_tracker.active_orders.items():
+                    if tracked.trading_pair == trading_pair:
+                        if tracked.trade_type == TradeType.SELL:
+                            active_sell_count += 1
+                            total_sell_held += tracked.amount - tracked.executed_amount_base
+                        elif tracked.trade_type == TradeType.BUY:
+                            active_buy_count += 1
+                            total_buy_held += (tracked.amount - tracked.executed_amount_base) * tracked.price
+
+                self.logger().warning(
+                    f"INSUFFICIENT FUNDS CONTEXT: {trading_pair} {trade_type.name} "
+                    f"attempted={amount} price={price} | "
+                    f"{base_asset}: avail={avail_base:.8f} held={held_base:.8f} total={total_base:.8f} | "
+                    f"{quote_asset}: avail={avail_quote:.8f} total={total_quote:.8f} | "
+                    f"Active orders on pair: {active_sell_count} sells (holding ~{total_sell_held:.8f} {base_asset}), "
+                    f"{active_buy_count} buys (holding ~{total_buy_held:.8f} {quote_asset})"
+                )
+            except Exception as ctx_err:
+                self.logger().debug(f"Failed to log insufficient funds context: {repr(ctx_err)}")
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         cancel_id = tracked_order.exchange_order_id
@@ -285,10 +469,21 @@ class NonkycExchange(ExchangePyBase):
         api_params = {
             "id": cancel_id,
         }
+        self._log_order_lifecycle(order_id, "CANCEL_SENT", f"exch_id={cancel_id}")
+        t_start = time.monotonic()
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
             data=api_params,
             is_auth_required=True)
+        t_elapsed = (time.monotonic() - t_start) * 1000
+        self._record_api_latency("cancelorder", t_elapsed)
+        self.logger().debug(
+            f"REST latency: cancelorder {tracked_order.trading_pair} -> {t_elapsed:.0f}ms"
+        )
+        if t_elapsed > 2000:
+            self.logger().warning(
+                f"REST SLOW: cancelorder {tracked_order.trading_pair} took {t_elapsed:.0f}ms"
+            )
         if cancel_result.get("id") is not None:
             return True
         return False
@@ -555,6 +750,32 @@ class NonkycExchange(ExchangePyBase):
                 self.logger().exception(f"Error parsing the trading pair rule {rule}. Skipping.")
         return retval
 
+    async def _update_trading_rules(self):
+        exchange_info = await self._make_trading_rules_request()
+        trading_rules_list = await self._format_trading_rules(exchange_info)
+        # Detect trading rule changes before overwriting (LOG 14)
+        for new_rule in trading_rules_list:
+            pair = new_rule.trading_pair
+            old_rule = self._trading_rules.get(pair)
+            if old_rule is not None:
+                changes = []
+                if old_rule.min_order_size != new_rule.min_order_size:
+                    changes.append(f"min_order_size: {old_rule.min_order_size} -> {new_rule.min_order_size}")
+                if old_rule.min_price_increment != new_rule.min_price_increment:
+                    changes.append(f"tick_size: {old_rule.min_price_increment} -> {new_rule.min_price_increment}")
+                if old_rule.min_base_amount_increment != new_rule.min_base_amount_increment:
+                    changes.append(f"qty_step: {old_rule.min_base_amount_increment} -> {new_rule.min_base_amount_increment}")
+                if old_rule.min_notional_size != new_rule.min_notional_size:
+                    changes.append(f"min_notional: {old_rule.min_notional_size} -> {new_rule.min_notional_size}")
+                if changes:
+                    self.logger().warning(
+                        f"TRADING RULES CHANGED for {pair}: {', '.join(changes)}"
+                    )
+        self._trading_rules.clear()
+        for trading_rule in trading_rules_list:
+            self._trading_rules[trading_rule.trading_pair] = trading_rule
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+
     async def _status_polling_loop_fetch_updates(self):
         self._bulk_fills_fetched_this_cycle = True
         await self._update_order_fills_from_trades()
@@ -732,17 +953,28 @@ class NonkycExchange(ExchangePyBase):
                                 fill_timestamp=message_params["updatedAt"] * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
+                            self._log_order_lifecycle(client_order_id, "FILL",
+                                f"qty={message_params['tradeQuantity']} price={message_params['tradePrice']} "
+                                f"exch_id={message_params['id']}")
 
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
+                        new_state = CONSTANTS.ORDER_STATE.get(message_params["status"], OrderState.OPEN)
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=message_params["updatedAt"] * 1e-3,
-                            new_state=CONSTANTS.ORDER_STATE.get(message_params["status"], OrderState.OPEN),
+                            new_state=new_state,
                             client_order_id=client_order_id,
                             exchange_order_id=str(message_params["id"]),
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
+                        # Order lifecycle logging for cancel/fill completion
+                        if reportType == "cancelled":
+                            self._log_order_lifecycle(client_order_id, "CANCEL_CONFIRMED",
+                                f"exch_id={message_params['id']}")
+                        elif new_state == OrderState.FILLED:
+                            self._log_order_lifecycle(client_order_id, "COMPLETED",
+                                f"fully filled exch_id={message_params['id']}")
 
                 # NOTE: subscribeBalances / currentBalances / balanceUpdate are undocumented
                 # NonKYC WS methods. They work as of 2026-03, but are not in the official
@@ -767,6 +999,18 @@ class NonkycExchange(ExchangePyBase):
                                 f"NonKYC balance delta: source=currentBalances asset={asset_name} "
                                 f"free {old_free}->{free_balance} total {old_total}->{total_balance}"
                             )
+                        # Convergence check: was this asset recently pre-adjusted?
+                        if asset_name in self._pre_adjusted_assets:
+                            adjust_age = time.time() - self._pre_adjusted_assets[asset_name]
+                            if adjust_age < 10.0:
+                                delta = free_balance - old_free
+                                if abs(delta) > Decimal("0.00000001"):
+                                    self.logger().info(
+                                        f"Balance pre-adjust convergence: {asset_name} "
+                                        f"pre-adjusted={old_free:.8f} exchange={free_balance:.8f} "
+                                        f"delta={delta:+.8f} age={adjust_age:.1f}s"
+                                    )
+                            del self._pre_adjusted_assets[asset_name]
                         self._account_available_balances[asset_name] = free_balance
                         self._account_balances[asset_name] = total_balance
 
@@ -785,6 +1029,18 @@ class NonkycExchange(ExchangePyBase):
                             f"NonKYC balance delta: source=balanceUpdate asset={asset_name} "
                             f"free {old_free}->{free_balance} total {old_total}->{total_balance}"
                         )
+                    # Convergence check: was this asset recently pre-adjusted?
+                    if asset_name in self._pre_adjusted_assets:
+                        adjust_age = time.time() - self._pre_adjusted_assets[asset_name]
+                        if adjust_age < 10.0:
+                            delta = free_balance - old_free
+                            if abs(delta) > Decimal("0.00000001"):
+                                self.logger().info(
+                                    f"Balance pre-adjust convergence: {asset_name} "
+                                    f"pre-adjusted={old_free:.8f} exchange={free_balance:.8f} "
+                                    f"delta={delta:+.8f} age={adjust_age:.1f}s"
+                                )
+                        del self._pre_adjusted_assets[asset_name]
                     self._account_available_balances[asset_name] = free_balance
                     self._account_balances[asset_name] = total_balance
 
@@ -994,10 +1250,17 @@ class NonkycExchange(ExchangePyBase):
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
 
+        t_start = time.monotonic()
         balances = await self._api_get(
             path_url=CONSTANTS.USER_BALANCES_PATH_URL,
             is_auth_required=True)
+        t_elapsed = (time.monotonic() - t_start) * 1000
+        self._record_api_latency("balances", t_elapsed)
+        self.logger().debug(f"REST latency: balances -> {t_elapsed:.0f}ms ({len(balances)} assets)")
+        if t_elapsed > 3000:
+            self.logger().warning(f"REST SLOW: balance poll took {t_elapsed:.0f}ms")
 
+        reconciliation_diffs = []
         for balance_entry in balances:
             asset_name = balance_entry["asset"]
             # NonKYC balance fields:
@@ -1007,14 +1270,70 @@ class NonkycExchange(ExchangePyBase):
             # Total trading balance = available + held (pending excluded intentionally)
             available_balance = Decimal(balance_entry["available"])
             total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
+
+            # REST vs WS reconciliation check (LOG 10)
+            ws_available = self._account_available_balances.get(asset_name)
+            if ws_available is not None and ws_available != available_balance:
+                diff = available_balance - ws_available
+                if abs(diff) > Decimal("0.00001") and total_balance > Decimal("0"):
+                    reconciliation_diffs.append(
+                        f"{asset_name}: WS={ws_available:.8f} REST={available_balance:.8f} "
+                        f"delta={diff:+.8f}"
+                    )
+
             self._account_available_balances[asset_name] = available_balance
             self._account_balances[asset_name] = total_balance
             remote_asset_names.add(asset_name)
+
+        if reconciliation_diffs:
+            self.logger().info(
+                f"Balance reconciliation (REST overwrote WS): "
+                + " | ".join(reconciliation_diffs)
+            )
 
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
+
+        # Periodic balance health snapshot (throttled to once per 60s)
+        now = time.time()
+        if now - self._last_balance_health_log > 60.0:
+            self._last_balance_health_log = now
+            non_zero = {
+                asset: {
+                    "avail": f"{self._account_available_balances.get(asset, Decimal('0')):.8f}",
+                    "held": f"{(self._account_balances.get(asset, Decimal('0')) - self._account_available_balances.get(asset, Decimal('0'))):.8f}",
+                    "total": f"{self._account_balances.get(asset, Decimal('0')):.8f}",
+                }
+                for asset in self._account_balances
+                if self._account_balances[asset] > Decimal("0")
+            }
+            if non_zero:
+                summary_parts = [f"{asset}: avail={v['avail']} held={v['held']} total={v['total']}"
+                                 for asset, v in sorted(non_zero.items())]
+                self.logger().info(
+                    f"Balance health: {self.name} | " + " | ".join(summary_parts)
+                )
+            # Include WS reconnect stats (LOG 7)
+            if self._ws_reconnect_count_since_log > 0:
+                self.logger().info(
+                    f"WS health: {self._ws_reconnect_count_since_log} reconnect(s) since last report, "
+                    f"{self._ws_reconnect_count} total this session"
+                )
+                self._ws_reconnect_count_since_log = 0
+            # API latency summary (LOG 9)
+            if self._api_latency_samples:
+                latency_parts = []
+                for endpoint, samples in self._api_latency_samples.items():
+                    if samples:
+                        avg = sum(samples) / len(samples)
+                        peak = max(samples)
+                        latency_parts.append(f"{endpoint}: avg={avg:.0f}ms peak={peak:.0f}ms n={len(samples)}")
+                if latency_parts:
+                    self.logger().info(f"API latency: {' | '.join(latency_parts)}")
+            # Error rate summary (LOG 13)
+            self.logger().info(f"Error summary: {self._get_and_reset_error_summary()}")
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
@@ -1046,15 +1365,26 @@ class NonkycExchange(ExchangePyBase):
                 limit_id=CONSTANTS.TICKER_INFO_PATH_URL
             )
             return float(resp_json["last_price"])
-        except Exception:
-            # Fallback: filter from tickers list
-            all_tickers = await self._api_request(
-                method=RESTMethod.GET,
-                path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
-                limit_id=CONSTANTS.TICKER_BOOK_PATH_URL
+        except Exception as primary_err:
+            self.logger().debug(
+                f"Primary ticker endpoint failed for {trading_pair} "
+                f"(/{CONSTANTS.TICKER_INFO_PATH_URL}/{symbol}): {repr(primary_err)}. "
+                f"Falling back to full tickers list."
             )
-            ticker_id = symbol.replace("/", "_")
-            for ticker in all_tickers:
-                if ticker.get("ticker_id") == ticker_id:
-                    return float(ticker["last_price"])
-            raise ValueError(f"Ticker not found for {trading_pair}")
+            try:
+                all_tickers = await self._api_request(
+                    method=RESTMethod.GET,
+                    path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
+                    limit_id=CONSTANTS.TICKER_BOOK_PATH_URL
+                )
+                ticker_id = symbol.replace("/", "_")
+                for ticker in all_tickers:
+                    if ticker.get("ticker_id") == ticker_id:
+                        return float(ticker["last_price"])
+                raise ValueError(f"Ticker not found for {trading_pair} in tickers list")
+            except Exception as fallback_err:
+                self.logger().warning(
+                    f"Both ticker endpoints failed for {trading_pair}: "
+                    f"primary={repr(primary_err)}, fallback={repr(fallback_err)}"
+                )
+                raise

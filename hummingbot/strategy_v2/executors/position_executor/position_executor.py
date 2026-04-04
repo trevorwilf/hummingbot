@@ -78,6 +78,7 @@ class PositionExecutor(ExecutorBase):
         self._pending_close_after_cancel: bool = False
         self._pending_close_price: Decimal = Decimal("NaN")
         self._pending_close_timestamp: Optional[float] = None
+        self._partial_barrier_logged: bool = False
 
     @property
     def is_perpetual(self) -> bool:
@@ -132,6 +133,33 @@ class PositionExecutor(ExecutorBase):
         :return: The filled amount of the open order in quote currency.
         """
         return self.open_filled_amount * self.entry_price
+
+    @property
+    def amount_to_close_quote(self) -> Decimal:
+        """
+        Get the quote value of the amount eligible for close orders,
+        using the current market price for accurate min-notional checks.
+        """
+        price = self.current_market_price
+        if price is None or not price.is_finite() or price <= Decimal("0"):
+            price = self.entry_price
+        return self.amount_to_close * price
+
+    @property
+    def order_role(self) -> str:
+        """Describe the executor's role for logging/observability."""
+        if self.close_type == CloseType.TAKE_PROFIT:
+            return "tp_exit"
+        elif self.close_type == CloseType.STOP_LOSS:
+            return "sl_exit"
+        elif self.close_type == CloseType.TIME_LIMIT:
+            return "time_limit_exit"
+        elif self.close_type == CloseType.TRAILING_STOP:
+            return "trailing_exit"
+        elif self._status == RunnableStatus.SHUTTING_DOWN:
+            return "closing"
+        else:
+            return "entry"
 
     @property
     def close_filled_amount(self) -> Decimal:
@@ -485,16 +513,28 @@ class PositionExecutor(ExecutorBase):
 
     def control_barriers(self):
         """
-        This method is responsible for controlling the barriers. It controls the stop loss, take profit, time limit and
-        trailing stop.
-
-        :return: None
+        Control barriers (stop loss, take profit, trailing stop, time limit).
+        Barriers are armed when the filled amount eligible for closing meets
+        exchange minimum order size and notional requirements — NOT gated
+        on the entry order being 100% filled. This ensures partial fills
+        get protective exits promptly.
         """
-        if self._open_order and self._open_order.is_filled and self.open_filled_amount >= self.trading_rules.min_order_size \
-                and self.open_filled_amount_quote >= self.trading_rules.min_notional_size:
-            self.control_stop_loss()
-            self.control_trailing_stop()
-            self.control_take_profit()
+        if self._open_order is not None:
+            eligible = (
+                self.amount_to_close >= self.trading_rules.min_order_size
+                and self.amount_to_close_quote >= self.trading_rules.min_notional_size
+            )
+            if eligible:
+                if not self._open_order.is_filled and not getattr(self, '_partial_barrier_logged', False):
+                    self._partial_barrier_logged = True
+                    self.logger().info(
+                        f"Executor {self.config.id}: arming barriers for partial fill — "
+                        f"filled={self.open_filled_amount}, amount_to_close={self.amount_to_close}, "
+                        f"entry_order_remaining={self.config.amount - self.open_filled_amount}"
+                    )
+                self.control_stop_loss()
+                self.control_trailing_stop()
+                self.control_take_profit()
         self.control_time_limit()
 
     def place_close_order_and_cancel_open_orders(self, close_type: CloseType, price: Decimal = Decimal("NaN")):
@@ -653,9 +693,24 @@ class PositionExecutor(ExecutorBase):
                     if is_within_activation_bounds:
                         self.place_take_profit_limit_order()
                 else:
-                    if self._take_profit_limit_order.is_open and not self._take_profit_limit_order.is_filled and \
-                            not is_within_activation_bounds:
-                        self.cancel_take_profit()
+                    if self._take_profit_limit_order.is_open and not self._take_profit_limit_order.is_filled:
+                        if not is_within_activation_bounds:
+                            self.cancel_take_profit()
+                        else:
+                            # Renew TP if amount_to_close has changed materially
+                            # (e.g., additional partial fills arrived since TP was placed)
+                            current_tp_amount = self._take_profit_limit_order.order.amount if self._take_profit_limit_order.order else Decimal("0")
+                            desired_amount = self.amount_to_close
+                            if current_tp_amount > Decimal("0") and desired_amount > Decimal("0"):
+                                delta_pct = abs(desired_amount - current_tp_amount) / current_tp_amount
+                                # Renew if the difference is > 1% to avoid churn
+                                if delta_pct > Decimal("0.01"):
+                                    self.logger().info(
+                                        f"Executor {self.config.id}: renewing TP order — "
+                                        f"amount changed {current_tp_amount} -> {desired_amount} "
+                                        f"(delta {delta_pct*100:.1f}%)"
+                                    )
+                                    self.renew_take_profit_order()
             elif self.net_pnl_pct >= self.config.triple_barrier_config.take_profit:
                 self.place_close_order_and_cancel_open_orders(close_type=CloseType.TAKE_PROFIT)
 
@@ -914,6 +969,20 @@ class PositionExecutor(ExecutorBase):
                 )
 
     def get_custom_info(self) -> Dict:
+        has_open_close_order = bool(
+            self._take_profit_limit_order
+            and self._take_profit_limit_order.order
+            and self._take_profit_limit_order.order.is_open
+        ) or bool(
+            self._close_order
+            and self._close_order.order
+            and self._close_order.order.is_open
+        )
+
+        close_order_side = None
+        if self.is_trading or self.open_filled_amount > Decimal("0"):
+            close_order_side = TradeType.SELL if self.config.side == TradeType.BUY else TradeType.BUY
+
         return {
             "level_id": self.config.level_id,
             "current_position_average_price": self.entry_price,
@@ -925,6 +994,11 @@ class PositionExecutor(ExecutorBase):
             "order_ids": [order.order_id for order in [self._open_order, self._close_order, self._take_profit_limit_order] if order],
             "held_position_orders": self._held_position_orders,
             "terminal_failure_reason": self._terminal_failure_reason,
+            "amount_to_close": str(self.amount_to_close),
+            "open_filled_amount": str(self.open_filled_amount),
+            "has_open_close_order": has_open_close_order,
+            "close_order_side": close_order_side,
+            "order_role": self.order_role,
         }
 
     def to_format_status(self, scale=1.0):

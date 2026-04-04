@@ -897,20 +897,25 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         controller.executors_info = []
         self.mock_market_data_provider.time.return_value = current_time
 
-        # The logger uses HummingbotLogger.logger_name_for_class(cls) which includes the class name
-        logger = logging.getLogger("hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerBase")
-        with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
-            with self.assertLogs(logger, level="DEBUG") as log:
-                controller.check_position_rebalance()
+        # Use the actual class logger (may be StructLogger) to avoid cross-test pollution
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            with patch('hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerConfigBase.get_required_base_amount', return_value=Decimal("10.0")):
+                with self.assertLogs(logger, level="DEBUG") as log:
+                    controller.check_position_rebalance()
 
-        # Find the rebalance check log line
-        rebalance_logs = [m for m in log.output if "Rebalance check for" in m]
-        self.assertTrue(len(rebalance_logs) > 0, "Expected 'Rebalance check for' in DEBUG logs")
-        msg = rebalance_logs[0]
-        self.assertIn("required_base=", msg)
-        self.assertIn("held_base=", msg)
-        self.assertIn("inflight_buy=", msg)
-        self.assertIn("adjusted_diff=", msg)
+            # Find the rebalance check log line
+            rebalance_logs = [m for m in log.output if "Rebalance check for" in m]
+            self.assertTrue(len(rebalance_logs) > 0, "Expected 'Rebalance check for' in DEBUG logs")
+            msg = rebalance_logs[0]
+            self.assertIn("required_base=", msg)
+            self.assertIn("held_base=", msg)
+            self.assertIn("inflight_buy=", msg)
+            self.assertIn("adjusted_diff=", msg)
+        finally:
+            logger.setLevel(old_level)
 
     def test_inflight_buy_logging_when_found(self):
         """get_inflight_buy_base_amount emits DEBUG log when executors are found."""
@@ -920,12 +925,18 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
             "position_executor", TradeType.BUY, "binance", "ETH-USDT", Decimal("5.0"), "buy_0")
         controller.executors_info = [real_exec]
 
-        logger = logging.getLogger("hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerBase")
-        with self.assertLogs(logger, level="DEBUG") as log:
-            controller.get_inflight_buy_base_amount()
+        # Use the actual class logger (may be StructLogger) to avoid cross-test pollution
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            with self.assertLogs(logger, level="DEBUG") as log:
+                controller.get_inflight_buy_base_amount()
 
-        inflight_logs = [m for m in log.output if "Inflight buy detection" in m]
-        self.assertTrue(len(inflight_logs) > 0, "Expected 'Inflight buy detection' in DEBUG logs")
-        msg = inflight_logs[0]
-        self.assertIn(real_exec.id, msg)
-        self.assertIn("5.0", msg)
+            inflight_logs = [m for m in log.output if "Inflight buy detection" in m]
+            self.assertTrue(len(inflight_logs) > 0, "Expected 'Inflight buy detection' in DEBUG logs")
+            msg = inflight_logs[0]
+            self.assertIn(real_exec.id, msg)
+            self.assertIn("5.0", msg)
+        finally:
+            logger.setLevel(old_level)

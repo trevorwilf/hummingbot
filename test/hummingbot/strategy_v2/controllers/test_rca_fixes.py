@@ -81,12 +81,17 @@ class TestBuyExecutorCloseReservation(IsolatedAsyncioWrapperTestCase):
     """Fix 1 (RCA): Active buy executors reserve base for close orders."""
 
     def test_buy_executor_close_reservation_reduces_spendable_sell(self):
-        """Buy executor holding 10 base should reduce spendable sell to 0."""
+        """Buy executor with 10 base filled, no TP sell on exchange => reserve 10, spendable = 0."""
         ctrl = _make_controller(available_base=Decimal("10"))
         mock_executor = MagicMock()
         mock_executor.is_active = True
         mock_executor.is_trading = True
-        mock_executor.custom_info = {"level_id": "buy_0"}
+        mock_executor.custom_info = {
+            "level_id": "buy_0",
+            "has_open_close_order": False,
+            "close_order_side": TradeType.SELL,
+            "amount_to_close": "10",
+        }
         mock_executor.config = MagicMock()
         mock_executor.config.amount = Decimal("10")
         ctrl.executors_info = [mock_executor]
@@ -95,12 +100,19 @@ class TestBuyExecutorCloseReservation(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0"), spendable)
 
     def test_mixed_buy_and_sell_executors_reservation(self):
-        """Buy executor (5) + sell executor (3) with 15 available => spendable = 7."""
+        """Buy executor (5 base, no TP sell) + sell executor (3) with 15 available.
+        Sell executor is already held by exchange, so NOT subtracted.
+        Only the buy's 5 base is reserved => spendable = 10."""
         ctrl = _make_controller(available_base=Decimal("15"))
         buy_exec = MagicMock()
         buy_exec.is_active = True
         buy_exec.is_trading = True
-        buy_exec.custom_info = {"level_id": "buy_0"}
+        buy_exec.custom_info = {
+            "level_id": "buy_0",
+            "has_open_close_order": False,
+            "close_order_side": TradeType.SELL,
+            "amount_to_close": "5",
+        }
         buy_exec.config = MagicMock()
         buy_exec.config.amount = Decimal("5")
 
@@ -113,7 +125,7 @@ class TestBuyExecutorCloseReservation(IsolatedAsyncioWrapperTestCase):
 
         ctrl.executors_info = [buy_exec, sell_exec]
         spendable = ctrl.get_spendable_sell_base_inventory()
-        self.assertEqual(Decimal("7"), spendable)
+        self.assertEqual(Decimal("10"), spendable)
 
     def test_no_active_executors_returns_full_balance(self):
         """No executors, 100 base available => spendable = 100."""
@@ -123,12 +135,18 @@ class TestBuyExecutorCloseReservation(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("100"), spendable)
 
     def test_double_booking_prevented_in_action_proposal(self):
-        """With buy executor holding all available base, no sell actions should be created."""
+        """With buy executor holding all available base (no TP sell), no sell actions should be created."""
         ctrl = _make_controller(available_base=Decimal("0.13"))
         mock_executor = MagicMock()
         mock_executor.is_active = True
         mock_executor.is_trading = True
-        mock_executor.custom_info = {"level_id": "buy_0", "current_position_average_price": "0.22"}
+        mock_executor.custom_info = {
+            "level_id": "buy_0",
+            "current_position_average_price": "0.22",
+            "has_open_close_order": False,
+            "close_order_side": TradeType.SELL,
+            "amount_to_close": "0.13",
+        }
         mock_executor.config = MagicMock()
         mock_executor.config.amount = Decimal("0.13")
         ctrl.executors_info = [mock_executor]

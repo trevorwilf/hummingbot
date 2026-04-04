@@ -106,6 +106,7 @@ class NonkycAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         error_response.data = {
             "jsonrpc": "2.0",
             "error": {"code": 1002, "message": "Authorization failed"},
+            "id": 99,
         }
 
         async def mock_iter():
@@ -166,6 +167,7 @@ class NonkycAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         error_response.data = {
             "jsonrpc": "2.0",
             "error": {"code": 1002, "message": "Authorization failed"},
+            "id": 99,
         }
 
         async def mock_iter():

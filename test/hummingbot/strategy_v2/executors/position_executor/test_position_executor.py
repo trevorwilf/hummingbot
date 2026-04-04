@@ -42,6 +42,8 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         type(connector_mock).available_balances = PropertyMock(
             return_value={"ETH": Decimal("1000"), "USDT": Decimal("100000")})
         connector_mock.get_price_by_type.return_value = Decimal("100")
+        # Default quantize_order_amount to pass through the amount argument
+        connector_mock.quantize_order_amount.side_effect = lambda trading_pair, amount, **kw: Decimal(str(amount))
         strategy.connectors = {
             "binance": connector_mock,
         }

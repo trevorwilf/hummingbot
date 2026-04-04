@@ -94,6 +94,8 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         Sends the authentication message and validates the response.
         Includes timeout and retry with exponential backoff.
+        Correlates the response on the request ID to avoid accepting
+        unrelated messages as auth confirmations.
         :param ws: the websocket assistant used to connect to the exchange
         """
         max_retries = 3
@@ -101,8 +103,9 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         for attempt in range(1, max_retries + 1):
             try:
-                auth_message: WSJSONRequest = WSJSONRequest(
-                    payload=self._auth.generate_ws_authentication_message())
+                auth_payload = self._auth.generate_ws_authentication_message()
+                auth_request_id = auth_payload.get("id")  # Currently 99
+                auth_message: WSJSONRequest = WSJSONRequest(payload=auth_payload)
                 await ws.send(auth_message)
 
                 # Wait for auth response with hard timeout on silent sockets
@@ -113,15 +116,17 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             if not isinstance(data, dict):
                                 continue  # skip non-dict messages
 
+                            # Only accept responses matching our auth request ID
+                            response_id = data.get("id")
+                            if auth_request_id is not None and response_id != auth_request_id:
+                                continue  # Not our auth response
+
                             if data.get("result") is True:
                                 self.logger().info("WebSocket authentication successful")
                                 return
                             elif "error" in data:
                                 error_msg = data.get("error", {}).get("message", "Unknown error")
                                 raise IOError(f"WebSocket authentication failed: {error_msg}")
-
-                            # Not an auth response (e.g., ticker update) — keep waiting
-                            continue
 
                         # iter_messages exhausted without auth response
                         raise IOError("WebSocket closed before authentication completed")
@@ -148,3 +153,23 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         websocket_assistant and await websocket_assistant.disconnect()
         self._ws_assistant = None
+        # Increment reconnect counter on the exchange connector
+        try:
+            self._connector._ws_reconnect_count += 1
+            self._connector._ws_reconnect_count_since_log += 1
+            self._connector._increment_error("ws_reconnect")
+            self.logger().info(
+                f"WS user stream interrupted (reconnect #{self._connector._ws_reconnect_count})"
+            )
+            # Reset balance WS confirmation state so the watchdog can
+            # re-evaluate after reconnect
+            if hasattr(self._connector, '_reset_balance_ws_state'):
+                self._connector._reset_balance_ws_state()
+            # Force an immediate REST balance refresh to ensure consistency
+            if hasattr(self._connector, '_update_balances'):
+                asyncio.ensure_future(self._connector._update_balances())
+                self.logger().info("Forced REST balance refresh after WS reconnect")
+        except AttributeError:
+            pass
+        except Exception as e:
+            self.logger().warning(f"Post-reconnect cleanup failed: {repr(e)}")
