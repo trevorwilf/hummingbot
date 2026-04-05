@@ -622,26 +622,46 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.data_source._resync_pending.get(self.trading_pair, False))
 
     async def test_successful_resync_clears_state(self):
-        """Successful resync should clear failure tracking. _last_to_version is NOT set
-        from snapshot alone — it's only set after a bridging diff is applied."""
+        """Resync with successful bridge should clear failure tracking.
+        When bridge does NOT succeed (no cached diffs to bridge), failure count
+        is incremented and state stays RESYNCING."""
         from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+
+        # --- Case 1: resync with successful bridge (pre-cache bridging diffs) ---
         self.data_source._resync_pending[self.trading_pair] = True
         self.data_source._resync_failure_count[self.trading_pair] = 3
         self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
         self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
 
+        msg_queue = asyncio.Queue()
+
         with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
             mock_snapshot_msg = MagicMock()
             mock_snapshot_msg.update_id = 500
-            mock_snap.return_value = mock_snapshot_msg
 
-            await self.data_source._attempt_resync(self.trading_pair)
+            async def fake_snapshot(tp):
+                # Simulate what the real _order_book_snapshot does
+                self.data_source._snapshot_version[tp] = mock_snapshot_msg.update_id
+                self.data_source._ob_state[tp] = _OBState.BRIDGING
+                self.data_source._bridge_established[tp] = False
+                self.data_source._bridging_start_time[tp] = time.time()
+                return mock_snapshot_msg
+
+            mock_snap.side_effect = fake_snapshot
+
+            # Pre-cache a diff that will bridge snapshot_version=500
+            from collections import deque
+            bridging_msg = MagicMock()
+            bridging_msg.update_id = 502
+            self.data_source._cached_diffs[self.trading_pair] = deque([
+                (500, 502, bridging_msg),
+            ])
+
+            await self.data_source._attempt_resync(self.trading_pair, msg_queue)
 
         self.assertFalse(self.data_source._resync_pending[self.trading_pair])
         self.assertEqual(0, self.data_source._resync_failure_count[self.trading_pair])
-        # _last_to_version should NOT be set from snapshot alone (Fix 2, Defect C)
-        # It's only set after bridging diffs are applied
-        # The snapshot sets _snapshot_version and transitions to BRIDGING
+        self.assertEqual(_OBState.LIVE, self.data_source._get_ob_state(self.trading_pair))
 
     async def test_ws_interruption_clears_continuity_state(self):
         """WebSocket disconnection should clear all version tracking state."""
@@ -708,16 +728,25 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(self.data_source._bridge_established[self.trading_pair])
 
     async def test_bridge_validation_reinitializes_on_gap(self):
-        """Diff with fromVersion > snapshot_version + 1 should fail bridge (need newer snapshot)."""
+        """Diff with fromVersion > snapshot_version + 1 should trigger resync (gap detected)."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
         self._set_bridging_state(100)
 
         msg_queue = asyncio.Queue()
-        # Only diff in cache has fromVersion=105 > snapshot+1=101 — bridge fails
-        raw = self._create_raw_diff_message("105", "110")
-        await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+        # Only diff in cache has fromVersion=105 > snapshot+1=101 — gap detected
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 200
+            mock_snap.return_value = mock_snapshot_msg
 
-        # Diff is cached but bridge attempt fails (gap too large)
+            raw = self._create_raw_diff_message("105", "110")
+            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        # Diff is cached but gap triggers resync — state should be RESYNCING (not stuck in BRIDGING)
         self.assertEqual(0, msg_queue.qsize())
+        state = self.data_source._get_ob_state(self.trading_pair)
+        self.assertIn(state, (_OBState.RESYNCING, _OBState.BRIDGING))
+        self.assertTrue(self.data_source._resync_pending.get(self.trading_pair, False))
 
     async def test_bridge_state_cleared_on_interruption(self):
         """Stream interruption should clear all bridge tracking state."""
@@ -865,3 +894,169 @@ class MexcAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         # State should be RESYNCING or BRIDGING (after snapshot fetch)
         state = self.data_source._get_ob_state(self.trading_pair)
         self.assertIn(state, (_OBState.RESYNCING, _OBState.BRIDGING))
+
+    # --- New tests for _try_bridge_from_cache tuple return and BRIDGING gap/timeout ---
+
+    async def test_bridging_gap_triggers_resync(self):
+        """In BRIDGING state, a diff causing a gap (fromVersion > snapshot+1) should
+        trigger _initiate_resync and transition to RESYNCING."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self._set_bridging_state(100)
+        self.data_source._bridging_start_time[self.trading_pair] = time.time()
+
+        msg_queue = asyncio.Queue()
+
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 300
+            mock_snap.return_value = mock_snapshot_msg
+
+            # fromVersion=105 > snapshot_version(100)+1=101 => gap detected
+            raw = self._create_raw_diff_message("105", "110")
+            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+        # Should NOT be stuck in BRIDGING — should have transitioned to RESYNCING
+        state = self.data_source._get_ob_state(self.trading_pair)
+        self.assertEqual(_OBState.RESYNCING, state)
+        self.assertTrue(self.data_source._resync_pending.get(self.trading_pair, False))
+        # No diffs should be in the output queue
+        self.assertEqual(0, msg_queue.qsize())
+
+    async def test_bridging_timeout_triggers_resync(self):
+        """When BRIDGING has exceeded BRIDGING_TIMEOUT without establishing a bridge,
+        a non-bridging diff should trigger _initiate_resync."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self._set_bridging_state(100)
+        # Set bridging start time to 10 seconds ago (well past the 5s timeout)
+        self.data_source._bridging_start_time[self.trading_pair] = time.time() - 10
+
+        msg_queue = asyncio.Queue()
+
+        with patch.object(self.data_source, '_initiate_resync', new_callable=AsyncMock) as mock_resync:
+            # Feed a stale diff that won't bridge (toVersion <= snapshot_version)
+            raw = self._create_raw_diff_message("90", "95")
+            await self.data_source._parse_order_book_diff_message(raw, msg_queue)
+
+            # _initiate_resync should have been called due to timeout
+            mock_resync.assert_called_once_with(self.trading_pair)
+
+        self.assertEqual(0, msg_queue.qsize())
+
+    async def test_resync_with_failed_bridge_increments_failure(self):
+        """When _attempt_resync fetches a snapshot but bridge fails (no matching cached diffs),
+        failure count should be incremented and state should be RESYNCING."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 0
+        self.data_source._resync_next_allowed_time[self.trading_pair] = 0
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
+
+        msg_queue = asyncio.Queue()
+
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 500
+            mock_snap.return_value = mock_snapshot_msg
+
+            # No cached diffs => bridge will fail
+            self.data_source._cached_diffs.pop(self.trading_pair, None)
+
+            await self.data_source._attempt_resync(self.trading_pair, msg_queue)
+
+        # Bridge failed: failure count incremented, state RESYNCING, resync still pending
+        self.assertEqual(1, self.data_source._resync_failure_count[self.trading_pair])
+        self.assertEqual(_OBState.RESYNCING, self.data_source._get_ob_state(self.trading_pair))
+        self.assertTrue(self.data_source._resync_pending[self.trading_pair])
+        # Backoff delay should be set in the future
+        self.assertGreater(
+            self.data_source._resync_next_allowed_time[self.trading_pair], time.time()
+        )
+
+    async def test_resync_with_successful_bridge_goes_live(self):
+        """When _attempt_resync fetches a snapshot and cached diffs successfully bridge,
+        state should be LIVE with failure tracking cleared."""
+        from collections import deque
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+
+        self.data_source._resync_pending[self.trading_pair] = True
+        self.data_source._resync_failure_count[self.trading_pair] = 2
+        self.data_source._resync_next_allowed_time[self.trading_pair] = time.time() + 1000
+        self.data_source._ob_state[self.trading_pair] = _OBState.RESYNCING
+
+        msg_queue = asyncio.Queue()
+
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 500
+
+            async def fake_snapshot(tp):
+                self.data_source._snapshot_version[tp] = mock_snapshot_msg.update_id
+                self.data_source._ob_state[tp] = _OBState.BRIDGING
+                self.data_source._bridge_established[tp] = False
+                self.data_source._bridging_start_time[tp] = time.time()
+                return mock_snapshot_msg
+
+            mock_snap.side_effect = fake_snapshot
+
+            # Pre-cache diffs that will bridge snapshot_version=500
+            bridging_msg1 = MagicMock()
+            bridging_msg1.update_id = 503
+            bridging_msg2 = MagicMock()
+            bridging_msg2.update_id = 506
+            self.data_source._cached_diffs[self.trading_pair] = deque([
+                (499, 503, bridging_msg1),  # fromVersion=499 <= 500+1, bridges
+                (504, 506, bridging_msg2),
+            ])
+
+            await self.data_source._attempt_resync(self.trading_pair, msg_queue)
+
+        # Bridge succeeded: state LIVE, failure tracking cleared
+        self.assertEqual(_OBState.LIVE, self.data_source._get_ob_state(self.trading_pair))
+        self.assertEqual(0, self.data_source._resync_failure_count[self.trading_pair])
+        self.assertFalse(self.data_source._resync_pending[self.trading_pair])
+        # Bridged diffs should be in the output queue
+        self.assertEqual(2, msg_queue.qsize())
+        # last_to_version should be set to the last bridged diff's toVersion
+        self.assertEqual(506, self.data_source._last_to_version[self.trading_pair])
+
+    async def test_bridging_deadlock_full_sequence(self):
+        """Full sequence: BUFFERING -> snapshot(100) -> feed diff(105,110) -> verify
+        the connector does NOT get stuck in BRIDGING; recovery path is triggered
+        and state transitions to RESYNCING."""
+        from hummingbot.connector.exchange.mexc.mexc_api_order_book_data_source import _OBState
+
+        # Start in BUFFERING (no snapshot yet)
+        self.data_source._ob_state[self.trading_pair] = _OBState.BUFFERING
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._snapshot_version.pop(self.trading_pair, None)
+        self.data_source._last_to_version.pop(self.trading_pair, None)
+
+        msg_queue = asyncio.Queue()
+
+        # Buffer some early diffs while in BUFFERING
+        raw_early = self._create_raw_diff_message("90", "95")
+        await self.data_source._parse_order_book_diff_message(raw_early, msg_queue)
+        self.assertEqual(0, msg_queue.qsize())
+        self.assertEqual(_OBState.BUFFERING, self.data_source._get_ob_state(self.trading_pair))
+
+        # Simulate snapshot arriving with version=100 (transitions to BRIDGING)
+        self.data_source._snapshot_version[self.trading_pair] = 100
+        self.data_source._ob_state[self.trading_pair] = _OBState.BRIDGING
+        self.data_source._bridge_established[self.trading_pair] = False
+        self.data_source._bridging_start_time[self.trading_pair] = time.time()
+
+        # Feed a diff with a gap: fromVersion=105 > snapshot(100)+1=101
+        with patch.object(self.data_source, '_order_book_snapshot', new_callable=AsyncMock) as mock_snap:
+            mock_snapshot_msg = MagicMock()
+            mock_snapshot_msg.update_id = 300
+            mock_snap.return_value = mock_snapshot_msg
+
+            raw_gap = self._create_raw_diff_message("105", "110")
+            await self.data_source._parse_order_book_diff_message(raw_gap, msg_queue)
+
+        # Should NOT be stuck in BRIDGING — should be RESYNCING
+        state = self.data_source._get_ob_state(self.trading_pair)
+        self.assertEqual(_OBState.RESYNCING, state,
+                         f"Expected RESYNCING after gap diff, got {state}")
+        self.assertTrue(self.data_source._resync_pending.get(self.trading_pair, False))
+        self.assertEqual(0, msg_queue.qsize())

@@ -84,6 +84,17 @@ class NonkycExchange(ExchangePyBase):
             "Post-only/maker-only (LIMIT_MAKER) orders are not supported by this exchange."
         )
 
+    @property
+    def balance_data_source(self) -> str:
+        """Returns the current balance data source for operational visibility."""
+        if not self.ENABLE_BALANCE_WS:
+            return "rest_only"
+        if self._balance_ws_confirmed:
+            return "websocket_confirmed"
+        if self._balance_ws_subscription_time is not None:
+            return "websocket_pending"
+        return "rest_fallback"
+
     def _reset_balance_ws_state(self):
         """
         Reset balance WebSocket confirmation state for a new session.
@@ -373,13 +384,24 @@ class NonkycExchange(ExchangePyBase):
                     self._account_available_balances[base_asset] = adjusted
                     self._pre_adjusted_assets[base_asset] = time.time()
             else:
-                # Buy order: exchange holds quote asset (amount * price)
+                # Buy order: exchange holds quote asset (amount * price + fee)
                 current = self._account_available_balances.get(quote_asset, Decimal("0"))
-                hold_amount = order.amount * order.price
+                notional = order.amount * order.price
+                # Include estimated quote-side fee in hold amount.
+                # Use taker fee (conservative — covers both maker and taker fills).
+                fee_pct = Decimal("0")
+                if self._trading_fees:
+                    fee_pct = self._trading_fees.get("taker_fee", Decimal("0"))
+                if fee_pct == Decimal("0"):
+                    # Fallback to estimate
+                    fee_pct = Decimal(str(self.estimate_fee_pct(is_maker=False)))
+                fee_amount = notional * fee_pct
+                hold_amount = notional + fee_amount
                 adjusted = max(Decimal("0"), current - hold_amount)
                 if adjusted != current:
                     self.logger().debug(
-                        f"Local balance pre-adjust: BUY {hold_amount} {quote_asset}, "
+                        f"Local balance pre-adjust: BUY {quote_asset} "
+                        f"notional={notional} fee={fee_amount} total_hold={hold_amount}, "
                         f"available {current} -> {adjusted} (pending WS confirmation)"
                     )
                     self._account_available_balances[quote_asset] = adjusted
@@ -1313,7 +1335,8 @@ class NonkycExchange(ExchangePyBase):
                 summary_parts = [f"{asset}: avail={v['avail']} held={v['held']} total={v['total']}"
                                  for asset, v in sorted(non_zero.items())]
                 self.logger().info(
-                    f"Balance health: {self.name} | " + " | ".join(summary_parts)
+                    f"Balance health: {self.name} | balance_source={self.balance_data_source} | "
+                    + " | ".join(summary_parts)
                 )
             # Include WS reconnect stats (LOG 7)
             if self._ws_reconnect_count_since_log > 0:

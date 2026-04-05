@@ -6,9 +6,12 @@ Tests for Phase 1 RCA fixes:
 4. Last-price error logging includes exception repr
 5. NonKYC last-price logs primary failure before fallback
 6. WS auth response correlates on request ID
+7. Buy pre-adjust includes fee in hold amount (Fix 4)
+8. Balance data source observability property (Fix 5)
 """
 import asyncio
 import logging
+import time
 import unittest
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -31,6 +34,9 @@ class TestLocalBalancePreAdjust(IsolatedAsyncioWrapperTestCase):
         exchange = MagicMock(spec=NonkycExchange)
         exchange._account_available_balances = dict(available_balances or {})
         exchange._account_balances = dict(total_balances or {})
+        exchange._trading_fees = {}
+        exchange._pre_adjusted_assets = {}
+        exchange.estimate_fee_pct = MagicMock(return_value=0.0)
         exchange.logger = MagicMock(return_value=MagicMock())
 
         # Bind the real method to our mock
@@ -455,6 +461,210 @@ class TestWSAuthIDCorrelation(IsolatedAsyncioWrapperTestCase):
 
         # Auth should succeed (second message matched)
         ds.logger().info.assert_called_with("WebSocket authentication successful")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Buy pre-adjust includes fee (Fix 4)
+# ---------------------------------------------------------------------------
+
+class TestBuyPreAdjustIncludesFee(IsolatedAsyncioWrapperTestCase):
+    """Tests for Fix 4: Buy pre-adjust hold amount includes taker fee."""
+
+    def _make_exchange(self, available_balances=None, total_balances=None,
+                       trading_fees=None):
+        """Create a minimal NonkycExchange mock with real balance dicts."""
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+
+        exchange = MagicMock(spec=NonkycExchange)
+        exchange._account_available_balances = dict(available_balances or {})
+        exchange._account_balances = dict(total_balances or {})
+        exchange._trading_fees = trading_fees or {}
+        exchange._pre_adjusted_assets = {}
+        exchange.logger = MagicMock(return_value=MagicMock())
+        exchange.estimate_fee_pct = MagicMock(return_value=0.0)
+
+        # Bind the real method to our mock
+        exchange._place_order_and_process_update = NonkycExchange._place_order_and_process_update.__get__(
+            exchange, NonkycExchange
+        )
+        return exchange
+
+    def _make_order(self, trading_pair, trade_type, amount, price=Decimal("0")):
+        order = MagicMock()
+        order.trading_pair = trading_pair
+        order.trade_type = trade_type
+        order.amount = amount
+        order.price = price
+        order.client_order_id = "test_order_fee"
+        order.order_type = OrderType.LIMIT
+        return order
+
+    async def test_buy_pre_adjust_includes_fee(self):
+        """
+        BUY pre-adjust must deduct notional + fee from quote balance.
+        amount=10, price=1.0, taker_fee=0.002 => hold = 10 * 1.002 = 10.02
+        Starting quote=100 => expected=89.98
+        """
+        exchange = self._make_exchange(
+            available_balances={"USDT": Decimal("100")},
+            total_balances={"USDT": Decimal("100")},
+            trading_fees={"taker_fee": Decimal("0.002")},
+        )
+        with patch(
+            "hummingbot.connector.exchange_py_base.ExchangePyBase._place_order_and_process_update",
+            new_callable=AsyncMock,
+            return_value="fee_order_1",
+        ):
+            order = self._make_order(
+                "ARRR-USDT", TradeType.BUY,
+                Decimal("10"), Decimal("1.0"),
+            )
+            await exchange._place_order_and_process_update(order)
+
+        # notional=10, fee=10*0.002=0.02, hold=10.02, remaining=89.98
+        self.assertEqual(
+            exchange._account_available_balances["USDT"],
+            Decimal("89.98"),
+        )
+
+    async def test_buy_pre_adjust_zero_fee(self):
+        """
+        When taker_fee=0 and estimate_fee_pct returns 0, hold should be
+        exactly notional with no fee component.
+        """
+        exchange = self._make_exchange(
+            available_balances={"USDT": Decimal("100")},
+            total_balances={"USDT": Decimal("100")},
+            trading_fees={"taker_fee": Decimal("0")},
+        )
+        exchange.estimate_fee_pct = MagicMock(return_value=0.0)
+
+        with patch(
+            "hummingbot.connector.exchange_py_base.ExchangePyBase._place_order_and_process_update",
+            new_callable=AsyncMock,
+            return_value="fee_order_2",
+        ):
+            order = self._make_order(
+                "ARRR-USDT", TradeType.BUY,
+                Decimal("10"), Decimal("1.0"),
+            )
+            await exchange._place_order_and_process_update(order)
+
+        # hold = notional only = 10.0, remaining = 90.0
+        self.assertEqual(
+            exchange._account_available_balances["USDT"],
+            Decimal("90"),
+        )
+
+    async def test_sell_pre_adjust_unchanged(self):
+        """
+        SELL pre-adjust uses order.amount only (base asset), no fee adjustment.
+        """
+        exchange = self._make_exchange(
+            available_balances={"ARRR": Decimal("100")},
+            total_balances={"ARRR": Decimal("100")},
+            trading_fees={"taker_fee": Decimal("0.002")},
+        )
+        with patch(
+            "hummingbot.connector.exchange_py_base.ExchangePyBase._place_order_and_process_update",
+            new_callable=AsyncMock,
+            return_value="fee_order_3",
+        ):
+            order = self._make_order(
+                "ARRR-USDT", TradeType.SELL,
+                Decimal("10"), Decimal("1.0"),
+            )
+            await exchange._place_order_and_process_update(order)
+
+        # Sell holds base only: 100 - 10 = 90 (no fee on base side)
+        self.assertEqual(
+            exchange._account_available_balances["ARRR"],
+            Decimal("90"),
+        )
+
+    async def test_convergence_delta_near_zero_with_fee(self):
+        """
+        When pre-adjust includes fee and the exchange balance update arrives
+        with the exact hold amount, the convergence delta should be ~0.
+        This verifies the fee-inclusive hold matches what the exchange actually holds.
+        """
+        initial_quote = Decimal("100")
+        amount = Decimal("10")
+        price = Decimal("1.0")
+        fee_pct = Decimal("0.002")
+
+        exchange = self._make_exchange(
+            available_balances={"USDT": initial_quote},
+            total_balances={"USDT": initial_quote},
+            trading_fees={"taker_fee": fee_pct},
+        )
+        with patch(
+            "hummingbot.connector.exchange_py_base.ExchangePyBase._place_order_and_process_update",
+            new_callable=AsyncMock,
+            return_value="fee_order_4",
+        ):
+            order = self._make_order(
+                "ARRR-USDT", TradeType.BUY,
+                amount, price,
+            )
+            await exchange._place_order_and_process_update(order)
+
+        pre_adjusted = exchange._account_available_balances["USDT"]
+        # pre_adjusted should be 100 - 10.02 = 89.98
+
+        # Simulate exchange balance update with the real exchange-held amount
+        # Exchange holds notional + fee = 10.02, so available = 100 - 10.02 = 89.98
+        notional = amount * price
+        fee_amount = notional * fee_pct
+        exchange_available = initial_quote - (notional + fee_amount)
+
+        convergence_delta = abs(pre_adjusted - exchange_available)
+        self.assertEqual(convergence_delta, Decimal("0"))
+
+
+# ---------------------------------------------------------------------------
+# Tests: Balance data source observability (Fix 5)
+# ---------------------------------------------------------------------------
+
+class TestBalanceDataSource(unittest.TestCase):
+    """Tests for Fix 5: balance_data_source property for operational visibility."""
+
+    def _make_exchange(self):
+        """Create a minimal NonkycExchange mock with balance_data_source bound."""
+        from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
+
+        exchange = MagicMock(spec=NonkycExchange)
+        exchange.ENABLE_BALANCE_WS = True
+        exchange._balance_ws_confirmed = False
+        exchange._balance_ws_subscription_time = None
+
+        # Bind the real property as a method call
+        type(exchange).balance_data_source = NonkycExchange.balance_data_source
+        return exchange
+
+    def test_balance_data_source_rest_only(self):
+        """When ENABLE_BALANCE_WS is False, returns 'rest_only'."""
+        exchange = self._make_exchange()
+        exchange.ENABLE_BALANCE_WS = False
+        self.assertEqual(exchange.balance_data_source, "rest_only")
+
+    def test_balance_data_source_websocket_confirmed(self):
+        """When WS balance is confirmed, returns 'websocket_confirmed'."""
+        exchange = self._make_exchange()
+        exchange._balance_ws_confirmed = True
+        self.assertEqual(exchange.balance_data_source, "websocket_confirmed")
+
+    def test_balance_data_source_websocket_pending(self):
+        """When WS subscription sent but not confirmed, returns 'websocket_pending'."""
+        exchange = self._make_exchange()
+        exchange._balance_ws_subscription_time = time.time()
+        self.assertEqual(exchange.balance_data_source, "websocket_pending")
+
+    def test_balance_data_source_rest_fallback(self):
+        """Default state with ENABLE_BALANCE_WS=True returns 'rest_fallback'."""
+        exchange = self._make_exchange()
+        # Default: ENABLE_BALANCE_WS=True, _balance_ws_confirmed=False, _subscription_time=None
+        self.assertEqual(exchange.balance_data_source, "rest_fallback")
 
 
 if __name__ == "__main__":

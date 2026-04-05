@@ -1,6 +1,6 @@
 import time as _time
 from decimal import Decimal
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
@@ -131,6 +131,27 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
             "is_updatable": False
         }
     )
+    max_market_data_stale_seconds: int = Field(
+        default=30,
+        json_schema_extra={
+            "prompt": "Seconds of no market data before soft stale action: ",
+            "is_updatable": True
+        }
+    )
+    hard_market_data_stale_seconds: int = Field(
+        default=90,
+        json_schema_extra={
+            "prompt": "Seconds of no market data before hard stop of all executors: ",
+            "is_updatable": True
+        }
+    )
+    stale_data_action: str = Field(
+        default="cancel_passive_orders",
+        json_schema_extra={
+            "prompt": "Action on stale market data (warn_only, pause_new_orders, cancel_passive_orders): ",
+            "is_updatable": True
+        }
+    )
 
     @field_validator("trailing_stop", mode="before")
     @classmethod
@@ -235,8 +256,13 @@ class MarketMakingControllerBase(ControllerBase):
         self._last_rebalance_attempt_timestamp: float = 0.0
         self._wallet_balance_seeded: bool = False
         self._startup_logged: bool = False
-        self._last_ob_diff_uid: int = 0
-        self._last_ob_change_time: float = _time.time()
+        self._last_ob_snapshot_uid: Optional[int] = None  # None = never seen
+        self._last_ob_diff_uid: Optional[int] = None      # None = never seen
+        self._last_ob_event_time: Optional[float] = None   # None = no market data yet
+        self._stale_state: str = "unknown"                 # "unknown" | "healthy" | "stale"
+        self._last_stale_log_time: float = 0.0             # Rate-limit logging
+        self._stale_transition_time: Optional[float] = None  # When stale state began
+        self._stale_suppression_logged: bool = False
         self.market_data_provider.initialize_rate_sources([ConnectorPair(
             connector_name=config.connector_name, trading_pair=config.trading_pair)])
         self.logger().info(
@@ -296,6 +322,84 @@ class MarketMakingControllerBase(ControllerBase):
             f"seeding={seed_amount} {base_asset}"
         )
         return seed_amount
+
+    def _check_market_data_freshness(self):
+        """Check order book freshness using both snapshot and diff UIDs."""
+        try:
+            connectors = getattr(self.market_data_provider, 'connectors', None)
+            if not connectors or self.config.connector_name not in connectors:
+                return
+            connector = connectors[self.config.connector_name]
+            ob = connector.get_order_book(self.config.trading_pair)
+            if ob is None:
+                return
+
+            now = _time.time()
+            changed = False
+
+            # Check snapshot UID
+            snapshot_uid = getattr(ob, 'snapshot_uid', None)
+            if snapshot_uid is not None and snapshot_uid != 0:
+                if self._last_ob_snapshot_uid != snapshot_uid:
+                    self._last_ob_snapshot_uid = snapshot_uid
+                    changed = True
+
+            # Check diff UID
+            diff_uid = getattr(ob, 'last_diff_uid', None)
+            if diff_uid is not None and diff_uid != 0:
+                if self._last_ob_diff_uid != diff_uid:
+                    self._last_ob_diff_uid = diff_uid
+                    changed = True
+
+            if changed:
+                self._last_ob_event_time = now
+                old_state = self._stale_state
+                self._stale_state = "healthy"
+                self._stale_suppression_logged = False
+                if old_state == "stale" and self._stale_transition_time is not None:
+                    duration = now - self._stale_transition_time
+                    self.logger().info(
+                        f"MARKET DATA RECOVERED: controller={self.config.id} "
+                        f"stale duration={duration:.0f}s"
+                    )
+                self._stale_transition_time = None
+                return
+
+            # No change detected — evaluate staleness
+            if self._last_ob_event_time is None:
+                # No market data ever received — don't warn yet
+                return
+
+            age = now - self._last_ob_event_time
+            threshold = getattr(self.config, 'max_market_data_stale_seconds', 30)
+
+            if age > threshold:
+                old_state = self._stale_state
+                self._stale_state = "stale"
+
+                if old_state != "stale":
+                    # State transition: log once
+                    self._stale_transition_time = now
+                    self.logger().warning(
+                        f"STALE MARKET DATA: controller={self.config.id} "
+                        f"orderbook last updated {age:.0f}s ago "
+                        f"(threshold: {threshold}s). Pausing/cancelling per policy."
+                    )
+                    self._last_stale_log_time = now
+                elif now - self._last_stale_log_time >= 60.0:
+                    # Milestone log every 60s while stale
+                    self.logger().info(
+                        f"STALE MARKET DATA (ongoing): controller={self.config.id} "
+                        f"orderbook last updated {age:.0f}s ago"
+                    )
+                    self._last_stale_log_time = now
+            else:
+                self._stale_state = "healthy"
+
+        except Exception as e:
+            self.logger().debug(
+                f"Market data freshness check error: {repr(e)}", exc_info=True
+            )
 
     def _get_active_order_price_bounds(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         """
@@ -436,26 +540,20 @@ class MarketMakingControllerBase(ControllerBase):
         )
 
         # Market data freshness check (LOG 12)
-        try:
-            connectors = getattr(self.market_data_provider, 'connectors', None)
-            if connectors and self.config.connector_name in connectors:
-                connector = connectors[self.config.connector_name]
-                ob = connector.get_order_book(self.config.trading_pair)
-                if ob and hasattr(ob, 'last_diff_uid'):
-                    current_uid = ob.last_diff_uid
-                    if current_uid != self._last_ob_diff_uid:
-                        self._last_ob_diff_uid = current_uid
-                        self._last_ob_change_time = _time.time()
-                    else:
-                        age_seconds = _time.time() - self._last_ob_change_time
-                        if age_seconds > 30:
-                            self.logger().warning(
-                                f"STALE MARKET DATA: controller={self.config.id} "
-                                f"orderbook last updated {age_seconds:.0f}s ago "
-                                f"(threshold: 30s). Quoting on potentially stale prices."
-                            )
-        except Exception:
-            pass  # Best effort — don't break quoting
+        self._check_market_data_freshness()
+
+        # Suppress new order creation when stale (FIX 3)
+        if self._stale_state == "stale" and self.config.stale_data_action != "warn_only":
+            stale_age = _time.time() - (self._last_ob_event_time or 0)
+            if stale_age > self.config.max_market_data_stale_seconds:
+                if not self._stale_suppression_logged:
+                    self.logger().warning(
+                        f"STALE SUPPRESSION: controller={self.config.id} "
+                        f"suppressing new orders (stale {stale_age:.0f}s, "
+                        f"action={self.config.stale_data_action})"
+                    )
+                    self._stale_suppression_logged = True
+                return self.stop_actions_proposal()
 
         # Per-controller executor inventory summary
         try:
@@ -696,9 +794,43 @@ class MarketMakingControllerBase(ControllerBase):
 
     def executors_to_early_stop(self) -> List[ExecutorAction]:
         """
-        Get the executors to early stop based on the current state of market data. This method can be overridden to
-        implement custom behavior.
+        Stop executors when market data is stale, according to configured policy.
+        Hard threshold stops ALL active executors; soft threshold stops passive only.
         """
+        if self._stale_state != "stale" or self._last_ob_event_time is None:
+            return []
+
+        stale_age = _time.time() - self._last_ob_event_time
+
+        # Hard threshold: stop ALL active executors regardless of action mode
+        if stale_age > self.config.hard_market_data_stale_seconds:
+            active = [e for e in self.executors_info if e.is_active]
+            if active:
+                self.logger().warning(
+                    f"STALE HARD STOP: controller={self.config.id} "
+                    f"stopping {len(active)} executors (stale {stale_age:.0f}s > "
+                    f"hard threshold {self.config.hard_market_data_stale_seconds}s)"
+                )
+            return [StopExecutorAction(
+                controller_id=self.config.id,
+                executor_id=executor.id
+            ) for executor in active]
+
+        # Soft threshold with cancel_passive_orders
+        if (self.config.stale_data_action == "cancel_passive_orders"
+                and stale_age > self.config.max_market_data_stale_seconds):
+            passive = [e for e in self.executors_info
+                       if e.is_active and not e.is_trading]
+            if passive:
+                self.logger().warning(
+                    f"STALE CANCEL PASSIVE: controller={self.config.id} "
+                    f"stopping {len(passive)} passive executors (stale {stale_age:.0f}s)"
+                )
+            return [StopExecutorAction(
+                controller_id=self.config.id,
+                executor_id=executor.id
+            ) for executor in passive]
+
         return []
 
     async def update_processed_data(self):

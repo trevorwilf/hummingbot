@@ -940,3 +940,324 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
             self.assertIn("5.0", msg)
         finally:
             logger.setLevel(old_level)
+
+    # ---- FIX 2: Stale Market Data Detector tests ----
+
+    def _make_controller_with_order_book(self, snapshot_uid=0, last_diff_uid=0, **config_overrides):
+        """Helper: create a controller with a mock connector that has a mock order book."""
+        config_kwargs = dict(
+            id="test",
+            controller_name="market_making_test_controller",
+            connector_name="binance_perpetual",
+            trading_pair="ETH-USDT",
+            total_amount_quote=Decimal("1000"),
+            buy_spreads=[0.01],
+            sell_spreads=[0.01],
+            buy_amounts_pct=[Decimal(50)],
+            sell_amounts_pct=[Decimal(50)],
+            executor_refresh_time=300,
+            cooldown_time=15,
+            leverage=20,
+            position_mode=PositionMode.HEDGE,
+        )
+        config_kwargs.update(config_overrides)
+        config = MarketMakingControllerConfigBase(**config_kwargs)
+
+        mock_order_book = MagicMock()
+        mock_order_book.snapshot_uid = snapshot_uid
+        mock_order_book.last_diff_uid = last_diff_uid
+
+        mock_connector = MagicMock()
+        mock_connector.get_order_book.return_value = mock_order_book
+
+        self.mock_market_data_provider.connectors = {config.connector_name: mock_connector}
+
+        controller = MarketMakingControllerBase(
+            config=config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+        controller.processed_data = {"reference_price": Decimal("100"), "spread_multiplier": Decimal("1")}
+        controller.executors_info = []
+        controller.positions_held = []
+        return controller, mock_order_book, mock_connector
+
+    def test_no_stale_warning_before_first_market_data(self):
+        """Before any market data arrives, freshness check should not warn and state stays 'unknown'."""
+        import logging
+        # Create controller with snapshot_uid=0 and last_diff_uid=0 (no real data yet)
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=0, last_diff_uid=0)
+        self.assertEqual(controller._stale_state, "unknown")
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            # assertLogs requires at least one log; emit a dummy DEBUG to satisfy it
+            with self.assertLogs(logger, level="DEBUG") as log:
+                controller._check_market_data_freshness()
+                logger.debug("dummy")
+
+            warning_logs = [m for m in log.output if "WARNING" in m and "STALE" in m]
+            self.assertEqual(len(warning_logs), 0, "No WARNING should be emitted before first market data")
+            self.assertEqual(controller._stale_state, "unknown")
+        finally:
+            logger.setLevel(old_level)
+
+    def test_snapshot_resets_stale_timer(self):
+        """A non-zero snapshot_uid should transition state to 'healthy'."""
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=42, last_diff_uid=0)
+        self.assertEqual(controller._stale_state, "unknown")
+
+        controller._check_market_data_freshness()
+
+        self.assertEqual(controller._stale_state, "healthy")
+        self.assertIsNotNone(controller._last_ob_event_time)
+        self.assertEqual(controller._last_ob_snapshot_uid, 42)
+
+    def test_diff_resets_stale_timer(self):
+        """A non-zero last_diff_uid should transition state to 'healthy'."""
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=0, last_diff_uid=99)
+        self.assertEqual(controller._stale_state, "unknown")
+
+        controller._check_market_data_freshness()
+
+        self.assertEqual(controller._stale_state, "healthy")
+        self.assertIsNotNone(controller._last_ob_event_time)
+        self.assertEqual(controller._last_ob_diff_uid, 99)
+
+    def test_stale_fires_after_threshold(self):
+        """When data is older than threshold, state transitions to 'stale' with WARNING."""
+        import logging
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        # Simulate: data was received, then went stale
+        controller._last_ob_event_time = _time.time() - 35  # 35s ago, default threshold is 30s
+        controller._last_ob_snapshot_uid = 1  # Already seen this UID
+        controller._stale_state = "healthy"
+        # OB still has the same UID (no change)
+        mock_ob.snapshot_uid = 1
+        mock_ob.last_diff_uid = 0
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+            with self.assertLogs(logger, level="WARNING") as log:
+                controller._check_market_data_freshness()
+
+            self.assertEqual(controller._stale_state, "stale")
+            stale_warnings = [m for m in log.output if "STALE MARKET DATA" in m]
+            self.assertTrue(len(stale_warnings) > 0, "Expected STALE MARKET DATA warning")
+        finally:
+            logger.setLevel(old_level)
+
+    def test_stale_log_rate_limited(self):
+        """Once in stale state, logging should be rate-limited to 60s intervals."""
+        import logging
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        # Already in stale state, last log was just now
+        controller._stale_state = "stale"
+        controller._last_ob_event_time = _time.time() - 35
+        controller._last_ob_snapshot_uid = 1
+        controller._last_stale_log_time = _time.time()  # Just logged
+        controller._stale_transition_time = _time.time() - 5  # Entered stale 5s ago
+        mock_ob.snapshot_uid = 1
+        mock_ob.last_diff_uid = 0
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            with self.assertLogs(logger, level="DEBUG") as log:
+                controller._check_market_data_freshness()
+                logger.debug("dummy")
+
+            # Should NOT have any additional WARNING or INFO stale logs (rate limited)
+            stale_logs = [m for m in log.output
+                          if ("STALE MARKET DATA" in m) and ("dummy" not in m)]
+            self.assertEqual(len(stale_logs), 0,
+                             f"No stale log should be emitted within 60s rate limit, got: {stale_logs}")
+        finally:
+            logger.setLevel(old_level)
+
+    def test_stale_recovery_logged(self):
+        """Recovery from stale state should log an INFO message with duration."""
+        import logging
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        # Simulate stale state
+        controller._stale_state = "stale"
+        controller._stale_transition_time = _time.time() - 10  # Stale for 10s
+        controller._last_ob_snapshot_uid = 1
+        controller._last_ob_event_time = _time.time() - 40
+
+        # Now simulate fresh data arriving (new snapshot UID)
+        mock_ob.snapshot_uid = 2
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            with self.assertLogs(logger, level="INFO") as log:
+                controller._check_market_data_freshness()
+
+            self.assertEqual(controller._stale_state, "healthy")
+            recovery_logs = [m for m in log.output if "MARKET DATA RECOVERED" in m]
+            self.assertTrue(len(recovery_logs) > 0, "Expected MARKET DATA RECOVERED info log")
+            self.assertIn("stale duration=", recovery_logs[0])
+        finally:
+            logger.setLevel(old_level)
+
+    def test_exception_logged_not_swallowed(self):
+        """If get_order_book raises, a DEBUG log is emitted and no crash occurs."""
+        import logging
+
+        controller, _, mock_connector = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        mock_connector.get_order_book.side_effect = RuntimeError("test error")
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            with self.assertLogs(logger, level="DEBUG") as log:
+                controller._check_market_data_freshness()  # Should not raise
+
+            error_logs = [m for m in log.output if "freshness check error" in m]
+            self.assertTrue(len(error_logs) > 0, "Expected DEBUG log for freshness check error")
+        finally:
+            logger.setLevel(old_level)
+
+    # ---- FIX 3: Stale Detection Safety Actions tests ----
+
+    def _make_mock_executor(self, executor_id, is_active=True, is_trading=False, level_id="buy_0"):
+        """Helper: create a mock executor for stale action tests."""
+        mock_executor = MagicMock(spec=ExecutorInfo)
+        mock_executor.id = executor_id
+        mock_executor.is_active = is_active
+        mock_executor.is_trading = is_trading
+        mock_executor.custom_info = {"level_id": level_id}
+        mock_executor.timestamp = 0
+        mock_executor.close_type = None
+        mock_executor.config = MagicMock()
+        mock_executor.config.connector_name = "binance_perpetual"
+        mock_executor.config.trading_pair = "ETH-USDT"
+        return mock_executor
+
+    def test_warn_only_does_not_stop_executors(self):
+        """With stale_data_action='warn_only', executors_to_early_stop returns empty list."""
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0, stale_data_action="warn_only")
+        controller._stale_state = "stale"
+        controller._last_ob_event_time = _time.time() - 50  # 50s stale
+
+        # Add active executors
+        controller.executors_info = [
+            self._make_mock_executor("exec_1", is_active=True, is_trading=False),
+            self._make_mock_executor("exec_2", is_active=True, is_trading=True),
+        ]
+
+        result = controller.executors_to_early_stop()
+        self.assertEqual(result, [])
+
+    def test_pause_new_orders_suppresses_creates(self):
+        """With stale + 'pause_new_orders', create_actions_proposal returns stop actions only."""
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0, stale_data_action="pause_new_orders")
+        controller._stale_state = "stale"
+        controller._last_ob_event_time = _time.time() - 50
+        controller._last_ob_snapshot_uid = 1
+        mock_ob.snapshot_uid = 1
+        mock_ob.last_diff_uid = 0
+
+        controller.executors_info = [
+            self._make_mock_executor("exec_1", is_active=True, is_trading=False, level_id="buy_0"),
+        ]
+
+        # market_data_provider.time() is used by executors_to_refresh inside stop_actions_proposal
+        self.mock_market_data_provider.time.return_value = _time.time()
+
+        actions = controller.create_actions_proposal()
+        # Should contain only StopExecutorAction (no CreateExecutorAction)
+        for action in actions:
+            self.assertIsInstance(action, StopExecutorAction)
+        create_actions = [a for a in actions if isinstance(a, CreateExecutorAction)]
+        self.assertEqual(len(create_actions), 0, "No create actions should be emitted when paused")
+
+    def test_cancel_passive_stops_resting(self):
+        """With stale + 'cancel_passive_orders', passive (not trading) executors are stopped."""
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0, stale_data_action="cancel_passive_orders")
+        controller._stale_state = "stale"
+        controller._last_ob_event_time = _time.time() - 50  # Past soft threshold
+
+        passive_exec = self._make_mock_executor("passive_1", is_active=True, is_trading=False)
+        trading_exec = self._make_mock_executor("trading_1", is_active=True, is_trading=True)
+        controller.executors_info = [passive_exec, trading_exec]
+
+        result = controller.executors_to_early_stop()
+
+        # Should stop passive executor but not trading one
+        stopped_ids = [a.executor_id for a in result]
+        self.assertIn("passive_1", stopped_ids)
+        self.assertNotIn("trading_1", stopped_ids)
+
+    def test_hard_threshold_stops_all(self):
+        """When stale > hard threshold (90s), ALL active executors are stopped."""
+        import time as _time
+
+        controller, mock_ob, _ = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0, stale_data_action="warn_only")
+        controller._stale_state = "stale"
+        controller._last_ob_event_time = _time.time() - 100  # 100s > 90s hard threshold
+
+        passive_exec = self._make_mock_executor("passive_1", is_active=True, is_trading=False)
+        trading_exec = self._make_mock_executor("trading_1", is_active=True, is_trading=True)
+        inactive_exec = self._make_mock_executor("inactive_1", is_active=False, is_trading=False)
+        controller.executors_info = [passive_exec, trading_exec, inactive_exec]
+
+        result = controller.executors_to_early_stop()
+
+        stopped_ids = [a.executor_id for a in result]
+        self.assertIn("passive_1", stopped_ids)
+        self.assertIn("trading_1", stopped_ids)
+        self.assertNotIn("inactive_1", stopped_ids)
+        self.assertEqual(len(result), 2)
+
+    def test_no_action_when_healthy(self):
+        """When state is healthy, executors_to_early_stop returns empty list."""
+        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        controller._stale_state = "healthy"
+
+        controller.executors_info = [
+            self._make_mock_executor("exec_1", is_active=True, is_trading=False),
+            self._make_mock_executor("exec_2", is_active=True, is_trading=True),
+        ]
+
+        result = controller.executors_to_early_stop()
+        self.assertEqual(result, [])
+
+    def test_default_config_is_cancel_passive(self):
+        """Default stale_data_action should be 'cancel_passive_orders'."""
+        config = MarketMakingControllerConfigBase(
+            id="test_defaults",
+            controller_name="test_defaults",
+            connector_name="binance_perpetual",
+            trading_pair="ETH-USDT",
+            total_amount_quote=Decimal("1000"),
+            buy_spreads=[0.01],
+            sell_spreads=[0.01],
+        )
+        self.assertEqual(config.stale_data_action, "cancel_passive_orders")
+        self.assertEqual(config.max_market_data_stale_seconds, 30)
+        self.assertEqual(config.hard_market_data_stale_seconds, 90)
