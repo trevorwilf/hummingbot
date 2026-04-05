@@ -1027,18 +1027,20 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(controller._last_ob_diff_uid, 99)
 
     def test_stale_fires_after_threshold(self):
-        """When data is older than threshold, state transitions to 'stale' with WARNING."""
+        """When data is older than threshold AND WS is disconnected, state transitions to 'stale' with WARNING."""
         import logging
         import time as _time
 
-        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
         # Simulate: data was received, then went stale
-        controller._last_ob_event_time = _time.time() - 35  # 35s ago, default threshold is 30s
+        controller._last_ob_event_time = _time.time() - 125  # 125s ago, default threshold is 120s
         controller._last_ob_snapshot_uid = 1  # Already seen this UID
         controller._stale_state = "healthy"
         # OB still has the same UID (no change)
         mock_ob.snapshot_uid = 1
         mock_ob.last_diff_uid = 0
+        # WS must be disconnected for stale to trigger
+        mock_connector.is_public_ws_connected = False
 
         logger = controller.logger()
         old_level = logger.level
@@ -1058,15 +1060,17 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         import logging
         import time as _time
 
-        controller, mock_ob, _ = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(snapshot_uid=1, last_diff_uid=0)
         # Already in stale state, last log was just now
         controller._stale_state = "stale"
-        controller._last_ob_event_time = _time.time() - 35
+        controller._last_ob_event_time = _time.time() - 125
         controller._last_ob_snapshot_uid = 1
         controller._last_stale_log_time = _time.time()  # Just logged
         controller._stale_transition_time = _time.time() - 5  # Entered stale 5s ago
         mock_ob.snapshot_uid = 1
         mock_ob.last_diff_uid = 0
+        # WS must be disconnected for stale path
+        mock_connector.is_public_ws_connected = False
 
         logger = controller.logger()
         old_level = logger.level
@@ -1155,7 +1159,7 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         controller, mock_ob, _ = self._make_controller_with_order_book(
             snapshot_uid=1, last_diff_uid=0, stale_data_action="warn_only")
         controller._stale_state = "stale"
-        controller._last_ob_event_time = _time.time() - 50  # 50s stale
+        controller._last_ob_event_time = _time.time() - 130  # 130s stale (past 120s threshold)
 
         # Add active executors
         controller.executors_info = [
@@ -1170,13 +1174,14 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         """With stale + 'pause_new_orders', create_actions_proposal returns stop actions only."""
         import time as _time
 
-        controller, mock_ob, _ = self._make_controller_with_order_book(
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(
             snapshot_uid=1, last_diff_uid=0, stale_data_action="pause_new_orders")
         controller._stale_state = "stale"
-        controller._last_ob_event_time = _time.time() - 50
+        controller._last_ob_event_time = _time.time() - 130  # Past 120s threshold
         controller._last_ob_snapshot_uid = 1
         mock_ob.snapshot_uid = 1
         mock_ob.last_diff_uid = 0
+        mock_connector.is_public_ws_connected = False
 
         controller.executors_info = [
             self._make_mock_executor("exec_1", is_active=True, is_trading=False, level_id="buy_0"),
@@ -1199,7 +1204,7 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         controller, mock_ob, _ = self._make_controller_with_order_book(
             snapshot_uid=1, last_diff_uid=0, stale_data_action="cancel_passive_orders")
         controller._stale_state = "stale"
-        controller._last_ob_event_time = _time.time() - 50  # Past soft threshold
+        controller._last_ob_event_time = _time.time() - 130  # Past soft threshold (120s)
 
         passive_exec = self._make_mock_executor("passive_1", is_active=True, is_trading=False)
         trading_exec = self._make_mock_executor("trading_1", is_active=True, is_trading=True)
@@ -1213,13 +1218,13 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("trading_1", stopped_ids)
 
     def test_hard_threshold_stops_all(self):
-        """When stale > hard threshold (90s), ALL active executors are stopped."""
+        """When stale > hard threshold (300s), ALL active executors are stopped."""
         import time as _time
 
         controller, mock_ob, _ = self._make_controller_with_order_book(
             snapshot_uid=1, last_diff_uid=0, stale_data_action="warn_only")
         controller._stale_state = "stale"
-        controller._last_ob_event_time = _time.time() - 100  # 100s > 90s hard threshold
+        controller._last_ob_event_time = _time.time() - 310  # 310s > 300s hard threshold
 
         passive_exec = self._make_mock_executor("passive_1", is_active=True, is_trading=False)
         trading_exec = self._make_mock_executor("trading_1", is_active=True, is_trading=True)
@@ -1247,8 +1252,8 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
         result = controller.executors_to_early_stop()
         self.assertEqual(result, [])
 
-    def test_default_config_is_cancel_passive(self):
-        """Default stale_data_action should be 'cancel_passive_orders'."""
+    def test_default_config_is_pause_new_orders(self):
+        """Default stale_data_action should be 'pause_new_orders'."""
         config = MarketMakingControllerConfigBase(
             id="test_defaults",
             controller_name="test_defaults",
@@ -1258,6 +1263,199 @@ class TestMarketMakingControllerBase(IsolatedAsyncioWrapperTestCase):
             buy_spreads=[0.01],
             sell_spreads=[0.01],
         )
-        self.assertEqual(config.stale_data_action, "cancel_passive_orders")
-        self.assertEqual(config.max_market_data_stale_seconds, 30)
-        self.assertEqual(config.hard_market_data_stale_seconds, 90)
+        self.assertEqual(config.stale_data_action, "pause_new_orders")
+        self.assertEqual(config.max_market_data_stale_seconds, 120)
+        self.assertEqual(config.hard_market_data_stale_seconds, 300)
+
+    # ---- Quiet-market / WS-connected stale detection tests ----
+
+    def test_quiet_market_ws_connected(self):
+        """When WS is connected but UIDs unchanged past threshold, state should be 'quiet' not 'stale'."""
+        import logging
+        import time as _time
+
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0)
+        controller._last_ob_event_time = _time.time() - 130  # 130s > 120s threshold
+        controller._last_ob_snapshot_uid = 1
+        controller._stale_state = "healthy"
+        mock_ob.snapshot_uid = 1
+        mock_ob.last_diff_uid = 0
+        # WS is connected — should result in quiet, not stale
+        mock_connector.is_public_ws_connected = True
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            with self.assertLogs(logger, level="INFO") as log:
+                controller._check_market_data_freshness()
+
+            self.assertEqual(controller._stale_state, "quiet")
+            quiet_logs = [m for m in log.output if "QUIET MARKET" in m]
+            self.assertTrue(len(quiet_logs) > 0, "Expected QUIET MARKET info log")
+        finally:
+            logger.setLevel(old_level)
+
+        # Verify no passive executors are stopped in quiet state
+        passive_exec = self._make_mock_executor("passive_1", is_active=True, is_trading=False)
+        controller.executors_info = [passive_exec]
+        result = controller.executors_to_early_stop()
+        self.assertEqual(result, [], "Quiet state should NOT trigger executor stops")
+
+    def test_disconnected_stale(self):
+        """When WS is disconnected and UIDs unchanged past threshold, state should be 'stale'."""
+        import time as _time
+
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0)
+        controller._last_ob_event_time = _time.time() - 130  # 130s > 120s threshold
+        controller._last_ob_snapshot_uid = 1
+        controller._stale_state = "healthy"
+        mock_ob.snapshot_uid = 1
+        mock_ob.last_diff_uid = 0
+        mock_connector.is_public_ws_connected = False
+
+        import logging
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+            with self.assertLogs(logger, level="WARNING") as log:
+                controller._check_market_data_freshness()
+
+            self.assertEqual(controller._stale_state, "stale")
+            stale_warnings = [m for m in log.output if "STALE MARKET DATA" in m]
+            self.assertTrue(len(stale_warnings) > 0, "Expected STALE MARKET DATA warning")
+            self.assertIn("WS disconnected", stale_warnings[0])
+        finally:
+            logger.setLevel(old_level)
+
+    def test_recovery_from_quiet(self):
+        """After entering quiet state, a UID change should recover to 'healthy' and log MARKET DATA RECOVERED."""
+        import logging
+        import time as _time
+
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0)
+        # Set up quiet state
+        controller._stale_state = "quiet"
+        controller._stale_transition_time = _time.time() - 60  # In quiet for 60s
+        controller._last_ob_snapshot_uid = 1
+        controller._last_ob_event_time = _time.time() - 200
+        mock_connector.is_public_ws_connected = True
+
+        # Now simulate fresh data arriving (new snapshot UID)
+        mock_ob.snapshot_uid = 2
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            with self.assertLogs(logger, level="INFO") as log:
+                controller._check_market_data_freshness()
+
+            self.assertEqual(controller._stale_state, "healthy")
+            recovery_logs = [m for m in log.output if "MARKET DATA RECOVERED" in m]
+            self.assertTrue(len(recovery_logs) > 0, "Expected MARKET DATA RECOVERED info log")
+            self.assertIn("stale duration=", recovery_logs[0])
+        finally:
+            logger.setLevel(old_level)
+
+    def test_fallback_no_ws_property(self):
+        """When connector has no is_public_ws_connected attribute, should fall back to stale."""
+        import logging
+        import time as _time
+
+        controller, mock_ob, mock_connector = self._make_controller_with_order_book(
+            snapshot_uid=1, last_diff_uid=0)
+        controller._last_ob_event_time = _time.time() - 130  # Past threshold
+        controller._last_ob_snapshot_uid = 1
+        controller._stale_state = "healthy"
+        mock_ob.snapshot_uid = 1
+        mock_ob.last_diff_uid = 0
+
+        # Remove the is_public_ws_connected attribute entirely so getattr returns False
+        if hasattr(mock_connector, 'is_public_ws_connected'):
+            del mock_connector.is_public_ws_connected
+        # For MagicMock, we need to use spec or configure getattr to not auto-create
+        # The production code uses getattr(connector, 'is_public_ws_connected', False)
+        # which returns False for missing attributes on real objects, but MagicMock
+        # auto-creates them. We use PropertyMock to raise AttributeError.
+        type(mock_connector).is_public_ws_connected = property(
+            lambda self: (_ for _ in ()).throw(AttributeError("no such attribute"))
+        )
+
+        logger = controller.logger()
+        old_level = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+            with self.assertLogs(logger, level="WARNING") as log:
+                controller._check_market_data_freshness()
+
+            self.assertEqual(controller._stale_state, "stale")
+            stale_warnings = [m for m in log.output if "STALE MARKET DATA" in m]
+            self.assertTrue(len(stale_warnings) > 0,
+                            "Expected stale when connector lacks is_public_ws_connected")
+        finally:
+            logger.setLevel(old_level)
+            # Clean up the property to avoid affecting other tests
+            try:
+                del type(mock_connector).is_public_ws_connected
+            except Exception:
+                pass
+
+    def test_default_values_updated(self):
+        """Assert that default config values match the updated defaults."""
+        config = MarketMakingControllerConfigBase(
+            id="test_updated_defaults",
+            controller_name="test_updated_defaults",
+            connector_name="binance_perpetual",
+            trading_pair="ETH-USDT",
+            total_amount_quote=Decimal("1000"),
+            buy_spreads=[0.01],
+            sell_spreads=[0.01],
+        )
+        self.assertEqual(config.max_market_data_stale_seconds, 120)
+        self.assertEqual(config.hard_market_data_stale_seconds, 300)
+        self.assertEqual(config.stale_data_action, "pause_new_orders")
+
+    def test_stale_config_logged_at_startup(self):
+        """Creating a controller should log 'Market data staleness config' with correct values."""
+        import logging
+
+        config = MarketMakingControllerConfigBase(
+            id="startup_log_test",
+            controller_name="startup_log_test",
+            connector_name="binance_perpetual",
+            trading_pair="ETH-USDT",
+            total_amount_quote=Decimal("1000"),
+            buy_spreads=[0.01],
+            sell_spreads=[0.01],
+            max_market_data_stale_seconds=120,
+            hard_market_data_stale_seconds=300,
+            stale_data_action="pause_new_orders",
+        )
+
+        # We need to capture the log emitted during __init__
+        # Use patch on the logger class to intercept
+        with patch("hummingbot.strategy_v2.controllers.market_making_controller_base.MarketMakingControllerBase.logger") as mock_logger_fn:
+            mock_logger_instance = MagicMock()
+            mock_logger_fn.return_value = mock_logger_instance
+
+            controller = MarketMakingControllerBase(
+                config=config,
+                market_data_provider=self.mock_market_data_provider,
+                actions_queue=self.mock_actions_queue,
+            )
+
+            # Collect all info() call args
+            info_calls = [str(call) for call in mock_logger_instance.info.call_args_list]
+            staleness_logs = [c for c in info_calls if "Market data staleness config" in c]
+            self.assertTrue(len(staleness_logs) > 0,
+                            f"Expected 'Market data staleness config' log at startup, got: {info_calls}")
+            staleness_msg = staleness_logs[0]
+            self.assertIn("startup_log_test", staleness_msg)
+            self.assertIn("max_stale_seconds=120", staleness_msg)
+            self.assertIn("hard_stale_seconds=300", staleness_msg)
+            self.assertIn("stale_action=pause_new_orders", staleness_msg)

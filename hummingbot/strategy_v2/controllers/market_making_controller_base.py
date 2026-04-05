@@ -132,21 +132,24 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
         }
     )
     max_market_data_stale_seconds: int = Field(
-        default=30,
+        default=120,  # Live testing shows quiet markets can have 45-90+ second gaps
+                      # between data frames on healthy connections.
         json_schema_extra={
             "prompt": "Seconds of no market data before soft stale action: ",
             "is_updatable": True
         }
     )
     hard_market_data_stale_seconds: int = Field(
-        default=90,
+        default=300,  # Must be substantially above soft threshold to avoid
+                      # premature hard stops on quiet venues.
         json_schema_extra={
             "prompt": "Seconds of no market data before hard stop of all executors: ",
             "is_updatable": True
         }
     )
     stale_data_action: str = Field(
-        default="cancel_passive_orders",
+        default="pause_new_orders",  # Cancelling passive orders destroys queue position
+                                     # and creates churn. Pausing new orders is safer.
         json_schema_extra={
             "prompt": "Action on stale market data (warn_only, pause_new_orders, cancel_passive_orders): ",
             "is_updatable": True
@@ -274,6 +277,12 @@ class MarketMakingControllerBase(ControllerBase):
             f"skip_rebalance={getattr(self.config, 'skip_rebalance', 'N/A')} "
             f"refresh_time={getattr(self.config, 'executor_refresh_time', 'N/A')}s"
         )
+        self.logger().info(
+            f"Market data staleness config: controller={self.config.id} "
+            f"max_stale_seconds={self.config.max_market_data_stale_seconds} "
+            f"hard_stale_seconds={self.config.hard_market_data_stale_seconds} "
+            f"stale_action={self.config.stale_data_action}"
+        )
 
     def compute_wallet_seed_amount(self, reference_price: Decimal) -> Decimal:
         """
@@ -324,7 +333,19 @@ class MarketMakingControllerBase(ControllerBase):
         return seed_amount
 
     def _check_market_data_freshness(self):
-        """Check order book freshness using both snapshot and diff UIDs."""
+        """
+        Check order book freshness using UID mutations AND WebSocket connection state.
+
+        Design rationale (validated by live WS testing against NonKYC):
+        - Quiet markets (e.g., ARRR-USDT) can have 45-90+ second gaps between
+          ANY WebSocket data frames, even with ticker+orderbook+trades subscribed.
+        - The WS connection stays alive via invisible protocol-level pings that
+          do NOT update any application-level timestamps.
+        - Therefore we CANNOT use message timestamps for transport liveness.
+        - Instead, we check the WSConnection.connected state, which reflects
+          protocol-level connectivity. If connected=True, the transport is alive
+          and the market is simply quiet — NOT stale.
+        """
         try:
             connectors = getattr(self.market_data_provider, 'connectors', None)
             if not connectors or self.config.connector_name not in connectors:
@@ -356,7 +377,7 @@ class MarketMakingControllerBase(ControllerBase):
                 old_state = self._stale_state
                 self._stale_state = "healthy"
                 self._stale_suppression_logged = False
-                if old_state == "stale" and self._stale_transition_time is not None:
+                if old_state in ("stale", "quiet") and self._stale_transition_time is not None:
                     duration = now - self._stale_transition_time
                     self.logger().info(
                         f"MARKET DATA RECOVERED: controller={self.config.id} "
@@ -365,32 +386,58 @@ class MarketMakingControllerBase(ControllerBase):
                 self._stale_transition_time = None
                 return
 
-            # No change detected — evaluate staleness
+            # No UID change — evaluate staleness
             if self._last_ob_event_time is None:
-                # No market data ever received — don't warn yet
                 return
 
             age = now - self._last_ob_event_time
-            threshold = getattr(self.config, 'max_market_data_stale_seconds', 30)
+            threshold = self.config.max_market_data_stale_seconds
 
             if age > threshold:
+                # Before declaring stale, check if the WS transport is still alive
+                ws_connected = False
+                try:
+                    ws_connected = getattr(connector, 'is_public_ws_connected', False)
+                except Exception:
+                    pass
+
+                if ws_connected:
+                    # Transport alive but book unchanged — quiet market, NOT a dead feed
+                    if self._stale_state != "quiet":
+                        self._stale_state = "quiet"
+                        self._stale_transition_time = self._stale_transition_time or now
+                        self.logger().info(
+                            f"QUIET MARKET: controller={self.config.id} "
+                            f"orderbook unchanged for {age:.0f}s but WS connected. "
+                            f"Not escalating to stale."
+                        )
+                        self._last_stale_log_time = now
+                    elif now - (self._last_stale_log_time or 0) >= 120.0:
+                        self.logger().info(
+                            f"QUIET MARKET (ongoing): controller={self.config.id} "
+                            f"orderbook unchanged for {age:.0f}s, WS still connected"
+                        )
+                        self._last_stale_log_time = now
+                    # Do NOT escalate — market is quiet but transport is alive
+                    return
+
+                # WS is disconnected — genuine staleness
                 old_state = self._stale_state
                 self._stale_state = "stale"
 
                 if old_state != "stale":
-                    # State transition: log once
-                    self._stale_transition_time = now
+                    self._stale_transition_time = self._stale_transition_time or now
                     self.logger().warning(
                         f"STALE MARKET DATA: controller={self.config.id} "
                         f"orderbook last updated {age:.0f}s ago "
-                        f"(threshold: {threshold}s). Pausing/cancelling per policy."
+                        f"(threshold: {threshold}s). WS disconnected. "
+                        f"Escalating per policy: {self.config.stale_data_action}"
                     )
                     self._last_stale_log_time = now
-                elif now - self._last_stale_log_time >= 60.0:
-                    # Milestone log every 60s while stale
+                elif now - (self._last_stale_log_time or 0) >= 60.0:
                     self.logger().info(
                         f"STALE MARKET DATA (ongoing): controller={self.config.id} "
-                        f"orderbook last updated {age:.0f}s ago"
+                        f"orderbook last updated {age:.0f}s ago, WS disconnected"
                     )
                     self._last_stale_log_time = now
             else:

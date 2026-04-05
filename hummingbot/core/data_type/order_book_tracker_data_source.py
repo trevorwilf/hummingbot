@@ -40,6 +40,21 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
     def order_book_create_function(self, func: Callable[[], OrderBook]):
         self._order_book_create_function = func
 
+    @property
+    def is_connected(self) -> bool:
+        """
+        Returns True if the public order book WebSocket connection is currently alive.
+        This checks the underlying WSConnection.connected state, which reflects
+        protocol-level connectivity (including heartbeat pings), not just data frame
+        receipt. Returns False if no connection exists.
+        """
+        if self._ws_assistant is not None:
+            try:
+                return self._ws_assistant._connection.connected
+            except (AttributeError, Exception):
+                pass
+        return False
+
     @abstractmethod
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         """

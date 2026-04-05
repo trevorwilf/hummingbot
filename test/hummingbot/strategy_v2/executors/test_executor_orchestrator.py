@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -947,3 +948,170 @@ class TestExecutorOrchestrator(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertTrue(any("Budget preflight failed" in msg for msg in log.output))
+
+    # ---- Fix 4: Cross-cycle shutdown-in-flight awareness tests ----
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_cross_cycle_deferral(self, markets_recorder_mock):
+        """Cycle 1: stop a SELL executor. Mark it as SHUTTING_DOWN.
+        Cycle 2: create for same connector/pair/side is deferred."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        config_sell = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(100), amount=Decimal(10))
+        config_sell_id = config_sell.id
+
+        # Create a mock executor for the SELL side
+        sell_executor = MagicMock(spec=PositionExecutor)
+        sell_executor.config = config_sell
+        sell_executor.is_closed = False
+        sell_executor.early_stop = MagicMock()
+        # After stop, executor transitions to SHUTTING_DOWN
+        sell_executor.status = RunnableStatus.SHUTTING_DOWN
+
+        self.orchestrator.active_executors["test"] = [sell_executor]
+        self.orchestrator.cached_performance["test"] = PerformanceReport()
+
+        # --- Cycle 1: Stop the sell executor ---
+        stop_actions = [StopExecutorAction(executor_id=config_sell_id, controller_id="test")]
+        self.orchestrator.execute_actions(stop_actions)
+
+        # Verify the key was recorded in shutdown-in-flight
+        key = ("binance", "ETH-USDT", TradeType.SELL)
+        self.assertIn(key, self.orchestrator._shutdown_in_flight_keys)
+
+        # --- Cycle 2: Try to create a new SELL executor for same connector/pair ---
+        create_config = PositionExecutorConfig(
+            timestamp=1235, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(105), amount=Decimal(5))
+
+        # Track whether create_executor is called
+        self.orchestrator.create_executor = MagicMock()
+
+        create_actions = [CreateExecutorAction(executor_config=create_config, controller_id="test")]
+        self.orchestrator.execute_actions(create_actions)
+
+        # The create must have been deferred (not executed)
+        self.orchestrator.create_executor.assert_not_called()
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_deferral_release(self, markets_recorder_mock):
+        """After executor transitions out of SHUTTING_DOWN, creates proceed normally."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        config_sell = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(100), amount=Decimal(10))
+
+        # Create a mock executor that WAS shutting down but has now terminated
+        sell_executor = MagicMock(spec=PositionExecutor)
+        sell_executor.config = config_sell
+        sell_executor.status = RunnableStatus.TERMINATED  # No longer shutting down
+
+        self.orchestrator.active_executors["test"] = [sell_executor]
+        self.orchestrator.cached_performance["test"] = PerformanceReport()
+
+        # Manually seed the shutdown-in-flight key (as if Cycle 1 stop happened)
+        key = ("binance", "ETH-USDT", TradeType.SELL)
+        self.orchestrator._shutdown_in_flight_keys[key] = time.time()
+
+        # Now try to create for the same key
+        create_config = PositionExecutorConfig(
+            timestamp=1235, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(105), amount=Decimal(5))
+
+        self.orchestrator.create_executor = MagicMock()
+
+        create_actions = [CreateExecutorAction(executor_config=create_config, controller_id="test")]
+        self.orchestrator.execute_actions(create_actions)
+
+        # The create must proceed since executor is no longer SHUTTING_DOWN
+        self.orchestrator.create_executor.assert_called_once()
+
+        # The key should have been cleaned up from tracking
+        self.assertNotIn(key, self.orchestrator._shutdown_in_flight_keys)
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_safety_valve_cleanup(self, markets_recorder_mock):
+        """Shutdown-in-flight key older than 30 seconds is cleaned up.
+        Creates are NOT deferred even if the key existed."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        self.orchestrator.cached_performance["test"] = PerformanceReport()
+        self.orchestrator.active_executors["test"] = []
+
+        # Seed a stale shutdown-in-flight key (older than 30 seconds)
+        key = ("binance", "ETH-USDT", TradeType.SELL)
+        self.orchestrator._shutdown_in_flight_keys[key] = time.time() - 60.0  # 60s ago
+
+        create_config = PositionExecutorConfig(
+            timestamp=1235, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(105), amount=Decimal(5))
+
+        self.orchestrator.create_executor = MagicMock()
+
+        create_actions = [CreateExecutorAction(executor_config=create_config, controller_id="test")]
+        self.orchestrator.execute_actions(create_actions)
+
+        # The stale key should have been cleaned up before create processing
+        self.assertNotIn(key, self.orchestrator._shutdown_in_flight_keys)
+
+        # The create must proceed since the key was cleaned up
+        self.orchestrator.create_executor.assert_called_once()
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_no_false_deferral(self, markets_recorder_mock):
+        """Creates for a side with no shutdown-in-flight proceed immediately."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        self.orchestrator.cached_performance["test"] = PerformanceReport()
+        self.orchestrator.active_executors["test"] = []
+
+        # No shutdown-in-flight keys at all
+        self.assertEqual(len(self.orchestrator._shutdown_in_flight_keys), 0)
+
+        create_config = PositionExecutorConfig(
+            timestamp=1235, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+
+        self.orchestrator.create_executor = MagicMock()
+
+        create_actions = [CreateExecutorAction(executor_config=create_config, controller_id="test")]
+        self.orchestrator.execute_actions(create_actions)
+
+        # The create must proceed without deferral
+        self.orchestrator.create_executor.assert_called_once()
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_no_false_deferral_different_side(self, markets_recorder_mock):
+        """Creates for BUY side are NOT deferred when only SELL side has shutdown-in-flight."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        self.orchestrator.cached_performance["test"] = PerformanceReport()
+
+        # Executor still shutting down on SELL side
+        sell_executor = MagicMock(spec=PositionExecutor)
+        sell_config = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.SELL, entry_price=Decimal(100), amount=Decimal(10))
+        sell_executor.config = sell_config
+        sell_executor.status = RunnableStatus.SHUTTING_DOWN
+        self.orchestrator.active_executors["test"] = [sell_executor]
+
+        # Shutdown-in-flight for SELL only
+        sell_key = ("binance", "ETH-USDT", TradeType.SELL)
+        self.orchestrator._shutdown_in_flight_keys[sell_key] = time.time()
+
+        # Create for BUY side (different from the shutting-down SELL side)
+        buy_config = PositionExecutorConfig(
+            timestamp=1235, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(10))
+
+        self.orchestrator.create_executor = MagicMock()
+
+        create_actions = [CreateExecutorAction(executor_config=buy_config, controller_id="test")]
+        self.orchestrator.execute_actions(create_actions)
+
+        # BUY create must proceed even though SELL is shutting down
+        self.orchestrator.create_executor.assert_called_once()

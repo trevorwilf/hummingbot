@@ -17,7 +17,7 @@ from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo, PerformanceReport
 
@@ -380,6 +380,90 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                                       connector_name="binance",
                                       side=TradeType.SELL, entry_price=Decimal("100"), amount=Decimal("1"),
                                       triple_barrier_config=TripleBarrierConfig())
+
+    @patch.object(StrategyV2Base, "create_actions_proposal")
+    @patch.object(StrategyV2Base, "stop_actions_proposal")
+    @patch.object(StrategyV2Base, "store_actions_proposal")
+    @patch.object(StrategyV2Base, "update_controllers_configs")
+    @patch.object(StrategyV2Base, "update_executors_info")
+    @patch("hummingbot.data_feed.market_data_provider.MarketDataProvider.ready", new_callable=PropertyMock)
+    def test_on_tick_uses_batch_execute_actions(
+        self,
+        mock_ready,
+        mock_update_executors_info,
+        mock_update_controllers_configs,
+        mock_store_actions_proposal,
+        mock_stop_actions_proposal,
+        mock_create_actions_proposal,
+    ):
+        """Fix 1: on_tick() must call execute_actions (plural batch) instead of
+        looping over execute_action (singular) for each action."""
+        mock_ready.return_value = True
+
+        # Return a mix of action types so we can verify batch dispatch
+        create_config = self.get_position_config_market_short()
+        actions = [
+            CreateExecutorAction(controller_id="controller_1", executor_config=create_config),
+            StopExecutorAction(controller_id="controller_1", executor_id="some-id"),
+        ]
+        mock_create_actions_proposal.return_value = [actions[0]]
+        mock_stop_actions_proposal.return_value = [actions[1]]
+        mock_store_actions_proposal.return_value = []
+
+        # Ensure the strategy has controllers and the startup gate is open
+        self.strategy._wallet_balances_seeded = True
+        self.strategy._startup_gate = MagicMock()
+        self.strategy._startup_gate.is_set.return_value = True
+        self.strategy._is_stop_triggered = False
+
+        # Reset both singular and plural mocks
+        self.strategy.executor_orchestrator.execute_action = MagicMock()
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+
+        self.strategy.on_tick()
+
+        # The batch method execute_actions (plural) must have been called
+        self.strategy.executor_orchestrator.execute_actions.assert_called_once()
+
+        # The old singular execute_action must NOT have been called directly by on_tick.
+        # (It may be called internally by execute_actions, but on_tick itself must not loop.)
+        # We verify by checking the call args of execute_actions contain our actions.
+        batch_arg = self.strategy.executor_orchestrator.execute_actions.call_args[0][0]
+        self.assertEqual(len(batch_arg), 2)
+        # determine_executor_actions() returns stop actions first, then store, then create
+        self.assertIsInstance(batch_arg[0], StopExecutorAction)
+        self.assertIsInstance(batch_arg[1], CreateExecutorAction)
+
+    @patch.object(StrategyV2Base, "create_actions_proposal", return_value=[])
+    @patch.object(StrategyV2Base, "stop_actions_proposal", return_value=[])
+    @patch.object(StrategyV2Base, "store_actions_proposal", return_value=[])
+    @patch.object(StrategyV2Base, "update_controllers_configs")
+    @patch.object(StrategyV2Base, "update_executors_info")
+    @patch("hummingbot.data_feed.market_data_provider.MarketDataProvider.ready", new_callable=PropertyMock)
+    def test_on_tick_no_actions_skips_execute(
+        self,
+        mock_ready,
+        mock_update_executors_info,
+        mock_update_controllers_configs,
+        mock_store_actions_proposal,
+        mock_stop_actions_proposal,
+        mock_create_actions_proposal,
+    ):
+        """Fix 1: When determine_executor_actions returns empty list,
+        execute_actions must NOT be called at all (guarded by 'if executor_actions')."""
+        mock_ready.return_value = True
+
+        self.strategy._wallet_balances_seeded = True
+        self.strategy._startup_gate = MagicMock()
+        self.strategy._startup_gate.is_set.return_value = True
+        self.strategy._is_stop_triggered = False
+
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+
+        self.strategy.on_tick()
+
+        # With no actions, execute_actions should not be called
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
 
 
 class StrategyV2BaseBasicTest(unittest.TestCase):

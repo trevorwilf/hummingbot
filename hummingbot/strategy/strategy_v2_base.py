@@ -335,8 +335,8 @@ class StrategyV2Base(StrategyPyBase):
                     self.logger().info("Startup gate: wallet seeding complete, releasing controllers for trading")
                     self._startup_gate.set()
                 executor_actions: List[ExecutorAction] = self.determine_executor_actions()
-                for action in executor_actions:
-                    self.executor_orchestrator.execute_action(action)
+                if executor_actions:
+                    self.executor_orchestrator.execute_actions(executor_actions)
 
     def is_startup_ready(self) -> bool:
         return self._startup_gate.is_set()

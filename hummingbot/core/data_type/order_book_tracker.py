@@ -277,6 +277,16 @@ class OrderBookTracker:
         return self._data_source
 
     @property
+    def is_public_ws_connected(self) -> bool:
+        """
+        Returns True if the public order book WebSocket is currently connected.
+        """
+        try:
+            return self._data_source.is_connected
+        except (AttributeError, Exception):
+            return False
+
+    @property
     def order_books(self) -> Dict[str, OrderBook]:
         return self._order_books
 

@@ -153,6 +153,17 @@ class ExchangePyBase(ExchangeBase, ABC):
         return self.order_book_tracker.order_books
 
     @property
+    def is_public_ws_connected(self) -> bool:
+        """
+        Returns True if the public order book WebSocket is currently connected.
+        Used by controllers to distinguish 'quiet market' from 'dead connection'.
+        """
+        try:
+            return self.order_book_tracker.is_public_ws_connected
+        except (AttributeError, Exception):
+            return False
+
+    @property
     def in_flight_orders(self) -> Dict[str, InFlightOrder]:
         return self._order_tracker.active_orders
 

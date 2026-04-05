@@ -224,6 +224,7 @@ class TestSameCycleStopCreateDeferral(unittest.TestCase):
         orchestrator.active_executors = {}
         orchestrator.execute_action = MagicMock()
         orchestrator._preflight_budget_check = MagicMock(side_effect=lambda x: x)
+        orchestrator._shutdown_in_flight_keys = {}
 
         # Setup: active sell executor that will be stopped
         mock_executor = MagicMock()
@@ -270,6 +271,7 @@ class TestSameCycleStopCreateDeferral(unittest.TestCase):
         orchestrator.active_executors = {}
         orchestrator.execute_action = MagicMock()
         orchestrator._preflight_budget_check = MagicMock(side_effect=lambda x: x)
+        orchestrator._shutdown_in_flight_keys = {}
 
         # Stop a SELL executor
         mock_executor = MagicMock()

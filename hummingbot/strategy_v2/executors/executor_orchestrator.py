@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import uuid
 from collections import deque
 from decimal import Decimal
@@ -28,6 +29,7 @@ from hummingbot.strategy_v2.models.executor_actions import (
     StopExecutorAction,
     StoreExecutorAction,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo, PerformanceReport
 
@@ -174,6 +176,9 @@ class ExecutorOrchestrator:
         self.executors_ids_position_held = deque(maxlen=50)
         self.cached_performance = {}
         self.initial_positions_by_controller = initial_positions_by_controller or {}
+        # Track (connector, pair, side) keys with executors currently shutting down.
+        # Used to defer creates across cycles, not just within one batch.
+        self._shutdown_in_flight_keys: Dict[tuple, float] = {}
         self._initialize_cached_performance()
 
     def _initialize_cached_performance(self):
@@ -473,6 +478,17 @@ class ExecutorOrchestrator:
         for action in store_actions:
             self.execute_action(action)
 
+        # Update shutdown-in-flight tracking for cross-cycle deferral
+        for key in stopped_keys:
+            self._shutdown_in_flight_keys[key] = time.time()
+
+        # Clean up stale shutdown tracking entries (safety valve: 30 seconds max)
+        stale_cutoff = time.time() - 30.0
+        self._shutdown_in_flight_keys = {
+            k: v for k, v in self._shutdown_in_flight_keys.items()
+            if v > stale_cutoff
+        }
+
         # Separate creates into immediate vs deferred
         immediate_creates = []
         deferred_creates = []
@@ -483,17 +499,46 @@ class ExecutorOrchestrator:
                     action.executor_config.trading_pair,
                     action.executor_config.side
                 )
+                # Same-cycle stop conflict
                 if key in stopped_keys:
                     deferred_creates.append(action)
-                else:
-                    immediate_creates.append(action)
+                    continue
+
+                # Cross-cycle: check if any executor for this key is still SHUTTING_DOWN
+                if key in self._shutdown_in_flight_keys:
+                    still_shutting_down = False
+                    for controller_id, executors in self.active_executors.items():
+                        for executor in executors:
+                            try:
+                                exec_key = (
+                                    executor.config.connector_name,
+                                    executor.config.trading_pair,
+                                    executor.config.side
+                                )
+                                if exec_key == key and executor.status == RunnableStatus.SHUTTING_DOWN:
+                                    still_shutting_down = True
+                                    break
+                            except AttributeError:
+                                continue
+                        if still_shutting_down:
+                            break
+
+                    if still_shutting_down:
+                        deferred_creates.append(action)
+                        continue
+                    else:
+                        # Shutdown completed, remove from tracking
+                        self._shutdown_in_flight_keys.pop(key, None)
+
+                immediate_creates.append(action)
             except AttributeError:
                 immediate_creates.append(action)
 
         if deferred_creates:
             self.logger().info(
-                f"Deferred {len(deferred_creates)} create action(s) due to same-cycle "
-                f"stop on same connector/pair/side (will re-propose next cycle)"
+                f"Deferred {len(deferred_creates)} create action(s) due to "
+                f"stop/shutdown conflict on same connector/pair/side "
+                f"(will re-propose next cycle)"
             )
 
         # Only run budget preflight on non-deferred creates
