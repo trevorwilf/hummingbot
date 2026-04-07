@@ -354,7 +354,7 @@ class XEMMExecutor(ExecutorBase):
         """
         try:
             conversion_rate = self.rate_oracle.get_pair_rate(self.quote_conversion_pair)
-            if conversion_rate is None:
+            if conversion_rate is None or conversion_rate == Decimal("0"):
                 self.logger().error(f"Could not fetch conversion rate for {self.quote_conversion_pair}")
                 raise ValueError(f"Could not fetch conversion rate for {self.quote_conversion_pair}")
             return conversion_rate

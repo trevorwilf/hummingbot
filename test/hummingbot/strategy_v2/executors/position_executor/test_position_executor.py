@@ -753,3 +753,73 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         position_executor.early_stop(keep_position=True)
         self.assertEqual(position_executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch.object(PositionExecutor, "get_price")
+    def test_market_close_order_no_nan_price(self, mock_price, trading_rules_mock):
+        """Market close order should use mid-price as reference, not NaN."""
+        mock_price.return_value = Decimal("50.0")
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.0001")
+        trading_rules.min_notional_size = Decimal("0")
+        trading_rules_mock.return_value = trading_rules
+
+        position_config = self.get_position_config_market_long()
+        position_executor = self.get_position_executor_running_from_config(position_config)
+
+        # Simulate a filled open order so amount_to_close > 0
+        mock_open_order = MagicMock()
+        mock_open_order.executed_amount_base = Decimal("1.0")
+        mock_open_order.cum_fees_base = Decimal("0")
+        mock_open_order.average_executed_price = Decimal("100")
+        position_executor._open_order = TrackedOrder(order_id="test_open")
+        position_executor._open_order.order = mock_open_order
+
+        # Mock place_order to capture the price argument
+        captured_args = {}
+
+        def mock_place_order(**kwargs):
+            captured_args.update(kwargs)
+            return "test_order_id"
+
+        position_executor.place_order = mock_place_order
+
+        # Call with NaN (the default)
+        position_executor._place_close_order_now()
+
+        # Verify price is NOT NaN
+        self.assertIn("price", captured_args)
+        self.assertFalse(captured_args["price"].is_nan(),
+                         "Market close order price should not be NaN")
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch.object(PositionExecutor, "get_price")
+    def test_market_close_uses_mid_price_for_reference(self, mock_price, trading_rules_mock):
+        """Market close order should use mid-price as the reference price."""
+        mock_price.return_value = Decimal("42.0")
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.0001")
+        trading_rules.min_notional_size = Decimal("0")
+        trading_rules_mock.return_value = trading_rules
+
+        position_config = self.get_position_config_market_long()
+        position_executor = self.get_position_executor_running_from_config(position_config)
+
+        # Simulate a filled open order so amount_to_close > 0
+        mock_open_order = MagicMock()
+        mock_open_order.executed_amount_base = Decimal("1.0")
+        mock_open_order.cum_fees_base = Decimal("0")
+        mock_open_order.average_executed_price = Decimal("100")
+        position_executor._open_order = TrackedOrder(order_id="test_open")
+        position_executor._open_order.order = mock_open_order
+
+        captured_args = {}
+
+        def mock_place_order(**kwargs):
+            captured_args.update(kwargs)
+            return "test_order_id"
+
+        position_executor.place_order = mock_place_order
+        position_executor._place_close_order_now()
+
+        self.assertEqual(Decimal("42.0"), captured_args["price"])

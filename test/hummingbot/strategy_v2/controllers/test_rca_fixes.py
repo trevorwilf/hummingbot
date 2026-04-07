@@ -16,7 +16,7 @@ from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
 )
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
 def _make_config(**overrides):
@@ -355,3 +355,57 @@ class TestControllerMinNotionalValidation(IsolatedAsyncioWrapperTestCase):
         ctrl.create_actions_proposal()
         # Still flagged
         self.assertTrue(ctrl._min_notional_warned.get("buy_0"))
+
+
+class TestExecutorRefreshIncludesPartiallyFilled(IsolatedAsyncioWrapperTestCase):
+    """Fix B: Partially filled (is_trading) executors should be refreshed on schedule."""
+
+    def _make_executor_mock(self, is_trading=False, is_active=True, age=600, executor_id="exec_1"):
+        mock = MagicMock()
+        mock.is_trading = is_trading
+        mock.is_active = is_active
+        mock.timestamp = 1000.0 - age  # will use time=1000
+        mock.id = executor_id
+        return mock
+
+    def test_refresh_includes_partially_filled_executor(self):
+        """Partially filled executor older than refresh time should be included."""
+        ctrl = _make_controller(executor_refresh_time=300)
+        ctrl.market_data_provider.time.return_value = 1000.0
+        executor = self._make_executor_mock(is_trading=True, is_active=True, age=600)
+        ctrl.executors_info = [executor]
+
+        actions = ctrl.executors_to_refresh()
+        self.assertEqual(1, len(actions))
+        self.assertIsInstance(actions[0], StopExecutorAction)
+        self.assertEqual("exec_1", actions[0].executor_id)
+
+    def test_refresh_excludes_young_trading_executor(self):
+        """Partially filled executor younger than refresh time should NOT be included."""
+        ctrl = _make_controller(executor_refresh_time=300)
+        ctrl.market_data_provider.time.return_value = 1000.0
+        executor = self._make_executor_mock(is_trading=True, is_active=True, age=100)
+        ctrl.executors_info = [executor]
+
+        actions = ctrl.executors_to_refresh()
+        self.assertEqual(0, len(actions))
+
+    def test_refresh_still_includes_unfilled_executor(self):
+        """Unfilled executor older than refresh time should still be included (existing behavior)."""
+        ctrl = _make_controller(executor_refresh_time=300)
+        ctrl.market_data_provider.time.return_value = 1000.0
+        executor = self._make_executor_mock(is_trading=False, is_active=True, age=600)
+        ctrl.executors_info = [executor]
+
+        actions = ctrl.executors_to_refresh()
+        self.assertEqual(1, len(actions))
+
+    def test_refresh_excludes_inactive_executor(self):
+        """Inactive executor should never be included regardless of is_trading."""
+        ctrl = _make_controller(executor_refresh_time=300)
+        ctrl.market_data_provider.time.return_value = 1000.0
+        executor = self._make_executor_mock(is_trading=True, is_active=False, age=600)
+        ctrl.executors_info = [executor]
+
+        actions = ctrl.executors_to_refresh()
+        self.assertEqual(0, len(actions))

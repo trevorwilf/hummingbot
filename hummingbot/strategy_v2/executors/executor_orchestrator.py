@@ -586,6 +586,11 @@ class ExecutorOrchestrator:
 
             for action in group_actions:
                 config = action.executor_config
+                # Skip budget check for config types that don't have a simple amount
+                # (e.g., DCA, TWAP, Grid — they manage their own budgets internally)
+                if not hasattr(config, 'amount'):
+                    surviving_actions.append(action)
+                    continue
                 # Build an order candidate from the executor config
                 try:
                     # Determine price for validation
@@ -651,8 +656,8 @@ class ExecutorOrchestrator:
                 except Exception as e:
                     self.logger().warning(
                         f"Budget preflight failed for action on {config.trading_pair}: {e}. "
-                        f"Allowing action through.")
-                    surviving_actions.append(action)
+                        f"Dropping action (fail-closed).")
+                    dropped_actions.append(action)
 
             budget_checker.reset_locked_collateral()
 

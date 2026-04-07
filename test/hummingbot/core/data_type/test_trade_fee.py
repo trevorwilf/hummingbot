@@ -318,3 +318,37 @@ class TradeUpdateTests(TestCase):
         )
 
         self.assertEqual(trade_update, TradeUpdate.from_json(trade_update.to_json()))
+
+    def test_flat_fee_quote_to_base_uses_trade_price(self):
+        """Flat fee in quote token, target is base — should use fee / price."""
+        fee = DeductedFromReturnsTradeFee(
+            percent=Decimal("0"),
+            percent_token="USDT",
+            flat_fees=[TokenAmount(token="USDT", amount=Decimal("10"))],
+        )
+        # trading_pair = HBOT-USDT, price = 100, target token = HBOT (base)
+        result = fee.fee_amount_in_token(
+            trading_pair="HBOT-USDT",
+            price=Decimal("100"),
+            order_amount=Decimal("1"),
+            token="HBOT",
+        )
+        # 10 USDT / 100 = 0.1 HBOT
+        self.assertEqual(Decimal("0.1"), result)
+
+    def test_flat_fee_conversion_zero_rate_no_exception(self):
+        """Generic conversion with zero rate should not raise — fee component is skipped."""
+        fee = DeductedFromReturnsTradeFee(
+            percent=Decimal("0"),
+            percent_token="USDT",
+            flat_fees=[TokenAmount(token="GBP", amount=Decimal("10"))],
+        )
+        # GBP -> HBOT has no rate; _get_exchange_rate returns 0
+        result = fee.fee_amount_in_token(
+            trading_pair="HBOT-USDT",
+            price=Decimal("100"),
+            order_amount=Decimal("1"),
+            token="HBOT",
+        )
+        # Should return 0 (fee skipped), not raise
+        self.assertEqual(Decimal("0"), result)

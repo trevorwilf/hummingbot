@@ -78,6 +78,9 @@ class NonkycExchange(ExchangePyBase):
             "balance_poll_failure": 0,
         }
         self._error_counters_last_reset: float = time.time()
+        self._balance_settling: bool = False
+        self._balance_settle_start: float = 0.0
+        self._BALANCE_SETTLE_TIMEOUT: float = 15.0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.logger().info(
             "NonKYC connector supports LIMIT and MARKET order types. "
@@ -107,6 +110,18 @@ class NonkycExchange(ExchangePyBase):
             self.logger().info(
                 "Balance WS state reset for new session — awaiting re-confirmation"
             )
+        self._enter_balance_settling()
+
+    def _enter_balance_settling(self):
+        self._balance_settling = True
+        self._balance_settle_start = time.time()
+        self.logger().info("Balance settling: ACTIVE — order creation paused until REST balance sync")
+
+    def _exit_balance_settling(self):
+        if self._balance_settling:
+            elapsed = time.time() - self._balance_settle_start
+            self._balance_settling = False
+            self.logger().info(f"Balance settling: RESOLVED after {elapsed:.1f}s — order creation resumed")
 
     def _record_api_latency(self, endpoint: str, latency_ms: float):
         if endpoint not in self._api_latency_samples:
@@ -365,6 +380,16 @@ class NonkycExchange(ExchangePyBase):
         value immediately. The WS balanceUpdate overwrites with the real exchange
         value when it arrives.
         """
+        if self._balance_settling:
+            elapsed = time.time() - self._balance_settle_start
+            if elapsed > self._BALANCE_SETTLE_TIMEOUT:
+                self.logger().warning(
+                    f"Balance settling: TIMEOUT after {elapsed:.1f}s — allowing order creation")
+                self._balance_settling = False
+            else:
+                raise Exception(
+                    f"Order creation blocked: balance settling in progress "
+                    f"(elapsed={elapsed:.1f}s). Waiting for REST balance sync after reconnect.")
         exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
 
         # If we reach here, the exchange accepted the order and is holding collateral.
@@ -935,6 +960,33 @@ class NonkycExchange(ExchangePyBase):
                     self._balance_ws_subscription_time = None  # Don't warn again
 
                 event_type = event_message.get("method")
+
+                # Handle subscription responses (have "id" but no "method")
+                # subscribeBalances returns balance data in "result" field directly
+                if event_type is None and "result" in event_message:
+                    result = event_message["result"]
+                    # Check if this looks like a balance array
+                    if (isinstance(result, list) and result
+                            and isinstance(result[0], dict)
+                            and "ticker" in result[0]
+                            and "available" in result[0]):
+                        if not self._balance_ws_confirmed:
+                            self.logger().info(
+                                "NonKYC private balance WebSocket: CONFIRMED "
+                                "(received balance data in subscribeBalances response)"
+                            )
+                            self._balance_ws_confirmed = True
+                        for balance_entry in result:
+                            asset_name = balance_entry["ticker"]
+                            free_balance = Decimal(balance_entry["available"])
+                            total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
+                            self._account_available_balances[asset_name] = free_balance
+                            self._account_balances[asset_name] = total_balance
+                        self.logger().debug(
+                            f"Processed {len(result)} assets from subscribeBalances response"
+                        )
+                    continue  # Don't fall through to method-based handlers
+
                 if event_type == "report":
                     message_params = event_message.get('params', {})
                     reportType = message_params.get('reportType')
@@ -1312,6 +1364,8 @@ class NonkycExchange(ExchangePyBase):
                 f"Balance reconciliation (REST overwrote WS): "
                 + " | ".join(reconciliation_diffs)
             )
+
+        self._exit_balance_settling()
 
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:

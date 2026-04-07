@@ -7,14 +7,8 @@ from hummingbot.core.gateway.utils import unwrap_token_symbol
 
 def find_rate(prices: Dict[str, Decimal], pair: str) -> Decimal:
     '''
-    Finds exchange rate for a given trading pair from a dictionary of prices
-    For example, given prices of {"HBOT-USDT": Decimal("100"), "AAVE-USDT": Decimal("50"), "USDT-GBP": Decimal("0.75")}
-    A rate for USDT-HBOT will be 1 / 100
-    A rate for HBOT-AAVE will be 100 / 50
-    A rate for AAVE-HBOT will be 50 / 100
-    A rate for HBOT-GBP will be 100 * 0.75
-    :param prices: The dictionary of trading pairs and their prices
-    :param pair: The trading pair
+    Finds exchange rate for a given trading pair from a dictionary of prices.
+    Returns Decimal("0") if the rate cannot be determined (missing or zero denominator).
     '''
     if pair in prices:
         return prices[pair]
@@ -25,7 +19,10 @@ def find_rate(prices: Dict[str, Decimal], pair: str) -> Decimal:
         return Decimal("1")
     reverse_pair = combine_to_hb_trading_pair(base=quote, quote=base)
     if reverse_pair in prices:
-        return Decimal("1") / prices[reverse_pair]
+        rate = prices[reverse_pair]
+        if rate == Decimal("0"):
+            return Decimal("0")
+        return Decimal("1") / rate
     base_prices = {k: v for k, v in prices.items() if k.startswith(f"{base}-")}
     for base_pair, proxy_price in base_prices.items():
         link_quote = split_hb_trading_pair(base_pair)[1]
@@ -34,4 +31,8 @@ def find_rate(prices: Dict[str, Decimal], pair: str) -> Decimal:
             return proxy_price * prices[link_pair]
         common_denom_pair = combine_to_hb_trading_pair(base=quote, quote=link_quote)
         if common_denom_pair in prices:
-            return proxy_price / prices[common_denom_pair]
+            rate = prices[common_denom_pair]
+            if rate == Decimal("0"):
+                return Decimal("0")
+            return proxy_price / rate
+    return Decimal("0")

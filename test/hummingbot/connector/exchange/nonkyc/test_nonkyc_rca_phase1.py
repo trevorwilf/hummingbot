@@ -36,6 +36,9 @@ class TestLocalBalancePreAdjust(IsolatedAsyncioWrapperTestCase):
         exchange._account_balances = dict(total_balances or {})
         exchange._trading_fees = {}
         exchange._pre_adjusted_assets = {}
+        exchange._balance_settling = False
+        exchange._balance_settle_start = 0.0
+        exchange._BALANCE_SETTLE_TIMEOUT = 15.0
         exchange.estimate_fee_pct = MagicMock(return_value=0.0)
         exchange.logger = MagicMock(return_value=MagicMock())
 
@@ -482,6 +485,9 @@ class TestBuyPreAdjustIncludesFee(IsolatedAsyncioWrapperTestCase):
         exchange._account_balances = dict(total_balances or {})
         exchange._trading_fees = trading_fees or {}
         exchange._pre_adjusted_assets = {}
+        exchange._balance_settling = False
+        exchange._balance_settle_start = 0.0
+        exchange._BALANCE_SETTLE_TIMEOUT = 15.0
         exchange.logger = MagicMock(return_value=MagicMock())
         exchange.estimate_fee_pct = MagicMock(return_value=0.0)
 

@@ -924,8 +924,8 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
     @patch.object(MarketsRecorder, "get_instance")
-    def test_preflight_budget_exception_allows_action_through(self, markets_recorder_mock):
-        """If budget checker raises an exception, the action passes through with a warning."""
+    def test_preflight_budget_exception_drops_action_fail_closed(self, markets_recorder_mock):
+        """If budget checker raises an exception, the action is DROPPED (fail-closed)."""
         markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
 
         mock_budget_checker = MagicMock()
@@ -946,8 +946,9 @@ class TestExecutorOrchestrator(unittest.TestCase):
         with self.assertLogs(level="WARNING") as log:
             result = self.orchestrator._preflight_budget_check(actions)
 
-        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result), 0)
         self.assertTrue(any("Budget preflight failed" in msg for msg in log.output))
+        self.assertTrue(any("fail-closed" in msg for msg in log.output))
 
     # ---- Fix 4: Cross-cycle shutdown-in-flight awareness tests ----
 
@@ -1115,3 +1116,26 @@ class TestExecutorOrchestrator(unittest.TestCase):
 
         # BUY create must proceed even though SELL is shutting down
         self.orchestrator.create_executor.assert_called_once()
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_budget_preflight_exception_drops_action(self, markets_recorder_mock):
+        """When budget preflight raises an exception, the action should be DROPPED (fail-closed)."""
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+
+        mock_budget_checker = MagicMock()
+        mock_budget_checker.adjust_candidate_and_lock_available_collateral = MagicMock(
+            side_effect=RuntimeError("test error"))
+        mock_budget_checker.reset_locked_collateral = MagicMock()
+
+        mock_connector = MagicMock()
+        mock_connector.budget_checker = mock_budget_checker
+        self.mock_strategy.connectors = {"binance": mock_connector}
+
+        config = PositionExecutorConfig(
+            timestamp=1234, connector_name="binance", trading_pair="ETH-USDT",
+            side=TradeType.BUY, entry_price=Decimal("100"), amount=Decimal("1"))
+        action = CreateExecutorAction(executor_config=config, controller_id="test")
+
+        result = self.orchestrator._preflight_budget_check([action])
+        # Action should be dropped, not surviving
+        self.assertEqual(0, len(result))

@@ -602,6 +602,14 @@ class PositionExecutor(ExecutorBase):
             price if not price.is_nan() and price > 0
             else self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
         )
+        # For market orders, use mid-price as reference price for logging/events
+        # instead of NaN, which breaks event serialization and telemetry
+        order_price = price
+        if price.is_nan():
+            mid = self.get_price(
+                self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+            order_price = mid if mid > Decimal("0") else Decimal("0")
+
         if (close_amount >= self.trading_rules.min_order_size
                 and (close_notional >= self.trading_rules.min_notional_size or self.trading_rules.min_notional_size == 0)
                 and self.close_type != CloseType.POSITION_HOLD):
@@ -610,7 +618,7 @@ class PositionExecutor(ExecutorBase):
                 trading_pair=self.config.trading_pair,
                 order_type=OrderType.MARKET,
                 amount=close_amount,
-                price=price,
+                price=order_price,
                 side=self.close_order_side,
                 position_action=PositionAction.CLOSE,
             )

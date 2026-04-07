@@ -831,9 +831,27 @@ class MarketMakingControllerBase(ControllerBase):
         return stop_actions
 
     def executors_to_refresh(self) -> List[ExecutorAction]:
+        refresh_time = self.config.executor_refresh_time
+        now = self.market_data_provider.time()
+
+        def is_refresh_eligible(x) -> bool:
+            if not x.is_active:
+                return False
+            age = now - x.timestamp
+            if age <= refresh_time:
+                return False
+            # Original behavior: unfilled executors are always refresh-eligible
+            if not x.is_trading:
+                return True
+            # Partially filled / trading executors are refresh-eligible
+            # if they've exceeded the refresh time. The position executor's
+            # shutdown logic will handle canceling open orders and closing
+            # the position appropriately.
+            return True
+
         executors_to_refresh = self.filter_executors(
             executors=self.executors_info,
-            filter_func=lambda x: not x.is_trading and x.is_active and self.market_data_provider.time() - x.timestamp > self.config.executor_refresh_time)
+            filter_func=is_refresh_eligible)
 
         return [StopExecutorAction(
             controller_id=self.config.id,
