@@ -40,6 +40,15 @@ class TradeFill(HummingbotBase):
     trade_fee_in_quote = Column(SqliteDecimal(6))
     exchange_trade_id = Column(Text, primary_key=True, nullable=False)
     position = Column(Text, nullable=True, default=PositionAction.NIL.value)
+
+    # Provenance columns — all nullable, no default (additive, backward-compatible)
+    exchange_timestamp_ms = Column(BigInteger, nullable=True)    # Exchange-reported fill time (ms)
+    received_timestamp_ms = Column(BigInteger, nullable=True)    # Bot receive time (ms)
+    source_channel = Column(Text, nullable=True)                 # "ws" | "rest_poll" | "rest_reconstruct"
+    liquidity_role = Column(Text, nullable=True)                 # "maker" | "taker" | "unknown"
+    controller_id = Column(Text, nullable=True)                  # Controller instance ID
+    executor_id = Column(Text, nullable=True)                    # Executor instance ID
+
     order = relationship("Order", back_populates="trade_fills")
 
     def __repr__(self) -> str:
@@ -48,7 +57,11 @@ class TradeFill(HummingbotBase):
                f"quote_asset='{self.quote_asset}', timestamp={self.timestamp}, order_id='{self.order_id}', " \
                f"trade_type='{self.trade_type}', order_type='{self.order_type}', price={self.price}, " \
                f"amount={self.amount}, leverage={self.leverage}, trade_fee={self.trade_fee}, " \
-               f"exchange_trade_id={self.exchange_trade_id}, position={self.position})"
+               f"exchange_trade_id={self.exchange_trade_id}, position={self.position}, " \
+               f"exchange_timestamp_ms={self.exchange_timestamp_ms}, " \
+               f"received_timestamp_ms={self.received_timestamp_ms}, " \
+               f"source_channel='{self.source_channel}', liquidity_role='{self.liquidity_role}', " \
+               f"controller_id='{self.controller_id}', executor_id='{self.executor_id}')"
 
     @staticmethod
     def get_trades(sql_session: Session,
@@ -101,7 +114,13 @@ class TradeFill(HummingbotBase):
                               "Amount",
                               "Leverage",
                               "Position",
-                              "Age"]
+                              "Age",
+                              "Exchange_Timestamp_ms",
+                              "Received_Timestamp_ms",
+                              "Source_Channel",
+                              "Liquidity_Role",
+                              "Controller_Id",
+                              "Executor_Id"]
         data = []
         for trade in trades:
 
@@ -122,6 +141,12 @@ class TradeFill(HummingbotBase):
                 trade.leverage,
                 trade.position,
                 age,
+                trade.exchange_timestamp_ms,
+                trade.received_timestamp_ms,
+                trade.source_channel,
+                trade.liquidity_role,
+                trade.controller_id,
+                trade.executor_id,
             ])
         df = pd.DataFrame(data=data, columns=columns)
         df.set_index('Id', inplace=True)
@@ -142,6 +167,12 @@ class TradeFill(HummingbotBase):
             "quote_asset": trade_fill.quote_asset,
             "raw_json": {
                 "trade_fee": trade_fill.trade_fee,
+                "exchange_timestamp_ms": trade_fill.exchange_timestamp_ms,
+                "received_timestamp_ms": trade_fill.received_timestamp_ms,
+                "source_channel": trade_fill.source_channel,
+                "liquidity_role": trade_fill.liquidity_role,
+                "controller_id": trade_fill.controller_id,
+                "executor_id": trade_fill.executor_id,
             }
         }
 
@@ -165,4 +196,10 @@ class TradeFill(HummingbotBase):
             "leverage",
             "trade_fee",
             "trade_fee_in_quote",
-            "position", ]
+            "position",
+            "exchange_timestamp_ms",
+            "received_timestamp_ms",
+            "source_channel",
+            "liquidity_role",
+            "controller_id",
+            "executor_id", ]

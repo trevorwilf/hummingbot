@@ -76,6 +76,14 @@ class SQLConnectionManager(TransactionBase):
             self._metadata: MetaData = self.get_declarative_base().metadata
             self._metadata.create_all(self._engine)
 
+            # Add provenance columns to existing tables (safe to call repeatedly)
+            from hummingbot.model.migrate_provenance_columns import migrate_provenance_columns
+            try:
+                migrate_provenance_columns(self._engine)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Provenance migration failed (non-fatal): {e}")
+
             # SQLite does not enforce foreign key constraint, but for others engines, we need to drop it.
             # See: `hummingbot/market/markets_recorder.py`, at line 213.
             with self._engine.begin() as conn:

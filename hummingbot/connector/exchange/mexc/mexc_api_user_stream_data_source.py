@@ -22,6 +22,18 @@ def _redact_token(token: str) -> str:
     return "****"
 
 
+def _emit_structured_event_static(logger, event_type: str, payload: dict):
+    """Emit a structured JSON event to the forensic log."""
+    import json
+    event = {
+        "event_type": event_type,
+        "connector": "mexc",
+        "timestamp_ms": int(time.time() * 1e3),
+        **payload
+    }
+    logger.info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+
+
 class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
     """
     Manages the user stream connection for MEXC exchange, handling listen key lifecycle
@@ -180,7 +192,12 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     is_auth_required=True,
                     timeout=timeout,
                 )
-                return data["listenKey"]
+                listen_key = data["listenKey"]
+                _emit_structured_event_static(self.logger(), "listen_key_obtained", {
+                    "redacted_key": _redact_token(listen_key),
+                    "retry_count": retry_count,
+                })
+                return listen_key
             except asyncio.CancelledError:
                 raise
             except Exception as exception:
@@ -206,14 +223,21 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             if "code" in data:
                 self.logger().warning(f"Failed to refresh the listen key {_redact_token(self._current_listen_key)}: {data}")
+                _emit_structured_event_static(self.logger(), "listen_key_refresh_failed", {
+                    "error": str(data),
+                })
                 return False
 
         except asyncio.CancelledError:
             raise
         except Exception as exception:
             self.logger().warning(f"Failed to refresh the listen key {_redact_token(self._current_listen_key)}: {exception}")
+            _emit_structured_event_static(self.logger(), "listen_key_refresh_failed", {
+                "error": str(exception),
+            })
             return False
 
+        _emit_structured_event_static(self.logger(), "listen_key_refreshed", {})
         return True
 
     async def _manage_listen_key_task_loop(self):
@@ -260,6 +284,9 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 except Exception as e:
                     # Reset state on any error to force new key acquisition
                     self.logger().error(f"Error occurred renewing listen key ... {e}")
+                    _emit_structured_event_static(self.logger(), "listen_key_recreated", {
+                        "reason": "refresh_failed_or_expired",
+                    })
                     self._current_listen_key = None
                     self._listen_key_initialized_event.clear()
                     await self._sleep(self.LISTEN_KEY_RETRY_INTERVAL)

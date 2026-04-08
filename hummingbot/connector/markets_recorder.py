@@ -391,7 +391,8 @@ class MarketsRecorder:
                                             exchange_order_id=evt.exchange_order_id)
                 order_status: OrderStatus = OrderStatus(order=order_record,
                                                         timestamp=timestamp,
-                                                        status=event_type.name)
+                                                        status=event_type.name,
+                                                        received_timestamp_ms=int(time.time() * 1e3))
                 session.add(order_record)
                 session.add(order_status)
                 market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
@@ -453,6 +454,26 @@ class MarketsRecorder:
                     exchange_trade_id=evt.exchange_trade_id,
                     position=evt.position if evt.position else PositionAction.NIL.value,
                 )
+                # Enrich with provenance data from the in-flight order tracker
+                try:
+                    tracked_order = market._order_tracker.all_orders.get(order_id)
+                    if tracked_order is None:
+                        tracked_order = market._order_tracker._lost_orders.get(order_id)
+                    if tracked_order is not None:
+                        trade_update = tracked_order.order_fills.get(evt.exchange_trade_id)
+                        if trade_update is not None:
+                            trade_fill_record.exchange_timestamp_ms = int(trade_update.fill_timestamp * 1e3)
+                            trade_fill_record.received_timestamp_ms = int(time.time() * 1e3)
+                            trade_fill_record.liquidity_role = "taker" if trade_update.is_taker else "maker"
+                        if hasattr(tracked_order, '_fill_sources'):
+                            trade_fill_record.source_channel = tracked_order._fill_sources.get(
+                                evt.exchange_trade_id, "unknown")
+                except Exception:
+                    pass  # Never let provenance enrichment break fill recording
+
+                # Enrich OrderStatus with receive timestamp
+                order_status.received_timestamp_ms = int(time.time() * 1e3)
+
                 session.add(order_status)
                 session.add(trade_fill_record)
                 self.save_market_states(self._config_file_path, market, session=session)
@@ -538,7 +559,8 @@ class MarketsRecorder:
                     order_record.last_update_timestamp = timestamp
                     order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                             timestamp=timestamp,
-                                                            status=event_type.name)
+                                                            status=event_type.name,
+                                                            received_timestamp_ms=int(time.time() * 1e3))
                     session.add(order_status)
                     self.save_market_states(self._config_file_path, market, session=session)
 

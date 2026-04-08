@@ -17,11 +17,18 @@ class OrderStatus(HummingbotBase):
     order_id = Column(Text, ForeignKey("Order.id"), nullable=False)
     timestamp = Column(BigInteger, nullable=False)
     status = Column(Text, nullable=False)
+
+    # Provenance columns — all nullable, no default (additive, backward-compatible)
+    exchange_timestamp_ms = Column(BigInteger, nullable=True)    # Exchange-reported event time (ms)
+    received_timestamp_ms = Column(BigInteger, nullable=True)    # Bot receive time (ms)
+    source_channel = Column(Text, nullable=True)                 # "ws" | "rest_poll" | "rest_status_update"
+
     order = relationship("Order", back_populates="status")
 
     def __repr__(self) -> str:
         return f"OrderStatus(id={self.id}, order_id='{self.order_id}', timestamp={self.timestamp}, " \
-            f"status='{self.status}')"
+            f"status='{self.status}', exchange_timestamp_ms={self.exchange_timestamp_ms}, " \
+            f"received_timestamp_ms={self.received_timestamp_ms}, source_channel='{self.source_channel}')"
 
     @staticmethod
     def to_bounty_api_json(order_status: "OrderStatus") -> Dict[str, Any]:

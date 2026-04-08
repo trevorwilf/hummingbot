@@ -1,4 +1,5 @@
 import asyncio
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -379,6 +380,7 @@ class MexcExchange(ExchangePyBase):
             fill_quote_amount=Decimal(order_fill["amount"]),
             fill_price=Decimal(order_fill["price"]),
             fill_timestamp=float(order_fill["time"]) * 1e-3,
+            is_taker=not order_fill.get("isMaker", True),  # isMaker=True -> is_taker=False
         )
         return trade_update
 
@@ -387,11 +389,18 @@ class MexcExchange(ExchangePyBase):
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is None:
             self.logger().debug(f"Ignoring trade message with id {client_order_id}: not in in_flight_orders.")
+            if not hasattr(self, '_untracked_trade_count'):
+                self._untracked_trade_count = 0
+            self._untracked_trade_count += 1
         else:
             trade_update = self._create_trade_update_with_order_fill_data(
                 order_fill=trade,
                 order=tracked_order)
             self._order_tracker.process_trade_update(trade_update)
+            # Tag fill source for provenance tracking
+            if not hasattr(tracked_order, '_fill_sources'):
+                tracked_order._fill_sources = {}
+            tracked_order._fill_sources[str(trade["tradeId"])] = "ws"
 
     def _create_order_update_with_order_status_data(self, order_status: Dict[str, Any], order: InFlightOrder):
         client_order_id = str(order_status.get("clientId", ""))
@@ -417,6 +426,9 @@ class MexcExchange(ExchangePyBase):
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if not tracked_order:
             self.logger().debug(f"Ignoring order message with id {client_order_id}: not in in_flight_orders.")
+            if not hasattr(self, '_untracked_order_count'):
+                self._untracked_order_count = 0
+            self._untracked_order_count += 1
             return
 
         order_update = self._create_order_update_with_order_status_data(order_status=order, order=tracked_order)
@@ -438,6 +450,14 @@ class MexcExchange(ExchangePyBase):
 
         if (long_interval_current_tick > long_interval_last_tick
                 or (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick)):
+            # Emit untracked message summary if any accumulated
+            if getattr(self, '_untracked_trade_count', 0) > 0 or getattr(self, '_untracked_order_count', 0) > 0:
+                import json as _json
+                self.logger().info(
+                    f"[STRUCTURED_EVENT] {_json.dumps({'event_type': 'untracked_messages_summary', 'connector': 'mexc', 'timestamp_ms': int(time.time() * 1e3), 'untracked_trades': getattr(self, '_untracked_trade_count', 0), 'untracked_orders': getattr(self, '_untracked_order_count', 0)})}"
+                )
+                self._untracked_trade_count = 0
+                self._untracked_order_count = 0
             query_time = int(self._last_trades_poll_mexc_timestamp * 1e3)
             self._last_trades_poll_mexc_timestamp = self._time_synchronizer.time()
             order_by_exchange_id_map = {}
@@ -490,8 +510,13 @@ class MexcExchange(ExchangePyBase):
                             fill_quote_amount=Decimal(trade["quoteQty"]),
                             fill_price=Decimal(trade["price"]),
                             fill_timestamp=float(trade["time"]) * 1e-3,
+                            is_taker=not trade.get("isMaker", True),
                         )
                         self._order_tracker.process_trade_update(trade_update)
+                        # Tag fill source for provenance tracking
+                        if not hasattr(tracked_order, '_fill_sources'):
+                            tracked_order._fill_sources = {}
+                        tracked_order._fill_sources[str(trade["id"])] = "rest_poll"
                     elif self.is_confirmed_new_order_filled_event(str(trade["id"]), exchange_order_id, trading_pair):
                         # This is a fill of an order registered in the DB but not tracked any more
                         self._current_trade_fills.add(TradeFillOrderDetails(
@@ -561,6 +586,7 @@ class MexcExchange(ExchangePyBase):
                     fill_quote_amount=Decimal(trade["quoteQty"]),
                     fill_price=Decimal(trade["price"]),
                     fill_timestamp=float(trade["time"]) * 1e-3,
+                    is_taker=not trade.get("isMaker", True),
                 )
                 trade_updates.append(trade_update)
 

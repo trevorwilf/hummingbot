@@ -116,12 +116,29 @@ class NonkycExchange(ExchangePyBase):
         self._balance_settling = True
         self._balance_settle_start = time.time()
         self.logger().info("Balance settling: ACTIVE — order creation paused until REST balance sync")
+        self._emit_structured_event("balance_settling_entered", {
+            "reason": "ws_reconnect",
+        })
 
     def _exit_balance_settling(self):
         if self._balance_settling:
             elapsed = time.time() - self._balance_settle_start
             self._balance_settling = False
             self.logger().info(f"Balance settling: RESOLVED after {elapsed:.1f}s — order creation resumed")
+            self._emit_structured_event("balance_settling_exited", {
+                "duration_s": round(elapsed, 1),
+            })
+
+    def _emit_structured_event(self, event_type: str, payload: dict):
+        """Emit a structured JSON event to the forensic log."""
+        import json
+        event = {
+            "event_type": event_type,
+            "connector": "nonkyc",
+            "timestamp_ms": int(time.time() * 1e3),
+            **payload
+        }
+        self.logger().info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
 
     def _record_api_latency(self, endpoint: str, latency_ms: float):
         if endpoint not in self._api_latency_samples:
@@ -386,6 +403,9 @@ class NonkycExchange(ExchangePyBase):
                 self.logger().warning(
                     f"Balance settling: TIMEOUT after {elapsed:.1f}s — allowing order creation")
                 self._balance_settling = False
+                self._emit_structured_event("balance_settling_timeout", {
+                    "elapsed_s": round(elapsed, 1),
+                })
             else:
                 raise Exception(
                     f"Order creation blocked: balance settling in progress "
@@ -408,6 +428,13 @@ class NonkycExchange(ExchangePyBase):
                     )
                     self._account_available_balances[base_asset] = adjusted
                     self._pre_adjusted_assets[base_asset] = time.time()
+                    self._emit_structured_event("local_balance_pre_adjust_applied", {
+                        "side": "SELL",
+                        "asset": base_asset,
+                        "previous": str(current),
+                        "adjusted": str(adjusted),
+                        "order_id": order.client_order_id,
+                    })
             else:
                 # Buy order: exchange holds quote asset (amount * price + fee)
                 current = self._account_available_balances.get(quote_asset, Decimal("0"))
@@ -431,6 +458,13 @@ class NonkycExchange(ExchangePyBase):
                     )
                     self._account_available_balances[quote_asset] = adjusted
                     self._pre_adjusted_assets[quote_asset] = time.time()
+                    self._emit_structured_event("local_balance_pre_adjust_applied", {
+                        "side": "BUY",
+                        "asset": quote_asset,
+                        "previous": str(current),
+                        "adjusted": str(adjusted),
+                        "order_id": order.client_order_id,
+                    })
         except Exception as e:
             # Never let balance bookkeeping break order flow
             self.logger().warning(f"Local balance pre-adjust failed (non-fatal): {repr(e)}")
@@ -1027,6 +1061,10 @@ class NonkycExchange(ExchangePyBase):
                                 fill_timestamp=message_params["updatedAt"] * 1e-3,
                             )
                             self._order_tracker.process_trade_update(trade_update)
+                            # Tag fill source for provenance tracking
+                            if not hasattr(tracked_order, '_fill_sources'):
+                                tracked_order._fill_sources = {}
+                            tracked_order._fill_sources[str(message_params["tradeId"])] = "ws"
                             self._log_order_lifecycle(client_order_id, "FILL",
                                 f"qty={message_params['tradeQuantity']} price={message_params['tradePrice']} "
                                 f"exch_id={message_params['id']}")
@@ -1205,6 +1243,10 @@ class NonkycExchange(ExchangePyBase):
                             percent_token=fee_token,
                             flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
                         )
+                        # Derive maker/taker from side vs triggeredBy
+                        _side = str(trade.get("side", "")).lower()
+                        _triggered_by = str(trade.get("triggeredBy", "")).lower()
+                        _is_taker = (_side == _triggered_by) if (_side and _triggered_by) else True
                         trade_update = TradeUpdate(
                             trade_id=str(trade["id"]),
                             client_order_id=tracked_order.client_order_id,
@@ -1215,8 +1257,13 @@ class NonkycExchange(ExchangePyBase):
                             fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
                             fill_price=Decimal(trade["price"]),
                             fill_timestamp=trade["timestamp"] * 1e-3,
+                            is_taker=_is_taker,
                         )
                         self._order_tracker.process_trade_update(trade_update)
+                        # Tag fill source for provenance tracking
+                        if not hasattr(tracked_order, '_fill_sources'):
+                            tracked_order._fill_sources = {}
+                        tracked_order._fill_sources[str(trade["id"])] = "rest_poll"
                     elif self.is_confirmed_new_order_filled_event(str(trade["id"]), exchange_order_id, trading_pair):
                         # This is a fill of an order registered in the DB but not tracked any more
                         self._current_trade_fills.add(TradeFillOrderDetails(
@@ -1279,6 +1326,10 @@ class NonkycExchange(ExchangePyBase):
                     percent_token=fee_token,
                     flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
                 )
+                # Derive maker/taker from side vs triggeredBy
+                _side = str(trade.get("side", "")).lower()
+                _triggered_by = str(trade.get("triggeredBy", "")).lower()
+                _is_taker = (_side == _triggered_by) if (_side and _triggered_by) else True
                 trade_update = TradeUpdate(
                     trade_id=str(trade["id"]),
                     client_order_id=order.client_order_id,
@@ -1289,6 +1340,7 @@ class NonkycExchange(ExchangePyBase):
                     fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
                     fill_price=Decimal(trade["price"]),
                     fill_timestamp=trade["timestamp"] * 1e-3,
+                    is_taker=_is_taker,
                 )
                 trade_updates.append(trade_update)
 
@@ -1364,6 +1416,10 @@ class NonkycExchange(ExchangePyBase):
                 f"Balance reconciliation (REST overwrote WS): "
                 + " | ".join(reconciliation_diffs)
             )
+            self._emit_structured_event("balance_reconciled_ws_vs_rest", {
+                "diffs": reconciliation_diffs,
+                "count": len(reconciliation_diffs),
+            })
 
         self._exit_balance_settling()
 
