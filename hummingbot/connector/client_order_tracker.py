@@ -22,6 +22,7 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger.logger import HummingbotLogger
+from hummingbot.logger.structured_event_logger import get_structured_logger
 
 if TYPE_CHECKING:
     from hummingbot.connector.connector_base import ConnectorBase
@@ -206,6 +207,17 @@ class ClientOrderTracker:
         tracked_order: Optional[InFlightOrder] = self.all_fillable_orders.get(client_order_id)
 
         if tracked_order:
+            try:
+                get_structured_logger().emit("trade_update_received",
+                    order_id=trade_update.client_order_id,
+                    trade_id=trade_update.trade_id,
+                    exchange_order_id=trade_update.exchange_order_id,
+                    exchange_timestamp_ms=int(trade_update.fill_timestamp * 1e3),
+                    fill_price=str(trade_update.fill_price),
+                    fill_amount=str(trade_update.fill_base_amount),
+                    is_taker=trade_update.is_taker)
+            except Exception:
+                pass
             previous_executed_amount_base: Decimal = tracked_order.executed_amount_base
 
             updated: bool = tracked_order.update_with_trade_update(trade_update)
@@ -249,6 +261,15 @@ class ClientOrderTracker:
                     await self._process_order_update(order_update)
                     del self._cached_orders[client_order_id]
                     self._lost_orders[tracked_order.client_order_id] = tracked_order
+                    try:
+                        get_structured_logger().emit("order_marked_lost",
+                            order_id=client_order_id,
+                            exchange_order_id=tracked_order.exchange_order_id,
+                            trading_pair=tracked_order.trading_pair,
+                            order_type=tracked_order.order_type.name,
+                            not_found_count=self._order_not_found_records[client_order_id])
+                    except Exception:
+                        pass
         else:
             lost_order = self._lost_orders.get(client_order_id)
             if lost_order is not None:
@@ -278,6 +299,12 @@ class ClientOrderTracker:
         if tracked_order:
             if order_update.new_state == OrderState.FILLED and not tracked_order.is_done:
                 try:
+                    get_structured_logger().emit("filled_status_wait_started",
+                        order_id=tracked_order.client_order_id,
+                        timeout_s=self.TRADE_FILLS_WAIT_TIMEOUT)
+                except Exception:
+                    pass
+                try:
                     await asyncio.wait_for(
                         tracked_order.wait_until_completely_filled(), timeout=self.TRADE_FILLS_WAIT_TIMEOUT
                     )
@@ -286,6 +313,13 @@ class ClientOrderTracker:
                         f"The order fill updates did not arrive on time for {tracked_order.client_order_id}. "
                         f"The complete update will be processed with incomplete information."
                     )
+                    try:
+                        get_structured_logger().emit("filled_status_wait_timed_out",
+                            order_id=tracked_order.client_order_id,
+                            waited_s=self.TRADE_FILLS_WAIT_TIMEOUT,
+                            fills_received=len(tracked_order.order_fills))
+                    except Exception:
+                        pass
 
             previous_state: OrderState = tracked_order.current_state
 

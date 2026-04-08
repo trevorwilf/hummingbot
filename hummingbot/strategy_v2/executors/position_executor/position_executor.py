@@ -16,6 +16,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.logger.structured_event_logger import get_structured_logger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
@@ -434,6 +435,14 @@ class PositionExecutor(ExecutorBase):
         """
         if self._current_retries >= self._max_retries:
             self.close_type = CloseType.FAILED
+            try:
+                get_structured_logger().emit("executor_terminal_failure",
+                    controller_id=self.config.controller_id, executor_id=self.config.id,
+                    level_id=getattr(self.config, 'level_id', None),
+                    reason="max_retries_exceeded",
+                    retries=self._current_retries, max_retries=self._max_retries)
+            except Exception:
+                pass
             self.stop()
 
     async def on_start(self):
@@ -510,6 +519,20 @@ class PositionExecutor(ExecutorBase):
         )
         self._open_order = TrackedOrder(order_id=order_id)
         self.logger().debug(f"Executor ID: {self.config.id} - Placing open order {order_id}")
+        try:
+            get_structured_logger().emit("executor_open_order_submitted",
+                controller_id=self.config.controller_id, executor_id=self.config.id,
+                level_id=getattr(self.config, 'level_id', None),
+                connector=self.config.connector_name, trading_pair=self.config.trading_pair,
+                side=self.config.side.name, amount=str(self.config.amount),
+                order_id=order_id)
+            # Tag in-flight order with controller/executor IDs for provenance propagation
+            tracked = self.connectors[self.config.connector_name]._order_tracker.all_orders.get(order_id)
+            if tracked:
+                tracked._controller_id = self.config.controller_id
+                tracked._executor_id = self.config.id
+        except Exception:
+            pass
 
     def control_barriers(self):
         """
@@ -624,6 +647,18 @@ class PositionExecutor(ExecutorBase):
             )
             self._close_order = TrackedOrder(order_id=order_id)
             self.logger().debug(f"Executor ID: {self.config.id} - Placing close order {order_id} --> Filled amount: {self.open_filled_amount}")
+            try:
+                get_structured_logger().emit("executor_close_order_placed",
+                    controller_id=self.config.controller_id, executor_id=self.config.id,
+                    order_id=order_id, close_type=self.close_type.name if self.close_type else None,
+                    amount=str(close_amount), price=str(order_price))
+                # Tag in-flight order for provenance
+                tracked = self.connectors[self.config.connector_name]._order_tracker.all_orders.get(order_id)
+                if tracked:
+                    tracked._controller_id = self.config.controller_id
+                    tracked._executor_id = self.config.id
+            except Exception:
+                pass
         elif close_amount > 0 and self.close_type != CloseType.POSITION_HOLD:
             self.logger().warning(
                 f"Executor {self.config.id}: close order amount {close_amount} / notional ~{close_notional:.8f} "
@@ -719,6 +754,15 @@ class PositionExecutor(ExecutorBase):
                                         f"(delta {delta_pct*100:.1f}%)"
                                     )
                                     self.renew_take_profit_order()
+                                    try:
+                                        get_structured_logger().emit("executor_tp_order_renewed",
+                                            controller_id=self.config.controller_id,
+                                            executor_id=self.config.id,
+                                            old_amount=str(current_tp_amount),
+                                            new_amount=str(desired_amount),
+                                            delta_pct=str(round(float(delta_pct * 100), 1)))
+                                    except Exception:
+                                        pass
             elif self.net_pnl_pct >= self.config.triple_barrier_config.take_profit:
                 self.place_close_order_and_cancel_open_orders(close_type=CloseType.TAKE_PROFIT)
 
@@ -749,6 +793,13 @@ class PositionExecutor(ExecutorBase):
                         f"Executor {self.config.id}: TP sell deferred — no {base_asset} available "
                         f"(needed {amount}, available {available}). Will retry on next cycle."
                     )
+                    try:
+                        get_structured_logger().emit("executor_tp_order_deferred",
+                            controller_id=self.config.controller_id, executor_id=self.config.id,
+                            reason="no_spendable_base", asset=base_asset,
+                            needed=str(amount), available=str(available))
+                    except Exception:
+                        pass
                     return
                 if available < amount:
                     amount = connector.quantize_order_amount(self.config.trading_pair, available)
@@ -768,6 +819,13 @@ class PositionExecutor(ExecutorBase):
                             f"Executor {self.config.id}: TP buy deferred — insufficient {quote_asset} "
                             f"(needed ~{amount * mid_price}, available {available_quote}). Will retry on next cycle."
                         )
+                        try:
+                            get_structured_logger().emit("executor_tp_order_deferred",
+                                controller_id=self.config.controller_id, executor_id=self.config.id,
+                                reason="insufficient_quote", asset=quote_asset,
+                                needed=str(amount * mid_price), available=str(available_quote))
+                        except Exception:
+                            pass
                         return
                     if max_base < amount:
                         amount = connector.quantize_order_amount(self.config.trading_pair, max_base)
@@ -803,6 +861,18 @@ class PositionExecutor(ExecutorBase):
         )
         self._take_profit_limit_order = TrackedOrder(order_id=order_id)
         self.logger().debug(f"Executor ID: {self.config.id} - Placing take profit order {order_id}")
+        try:
+            get_structured_logger().emit("executor_tp_order_placed",
+                controller_id=self.config.controller_id, executor_id=self.config.id,
+                order_id=order_id, amount=str(amount),
+                take_profit_price=str(self.take_profit_price))
+            # Tag in-flight order for provenance
+            tracked = self.connectors[self.config.connector_name]._order_tracker.all_orders.get(order_id)
+            if tracked:
+                tracked._controller_id = self.config.controller_id
+                tracked._executor_id = self.config.id
+        except Exception:
+            pass
 
     def renew_take_profit_order(self):
         """

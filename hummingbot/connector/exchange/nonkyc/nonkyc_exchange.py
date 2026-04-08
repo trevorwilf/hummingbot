@@ -130,15 +130,23 @@ class NonkycExchange(ExchangePyBase):
             })
 
     def _emit_structured_event(self, event_type: str, payload: dict):
-        """Emit a structured JSON event to the forensic log."""
-        import json
-        event = {
-            "event_type": event_type,
-            "connector": "nonkyc",
-            "timestamp_ms": int(time.time() * 1e3),
-            **payload
-        }
-        self.logger().info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+        """Emit a structured JSON event to the forensic log and JSONL ledger."""
+        try:
+            from hummingbot.logger.structured_event_logger import get_structured_logger
+            get_structured_logger().emit(event_type, connector="nonkyc", **payload)
+        except Exception:
+            pass
+        try:
+            import json
+            event = {
+                "event_type": event_type,
+                "connector": "nonkyc",
+                "timestamp_ms": int(time.time() * 1e3),
+                **payload
+            }
+            self.logger().info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+        except Exception:
+            pass
 
     def _record_api_latency(self, endpoint: str, latency_ms: float):
         if endpoint not in self._api_latency_samples:
@@ -1065,6 +1073,28 @@ class NonkycExchange(ExchangePyBase):
                             if not hasattr(tracked_order, '_fill_sources'):
                                 tracked_order._fill_sources = {}
                             tracked_order._fill_sources[str(message_params["tradeId"])] = "ws"
+                            try:
+                                from hummingbot.logger.structured_event_logger import get_structured_logger
+                                _sel = get_structured_logger()
+                                _best_bid = _best_ask = None
+                                _ob = self.get_order_book(tracked_order.trading_pair)
+                                if _ob:
+                                    _best_bid = float(_ob.get_price(False)) if _ob.get_price(False) else None
+                                    _best_ask = float(_ob.get_price(True)) if _ob.get_price(True) else None
+                                _sel.emit("connector_fill_received",
+                                    connector="nonkyc", source="ws",
+                                    order_id=client_order_id,
+                                    trade_id=str(message_params["tradeId"]),
+                                    trading_pair=tracked_order.trading_pair,
+                                    side=tracked_order.trade_type.name,
+                                    fill_price=str(message_params["tradePrice"]),
+                                    fill_amount=str(message_params["tradeQuantity"]),
+                                    exchange_timestamp_ms=message_params["updatedAt"],
+                                    is_taker=True,
+                                    best_bid=_best_bid, best_ask=_best_ask,
+                                    balance_settling=self._balance_settling)
+                            except Exception:
+                                pass
                             self._log_order_lifecycle(client_order_id, "FILL",
                                 f"qty={message_params['tradeQuantity']} price={message_params['tradePrice']} "
                                 f"exch_id={message_params['id']}")

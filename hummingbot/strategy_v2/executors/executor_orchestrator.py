@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.logger.structured_event_logger import get_structured_logger
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.position import Position
 
@@ -642,7 +643,16 @@ class ExecutorOrchestrator:
                             f"amount={config.amount} price={price} on {connector_name} — "
                             f"insufficient balance, order dropped entirely"
                         )
+                        try:
+                            get_structured_logger().emit("budget_preflight_dropped",
+                                controller_id=action.controller_id,
+                                trading_pair=config.trading_pair, side=config.side.name,
+                                proposed_amount=str(config.amount), proposed_price=str(price),
+                                connector=connector_name)
+                        except Exception:
+                            pass
                     elif adjusted.amount != config.amount:
+                        _original_amount = config.amount
                         self.logger().warning(
                             f"BUDGET PREFLIGHT RESIZE: controller={action.controller_id} "
                             f"pair={config.trading_pair} side={config.side.name} "
@@ -651,6 +661,15 @@ class ExecutorOrchestrator:
                         )
                         config.amount = adjusted.amount
                         surviving_actions.append(action)
+                        try:
+                            get_structured_logger().emit("budget_preflight_resized",
+                                controller_id=action.controller_id,
+                                trading_pair=config.trading_pair, side=config.side.name,
+                                original_amount=str(_original_amount),
+                                adjusted_amount=str(adjusted.amount),
+                                connector=connector_name)
+                        except Exception:
+                            pass
                     else:
                         surviving_actions.append(action)
                 except Exception as e:
@@ -726,6 +745,17 @@ class ExecutorOrchestrator:
 
         executor.start()
         self.active_executors[controller_id].append(executor)
+        try:
+            get_structured_logger().emit("executor_created",
+                controller_id=controller_id,
+                executor_id=executor_config.id,
+                executor_type=executor_config.type,
+                connector=connector_name,
+                trading_pair=trading_pair,
+                side=side.name if side else None,
+                amount=str(amount), price=str(price))
+        except Exception:
+            pass
 
         # Log balance AFTER order placement
         if connector_name and trading_pair:
@@ -848,6 +878,16 @@ class ExecutorOrchestrator:
         try:
             MarketsRecorder.get_instance().store_or_update_executor(executor)
             self._update_cached_performance(controller_id, executor.executor_info)
+            try:
+                _ei = executor.executor_info
+                get_structured_logger().emit("executor_completed",
+                    controller_id=controller_id, executor_id=executor_id,
+                    close_type=_ei.close_type.name if hasattr(_ei, 'close_type') and _ei.close_type else None,
+                    net_pnl_quote=str(_ei.net_pnl_quote) if hasattr(_ei, 'net_pnl_quote') else None,
+                    net_pnl_pct=str(_ei.net_pnl_pct) if hasattr(_ei, 'net_pnl_pct') else None,
+                    filled_amount_quote=str(_ei.filled_amount_quote) if hasattr(_ei, 'filled_amount_quote') else None)
+            except Exception:
+                pass
         except Exception as e:
             self.logger().error(f"Error storing executor id {executor_id}: {str(e)}.")
             self.logger().error(f"Executor info: {executor.executor_info} | Config: {executor.config}")

@@ -33,6 +33,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.logger.structured_event_logger import get_structured_logger
 from hummingbot.model.controllers import Controllers
 from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
@@ -393,10 +394,33 @@ class MarketsRecorder:
                                                         timestamp=timestamp,
                                                         status=event_type.name,
                                                         received_timestamp_ms=int(time.time() * 1e3))
+                # Propagate controller/executor IDs from in-flight order
+                try:
+                    tracked = market._order_tracker.all_orders.get(evt.order_id)
+                    if tracked:
+                        order_record.controller_id = getattr(tracked, '_controller_id', None)
+                        order_record.executor_id = getattr(tracked, '_executor_id', None)
+                except Exception:
+                    pass
+
                 session.add(order_record)
                 session.add(order_status)
                 market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
                 self.save_market_states(self._config_file_path, market, session=session)
+
+                try:
+                    get_structured_logger().emit("order_created",
+                        order_id=evt.order_id,
+                        exchange_order_id=getattr(evt, 'exchange_order_id', None),
+                        trading_pair=evt.trading_pair,
+                        order_type=evt.type.name,
+                        trade_type=evt.trade_type.name if hasattr(evt, 'trade_type') else None,
+                        price=str(evt.price), amount=str(evt.amount),
+                        connector=market.display_name,
+                        controller_id=order_record.controller_id,
+                        executor_id=order_record.executor_id)
+                except Exception:
+                    pass
 
     def _did_fill_order(self,
                         event_tag: int,
@@ -468,6 +492,9 @@ class MarketsRecorder:
                         if hasattr(tracked_order, '_fill_sources'):
                             trade_fill_record.source_channel = tracked_order._fill_sources.get(
                                 evt.exchange_trade_id, "unknown")
+                        # Propagate controller/executor IDs
+                        trade_fill_record.controller_id = getattr(tracked_order, '_controller_id', None)
+                        trade_fill_record.executor_id = getattr(tracked_order, '_executor_id', None)
                 except Exception:
                     pass  # Never let provenance enrichment break fill recording
 
@@ -481,6 +508,23 @@ class MarketsRecorder:
                 market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(trade_fill_record.market,
                                                                                    trade_fill_record.exchange_trade_id,
                                                                                    trade_fill_record.symbol)})
+
+                try:
+                    get_structured_logger().emit("trade_fill_persisted",
+                        order_id=order_id, exchange_trade_id=evt.exchange_trade_id,
+                        trading_pair=evt.trading_pair, trade_type=evt.trade_type.name,
+                        order_type=evt.order_type.name,
+                        price=str(evt.price), amount=str(evt.amount),
+                        exchange_timestamp_ms=trade_fill_record.exchange_timestamp_ms,
+                        received_timestamp_ms=trade_fill_record.received_timestamp_ms,
+                        liquidity_role=trade_fill_record.liquidity_role,
+                        source_channel=trade_fill_record.source_channel,
+                        controller_id=trade_fill_record.controller_id,
+                        executor_id=trade_fill_record.executor_id,
+                        connector=market.display_name,
+                        fee_json=evt.trade_fee.to_json())
+                except Exception:
+                    pass
 
     def _did_complete_funding_payment(self,
                                       event_tag: int,

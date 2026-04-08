@@ -2,6 +2,8 @@ import time as _time
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, Union
 
+from hummingbot.logger.structured_event_logger import get_structured_logger
+
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
@@ -586,6 +588,41 @@ class MarketMakingControllerBase(ControllerBase):
             f"spread_mult={self.processed_data.get('spread_multiplier', 'N/A')}"
         )
 
+        # Structured event: cycle start with market snapshot
+        _sel = get_structured_logger()
+        _cycle_id = f"{self.config.id}_{int(_time.time()*1e3)}"
+        _cycle_start_ms = int(_time.time() * 1e3)
+        try:
+            _connectors = getattr(self.market_data_provider, 'connectors', None)
+            _connector = _connectors.get(self.config.connector_name) if _connectors else None
+            _mid = float(self.get_mid_price()) if hasattr(self, 'get_mid_price') else None
+            _best_bid = _best_ask = _spread_bps = None
+            if _connector:
+                _ob = _connector.get_order_book(self.config.trading_pair)
+                if _ob:
+                    _best_bid = float(_ob.get_price(False)) if _ob.get_price(False) else None
+                    _best_ask = float(_ob.get_price(True)) if _ob.get_price(True) else None
+                    if _best_bid and _best_ask and _best_bid > 0:
+                        _spread_bps = round((_best_ask - _best_bid) / _best_bid * 10000, 2)
+        except Exception:
+            _mid = _best_bid = _best_ask = _spread_bps = None
+        try:
+            _sel.emit("controller_cycle_started",
+                controller_id=self.config.id,
+                cycle_id=_cycle_id,
+                connector=self.config.connector_name,
+                trading_pair=self.config.trading_pair,
+                reference_price=str(self.processed_data.get("reference_price", "")),
+                spread_multiplier=str(self.processed_data.get("spread_multiplier", "")),
+                best_bid=_best_bid,
+                best_ask=_best_ask,
+                mid_price=_mid,
+                spread_bps=_spread_bps,
+                stale_state=getattr(self, '_stale_state', None),
+            )
+        except Exception:
+            pass
+
         # Market data freshness check (LOG 12)
         self._check_market_data_freshness()
 
@@ -600,6 +637,14 @@ class MarketMakingControllerBase(ControllerBase):
                         f"action={self.config.stale_data_action})"
                     )
                     self._stale_suppression_logged = True
+                try:
+                    _sel.emit("controller_stale_suppression",
+                        controller_id=self.config.id, cycle_id=_cycle_id,
+                        stale_age_s=round(stale_age, 1),
+                        action=self.config.stale_data_action,
+                    )
+                except Exception:
+                    pass
                 return self.stop_actions_proposal()
 
         # Per-controller executor inventory summary
@@ -663,6 +708,12 @@ class MarketMakingControllerBase(ControllerBase):
                     if not hasattr(self, '_cross_order_warned'):
                         self._cross_order_warned = {}
                     self._cross_order_warned[level_id] = True
+                try:
+                    _sel.emit("level_skipped_cross_order", controller_id=self.config.id,
+                        cycle_id=_cycle_id, level_id=level_id, side=trade_type.name,
+                        price=str(price), boundary_price=str(highest_buy))
+                except Exception:
+                    pass
                 continue
             elif trade_type == TradeType.BUY and lowest_sell is not None and price >= lowest_sell:
                 if not getattr(self, '_cross_order_warned', {}).get(level_id):
@@ -673,6 +724,12 @@ class MarketMakingControllerBase(ControllerBase):
                     if not hasattr(self, '_cross_order_warned'):
                         self._cross_order_warned = {}
                     self._cross_order_warned[level_id] = True
+                try:
+                    _sel.emit("level_skipped_cross_order", controller_id=self.config.id,
+                        cycle_id=_cycle_id, level_id=level_id, side=trade_type.name,
+                        price=str(price), boundary_price=str(lowest_sell))
+                except Exception:
+                    pass
                 continue
             else:
                 if hasattr(self, '_cross_order_warned') and level_id in self._cross_order_warned:
@@ -690,6 +747,12 @@ class MarketMakingControllerBase(ControllerBase):
                         if not hasattr(self, '_clip_exhausted_warned'):
                             self._clip_exhausted_warned = {}
                         self._clip_exhausted_warned[level_id] = True
+                    try:
+                        _sel.emit("level_skipped_no_spendable_base", controller_id=self.config.id,
+                            cycle_id=_cycle_id, level_id=level_id,
+                            initial_spendable=str(initial_spendable))
+                    except Exception:
+                        pass
                     continue
 
                 clipped_amount = min(amount, spendable_sell_base)
@@ -707,6 +770,13 @@ class MarketMakingControllerBase(ControllerBase):
                         if not hasattr(self, '_last_clip_state'):
                             self._last_clip_state = {}
                         self._last_clip_state[level_id] = clip_key
+                    try:
+                        _sel.emit("level_clipped_sell_inventory", controller_id=self.config.id,
+                            cycle_id=_cycle_id, level_id=level_id,
+                            original_amount=str(amount), clipped_amount=str(clipped_amount),
+                            spendable_remaining=str(spendable_sell_base))
+                    except Exception:
+                        pass
                 else:
                     # Clipping resolved — clear state so it can warn again if it recurs
                     if hasattr(self, '_last_clip_state') and level_id in self._last_clip_state:
@@ -739,6 +809,13 @@ class MarketMakingControllerBase(ControllerBase):
                         if not hasattr(self, '_min_size_warned'):
                             self._min_size_warned = {}
                         self._min_size_warned[level_id] = True
+                    try:
+                        _sel.emit("level_skipped_min_order_size", controller_id=self.config.id,
+                            cycle_id=_cycle_id, level_id=level_id,
+                            quantized_amount=str(q_amount),
+                            min_order_size=str(trading_rules.min_order_size))
+                    except Exception:
+                        pass
                     continue
                 elif trading_rules.min_notional_size > 0 and notional < trading_rules.min_notional_size:
                     if not getattr(self, '_min_notional_warned', {}).get(level_id):
@@ -750,6 +827,13 @@ class MarketMakingControllerBase(ControllerBase):
                         if not hasattr(self, '_min_notional_warned'):
                             self._min_notional_warned = {}
                         self._min_notional_warned[level_id] = True
+                    try:
+                        _sel.emit("level_skipped_min_notional", controller_id=self.config.id,
+                            cycle_id=_cycle_id, level_id=level_id,
+                            notional=str(notional), min_notional=str(trading_rules.min_notional_size),
+                            quantized_price=str(q_price), quantized_amount=str(q_amount))
+                    except Exception:
+                        pass
                     continue
                 else:
                     # Clear warning flags if the level becomes valid (price moved)
@@ -764,6 +848,12 @@ class MarketMakingControllerBase(ControllerBase):
                     controller_id=self.config.id,
                     executor_config=executor_config
                 ))
+                try:
+                    _sel.emit("level_created", controller_id=self.config.id,
+                        cycle_id=_cycle_id, level_id=level_id, side=trade_type.name,
+                        price=str(price), amount=str(amount))
+                except Exception:
+                    pass
 
         buy_count = sum(1 for a in create_actions if hasattr(a, 'executor_config') and a.executor_config.side == TradeType.BUY)
         sell_count = sum(1 for a in create_actions if hasattr(a, 'executor_config') and a.executor_config.side == TradeType.SELL)
@@ -771,6 +861,13 @@ class MarketMakingControllerBase(ControllerBase):
             f"Action proposal result: controller={self.config.id} "
             f"total_actions={len(create_actions)} buys={buy_count} sells={sell_count}"
         )
+        try:
+            _sel.emit("controller_cycle_completed",
+                controller_id=self.config.id, cycle_id=_cycle_id,
+                duration_ms=int(_time.time() * 1e3) - _cycle_start_ms,
+                actions_created=len(create_actions), buys=buy_count, sells=sell_count)
+        except Exception:
+            pass
         return create_actions
 
     def _get_trading_rules(self):
@@ -1057,13 +1154,27 @@ class MarketMakingControllerBase(ControllerBase):
         if abs(base_amount_diff) > threshold_amount:
             # We need to rebalance
             self._last_rebalance_attempt_timestamp = current_time
+            _side = TradeType.BUY if base_amount_diff > 0 else TradeType.SELL
+            try:
+                get_structured_logger().emit("rebalance_triggered",
+                    controller_id=self.config.id, side=_side.name,
+                    amount=str(abs(base_amount_diff)),
+                    required_base=str(required_base_amount),
+                    held_base=str(current_base_amount),
+                    threshold=str(threshold_amount))
+            except Exception:
+                pass
             if base_amount_diff > 0:
-                # Need to buy more base asset
                 return self.create_position_rebalance_order(TradeType.BUY, abs(base_amount_diff))
             else:
-                # Need to sell base asset (unlikely for market making but possible)
                 return self.create_position_rebalance_order(TradeType.SELL, abs(base_amount_diff))
 
+        try:
+            get_structured_logger().emit("rebalance_skipped",
+                controller_id=self.config.id, reason="within_threshold",
+                imbalance=str(base_amount_diff), threshold=str(threshold_amount))
+        except Exception:
+            pass
         return None
 
     def get_inflight_buy_base_amount(self) -> Decimal:

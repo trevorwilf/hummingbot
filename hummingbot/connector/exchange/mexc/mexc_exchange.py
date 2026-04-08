@@ -401,6 +401,27 @@ class MexcExchange(ExchangePyBase):
             if not hasattr(tracked_order, '_fill_sources'):
                 tracked_order._fill_sources = {}
             tracked_order._fill_sources[str(trade["tradeId"])] = "ws"
+            try:
+                from hummingbot.logger.structured_event_logger import get_structured_logger
+                _sel = get_structured_logger()
+                _best_bid = _best_ask = None
+                _ob = self.get_order_book(tracked_order.trading_pair)
+                if _ob:
+                    _best_bid = float(_ob.get_price(False)) if _ob.get_price(False) else None
+                    _best_ask = float(_ob.get_price(True)) if _ob.get_price(True) else None
+                _sel.emit("connector_fill_received",
+                    connector="mexc", source="ws",
+                    order_id=client_order_id,
+                    trade_id=str(trade["tradeId"]),
+                    trading_pair=tracked_order.trading_pair,
+                    side=tracked_order.trade_type.name,
+                    fill_price=str(trade.get("price", "")),
+                    fill_amount=str(trade.get("quantity", "")),
+                    exchange_timestamp_ms=int(float(trade.get("time", 0))),
+                    is_taker=not trade.get("isMaker", True),
+                    best_bid=_best_bid, best_ask=_best_ask)
+            except Exception:
+                pass
 
     def _create_order_update_with_order_status_data(self, order_status: Dict[str, Any], order: InFlightOrder):
         client_order_id = str(order_status.get("clientId", ""))

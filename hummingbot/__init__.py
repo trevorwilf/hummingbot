@@ -163,6 +163,14 @@ def init_logging(conf_filename: str,
                     config_dict["loggers"][logger]["level"] = override_log_level
         logging.config.dictConfig(config_dict)
 
+    # Initialize structured event logger (JSONL ledger)
+    try:
+        from hummingbot.logger.structured_event_logger import get_structured_logger
+        sel = get_structured_logger()
+        sel.setup(log_dir=join(prefix_path(), "logs"))
+    except Exception:
+        pass  # Never let structured event setup break startup
+
 
 def get_strategy_list() -> List[str]:
     """

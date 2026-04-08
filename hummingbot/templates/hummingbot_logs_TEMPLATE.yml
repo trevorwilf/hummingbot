@@ -8,6 +8,8 @@ formatters:
     forensic:
         format: "%(asctime)s - %(process)d - %(name)s:%(funcName)s:%(lineno)d - %(levelname)s - %(message)s"
         datefmt: "%Y-%m-%dT%H:%M:%S"
+    structured:
+        format: "%(message)s"
 
 handlers:
     console:
@@ -43,6 +45,13 @@ handlers:
         when: "D"
         interval: 1
         backupCount: 30
+    structured_file_handler:
+        class: logging.handlers.RotatingFileHandler
+        level: INFO
+        formatter: structured
+        filename: $PROJECT_DIR/logs/structured_events.jsonl
+        maxBytes: 52428800
+        backupCount: 5
     "null":
         class: logging.NullHandler
         level: DEBUG
@@ -132,6 +141,10 @@ loggers:
         handlers: [file_handler, forensic_file_handler]
         mqtt: false
 
+    hummingbot.structured_events:
+        level: INFO
+        handlers: [structured_file_handler]
+        propagate: no
     hummingbot.core.event.event_reporter:
         level: EVENT_LOG
         propagate: false

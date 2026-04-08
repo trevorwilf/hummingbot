@@ -23,15 +23,23 @@ def _redact_token(token: str) -> str:
 
 
 def _emit_structured_event_static(logger, event_type: str, payload: dict):
-    """Emit a structured JSON event to the forensic log."""
-    import json
-    event = {
-        "event_type": event_type,
-        "connector": "mexc",
-        "timestamp_ms": int(time.time() * 1e3),
-        **payload
-    }
-    logger.info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+    """Emit a structured JSON event to the forensic log and JSONL ledger."""
+    try:
+        from hummingbot.logger.structured_event_logger import get_structured_logger
+        get_structured_logger().emit(event_type, connector="mexc", **payload)
+    except Exception:
+        pass
+    try:
+        import json
+        event = {
+            "event_type": event_type,
+            "connector": "mexc",
+            "timestamp_ms": int(time.time() * 1e3),
+            **payload
+        }
+        logger.info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+    except Exception:
+        pass
 
 
 class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
