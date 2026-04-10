@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os.path
+import platform
 import threading
 import time
+import uuid
 from decimal import Decimal
 from shutil import move
 from typing import Dict, List, Optional, Tuple, Union
@@ -43,8 +45,11 @@ from hummingbot.model.order import Order
 from hummingbot.model.order_status import OrderStatus
 from hummingbot.model.position import Position
 from hummingbot.model.range_position_update import RangePositionUpdate
+from hummingbot.model.bot_run import BotRun
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.persistence.lifecycle_event import LifecycleEvent
+from hummingbot.persistence.lifecycle_writer import LifecycleWriter
 from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
@@ -55,6 +60,13 @@ class MarketsRecorder:
     market_event_tag_map: Dict[int, MarketEvent] = {
         event_obj.value: event_obj
         for event_obj in MarketEvent.__members__.values()
+    }
+    _LIFECYCLE_EVENT_MAP: Dict[MarketEvent, str] = {
+        MarketEvent.OrderCancelled: "cancel_confirmed",
+        MarketEvent.OrderFailure: "failed",
+        MarketEvent.BuyOrderCompleted: "completed",
+        MarketEvent.SellOrderCompleted: "completed",
+        MarketEvent.OrderExpired: "expired",
     }
 
     @classmethod
@@ -74,7 +86,8 @@ class MarketsRecorder:
                  markets: List[ConnectorBase],
                  config_file_path: str,
                  strategy_name: str,
-                 market_data_collection: MarketDataCollectionConfigMap):
+                 market_data_collection: MarketDataCollectionConfigMap,
+                 bot_run_id: Optional[str] = None):
         if threading.current_thread() != threading.main_thread():
             raise EnvironmentError("MarketsRecorded can only be initialized from the main thread.")
 
@@ -85,6 +98,8 @@ class MarketsRecorder:
         self._strategy_name: str = strategy_name
         self._market_data_collection_config: MarketDataCollectionConfigMap = market_data_collection
         self._market_data_collection_task: Optional[asyncio.Task] = None
+        self._bot_run_id: Optional[str] = bot_run_id
+        self._lifecycle_writer: Optional[LifecycleWriter] = None
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
         for market in self._markets:
             trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
@@ -118,6 +133,28 @@ class MarketsRecorder:
             (MarketEvent.RangePositionLiquidityRemoved, self._update_range_position_forwarder),
         ]
         MarketsRecorder._shared_instance = self
+
+    @staticmethod
+    def _get_quote_context(market, trading_pair) -> dict:
+        """Grab BBO from order book for lifecycle event context."""
+        best_bid = best_ask = mid_price = spread_bps = None
+        try:
+            ob = market.get_order_book(trading_pair)
+            if ob:
+                _bid = ob.get_price(False)
+                _ask = ob.get_price(True)
+                if _bid:
+                    best_bid = str(_bid)
+                if _ask:
+                    best_ask = str(_ask)
+                if _bid and _ask:
+                    mid = (float(_bid) + float(_ask)) / 2
+                    if mid > 0:
+                        spread_bps = str(round((float(_ask) - float(_bid)) / mid * 10000, 2))
+                        mid_price = str(mid)
+        except Exception:
+            pass
+        return {"best_bid": best_bid, "best_ask": best_ask, "mid_price": mid_price, "spread_bps": spread_bps}
 
     def _start_market_data_recording(self):
         self._market_data_collection_task = self._ev_loop.create_task(self._record_market_data())
@@ -177,6 +214,45 @@ class MarketsRecorder:
                 market.add_listener(event_pair[0], event_pair[1])
         if self._market_data_collection_config.market_data_collection_enabled:
             self._start_market_data_recording()
+        # Create BotRun row and set bot_run_id on structured logger
+        if self._bot_run_id:
+            try:
+                connector_names = [m.display_name for m in self._markets]
+                trading_pairs = []
+                for m in self._markets:
+                    trading_pairs.extend(m.trading_pairs)
+                db_backend = self._sql_manager.get_engine().dialect.name
+                with self._sql_manager.get_new_session() as session:
+                    with session.begin():
+                        bot_run = BotRun(
+                            id=self._bot_run_id,
+                            started_ts_ms=int(time.time() * 1e3),
+                            strategy_name=self._strategy_name,
+                            config_file_path=self._config_file_path,
+                            connectors=connector_names,
+                            trading_pairs=trading_pairs,
+                            db_backend=db_backend,
+                            host_name=platform.node(),
+                        )
+                        session.add(bot_run)
+                get_structured_logger().set_bot_run_id(self._bot_run_id)
+                get_structured_logger().emit("bot_run_started",
+                    bot_run_id=self._bot_run_id,
+                    strategy_name=self._strategy_name,
+                    connectors=connector_names,
+                    trading_pairs=trading_pairs)
+            except Exception as e:
+                self.logger().warning(f"Failed to create BotRun row: {e}")
+            # Create lifecycle writer
+            try:
+                self._lifecycle_writer = LifecycleWriter(
+                    sql_manager=self._sql_manager,
+                    bot_run_id=self._bot_run_id,
+                    log_dir="logs",
+                    structured_logger=get_structured_logger(),
+                )
+            except Exception as e:
+                self.logger().warning(f"Failed to create LifecycleWriter: {e}")
 
     def add_market(self, market: ConnectorBase):
         """Add a new market/connector dynamically."""
@@ -208,12 +284,32 @@ class MarketsRecorder:
             # Remove from markets list
             self._markets.remove(market)
 
-    def stop(self):
+    def stop(self, stop_reason: str = "operator_stop"):
         for market in self._markets:
             for event_pair in self._event_pairs:
                 market.remove_listener(event_pair[0], event_pair[1])
         if self._market_data_collection_task is not None:
             self._market_data_collection_task.cancel()
+        # Update BotRun row with end time and stop reason
+        if self._bot_run_id:
+            try:
+                with self._sql_manager.get_new_session() as session:
+                    with session.begin():
+                        bot_run = session.query(BotRun).filter(BotRun.id == self._bot_run_id).one_or_none()
+                        if bot_run is not None:
+                            bot_run.ended_ts_ms = int(time.time() * 1e3)
+                            bot_run.stop_reason = stop_reason
+                get_structured_logger().emit("bot_run_stopped",
+                    bot_run_id=self._bot_run_id,
+                    stop_reason=stop_reason)
+            except Exception as e:
+                self.logger().warning(f"Failed to update BotRun row on stop: {e}")
+        # Close lifecycle writer
+        if self._lifecycle_writer:
+            try:
+                self._lifecycle_writer.close()
+            except Exception:
+                pass
 
     def store_or_update_executor(self, executor):
         with self._sql_manager.get_new_session() as session:
@@ -371,7 +467,9 @@ class MarketsRecorder:
         base_asset, quote_asset = evt.trading_pair.split("-")
         timestamp = int(evt.creation_timestamp * 1e3)
         event_type: MarketEvent = self.market_event_tag_map[event_tag]
+        trade_type_str = "BUY" if event_type == MarketEvent.BuyOrderCreated else "SELL"
 
+        event_data = {}
         with self._sql_manager.get_new_session() as session:
             with session.begin():
                 order_record: Order = Order(id=evt.order_id,
@@ -389,17 +487,23 @@ class MarketsRecorder:
                                             position=evt.position if evt.position else PositionAction.NIL.value,
                                             last_status=event_type.name,
                                             last_update_timestamp=timestamp,
-                                            exchange_order_id=evt.exchange_order_id)
+                                            exchange_order_id=evt.exchange_order_id,
+                                            trade_type=trade_type_str,
+                                            bot_run_id=self._bot_run_id)
                 order_status: OrderStatus = OrderStatus(order=order_record,
                                                         timestamp=timestamp,
                                                         status=event_type.name,
-                                                        received_timestamp_ms=int(time.time() * 1e3))
-                # Propagate controller/executor IDs from in-flight order
+                                                        received_timestamp_ms=int(time.time() * 1e3),
+                                                        bot_run_id=self._bot_run_id)
+                # Propagate controller/executor/level IDs from in-flight order
                 try:
                     tracked = market._order_tracker.all_orders.get(evt.order_id)
                     if tracked:
-                        order_record.controller_id = getattr(tracked, '_controller_id', None)
-                        order_record.executor_id = getattr(tracked, '_executor_id', None)
+                        order_record.controller_id = getattr(tracked, 'controller_id', None)
+                        order_record.executor_id = getattr(tracked, 'executor_id', None)
+                        order_record.level_id = getattr(tracked, 'level_id', None)
+                        order_status.level_id = getattr(tracked, 'level_id', None)
+                        order_status.exchange_order_id = evt.exchange_order_id
                 except Exception:
                     pass
 
@@ -408,19 +512,47 @@ class MarketsRecorder:
                 market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
                 self.save_market_states(self._config_file_path, market, session=session)
 
-                try:
-                    get_structured_logger().emit("order_created",
-                        order_id=evt.order_id,
-                        exchange_order_id=getattr(evt, 'exchange_order_id', None),
-                        trading_pair=evt.trading_pair,
-                        order_type=evt.type.name,
-                        trade_type=evt.trade_type.name if hasattr(evt, 'trade_type') else None,
-                        price=str(evt.price), amount=str(evt.amount),
-                        connector=market.display_name,
-                        controller_id=order_record.controller_id,
-                        executor_id=order_record.executor_id)
-                except Exception:
-                    pass
+                event_data = {
+                    "order_id": evt.order_id,
+                    "exchange_order_id": getattr(evt, 'exchange_order_id', None),
+                    "trading_pair": evt.trading_pair,
+                    "order_type": evt.type.name,
+                    "trade_type": trade_type_str,
+                    "price": str(evt.price),
+                    "amount": str(evt.amount),
+                    "connector": market.display_name,
+                    "controller_id": order_record.controller_id,
+                    "executor_id": order_record.executor_id,
+                    "level_id": order_record.level_id,
+                }
+        # Emit structured event AFTER commit
+        try:
+            get_structured_logger().emit("order_created", **event_data)
+        except Exception:
+            pass
+        # Emit lifecycle event
+        if self._lifecycle_writer:
+            try:
+                qc = self._get_quote_context(market, evt.trading_pair)
+                lc_event = LifecycleEvent(
+                    event_type="submit_acked",
+                    connector=market.display_name,
+                    trading_pair=evt.trading_pair,
+                    client_order_id=evt.order_id,
+                    exchange_order_id=getattr(evt, 'exchange_order_id', None),
+                    trade_type=trade_type_str,
+                    order_type=evt.type.name,
+                    price=str(evt.price),
+                    amount=str(evt.amount),
+                    position_action=evt.position if evt.position else None,
+                    controller_id=event_data.get("controller_id"),
+                    executor_id=event_data.get("executor_id"),
+                    level_id=event_data.get("level_id"),
+                    **qc,
+                )
+                self._lifecycle_writer.write(lc_event)
+            except Exception:
+                pass
 
     def _did_fill_order(self,
                         event_tag: int,
@@ -435,6 +567,7 @@ class MarketsRecorder:
         event_type: MarketEvent = self.market_event_tag_map[event_tag]
         order_id: str = evt.order_id
 
+        event_data = {}
         with self._sql_manager.get_new_session() as session:
             with session.begin():
                 # Try to find the order record, and update it if necessary.
@@ -447,7 +580,8 @@ class MarketsRecorder:
                 # possible for fill event to come in before the order created event for market orders.
                 order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                         timestamp=timestamp,
-                                                        status=event_type.name)
+                                                        status=event_type.name,
+                                                        bot_run_id=self._bot_run_id)
                 try:
                     fee_in_quote = evt.trade_fee.fee_amount_in_token(
                         trading_pair=evt.trading_pair,
@@ -477,6 +611,8 @@ class MarketsRecorder:
                     trade_fee_in_quote=fee_in_quote,
                     exchange_trade_id=evt.exchange_trade_id,
                     position=evt.position if evt.position else PositionAction.NIL.value,
+                    exchange_order_id=getattr(evt, 'exchange_order_id', None),
+                    bot_run_id=self._bot_run_id,
                 )
                 # Enrich with provenance data from the in-flight order tracker
                 try:
@@ -486,15 +622,21 @@ class MarketsRecorder:
                     if tracked_order is not None:
                         trade_update = tracked_order.order_fills.get(evt.exchange_trade_id)
                         if trade_update is not None:
-                            trade_fill_record.exchange_timestamp_ms = int(trade_update.fill_timestamp * 1e3)
-                            trade_fill_record.received_timestamp_ms = int(time.time() * 1e3)
+                            trade_fill_record.exchange_timestamp_ms = getattr(trade_update, 'received_timestamp_ms', None) or int(trade_update.fill_timestamp * 1e3)
+                            trade_fill_record.received_timestamp_ms = getattr(trade_update, 'received_timestamp_ms', None) or int(time.time() * 1e3)
                             trade_fill_record.liquidity_role = "taker" if trade_update.is_taker else "maker"
-                        if hasattr(tracked_order, '_fill_sources'):
-                            trade_fill_record.source_channel = tracked_order._fill_sources.get(
+                        # Prefer source_channel from TradeUpdate if available, else fall back to fill_sources
+                        if trade_update is not None and getattr(trade_update, 'source_channel', None):
+                            trade_fill_record.source_channel = trade_update.source_channel
+                        else:
+                            trade_fill_record.source_channel = tracked_order.fill_sources.get(
                                 evt.exchange_trade_id, "unknown")
-                        # Propagate controller/executor IDs
-                        trade_fill_record.controller_id = getattr(tracked_order, '_controller_id', None)
-                        trade_fill_record.executor_id = getattr(tracked_order, '_executor_id', None)
+                        # Propagate controller/executor/level IDs
+                        trade_fill_record.controller_id = tracked_order.controller_id
+                        trade_fill_record.executor_id = tracked_order.executor_id
+                        trade_fill_record.level_id = getattr(tracked_order, 'level_id', None)
+                        order_status.level_id = getattr(tracked_order, 'level_id', None)
+                        order_status.exchange_order_id = getattr(evt, 'exchange_order_id', None)
                 except Exception:
                     pass  # Never let provenance enrichment break fill recording
 
@@ -509,22 +651,67 @@ class MarketsRecorder:
                                                                                    trade_fill_record.exchange_trade_id,
                                                                                    trade_fill_record.symbol)})
 
+                event_data = {
+                    "order_id": order_id,
+                    "exchange_trade_id": evt.exchange_trade_id,
+                    "trading_pair": evt.trading_pair,
+                    "trade_type": evt.trade_type.name,
+                    "order_type": evt.order_type.name,
+                    "price": str(evt.price),
+                    "amount": str(evt.amount),
+                    "exchange_order_id": trade_fill_record.exchange_order_id,
+                    "exchange_timestamp_ms": trade_fill_record.exchange_timestamp_ms,
+                    "received_timestamp_ms": trade_fill_record.received_timestamp_ms,
+                    "liquidity_role": trade_fill_record.liquidity_role,
+                    "source_channel": trade_fill_record.source_channel,
+                    "controller_id": trade_fill_record.controller_id,
+                    "executor_id": trade_fill_record.executor_id,
+                    "connector": market.display_name,
+                    "fee_json": evt.trade_fee.to_json(),
+                }
+        # Emit structured event AFTER commit
+        try:
+            get_structured_logger().emit("trade_fill_persisted", **event_data)
+        except Exception:
+            pass
+        # Emit lifecycle event for fill
+        if self._lifecycle_writer:
+            try:
+                # Get tracked_order for cum_fill_qty
+                _tracked = None
                 try:
-                    get_structured_logger().emit("trade_fill_persisted",
-                        order_id=order_id, exchange_trade_id=evt.exchange_trade_id,
-                        trading_pair=evt.trading_pair, trade_type=evt.trade_type.name,
-                        order_type=evt.order_type.name,
-                        price=str(evt.price), amount=str(evt.amount),
-                        exchange_timestamp_ms=trade_fill_record.exchange_timestamp_ms,
-                        received_timestamp_ms=trade_fill_record.received_timestamp_ms,
-                        liquidity_role=trade_fill_record.liquidity_role,
-                        source_channel=trade_fill_record.source_channel,
-                        controller_id=trade_fill_record.controller_id,
-                        executor_id=trade_fill_record.executor_id,
-                        connector=market.display_name,
-                        fee_json=evt.trade_fee.to_json())
+                    _tracked = market._order_tracker.all_orders.get(order_id)
+                    if _tracked is None:
+                        _tracked = market._order_tracker._lost_orders.get(order_id)
                 except Exception:
                     pass
+                qc = self._get_quote_context(market, evt.trading_pair)
+                lc_event = LifecycleEvent(
+                    event_type="fill",
+                    connector=market.display_name,
+                    trading_pair=evt.trading_pair,
+                    client_order_id=order_id,
+                    exchange_order_id=event_data.get("exchange_order_id"),
+                    exchange_trade_id=evt.exchange_trade_id,
+                    trade_type=evt.trade_type.name,
+                    order_type=evt.order_type.name,
+                    price=str(evt.price),
+                    amount=str(evt.amount),
+                    cum_fill_qty=str(_tracked.executed_amount_base) if _tracked else None,
+                    fee_json=evt.trade_fee.to_json(),
+                    fee_in_quote=str(event_data.get("fee_in_quote")) if event_data.get("fee_in_quote") else None,
+                    liquidity_role=event_data.get("liquidity_role"),
+                    source_channel=event_data.get("source_channel"),
+                    exchange_ts_ms=event_data.get("exchange_timestamp_ms"),
+                    received_ts_ms=event_data.get("received_timestamp_ms"),
+                    controller_id=event_data.get("controller_id"),
+                    executor_id=event_data.get("executor_id"),
+                    level_id=event_data.get("level_id") if "level_id" in event_data else None,
+                    **qc,
+                )
+                self._lifecycle_writer.write(lc_event)
+            except Exception:
+                pass
 
     def _did_complete_funding_payment(self,
                                       event_tag: int,
@@ -604,9 +791,38 @@ class MarketsRecorder:
                     order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                             timestamp=timestamp,
                                                             status=event_type.name,
-                                                            received_timestamp_ms=int(time.time() * 1e3))
+                                                            received_timestamp_ms=int(time.time() * 1e3),
+                                                            bot_run_id=self._bot_run_id)
+                    # Enrich with tracked order data if available
+                    try:
+                        tracked = market._order_tracker.all_orders.get(order_id)
+                        if tracked is None:
+                            tracked = market._order_tracker._lost_orders.get(order_id)
+                        if tracked is not None:
+                            order_status.exchange_order_id = tracked.exchange_order_id
+                            order_status.level_id = getattr(tracked, 'level_id', None)
+                    except Exception:
+                        pass
                     session.add(order_status)
                     self.save_market_states(self._config_file_path, market, session=session)
+                    # Emit lifecycle event
+                    if self._lifecycle_writer:
+                        try:
+                            lc_type = self._LIFECYCLE_EVENT_MAP.get(event_type, event_type.name)
+                            lc_event = LifecycleEvent(
+                                event_type=lc_type,
+                                connector=market.display_name,
+                                trading_pair=order_record.symbol,
+                                client_order_id=order_id,
+                                exchange_order_id=order_record.exchange_order_id,
+                                trade_type=order_record.trade_type,
+                                controller_id=order_record.controller_id,
+                                executor_id=order_record.executor_id,
+                                level_id=getattr(order_record, 'level_id', None),
+                            )
+                            self._lifecycle_writer.write(lc_event)
+                        except Exception:
+                            pass
 
     def _did_cancel_order(self,
                           event_tag: int,

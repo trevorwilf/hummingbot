@@ -22,6 +22,9 @@ class OrderStatus(HummingbotBase):
     exchange_timestamp_ms = Column(BigInteger, nullable=True)    # Exchange-reported event time (ms)
     received_timestamp_ms = Column(BigInteger, nullable=True)    # Bot receive time (ms)
     source_channel = Column(Text, nullable=True)                 # "ws" | "rest_poll" | "rest_status_update"
+    bot_run_id = Column(Text, nullable=True)                     # BotRun session ID
+    exchange_order_id = Column(Text, nullable=True)              # Exchange-assigned order ID
+    level_id = Column(Text, nullable=True)                       # Level/grid level ID
 
     order = relationship("Order", back_populates="status")
 

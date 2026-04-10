@@ -69,8 +69,11 @@ class TestStructuredEventLoggerEmit(unittest.TestCase):
         ev = events[0]
         self.assertIn("timestamp_ms", ev)
         self.assertIn("event_version", ev)
+        self.assertIn("event_id", ev)
+        self.assertIn("schema_name", ev)
         self.assertIn("session_id", ev)
         self.assertEqual(ev["event_version"], 1)
+        self.assertEqual(ev["schema_name"], "structured_v1")
         self.assertIsInstance(ev["timestamp_ms"], int)
 
     def test_emit_never_raises_with_bad_payload(self):
@@ -85,6 +88,24 @@ class TestStructuredEventLoggerEmit(unittest.TestCase):
             h.flush()
         events = self._read_events()
         self.assertEqual(len(events), 5)
+
+    def test_no_dual_write_exactly_10_events(self):
+        """Fix 1.1 verification: emit 10 events, read back JSONL, assert every line
+        parses as valid JSON and line count == 10 exactly (no dual-write)."""
+        for i in range(10):
+            self.logger.emit("dual_write_test", index=i)
+        for h in self.logger._logger.handlers:
+            h.flush()
+        path = os.path.join(self.tmpdir, "structured_events.jsonl")
+        with open(path, "r") as f:
+            lines = [line for line in f if line.strip()]
+        self.assertEqual(len(lines), 10, f"Expected exactly 10 lines, got {len(lines)}")
+        for i, line in enumerate(lines):
+            event = json.loads(line)  # Should not raise
+            self.assertEqual(event["event_type"], "dual_write_test")
+            self.assertEqual(event["index"], i)
+            # Verify no [STRUCTURED_EVENT] prefix
+            self.assertFalse(line.strip().startswith("["), f"Line {i} has unexpected prefix: {line[:50]}")
 
     def test_concurrent_emit(self):
         """Test thread safety."""
@@ -108,6 +129,59 @@ class TestStructuredEventLoggerEmit(unittest.TestCase):
             h.flush()
         events = self._read_events()
         self.assertEqual(len(events), 40)  # 4 threads * 10 events
+
+
+class TestStructuredEventLoggerBotRunId(unittest.TestCase):
+    """Test bot_run_id inclusion in events."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        StructuredEventLogger._instance = None
+        StructuredEventLogger._initialized = False
+        self.logger = StructuredEventLogger()
+        self.logger.setup(log_dir=self.tmpdir)
+
+    def tearDown(self):
+        for h in self.logger._logger.handlers[:]:
+            h.close()
+            self.logger._logger.removeHandler(h)
+        StructuredEventLogger._instance = None
+        StructuredEventLogger._initialized = False
+
+    def _read_events(self):
+        path = os.path.join(self.tmpdir, "structured_events.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, "r") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_bot_run_id_not_present_before_set(self):
+        self.logger.emit("test_no_run_id")
+        for h in self.logger._logger.handlers:
+            h.flush()
+        events = self._read_events()
+        self.assertEqual(len(events), 1)
+        self.assertNotIn("bot_run_id", events[0])
+
+    def test_bot_run_id_present_after_set(self):
+        self.logger.set_bot_run_id("test-run-abc")
+        self.logger.emit("test_with_run_id")
+        for h in self.logger._logger.handlers:
+            h.flush()
+        events = self._read_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["bot_run_id"], "test-run-abc")
+
+    def test_all_events_include_bot_run_id(self):
+        self.logger.set_bot_run_id("run-xyz")
+        for i in range(5):
+            self.logger.emit("test_event", index=i)
+        for h in self.logger._logger.handlers:
+            h.flush()
+        events = self._read_events()
+        self.assertEqual(len(events), 5)
+        for ev in events:
+            self.assertEqual(ev["bot_run_id"], "run-xyz")
 
 
 class TestStructuredEventLoggerLazySetup(unittest.TestCase):

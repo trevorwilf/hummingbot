@@ -287,9 +287,27 @@ class ExecutorBase(RunnableBase):
         :return: The result of the order placement.
         """
         if side == TradeType.BUY:
-            return self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
+            order_id = self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
         else:
-            return self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
+            order_id = self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
+        # Tag in-flight order with controller/executor/level IDs for provenance propagation
+        try:
+            tracked = self.connectors[connector_name]._order_tracker.all_orders.get(order_id)
+            if tracked:
+                tracked.controller_id = getattr(self.config, 'controller_id', None)
+                tracked.executor_id = getattr(self.config, 'id', None)
+                tracked.level_id = getattr(self.config, 'level_id', None) or getattr(self, 'level_id', None)
+                # Get bot_run_id from MarketsRecorder singleton or structured logger
+                try:
+                    from hummingbot.connector.markets_recorder import MarketsRecorder
+                    recorder = MarketsRecorder._shared_instance
+                    if recorder:
+                        tracked.bot_run_id = recorder._bot_run_id
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return order_id
 
     def get_price(self, connector_name: str, trading_pair: str, price_type: PriceType = PriceType.MidPrice):
         """

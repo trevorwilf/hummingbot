@@ -831,7 +831,8 @@ class AbstractExchangeConnectorTests:
                 f"OrderUpdate(trading_pair='{self.trading_pair}', "
                 f"update_timestamp={self.exchange.current_timestamp}, new_state={repr(OrderState.FAILED)}, "
                 f"client_order_id='{order_id_for_invalid_order}', exchange_order_id=None, "
-                f"misc_updates={repr(misc_updates)})"
+                f"misc_updates={repr(misc_updates)}, "
+                f"exchange_timestamp_ms=None, received_timestamp_ms=None, source_channel=None)"
             )
 
             self.assertTrue(self.is_logged("INFO", expected_log))

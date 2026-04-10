@@ -29,6 +29,7 @@ class StructuredEventLogger:
             return
         self._initialized = True
         self._session_id = str(uuid.uuid4())[:8]
+        self._bot_run_id: Optional[str] = None
         self._logger = logging.getLogger("structured_events")
         self._logger.setLevel(logging.INFO)
         self._logger.propagate = False  # Don't send to root logger
@@ -54,6 +55,14 @@ class StructuredEventLogger:
             import sys
             print(f"WARNING: StructuredEventLogger setup failed: {e}", file=sys.stderr)
 
+    def set_bot_run_id(self, bot_run_id: str):
+        """Set the bot_run_id to include in every subsequent event."""
+        self._bot_run_id = bot_run_id
+
+    @property
+    def bot_run_id(self) -> Optional[str]:
+        return self._bot_run_id
+
     def emit(self, event_type: str, **payload):
         """Emit a structured event. Never raises."""
         try:
@@ -62,19 +71,16 @@ class StructuredEventLogger:
                 self.setup()
             event = {
                 "event_type": event_type,
+                "event_id": str(uuid.uuid4()),
                 "event_version": 1,
+                "schema_name": "structured_v1",
                 "session_id": self._session_id,
                 "timestamp_ms": int(time.time() * 1e3),
             }
+            if self._bot_run_id is not None:
+                event["bot_run_id"] = self._bot_run_id
             event.update(payload)
             self._logger.info(json.dumps(event, default=str, separators=(",", ":")))
-            # Also emit to forensic log for backward compat with [STRUCTURED_EVENT] pattern
-            try:
-                logging.getLogger("hummingbot.structured_events").info(
-                    f"[STRUCTURED_EVENT] {json.dumps(event, default=str)}"
-                )
-            except Exception:
-                pass
         except Exception:
             pass  # Absolutely never break the caller
 

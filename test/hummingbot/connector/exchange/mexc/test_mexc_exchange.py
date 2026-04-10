@@ -984,7 +984,7 @@ class MexcExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 f"Order {order.client_order_id} has failed. Order Update: OrderUpdate(trading_pair='{self.trading_pair}',"
                 f" update_timestamp={order_status['updateTime'] * 1e-3}, new_state={repr(OrderState.FAILED)}, "
                 f"client_order_id='{order.client_order_id}', exchange_order_id='{order.exchange_order_id}', "
-                "misc_updates=None)")
+                "misc_updates=None, exchange_timestamp_ms=None, received_timestamp_ms=None, source_channel=None)")
         )
 
     @patch("hummingbot.connector.utils.get_tracking_nonce")

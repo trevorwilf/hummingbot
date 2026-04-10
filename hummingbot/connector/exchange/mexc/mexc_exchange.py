@@ -222,6 +222,20 @@ class MexcExchange(ExchangePyBase):
                 is_auth_required=True)
             o_id = str(order_result["orderId"])
             transact_time = float(order_result["transactTime"]) * 1e-3
+            try:
+                from hummingbot.logger.structured_event_logger import get_structured_logger
+                get_structured_logger().emit("order_submit_requested",
+                    connector="mexc",
+                    client_order_id=order_id,
+                    trading_pair=trading_pair,
+                    trade_type=trade_type.name,
+                    order_type=order_type.name,
+                    price=str(price),
+                    amount=str(amount),
+                    exchange_order_id=o_id,
+                )
+            except Exception:
+                pass
         except IOError as e:
             error_description = str(e)
             is_server_overloaded = ("status is 503" in error_description
@@ -239,6 +253,16 @@ class MexcExchange(ExchangePyBase):
             "symbol": symbol,
             "origClientOrderId": order_id,
         }
+        try:
+            from hummingbot.logger.structured_event_logger import get_structured_logger
+            get_structured_logger().emit("order_cancel_requested",
+                connector="mexc",
+                client_order_id=order_id,
+                trading_pair=tracked_order.trading_pair,
+                exchange_order_id=tracked_order.exchange_order_id,
+            )
+        except Exception:
+            pass
         cancel_result = await self._api_delete(
             path_url=CONSTANTS.ORDER_PATH_URL,
             params=api_params,
@@ -381,6 +405,8 @@ class MexcExchange(ExchangePyBase):
             fill_price=Decimal(order_fill["price"]),
             fill_timestamp=float(order_fill["time"]) * 1e-3,
             is_taker=not order_fill.get("isMaker", True),  # isMaker=True -> is_taker=False
+            received_timestamp_ms=int(time.time() * 1e3),
+            source_channel="ws",
         )
         return trade_update
 
@@ -398,9 +424,7 @@ class MexcExchange(ExchangePyBase):
                 order=tracked_order)
             self._order_tracker.process_trade_update(trade_update)
             # Tag fill source for provenance tracking
-            if not hasattr(tracked_order, '_fill_sources'):
-                tracked_order._fill_sources = {}
-            tracked_order._fill_sources[str(trade["tradeId"])] = "ws"
+            tracked_order.fill_sources[str(trade["tradeId"])] = "ws"
             try:
                 from hummingbot.logger.structured_event_logger import get_structured_logger
                 _sel = get_structured_logger()
@@ -532,12 +556,12 @@ class MexcExchange(ExchangePyBase):
                             fill_price=Decimal(trade["price"]),
                             fill_timestamp=float(trade["time"]) * 1e-3,
                             is_taker=not trade.get("isMaker", True),
+                            received_timestamp_ms=int(time.time() * 1e3),
+                            source_channel="rest_poll",
                         )
                         self._order_tracker.process_trade_update(trade_update)
                         # Tag fill source for provenance tracking
-                        if not hasattr(tracked_order, '_fill_sources'):
-                            tracked_order._fill_sources = {}
-                        tracked_order._fill_sources[str(trade["id"])] = "rest_poll"
+                        tracked_order.fill_sources[str(trade["id"])] = "rest_poll"
                     elif self.is_confirmed_new_order_filled_event(str(trade["id"]), exchange_order_id, trading_pair):
                         # This is a fill of an order registered in the DB but not tracked any more
                         self._current_trade_fills.add(TradeFillOrderDetails(
@@ -608,6 +632,8 @@ class MexcExchange(ExchangePyBase):
                     fill_price=Decimal(trade["price"]),
                     fill_timestamp=float(trade["time"]) * 1e-3,
                     is_taker=not trade.get("isMaker", True),
+                    received_timestamp_ms=int(time.time() * 1e3),
+                    source_channel="rest_poll",
                 )
                 trade_updates.append(trade_update)
 

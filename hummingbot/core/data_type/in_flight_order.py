@@ -5,7 +5,7 @@ import math
 import typing
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from async_timeout import timeout
 
@@ -43,6 +43,9 @@ class OrderUpdate(NamedTuple):
     client_order_id: Optional[str] = None
     exchange_order_id: Optional[str] = None
     misc_updates: Optional[Dict[str, Any]] = None
+    exchange_timestamp_ms: Optional[int] = None
+    received_timestamp_ms: Optional[int] = None
+    source_channel: Optional[str] = None
 
 
 class TradeUpdate(NamedTuple):
@@ -56,6 +59,8 @@ class TradeUpdate(NamedTuple):
     fill_quote_amount: Decimal
     fee: TradeFeeBase
     is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
+    received_timestamp_ms: Optional[int] = None
+    source_channel: Optional[str] = None  # "ws", "rest_poll", etc.
 
     @property
     def fee_asset(self):
@@ -73,6 +78,8 @@ class TradeUpdate(NamedTuple):
             fill_base_amount=Decimal(data["fill_base_amount"]),
             fill_quote_amount=Decimal(data["fill_quote_amount"]),
             fee=TradeFeeBase.from_json(data["fee"]),
+            received_timestamp_ms=data.get("received_timestamp_ms"),
+            source_channel=data.get("source_channel"),
         )
 
         return instance
@@ -123,6 +130,13 @@ class InFlightOrder:
         self.last_update_timestamp: float = creation_timestamp
 
         self.order_fills: Dict[str, TradeUpdate] = {}  # Dict[trade_id, TradeUpdate]
+
+        # Provenance fields for executor lineage and fill source tracking
+        self.controller_id: Optional[str] = None
+        self.executor_id: Optional[str] = None
+        self.level_id: Optional[str] = None
+        self.bot_run_id: Optional[str] = None
+        self.fill_sources: Dict[str, str] = {}  # {trade_id: "ws"|"rest_poll"|...}
 
         self.exchange_order_id_update_event = asyncio.Event()
         if self.exchange_order_id:
@@ -248,6 +262,11 @@ class InFlightOrder:
                                   for key, value
                                   in data.get("order_fills", {}).items()})
         order.last_update_timestamp = data.get("last_update_timestamp", order.creation_timestamp)
+        order.controller_id = data.get("controller_id")
+        order.executor_id = data.get("executor_id")
+        order.level_id = data.get("level_id")
+        order.bot_run_id = data.get("bot_run_id")
+        order.fill_sources = data.get("fill_sources", {})
 
         order.check_filled_condition()
         order.check_processed_by_exchange_condition()
@@ -277,6 +296,11 @@ class InFlightOrder:
             "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()},
             "cumulative_fee_paid_base": float(self.cumulative_fee_paid(self.base_asset)),
             "cumulative_fee_paid_quote": float(self.cumulative_fee_paid(self.quote_asset)),
+            "controller_id": self.controller_id,
+            "executor_id": self.executor_id,
+            "level_id": self.level_id,
+            "bot_run_id": self.bot_run_id,
+            "fill_sources": self.fill_sources,
         }
 
     def to_limit_order(self) -> LimitOrder:

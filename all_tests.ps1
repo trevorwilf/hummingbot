@@ -346,6 +346,37 @@ Run-Test "Connector: test_budget_checker.py" `
     "$PYTEST_V test/hummingbot/connector/test_budget_checker.py"
 
 # ═════════════════════════════════════════════════════════════════════════════
+# SECTION 10b: PROVENANCE & LIFECYCLE TESTS
+# ═════════════════════════════════════════════════════════════════════════════
+Write-Host ""
+Write-Host "  SECTION 10b: PROVENANCE & LIFECYCLE TESTS" -ForegroundColor Magenta
+Write-Host ""
+
+Run-Test "Logger: test_structured_event_logger.py" `
+    "$PYTEST_V test/hummingbot/logger/test_structured_event_logger.py"
+
+Run-Test "Model: test_provenance_columns.py" `
+    "$PYTEST_V test/hummingbot/model/test_provenance_columns.py"
+
+Run-Test "Model: test_bot_run.py" `
+    "$PYTEST_V test/hummingbot/model/test_bot_run.py"
+
+Run-Test "Model: test_order_lifecycle_event.py" `
+    "$PYTEST_V test/hummingbot/model/test_order_lifecycle_event.py"
+
+Run-Test "Persistence: test_lifecycle_event.py" `
+    "$PYTEST_V test/hummingbot/persistence/test_lifecycle_event.py"
+
+Run-Test "Persistence: test_lifecycle_writer.py" `
+    "$PYTEST_V test/hummingbot/persistence/test_lifecycle_writer.py"
+
+Run-Test "Connector: test_markets_recorder_provenance.py" `
+    "$PYTEST_V test/hummingbot/connector/test_markets_recorder_provenance.py"
+
+Run-Test "Connector: test_id_propagation.py" `
+    "$PYTEST_V test/hummingbot/connector/test_id_propagation.py"
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SECTION 11: CORE INFRASTRUCTURE TESTS
 # ═════════════════════════════════════════════════════════════════════════════
 Write-Host ""

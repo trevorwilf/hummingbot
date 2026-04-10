@@ -384,6 +384,20 @@ class NonkycExchange(ExchangePyBase):
                 )
             self._log_order_lifecycle(order_id, "PLACED",
                 f"{trade_type.name} {amount} {trading_pair} @ {price} -> exch_id={o_id}")
+            try:
+                from hummingbot.logger.structured_event_logger import get_structured_logger
+                get_structured_logger().emit("order_submit_requested",
+                    connector="nonkyc",
+                    client_order_id=order_id,
+                    trading_pair=trading_pair,
+                    trade_type=trade_type.name,
+                    order_type=order_type.name,
+                    price=str(price),
+                    amount=str(amount),
+                    exchange_order_id=o_id,
+                )
+            except Exception:
+                pass
         except IOError as e:
             t_elapsed = (time.monotonic() - t_start) * 1000
             self._record_api_latency("createorder", t_elapsed)
@@ -506,6 +520,21 @@ class NonkycExchange(ExchangePyBase):
             classification = "Other"
 
         self._log_order_lifecycle(order_id, "REJECTED", f"{classification}: {str(exception)[:150]}")
+        try:
+            from hummingbot.logger.structured_event_logger import get_structured_logger
+            get_structured_logger().emit("order_submit_rejected",
+                connector="nonkyc",
+                client_order_id=order_id,
+                trading_pair=trading_pair,
+                trade_type=trade_type.name,
+                order_type=order_type.name,
+                price=str(price) if price else None,
+                amount=str(amount),
+                error_classification=classification,
+                error_message=str(exception)[:200],
+            )
+        except Exception:
+            pass
 
         super()._on_order_failure(
             order_id=order_id, trading_pair=trading_pair, amount=amount,
@@ -559,6 +588,16 @@ class NonkycExchange(ExchangePyBase):
             "id": cancel_id,
         }
         self._log_order_lifecycle(order_id, "CANCEL_SENT", f"exch_id={cancel_id}")
+        try:
+            from hummingbot.logger.structured_event_logger import get_structured_logger
+            get_structured_logger().emit("order_cancel_requested",
+                connector="nonkyc",
+                client_order_id=order_id,
+                trading_pair=tracked_order.trading_pair,
+                exchange_order_id=str(cancel_id),
+            )
+        except Exception:
+            pass
         t_start = time.monotonic()
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
@@ -1067,12 +1106,12 @@ class NonkycExchange(ExchangePyBase):
                                 fill_quote_amount=Decimal(message_params["tradeQuantity"]) * Decimal(message_params["tradePrice"]),
                                 fill_price=Decimal(message_params["tradePrice"]),
                                 fill_timestamp=message_params["updatedAt"] * 1e-3,
+                                received_timestamp_ms=int(time.time() * 1e3),
+                                source_channel="ws",
                             )
                             self._order_tracker.process_trade_update(trade_update)
                             # Tag fill source for provenance tracking
-                            if not hasattr(tracked_order, '_fill_sources'):
-                                tracked_order._fill_sources = {}
-                            tracked_order._fill_sources[str(message_params["tradeId"])] = "ws"
+                            tracked_order.fill_sources[str(message_params["tradeId"])] = "ws"
                             try:
                                 from hummingbot.logger.structured_event_logger import get_structured_logger
                                 _sel = get_structured_logger()
@@ -1288,12 +1327,12 @@ class NonkycExchange(ExchangePyBase):
                             fill_price=Decimal(trade["price"]),
                             fill_timestamp=trade["timestamp"] * 1e-3,
                             is_taker=_is_taker,
+                            received_timestamp_ms=int(time.time() * 1e3),
+                            source_channel="rest_poll",
                         )
                         self._order_tracker.process_trade_update(trade_update)
                         # Tag fill source for provenance tracking
-                        if not hasattr(tracked_order, '_fill_sources'):
-                            tracked_order._fill_sources = {}
-                        tracked_order._fill_sources[str(trade["id"])] = "rest_poll"
+                        tracked_order.fill_sources[str(trade["id"])] = "rest_poll"
                     elif self.is_confirmed_new_order_filled_event(str(trade["id"]), exchange_order_id, trading_pair):
                         # This is a fill of an order registered in the DB but not tracked any more
                         self._current_trade_fills.add(TradeFillOrderDetails(
@@ -1371,6 +1410,8 @@ class NonkycExchange(ExchangePyBase):
                     fill_price=Decimal(trade["price"]),
                     fill_timestamp=trade["timestamp"] * 1e-3,
                     is_taker=_is_taker,
+                    received_timestamp_ms=int(time.time() * 1e3),
+                    source_channel="rest_poll",
                 )
                 trade_updates.append(trade_update)
 

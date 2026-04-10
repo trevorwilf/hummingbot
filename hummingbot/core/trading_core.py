@@ -4,6 +4,7 @@ import inspect
 import logging
 import sys
 import time
+import uuid
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -348,12 +349,14 @@ class TradingCore:
             self.client_config_map, db_name
         )
 
+        self._bot_run_id = str(uuid.uuid4())
         self.markets_recorder = MarketsRecorder(
             self.trade_fill_db,
             list(self.connector_manager.connectors.values()),
             self._strategy_file_name or db_name,
             self.strategy_name or db_name,
-            self.client_config_map.market_data_collection
+            self.client_config_map.market_data_collection,
+            bot_run_id=self._bot_run_id,
         )
 
         self.markets_recorder.start()

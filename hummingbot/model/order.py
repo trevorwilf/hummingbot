@@ -37,8 +37,11 @@ class Order(HummingbotBase):
     position = Column(Text, nullable=True)
 
     # Provenance columns — all nullable, no default (additive, backward-compatible)
+    trade_type = Column(Text, nullable=True)
     controller_id = Column(Text, nullable=True)
     executor_id = Column(Text, nullable=True)
+    bot_run_id = Column(Text, nullable=True)
+    level_id = Column(Text, nullable=True)
 
     status = relationship("OrderStatus", back_populates="order")
     trade_fills = relationship("TradeFill", back_populates="order")
@@ -51,6 +54,7 @@ class Order(HummingbotBase):
                f"price={self.price}, last_status='{self.last_status}', " \
                f"last_update_timestamp={self.last_update_timestamp}), " \
                f"exchange_order_id={self.exchange_order_id}, position={self.position}, " \
+               f"trade_type='{self.trade_type}', " \
                f"controller_id='{self.controller_id}', executor_id='{self.executor_id}'"
 
     @staticmethod

@@ -526,11 +526,6 @@ class PositionExecutor(ExecutorBase):
                 connector=self.config.connector_name, trading_pair=self.config.trading_pair,
                 side=self.config.side.name, amount=str(self.config.amount),
                 order_id=order_id)
-            # Tag in-flight order with controller/executor IDs for provenance propagation
-            tracked = self.connectors[self.config.connector_name]._order_tracker.all_orders.get(order_id)
-            if tracked:
-                tracked._controller_id = self.config.controller_id
-                tracked._executor_id = self.config.id
         except Exception:
             pass
 
@@ -652,11 +647,6 @@ class PositionExecutor(ExecutorBase):
                     controller_id=self.config.controller_id, executor_id=self.config.id,
                     order_id=order_id, close_type=self.close_type.name if self.close_type else None,
                     amount=str(close_amount), price=str(order_price))
-                # Tag in-flight order for provenance
-                tracked = self.connectors[self.config.connector_name]._order_tracker.all_orders.get(order_id)
-                if tracked:
-                    tracked._controller_id = self.config.controller_id
-                    tracked._executor_id = self.config.id
             except Exception:
                 pass
         elif close_amount > 0 and self.close_type != CloseType.POSITION_HOLD:
@@ -866,11 +856,6 @@ class PositionExecutor(ExecutorBase):
                 controller_id=self.config.controller_id, executor_id=self.config.id,
                 order_id=order_id, amount=str(amount),
                 take_profit_price=str(self.take_profit_price))
-            # Tag in-flight order for provenance
-            tracked = self.connectors[self.config.connector_name]._order_tracker.all_orders.get(order_id)
-            if tracked:
-                tracked._controller_id = self.config.controller_id
-                tracked._executor_id = self.config.id
         except Exception:
             pass
 

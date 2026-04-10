@@ -21,8 +21,17 @@ MIGRATIONS = [
     ("OrderStatus", "exchange_timestamp_ms", "BIGINT"),
     ("OrderStatus", "received_timestamp_ms", "BIGINT"),
     ("OrderStatus", "source_channel", "TEXT"),
+    ("Order", "trade_type", "TEXT"),
     ("Order", "controller_id", "TEXT"),
     ("Order", "executor_id", "TEXT"),
+    ("TradeFill", "exchange_order_id", "TEXT"),
+    ("Order", "bot_run_id", "TEXT"),
+    ("Order", "level_id", "TEXT"),
+    ("TradeFill", "bot_run_id", "TEXT"),
+    ("TradeFill", "level_id", "TEXT"),
+    ("OrderStatus", "bot_run_id", "TEXT"),
+    ("OrderStatus", "exchange_order_id", "TEXT"),
+    ("OrderStatus", "level_id", "TEXT"),
 ]
 
 

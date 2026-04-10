@@ -18,19 +18,22 @@ class TestProvenanceColumnsExist(unittest.TestCase):
 
     def test_trade_fill_has_provenance_columns(self):
         col_names = {c.name for c in TradeFill.__table__.columns}
-        for expected in ("exchange_timestamp_ms", "received_timestamp_ms",
+        for expected in ("exchange_order_id", "exchange_timestamp_ms", "received_timestamp_ms",
                          "source_channel", "liquidity_role",
-                         "controller_id", "executor_id"):
+                         "controller_id", "executor_id",
+                         "bot_run_id", "level_id"):
             self.assertIn(expected, col_names)
 
     def test_order_status_has_provenance_columns(self):
         col_names = {c.name for c in OrderStatus.__table__.columns}
-        for expected in ("exchange_timestamp_ms", "received_timestamp_ms", "source_channel"):
+        for expected in ("exchange_timestamp_ms", "received_timestamp_ms", "source_channel",
+                         "bot_run_id", "exchange_order_id", "level_id"):
             self.assertIn(expected, col_names)
 
     def test_order_has_provenance_columns(self):
         col_names = {c.name for c in Order.__table__.columns}
-        for expected in ("controller_id", "executor_id"):
+        for expected in ("trade_type", "controller_id", "executor_id",
+                         "bot_run_id", "level_id"):
             self.assertIn(expected, col_names)
 
     def test_trade_fill_provenance_columns_are_nullable(self):
@@ -46,17 +49,19 @@ class TestProvenanceColumnsInMethods(unittest.TestCase):
 
     def test_attribute_names_for_file_export(self):
         attrs = TradeFill.attribute_names_for_file_export()
-        for expected in ("exchange_timestamp_ms", "received_timestamp_ms",
+        for expected in ("exchange_order_id", "exchange_timestamp_ms", "received_timestamp_ms",
                          "source_channel", "liquidity_role",
-                         "controller_id", "executor_id"):
+                         "controller_id", "executor_id",
+                         "bot_run_id", "level_id"):
             self.assertIn(expected, attrs)
 
     def test_to_pandas_columns(self):
         # to_pandas with empty list should return a DataFrame with the right columns
         df = TradeFill.to_pandas([])
-        for expected in ("Exchange_Timestamp_ms", "Received_Timestamp_ms",
+        for expected in ("Exchange_Order_Id", "Exchange_Timestamp_ms", "Received_Timestamp_ms",
                          "Source_Channel", "Liquidity_Role",
-                         "Controller_Id", "Executor_Id"):
+                         "Controller_Id", "Executor_Id",
+                         "Bot_Run_Id", "Level_Id"):
             self.assertIn(expected, df.columns)
 
 
@@ -159,7 +164,10 @@ class TestMigrateProvenanceColumns(unittest.TestCase):
         self.assertIn("received_timestamp_ms", os_cols)
         self.assertIn("source_channel", os_cols)
 
+        self.assertIn("exchange_order_id", tf_cols_after)
+
         o_cols = {c["name"] for c in inspector.get_columns("Order")}
+        self.assertIn("trade_type", o_cols)
         self.assertIn("controller_id", o_cols)
         self.assertIn("executor_id", o_cols)
 

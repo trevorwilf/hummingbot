@@ -130,18 +130,65 @@ class TestIDPropagation(unittest.TestCase):
         self.assertEqual(result.executor_id, "exec_xyz")
 
     def test_tracked_order_attributes_read(self):
-        """Test that _controller_id and _executor_id can be set/read on mock order."""
-        mock_order = MagicMock()
-        mock_order._controller_id = "ctrl_test"
-        mock_order._executor_id = "exec_test"
-        self.assertEqual(getattr(mock_order, '_controller_id', None), "ctrl_test")
-        self.assertEqual(getattr(mock_order, '_executor_id', None), "exec_test")
+        """Test that controller_id and executor_id can be set/read on InFlightOrder."""
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        from hummingbot.core.data_type.common import OrderType, TradeType
+        order = InFlightOrder(
+            client_order_id="test_order",
+            trading_pair="BTC-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("0.1"),
+            creation_timestamp=time.time(),
+            price=Decimal("50000"),
+        )
+        order.controller_id = "ctrl_test"
+        order.executor_id = "exec_test"
+        self.assertEqual(order.controller_id, "ctrl_test")
+        self.assertEqual(order.executor_id, "exec_test")
 
-    def test_tracked_order_without_attributes_returns_none(self):
-        """Test backward compat when tracked order lacks the attributes."""
-        mock_order = MagicMock(spec=[])  # No attributes
-        self.assertIsNone(getattr(mock_order, '_controller_id', None))
-        self.assertIsNone(getattr(mock_order, '_executor_id', None))
+    def test_tracked_order_default_none(self):
+        """Test that InFlightOrder defaults controller_id/executor_id to None."""
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        from hummingbot.core.data_type.common import OrderType, TradeType
+        order = InFlightOrder(
+            client_order_id="test_order_2",
+            trading_pair="BTC-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("0.1"),
+            creation_timestamp=time.time(),
+            price=Decimal("50000"),
+        )
+        self.assertIsNone(order.controller_id)
+        self.assertIsNone(order.executor_id)
+        self.assertEqual(order.fill_sources, {})
+
+    def test_inflight_order_json_roundtrip_provenance(self):
+        """Test that controller_id/executor_id/fill_sources survive JSON roundtrip."""
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        from hummingbot.core.data_type.common import OrderType, TradeType
+        order = InFlightOrder(
+            client_order_id="test_rt",
+            trading_pair="BTC-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("0.1"),
+            creation_timestamp=time.time(),
+            price=Decimal("50000"),
+        )
+        order.controller_id = "ctrl_rt"
+        order.executor_id = "exec_rt"
+        order.level_id = "level_3"
+        order.bot_run_id = "run_abc"
+        order.fill_sources = {"trade_1": "ws", "trade_2": "rest_poll"}
+        json_data = order.to_json()
+        restored = InFlightOrder.from_json(json_data)
+        self.assertEqual(restored.controller_id, "ctrl_rt")
+        self.assertEqual(restored.executor_id, "exec_rt")
+        self.assertEqual(restored.level_id, "level_3")
+        self.assertEqual(restored.bot_run_id, "run_abc")
+        self.assertEqual(restored.fill_sources, {"trade_1": "ws", "trade_2": "rest_poll"})
 
 
 if __name__ == "__main__":
