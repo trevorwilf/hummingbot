@@ -376,6 +376,18 @@ Run-Test "Connector: test_markets_recorder_provenance.py" `
 Run-Test "Connector: test_id_propagation.py" `
     "$PYTEST_V test/hummingbot/connector/test_id_propagation.py"
 
+Run-Test "Persistence: test_replay_tool.py" `
+    "$PYTEST_V test/hummingbot/persistence/test_replay_tool.py"
+
+Run-Test "Connector: test_lifecycle_integration.py" `
+    "$PYTEST_V test/hummingbot/connector/test_lifecycle_integration.py"
+
+Run-Test "Connector: test_executor_lineage_comprehensive.py" `
+    "$PYTEST_V test/hummingbot/connector/test_executor_lineage_comprehensive.py"
+
+Run-Test "Logger: test_structured_event_logger_strict_jsonl.py" `
+    "$PYTEST_V test/hummingbot/logger/test_structured_event_logger_strict_jsonl.py"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 11: CORE INFRASTRUCTURE TESTS
 # ═════════════════════════════════════════════════════════════════════════════

@@ -156,6 +156,8 @@ class TestMarketsRecorderProvenanceEnrichment(unittest.TestCase):
         self.assertIsNone(result.liquidity_role)
         self.assertIsNone(result.controller_id)
         self.assertIsNone(result.executor_id)
+        self.assertIsNone(result.bot_run_id)
+        self.assertIsNone(result.level_id)
 
     def test_order_status_with_received_timestamp(self):
         """OrderStatus should accept received_timestamp_ms."""
