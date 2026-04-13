@@ -162,6 +162,9 @@ Run-Test "NonKYC: test_nonkyc_phase7b.py" `
 Run-Test "NonKYC: test_nonkyc_phase7c.py" `
     "$PYTEST_V $NONKYC/test_nonkyc_phase7c.py"
 
+Run-Test "NonKYC: test_nonkyc_phase2_connector_hardening.py" `
+    "$PYTEST_V $NONKYC/test_nonkyc_phase2_connector_hardening.py"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 3: NONKYC DATA FEED & RATE ORACLE
 # ═════════════════════════════════════════════════════════════════════════════
@@ -341,6 +344,9 @@ Run-Test "Strategy: test_pmm_dynamic.py" `
 
 Run-Test "Strategy: test_wallet_balance_seeding.py" `
     "$PYTEST_V $CONTROLLERS/test_wallet_balance_seeding.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_budget.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_budget.py"
 
 Run-Test "Connector: test_budget_checker.py" `
     "$PYTEST_V test/hummingbot/connector/test_budget_checker.py"

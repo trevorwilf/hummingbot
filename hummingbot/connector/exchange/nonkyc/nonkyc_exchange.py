@@ -81,6 +81,11 @@ class NonkycExchange(ExchangePyBase):
         self._balance_settling: bool = False
         self._balance_settle_start: float = 0.0
         self._BALANCE_SETTLE_TIMEOUT: float = 15.0
+        self._orders_reconciled_after_reconnect: bool = True
+        self._nonce_error_cooldown_until: float = 0.0
+        self._last_server_disconnect_time: float = 0.0
+        self._SERVER_DISCONNECT_BACKOFF: float = 10.0
+        self._balance_recheck_in_progress: bool = False
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.logger().info(
             "NonKYC connector supports LIMIT and MARKET order types. "
@@ -122,12 +127,81 @@ class NonkycExchange(ExchangePyBase):
 
     def _exit_balance_settling(self):
         if self._balance_settling:
+            # Wait for both balances AND active orders reconciliation
+            if not self._orders_reconciled_after_reconnect:
+                self.logger().debug("Balance settling: balances refreshed but orders not yet reconciled")
+                return
             elapsed = time.time() - self._balance_settle_start
             self._balance_settling = False
             self.logger().info(f"Balance settling: RESOLVED after {elapsed:.1f}s — order creation resumed")
             self._emit_structured_event("balance_settling_exited", {
                 "duration_s": round(elapsed, 1),
             })
+
+    async def _reconcile_active_orders_after_reconnect(self):
+        """Fetch active orders from exchange after reconnect and reconcile with tracked orders."""
+        try:
+            exchange_orders = await self._api_get(
+                path_url=CONSTANTS.ACCOUNT_ORDERS_PATH_URL,
+                params={"status": "active"},
+                is_auth_required=True,
+            )
+            if not isinstance(exchange_orders, list):
+                self.logger().warning(f"Unexpected active orders response type: {type(exchange_orders)}")
+                return
+
+            exchange_order_ids = set()
+            for eo in exchange_orders:
+                eo_id = str(eo.get("id", ""))
+                if eo_id:
+                    exchange_order_ids.add(eo_id)
+
+            tracked = self._order_tracker.active_orders
+            tracked_exchange_ids = set()
+            for o in tracked.values():
+                if o.exchange_order_id:
+                    tracked_exchange_ids.add(o.exchange_order_id)
+
+            orphans = exchange_order_ids - tracked_exchange_ids
+            missing = tracked_exchange_ids - exchange_order_ids
+
+            if orphans:
+                self.logger().warning(
+                    f"Post-reconnect reconciliation: {len(orphans)} exchange orders "
+                    f"not tracked locally (orphans): {orphans}"
+                )
+            if missing:
+                self.logger().warning(
+                    f"Post-reconnect reconciliation: {len(missing)} tracked orders "
+                    f"not found on exchange (may have filled/cancelled during disconnect): {missing}"
+                )
+                for client_id, order in tracked.items():
+                    if order.exchange_order_id in missing:
+                        try:
+                            await self._request_order_status(order)
+                        except Exception as e:
+                            self.logger().debug(f"Status check for {client_id} failed: {repr(e)}")
+
+            self._emit_structured_event("post_reconnect_order_reconciliation", {
+                "exchange_active": len(exchange_order_ids),
+                "tracked_active": len(tracked_exchange_ids),
+                "orphans": len(orphans),
+                "missing_from_exchange": len(missing),
+            })
+        except Exception as e:
+            self.logger().warning(f"Post-reconnect order reconciliation failed: {repr(e)}")
+        finally:
+            self._orders_reconciled_after_reconnect = True
+            # Now try to exit balance settling (balances may already be refreshed)
+            self._exit_balance_settling()
+
+    def _on_nonce_error_detected(self):
+        """Set a short cooldown on private REST requests after nonce error."""
+        self._nonce_error_cooldown_until = time.time() + 2.0
+        self.logger().warning("Nonce error detected — private REST cooldown for 2s")
+        self._emit_structured_event("nonce_error_cooldown_started", {
+            "cooldown_s": 2.0,
+        })
 
     def _emit_structured_event(self, event_type: str, payload: dict):
         """Emit a structured JSON event to the forensic log and JSONL ledger."""
@@ -274,6 +348,8 @@ class NonkycExchange(ExchangePyBase):
             "time",
             "clock",
         ])
+        if is_time_related:
+            self._on_nonce_error_detected()
         return is_time_related
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
@@ -419,6 +495,22 @@ class NonkycExchange(ExchangePyBase):
         value immediately. The WS balanceUpdate overwrites with the real exchange
         value when it arrives.
         """
+        # Nonce cooldown gate
+        if time.time() < self._nonce_error_cooldown_until:
+            remaining = self._nonce_error_cooldown_until - time.time()
+            self.logger().debug(f"Nonce cooldown: waiting {remaining:.1f}s before order placement")
+            await asyncio.sleep(remaining)
+        # Server disconnect backoff
+        server_disconnect_age = time.time() - self._last_server_disconnect_time
+        if server_disconnect_age < self._SERVER_DISCONNECT_BACKOFF:
+            remaining = self._SERVER_DISCONNECT_BACKOFF - server_disconnect_age
+            self.logger().info(
+                f"Order creation deferred: server disconnect {server_disconnect_age:.1f}s ago, "
+                f"backing off for {remaining:.1f}s more"
+            )
+            raise Exception(
+                f"Order creation backed off: ServerDisconnectedError {server_disconnect_age:.1f}s ago"
+            )
         if self._balance_settling:
             elapsed = time.time() - self._balance_settle_start
             if elapsed > self._BALANCE_SETTLE_TIMEOUT:
@@ -506,7 +598,11 @@ class NonkycExchange(ExchangePyBase):
     ):
         # Classify and count for error summary
         error_str = str(exception).lower()
-        if "insufficient" in error_str or "20001" in str(exception):
+        if "serverdisconnectederror" in error_str or "server disconnected" in error_str:
+            self._last_server_disconnect_time = time.time()
+            self._increment_error("rest_5xx")
+            classification = "Server disconnected"
+        elif "insufficient" in error_str or "20001" in str(exception):
             self._increment_error("order_reject_insufficient")
             classification = "Insufficient funds"
         elif any(t in error_str for t in ("500", "502", "503", "504", "server error")):
@@ -598,11 +694,26 @@ class NonkycExchange(ExchangePyBase):
             )
         except Exception:
             pass
+        CANCEL_REQUEST_TIMEOUT = 15.0
         t_start = time.monotonic()
-        cancel_result = await self._api_post(
-            path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
-            data=api_params,
-            is_auth_required=True)
+        try:
+            async with asyncio.timeout(CANCEL_REQUEST_TIMEOUT):
+                cancel_result = await self._api_post(
+                    path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
+                    data=api_params,
+                    is_auth_required=True)
+        except asyncio.TimeoutError:
+            t_elapsed = (time.monotonic() - t_start) * 1000
+            self._record_api_latency("cancelorder", t_elapsed)
+            self.logger().warning(
+                f"Cancel request timed out after {CANCEL_REQUEST_TIMEOUT}s for {order_id}. "
+                f"Will retry on next cycle."
+            )
+            self._emit_structured_event("cancel_request_timeout", {
+                "order_id": order_id,
+                "timeout_s": CANCEL_REQUEST_TIMEOUT,
+            })
+            return False
         t_elapsed = (time.monotonic() - t_start) * 1000
         self._record_api_latency("cancelorder", t_elapsed)
         self.logger().debug(
@@ -1491,6 +1602,31 @@ class NonkycExchange(ExchangePyBase):
                 "diffs": reconciliation_diffs,
                 "count": len(reconciliation_diffs),
             })
+            # Check for large balance mismatches — trigger second reconciliation pass
+            BALANCE_RECONCILIATION_THRESHOLD = Decimal("1.0")
+            large_diffs = []
+            for d in reconciliation_diffs:
+                try:
+                    delta_str = d.split("delta=")[1].split(")")[0] if "delta=" in d else "0"
+                    if abs(Decimal(delta_str)) > BALANCE_RECONCILIATION_THRESHOLD:
+                        large_diffs.append(d)
+                except Exception:
+                    pass
+            if large_diffs and not self._balance_recheck_in_progress:
+                self.logger().warning(
+                    f"Large balance mismatch detected ({len(large_diffs)} assets). "
+                    f"Scheduling second reconciliation pass."
+                )
+                self._emit_structured_event("balance_large_mismatch_detected", {
+                    "diffs": large_diffs,
+                })
+                self._balance_recheck_in_progress = True
+                try:
+                    await asyncio.sleep(2.0)
+                    await self._update_balances()
+                finally:
+                    self._balance_recheck_in_progress = False
+                return
 
         self._exit_balance_settling()
 

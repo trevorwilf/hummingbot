@@ -39,6 +39,9 @@ class TestLocalBalancePreAdjust(IsolatedAsyncioWrapperTestCase):
         exchange._balance_settling = False
         exchange._balance_settle_start = 0.0
         exchange._BALANCE_SETTLE_TIMEOUT = 15.0
+        exchange._nonce_error_cooldown_until = 0.0
+        exchange._last_server_disconnect_time = 0.0
+        exchange._SERVER_DISCONNECT_BACKOFF = 10.0
         exchange.estimate_fee_pct = MagicMock(return_value=0.0)
         exchange.logger = MagicMock(return_value=MagicMock())
 
@@ -488,6 +491,9 @@ class TestBuyPreAdjustIncludesFee(IsolatedAsyncioWrapperTestCase):
         exchange._balance_settling = False
         exchange._balance_settle_start = 0.0
         exchange._BALANCE_SETTLE_TIMEOUT = 15.0
+        exchange._nonce_error_cooldown_until = 0.0
+        exchange._last_server_disconnect_time = 0.0
+        exchange._SERVER_DISCONNECT_BACKOFF = 10.0
         exchange.logger = MagicMock(return_value=MagicMock())
         exchange.estimate_fee_pct = MagicMock(return_value=0.0)
 

@@ -165,10 +165,17 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
             # re-evaluate after reconnect
             if hasattr(self._connector, '_reset_balance_ws_state'):
                 self._connector._reset_balance_ws_state()
+            # Mark orders as not yet reconciled (prevents premature settling exit)
+            if hasattr(self._connector, '_orders_reconciled_after_reconnect'):
+                self._connector._orders_reconciled_after_reconnect = False
             # Force an immediate REST balance refresh to ensure consistency
             if hasattr(self._connector, '_update_balances'):
                 asyncio.ensure_future(self._connector._update_balances())
                 self.logger().info("Forced REST balance refresh after WS reconnect")
+            # Force active orders reconciliation after reconnect
+            if hasattr(self._connector, '_reconcile_active_orders_after_reconnect'):
+                asyncio.ensure_future(self._connector._reconcile_active_orders_after_reconnect())
+                self.logger().info("Forced active orders reconciliation after WS reconnect")
         except AttributeError:
             pass
         except Exception as e:
