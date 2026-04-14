@@ -106,6 +106,16 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": False,
         },
     )
+    claimed_base_amount: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Explicit base amount to claim from wallet on startup. "
+            "If set, this overrides claimed_base_value_quote for base-asset seeding. "
+            "Use this when you want precise control over the sell-side inventory "
+            "without quote-to-base conversion ambiguity."
+        ),
+        json_schema_extra={"is_updatable": False},
+    )
 
     # NOTE: buy_prices / sell_prices must remain defined before buy_amounts_pct / sell_amounts_pct.
     # The validators below derive default equal weights from the already-validated price lists.
@@ -354,6 +364,14 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             raise ValueError("claimed_base_value_quote cannot be greater than total_amount_quote")
         return value
 
+    @field_validator("claimed_base_amount")
+    @classmethod
+    def validate_claimed_base_amount(cls, value):
+        if value is not None:
+            if not value.is_finite() or value < Decimal("0"):
+                raise ValueError("claimed_base_amount must be a finite non-negative value")
+        return value
+
     @field_validator("min_order_quote")
     @classmethod
     def validate_min_order_quote(cls, value: Decimal):
@@ -490,6 +508,9 @@ class RangeInventoryLadderController(ControllerBase):
         self._state_loaded = False
         self._startup_logged = False
         self._cycles_seen = 0
+        self._last_drift_warning_time: float = 0.0
+        self._drift_warning_interval: float = 300.0  # warn at most every 5 minutes
+        self._last_drift_above_threshold: bool = False
         self._positions_empty_warning_emitted = False
         self._state_recovery_reason: Optional[str] = None
         self._state_recovery_backup_path: Optional[Path] = None
@@ -993,15 +1014,19 @@ class RangeInventoryLadderController(ControllerBase):
 
         managed_quote_claim = min(available_quote_balance, Decimal(self.config.total_amount_quote))
         claimed_base_amount = Decimal("0")
-        if (
-            self.config.use_wallet_balance
-            and self.config.claimed_base_value_quote > Decimal("0")
-            and reference_price > Decimal("0")
-        ):
-            claimed_base_amount = min(
-                available_base_balance,
-                Decimal(self.config.claimed_base_value_quote) / reference_price,
-            )
+        claim_source = "none"
+        if self.config.use_wallet_balance:
+            if self.config.claimed_base_amount is not None and self.config.claimed_base_amount > Decimal("0"):
+                # Explicit base amount claim -- no quote-to-base conversion needed
+                claimed_base_amount = min(available_base_balance, self.config.claimed_base_amount)
+                claim_source = "claimed_base_amount"
+            elif self.config.claimed_base_value_quote > Decimal("0") and reference_price > Decimal("0"):
+                # Legacy: convert quote value to base using startup reference price
+                claimed_base_amount = min(
+                    available_base_balance,
+                    Decimal(self.config.claimed_base_value_quote) / reference_price,
+                )
+                claim_source = "claimed_base_value_quote"
 
         self._state = {
             "schema_version": self.STATE_SCHEMA_VERSION,
@@ -1055,7 +1080,8 @@ class RangeInventoryLadderController(ControllerBase):
 
         self.logger().info(
             f"Initialized {self.config.id}: managed_quote={managed_quote_claim} {quote_asset}, "
-            f"claimed_base={claimed_base_amount} {base_asset}, reference_price={reference_price}"
+            f"claimed_base={claimed_base_amount} {base_asset} (claim_source={claim_source}), "
+            f"wallet_base_available={available_base_balance}, reference_price={reference_price}"
         )
         self._emit_structured(
             "range_ladder_initialized",
@@ -1063,12 +1089,61 @@ class RangeInventoryLadderController(ControllerBase):
             trading_pair=self.config.trading_pair,
             managed_quote=str(managed_quote_claim),
             claimed_base=str(claimed_base_amount),
+            claim_source=claim_source,
+            wallet_base_available=str(available_base_balance),
             reference_price=str(reference_price),
             reserve_quote=str(self._state["reserve_quote_balance"]),
             reserve_base=str(self._state["reserve_base_balance"]),
             state_file=str(self.state_path),
             schema_version=str(self.STATE_SCHEMA_VERSION),
         )
+        # Startup feasibility check: warn if no sell level is placeable after quantization
+        if claimed_base_amount > Decimal("0"):
+            try:
+                eligible_sell_prices = [
+                    p for p in self.config.sell_prices
+                    if p > reference_price
+                ]
+                feasible_sell_found = False
+                for sp in eligible_sell_prices:
+                    q_price = Decimal(
+                        self.market_data_provider.quantize_order_price(
+                            self.config.connector_name, self.config.trading_pair, sp
+                        )
+                    )
+                    q_amount = Decimal(
+                        self.market_data_provider.quantize_order_amount(
+                            self.config.connector_name, self.config.trading_pair, claimed_base_amount
+                        )
+                    )
+                    notional = q_amount * q_price
+                    if q_amount > Decimal("0") and notional >= self.config.min_order_quote:
+                        feasible_sell_found = True
+                        break
+                if not feasible_sell_found and eligible_sell_prices:
+                    q_amount_diag = Decimal(
+                        self.market_data_provider.quantize_order_amount(
+                            self.config.connector_name, self.config.trading_pair, claimed_base_amount
+                        )
+                    )
+                    self.logger().warning(
+                        f"{self.config.id}: STARTUP SELL FEASIBILITY WARNING — "
+                        f"claimed_base={claimed_base_amount} {base_asset} quantizes to {q_amount_diag}, "
+                        f"which cannot satisfy min_order_quote={self.config.min_order_quote} "
+                        f"at any eligible sell level {[str(p) for p in eligible_sell_prices]}. "
+                        f"No sell orders will be placed until base inventory increases. "
+                        f"Consider raising claimed_base_value_quote or using claimed_base_amount."
+                    )
+                    self._emit_structured(
+                        "range_ladder_startup_sell_infeasible",
+                        claimed_base=str(claimed_base_amount),
+                        quantized_base=str(q_amount_diag),
+                        eligible_sell_prices=[str(p) for p in eligible_sell_prices],
+                        min_order_quote=str(self.config.min_order_quote),
+                        reference_price=str(reference_price),
+                    )
+            except Exception as e:
+                self.logger().debug(f"Startup sell feasibility check failed (non-critical): {e}")
         return True
 
     def _update_ledger_from_completed_executors(self):
@@ -1591,16 +1666,36 @@ class RangeInventoryLadderController(ControllerBase):
         managed_fund_value_quote = managed_quote_total + managed_base_total * reference_price
 
         # Reconciliation alert: warn if wallet-derived differs significantly from ledger
+        # Throttled: only on transition (drift crossing threshold) or every 5 minutes
         RECONCILIATION_ALERT_THRESHOLD_QUOTE = Decimal("0.5")
         wallet_derived_quote = max(Decimal("0"), total_quote_balance - reserve_quote_balance)
         wallet_derived_base = max(Decimal("0"), total_base_balance - reserve_base_balance)
         ledger_quote_drift = wallet_derived_quote - owned_quote
         ledger_base_drift = wallet_derived_base - owned_base
-        if abs(ledger_quote_drift) > RECONCILIATION_ALERT_THRESHOLD_QUOTE:
+        drift_above_threshold = abs(ledger_quote_drift) > RECONCILIATION_ALERT_THRESHOLD_QUOTE
+        now_ts = self.market_data_provider.time()
+        should_warn = False
+        if drift_above_threshold:
+            if not self._last_drift_above_threshold:
+                should_warn = True
+            elif (now_ts - self._last_drift_warning_time) >= self._drift_warning_interval:
+                should_warn = True
+        self._last_drift_above_threshold = drift_above_threshold
+        if should_warn:
+            self._last_drift_warning_time = now_ts
             self.logger().warning(
                 f"{self.config.id}: external quote delta detected. "
                 f"owned_quote={owned_quote} wallet_derived={wallet_derived_quote} "
                 f"drift={ledger_quote_drift}"
+            )
+            self._emit_structured(
+                "range_ladder_reconciliation_drift",
+                owned_quote=str(owned_quote),
+                wallet_derived_quote=str(wallet_derived_quote),
+                drift_quote=str(ledger_quote_drift),
+                owned_base=str(owned_base),
+                wallet_derived_base=str(wallet_derived_base),
+                drift_base=str(ledger_base_drift),
             )
 
         self._cycles_seen += 1
@@ -1756,9 +1851,41 @@ class RangeInventoryLadderController(ControllerBase):
         self._emit_diagnostic_heartbeat_if_due()
 
 
+    def _find_executor_by_id(self, executor_id: str):
+        """Find an executor by its ID from the controller's executors."""
+        for executor in self.executors_info:
+            if executor.id == executor_id:
+                return executor
+        return None
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         actions: List[ExecutorAction] = []
-        actions.extend(self.stop_actions_proposal())
+        stop_actions = self.stop_actions_proposal()
+        actions.extend(stop_actions)
+
+        # If we are stopping executors this cycle, defer create decisions until the next
+        # cycle when budgets will reflect the freed capital. This prevents compression
+        # from running against stale reservations from soon-to-be-cancelled orders.
+        if stop_actions:
+            has_buy_stops = any(
+                self._executor_side(self._find_executor_by_id(a.executor_id)) == TradeType.BUY
+                for a in stop_actions
+                if hasattr(a, 'executor_id')
+            )
+            has_sell_stops = any(
+                self._executor_side(self._find_executor_by_id(a.executor_id)) == TradeType.SELL
+                for a in stop_actions
+                if hasattr(a, 'executor_id')
+            )
+            if has_buy_stops or has_sell_stops:
+                self._emit_structured(
+                    "range_ladder_create_deferred_for_stops",
+                    buy_stops=has_buy_stops,
+                    sell_stops=has_sell_stops,
+                    stop_count=len(stop_actions),
+                )
+                return actions
+
         actions.extend(self.create_actions_proposal())
         return actions
 
@@ -1856,15 +1983,32 @@ class RangeInventoryLadderController(ControllerBase):
             if kept_weight_total <= Decimal("0"):
                 return []
 
-            all_kept_levels_fundable = True
+            all_kept_levels_feasible = True
             for idx in kept_indexes:
                 relative_weight = self.config.normalized_buy_weights[idx] / kept_weight_total
                 level_quote = total_quote_budget * relative_weight
-                if level_quote < self.config.min_order_quote:
-                    all_kept_levels_fundable = False
+                # Quantization-aware feasibility: simulate what _build_buy_executor_action does
+                price = self.config.buy_prices[idx]
+                quantized_price = Decimal(
+                    self.market_data_provider.quantize_order_price(
+                        self.config.connector_name, self.config.trading_pair, price
+                    )
+                )
+                if quantized_price <= Decimal("0"):
+                    all_kept_levels_feasible = False
+                    break
+                amount = level_quote / quantized_price
+                quantized_amount = Decimal(
+                    self.market_data_provider.quantize_order_amount(
+                        self.config.connector_name, self.config.trading_pair, amount
+                    )
+                )
+                notional = quantized_amount * quantized_price
+                if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+                    all_kept_levels_feasible = False
                     break
 
-            if all_kept_levels_fundable:
+            if all_kept_levels_feasible:
                 return kept_indexes
 
             kept_indexes.pop()  # drop lowest / farthest buy level first
@@ -1891,16 +2035,28 @@ class RangeInventoryLadderController(ControllerBase):
             if kept_weight_total <= Decimal("0"):
                 return []
 
-            all_kept_levels_fundable = True
+            all_kept_levels_feasible = True
             for idx in kept_indexes:
                 relative_weight = self.config.normalized_sell_weights[idx] / kept_weight_total
                 level_base = total_base_budget * relative_weight
-                level_notional = level_base * self.config.sell_prices[idx]
-                if level_notional < self.config.min_order_quote:
-                    all_kept_levels_fundable = False
+                # Quantization-aware feasibility: simulate what _build_sell_executor_action does
+                price = self.config.sell_prices[idx]
+                quantized_price = Decimal(
+                    self.market_data_provider.quantize_order_price(
+                        self.config.connector_name, self.config.trading_pair, price
+                    )
+                )
+                quantized_amount = Decimal(
+                    self.market_data_provider.quantize_order_amount(
+                        self.config.connector_name, self.config.trading_pair, level_base
+                    )
+                )
+                notional = quantized_amount * quantized_price
+                if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+                    all_kept_levels_feasible = False
                     break
 
-            if all_kept_levels_fundable:
+            if all_kept_levels_feasible:
                 return kept_indexes
 
             kept_indexes.pop()  # drop highest / farthest sell level first
@@ -1931,6 +2087,18 @@ class RangeInventoryLadderController(ControllerBase):
         )
         notional = quantized_amount * quantized_price
         if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+            self._emit_structured(
+                "range_ladder_buy_level_skipped_post_quantization",
+                level_id=level_id,
+                raw_price=str(price),
+                quantized_price=str(quantized_price),
+                raw_amount=str(amount),
+                quantized_amount=str(quantized_amount),
+                notional=str(notional),
+                min_order_quote=str(self.config.min_order_quote),
+                allocated_quote=str(order_quote),
+                reason="quantized_amount_zero" if quantized_amount <= Decimal("0") else "notional_below_min",
+            )
             return None, Decimal("0")
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
@@ -1974,6 +2142,18 @@ class RangeInventoryLadderController(ControllerBase):
         )
         notional = quantized_amount * quantized_price
         if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+            self._emit_structured(
+                "range_ladder_sell_level_skipped_post_quantization",
+                level_id=level_id,
+                raw_price=str(price),
+                quantized_price=str(quantized_price),
+                raw_amount=str(order_base),
+                quantized_amount=str(quantized_amount),
+                notional=str(notional),
+                min_order_quote=str(self.config.min_order_quote),
+                allocated_base=str(order_base),
+                reason="quantized_amount_zero" if quantized_amount <= Decimal("0") else "notional_below_min",
+            )
             return None, Decimal("0")
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
@@ -2005,8 +2185,19 @@ class RangeInventoryLadderController(ControllerBase):
         for idx, price in enumerate(self.config.buy_prices):
             level_id = self._buy_level_id(idx)
             if level_id in blocked_levels:
+                self._emit_structured(
+                    "range_ladder_buy_level_filtered_blocked",
+                    level_id=level_id,
+                    price=str(price),
+                )
                 continue
             if not self._can_place_buy_level(price):
+                self._emit_structured(
+                    "range_ladder_buy_level_filtered_not_passive",
+                    level_id=level_id,
+                    price=str(price),
+                    best_bid=str(self.processed_data["best_bid"]),
+                )
                 continue
             eligible_buy_indexes.append(idx)
 
@@ -2077,8 +2268,19 @@ class RangeInventoryLadderController(ControllerBase):
         for idx, price in enumerate(self.config.sell_prices):
             level_id = self._sell_level_id(idx)
             if level_id in blocked_levels:
+                self._emit_structured(
+                    "range_ladder_sell_level_filtered_blocked",
+                    level_id=level_id,
+                    price=str(price),
+                )
                 continue
             if not self._can_place_sell_level(price):
+                self._emit_structured(
+                    "range_ladder_sell_level_filtered_not_passive",
+                    level_id=level_id,
+                    price=str(price),
+                    best_ask=str(self.processed_data["best_ask"]),
+                )
                 continue
             eligible_sell_indexes.append(idx)
 
@@ -2232,10 +2434,12 @@ class RangeInventoryLadderController(ControllerBase):
                 trading_pair=self.config.trading_pair,
             )
 
+        # Refresh policy: cancel and recreate resting orders after executor_refresh_time seconds.
+        # This ensures orders track the latest ladder prices and budget allocations.
         now = self.market_data_provider.time()
         for executor in active_order_executors:
             age = now - executor.timestamp
-            if age >= self.config.executor_refresh_time and not executor.is_trading:
+            if age >= self.config.executor_refresh_time:
                 actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
                 self._emit_structured(
                     "range_ladder_refresh_stop",
@@ -2257,6 +2461,7 @@ class RangeInventoryLadderController(ControllerBase):
             f"Price regime: {p['price_regime']} | Config rebuild pending: {p['config_rebuild_pending']}",
             f"Market data ready: {p.get('market_data_ready', True)} | Hard pause: {p.get('market_data_hard_pause', False)}",
             f"Initialization ready: {p.get('initialization_ready', True)} | Session expired: {p.get('session_expired', False)}",
+            f"Wallet avail / total: {p['available_quote_balance']:.6f} / {p['total_quote_balance']:.6f} {p['quote_asset']} | {p['available_base_balance']:.6f} / {p['total_base_balance']:.6f} {p['base_asset']}",
             f"Managed quote / base: {p['managed_quote_total']:.6f} {p['quote_asset']} / {p['managed_base_total']:.6f} {p['base_asset']}",
             f"Managed fund value: {p['managed_fund_value_quote']:.6f} {p['quote_asset']} | Cap factor: {p['cap_factor']:.6f}",
             f"Deployable quote / base: {p['deployable_quote_total']:.6f} {p['quote_asset']} / {p['deployable_base_total']:.6f} {p['base_asset']}",
@@ -2294,6 +2499,19 @@ class RangeInventoryLadderController(ControllerBase):
             lines.append(f"Blocked/cooldown levels: {', '.join(blocked)}")
         else:
             lines.append("Blocked/cooldown levels: none")
+        # Show eligible price levels based on current bid/ask
+        eligible_buys = [
+            str(price) for price in self.config.buy_prices
+            if self._can_place_buy_level(price)
+            and self._buy_level_id(self.config.buy_prices.index(price)) not in p["blocked_level_ids"]
+        ]
+        eligible_sells = [
+            str(price) for price in self.config.sell_prices
+            if self._can_place_sell_level(price)
+            and self._sell_level_id(self.config.sell_prices.index(price)) not in p["blocked_level_ids"]
+        ]
+        lines.append(f"Eligible buy prices: {', '.join(eligible_buys) if eligible_buys else 'none'}")
+        lines.append(f"Eligible sell prices: {', '.join(eligible_sells) if eligible_sells else 'none'}")
         return lines
 
     def get_custom_info(self) -> dict:
@@ -2313,6 +2531,10 @@ class RangeInventoryLadderController(ControllerBase):
             "deployable_base_total": str(p["deployable_base_total"]),
             "free_buy_budget_quote": str(p["free_buy_budget_quote"]),
             "free_sell_budget_base": str(p["free_sell_budget_base"]),
+            "available_quote_balance": str(p.get("available_quote_balance", "0")),
+            "available_base_balance": str(p.get("available_base_balance", "0")),
+            "total_quote_balance": str(p.get("total_quote_balance", "0")),
+            "total_base_balance": str(p.get("total_base_balance", "0")),
             "reserve_quote_balance": str(p["reserve_quote_balance"]),
             "reserve_base_balance": str(p["reserve_base_balance"]),
             "inventory_realized_pnl_quote": str(p["inventory_realized_pnl_quote"]),
