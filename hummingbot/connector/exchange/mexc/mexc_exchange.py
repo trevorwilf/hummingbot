@@ -16,7 +16,7 @@ from hummingbot.connector.utils import TradeFillOrderDetails, combine_to_hb_trad
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
 from hummingbot.core.utils.async_utils import safe_gather
@@ -188,10 +188,13 @@ class MexcExchange(ExchangePyBase):
         if trading_pair in self._trading_fees:
             fee_info = self._trading_fees[trading_pair]
             percent = fee_info["maker"] if is_maker else fee_info["taker"]
-            return DeductedFromReturnsTradeFee(percent=percent)
+        else:
+            percent = self.estimate_fee_pct(is_maker)
 
-        # Fall back to static defaults
-        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
+        # BUY fees are charged in quote (added to cost); SELL fees are deducted from returns
+        if order_side == TradeType.BUY:
+            return AddedToCostTradeFee(percent=percent)
+        return DeductedFromReturnsTradeFee(percent=percent)
 
     async def _place_order(self,
                            order_id: str,
@@ -246,6 +249,42 @@ class MexcExchange(ExchangePyBase):
             else:
                 raise
         return o_id, transact_time
+
+    async def _place_order_and_process_update(self, order, **kwargs) -> str:
+        exchange_order_id = await super()._place_order_and_process_update(order, **kwargs)
+
+        # Locally mirror the exchange hold so subsequent proposals see reduced available balance.
+        # This prevents oversubscription between order acceptance and WS/REST balance update.
+        try:
+            base_asset, quote_asset = order.trading_pair.split("-")
+
+            if order.trade_type == TradeType.SELL:
+                current = self._account_available_balances.get(base_asset, Decimal("0"))
+                adjusted = max(Decimal("0"), current - order.amount)
+                if adjusted != current:
+                    self.logger().debug(
+                        f"Local balance pre-adjust: SELL {order.amount} {base_asset}, "
+                        f"available {current} -> {adjusted} (pending exchange confirmation)"
+                    )
+                    self._account_available_balances[base_asset] = adjusted
+            else:
+                current = self._account_available_balances.get(quote_asset, Decimal("0"))
+                notional = order.amount * order.price
+                fee_pct = Decimal(str(self.estimate_fee_pct(is_maker=False)))
+                fee_amount = notional * fee_pct
+                hold_amount = notional + fee_amount
+                adjusted = max(Decimal("0"), current - hold_amount)
+                if adjusted != current:
+                    self.logger().debug(
+                        f"Local balance pre-adjust: BUY {quote_asset} "
+                        f"notional={notional} fee={fee_amount} total_hold={hold_amount}, "
+                        f"available {current} -> {adjusted} (pending exchange confirmation)"
+                    )
+                    self._account_available_balances[quote_asset] = adjusted
+        except Exception:
+            self.logger().debug("Local balance pre-adjust failed (non-critical)", exc_info=True)
+
+        return exchange_order_id
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
@@ -578,7 +617,9 @@ class MexcExchange(ExchangePyBase):
                                 order_type=OrderType.LIMIT_MAKER if trade["isMaker"] else OrderType.LIMIT,
                                 price=Decimal(trade["price"]),
                                 amount=Decimal(trade["qty"]),
-                                trade_fee=DeductedFromReturnsTradeFee(
+                                trade_fee=TradeFeeBase.new_spot_fee(
+                                    fee_schema=self.trade_fee_schema(),
+                                    trade_type=TradeType.BUY if trade["isBuyer"] else TradeType.SELL,
                                     flat_fees=[
                                         TokenAmount(
                                             trade["commissionAsset"],

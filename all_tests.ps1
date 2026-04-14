@@ -5,6 +5,7 @@
 
 $ErrorActionPreference = "Continue"
 
+$StartTime = Get-Date
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 1: ENVIRONMENT CHECK & LOG SETUP
 # ═════════════════════════════════════════════════════════════════════════════
@@ -107,6 +108,12 @@ Write-Host ""
 
 Run-Test "NonKYC: test_nonkyc_auth.py" `
     "$PYTEST_V $NONKYC/test_nonkyc_auth.py"
+
+Run-Test "NonKYC: test_nonkyc_auth_nonce.py" `
+    "$PYTEST_V $NONKYC/test_nonkyc_auth_nonce.py"
+
+Run-Test "NonKYC: test_nonkyc_fee_schema.py" `
+    "$PYTEST_V $NONKYC/test_nonkyc_fee_schema.py"
 
 Run-Test "NonKYC: test_nonkyc_utils.py" `
     "$PYTEST_V $NONKYC/test_nonkyc_utils.py"
@@ -254,6 +261,15 @@ Run-Test "MEXC: test_mexc_exchange.py" `
 Run-Test "MEXC: test_mexc_expert_review_fixes.py" `
     "$PYTEST_V $MEXC/test_mexc_expert_review_fixes.py"
 
+Run-Test "MEXC: test_mexc_fee_schema.py" `
+    "$PYTEST_V $MEXC/test_mexc_fee_schema.py"
+
+Run-Test "MEXC: test_mexc_balance_preadjust.py" `
+    "$PYTEST_V $MEXC/test_mexc_balance_preadjust.py"
+
+Run-Test "MEXC: test_mexc_fill_recreation_fee.py" `
+    "$PYTEST_V $MEXC/test_mexc_fill_recreation_fee.py"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 7: MEXC DATA FEED & RATE ORACLE
 # ═════════════════════════════════════════════════════════════════════════════
@@ -336,6 +352,9 @@ Run-Test "Strategy: test_executor_orchestrator.py" `
 Run-Test "Strategy: test_position_executor.py" `
     "$PYTEST_V $EXECUTORS/position_executor/test_position_executor.py"
 
+Run-Test "Strategy: test_terminal_error_patterns.py" `
+    "$PYTEST_V $EXECUTORS/position_executor/test_terminal_error_patterns.py"
+
 Run-Test "Strategy: test_market_making_controller_base.py" `
     "$PYTEST_V $CONTROLLERS/test_market_making_controller_base.py"
 
@@ -347,6 +366,15 @@ Run-Test "Strategy: test_wallet_balance_seeding.py" `
 
 Run-Test "Strategy: test_range_inventory_ladder_budget.py" `
     "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_budget.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_compression.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_compression.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_startup.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_startup.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_observability.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_observability.py"
 
 Run-Test "Connector: test_budget_checker.py" `
     "$PYTEST_V test/hummingbot/connector/test_budget_checker.py"
@@ -381,6 +409,9 @@ Run-Test "Connector: test_markets_recorder_provenance.py" `
 
 Run-Test "Connector: test_id_propagation.py" `
     "$PYTEST_V test/hummingbot/connector/test_id_propagation.py"
+
+Run-Test "Connector: test_markets_recorder_botrun.py" `
+    "$PYTEST_V test/hummingbot/connector/test_markets_recorder_botrun.py"
 
 Run-Test "Persistence: test_replay_tool.py" `
     "$PYTEST_V test/hummingbot/persistence/test_replay_tool.py"
@@ -463,12 +494,17 @@ if ($script:FailedSections.Count -gt 0) {
     Write-Host ""
 }
 
+$endTime = Get-Date
+$duration = $endTime - $startTime
+
 $nonkycStatus = if ($HaveNonkycKeys) { "RAN (public + authenticated)" } else { "RAN (public only)" }
 $mexcStatus = if ($HaveMexcKeys) { "RAN (public + authenticated)" } else { "RAN (public only)" }
 Write-Host "  NonKYC live tests: $nonkycStatus"
 Write-Host "  MEXC live tests:   $mexcStatus"
 Write-Host ""
 Write-Host "  Completed at: $(Get-Date)"
+Write-Host "  Total duration: $($duration.TotalSeconds) seconds"
+Write-Host "  Total duration: $($duration.TotalMinutes) minutes"
 Write-Host ""
 Write-Host "  Full log saved to: $(Resolve-Path $LogFile)"
 Write-Host "  You can paste this file into Claude for analysis."

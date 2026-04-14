@@ -134,10 +134,12 @@ class NonkycAuthTests(TestCase):
         configured_a = self.async_run_with_timeout(auth.rest_authenticate(req_a))
         configured_b = self.async_run_with_timeout(auth.rest_authenticate(req_b))
 
-        self.assertEqual(configured_a.headers["X-API-SIGN"], configured_b.headers["X-API-SIGN"])
-        # Verify URL contains sorted params
+        # Nonces are monotonically increasing so signatures differ, but the URL
+        # canonical form (sorted params) must be identical for both orderings
         self.assertIn("status=active&symbol=BTC/USDT", configured_a.url)
         self.assertIn("status=active&symbol=BTC/USDT", configured_b.url)
+        # Both URLs must be exactly the same (same canonical ordering)
+        self.assertEqual(configured_a.url, configured_b.url)
 
     def test_get_auth_slash_preserved_in_params(self):
         """Slash in param values (e.g., BTC/USDT) is NOT percent-encoded."""

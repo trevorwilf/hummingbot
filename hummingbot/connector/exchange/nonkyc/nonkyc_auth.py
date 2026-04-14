@@ -3,6 +3,7 @@ import hmac
 import json
 import random
 import string
+import threading
 from typing import Dict
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
@@ -14,6 +15,8 @@ class NonkycAuth(AuthBase):
         self.api_key = api_key
         self.secret_key = secret_key
         self.time_provider = time_provider
+        self._nonce_lock = threading.Lock()
+        self._last_nonce = 0
 
     async def rest_authenticate(self, request: RESTRequest) -> RESTRequest:
         """
@@ -75,7 +78,12 @@ class NonkycAuth(AuthBase):
         return payload
 
     def header_for_authentication(self, data: str) -> Dict[str, str]:
-        timestamp = int(self.time_provider.time() * 1e3)
+        with self._nonce_lock:
+            candidate = int(self.time_provider.time() * 1e3)
+            if candidate <= self._last_nonce:
+                candidate = self._last_nonce + 1
+            self._last_nonce = candidate
+            timestamp = candidate
         message_to_sign = f"{self.api_key}{data}{timestamp}"
         signature = self._generate_signature(message_to_sign)
         return {"X-API-KEY": self.api_key,

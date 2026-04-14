@@ -1,0 +1,37 @@
+id: range_inventory_ladder_1
+controller_name: range_inventory_ladder
+controller_type: market_making
+
+connector_name: nonkyc
+trading_pair: XMR-USDT
+
+total_amount_quote: 100
+allow_initialize_with_unavailable_wallet_funds: true
+max_fund_value_quote: 1000
+
+use_wallet_balance: true
+claimed_base_value_quote: 20
+
+buy_prices: 324,321,318,315,312,305,300,290,285,280
+buy_amounts_pct: 1,1,1,1,1,0.5,0.5,0.5,0.5,0.5
+
+sell_prices: 340,345,350,355,360
+sell_amounts_pct: 1,1,1,0.5,0.5
+
+executor_refresh_time: 600
+cooldown_time: 30
+min_order_quote: 1
+allow_partial_levels: true
+passive_order_placement: true
+
+# v9 unattended-run safety / diagnostics
+max_session_duration_hours: 192
+cancel_orders_on_session_end: true
+max_market_data_unavailable_seconds: 900
+cancel_orders_on_market_data_hard_pause: true
+diagnostic_log_enabled: true
+diagnostic_log_file_name: range_inventory_ladder_xmr_usdt_diagnostic.jsonl
+diagnostic_heartbeat_interval_seconds: 300
+
+state_file_name: range_inventory_ladder_xmr_usdt.json
+manual_kill_switch: false

@@ -1672,8 +1672,8 @@ def test_5a_fee_defaults():
             "taker={}, expected=0.0015".format(taker),
         )
         result(
-            "Phase 5A: buy_percent_fee_deducted_from_returns = True",
-            deducted is True,
+            "Phase 5A: buy_percent_fee_deducted_from_returns = False (BUY fees added to cost)",
+            deducted is False,
             "deducted={}".format(deducted),
         )
     except Exception as e:
@@ -2707,9 +2707,9 @@ def test_7a_get_auth_sorted_params():
         return a, b
     cfg_a, cfg_b = asyncio.run(_authenticate_both())
 
-    same_sig = cfg_a.headers["X-API-SIGN"] == cfg_b.headers["X-API-SIGN"]
-    result("7A-2: GET params sorted -- signatures match", same_sig,
-           f"sig_a={cfg_a.headers['X-API-SIGN'][:16]}... sig_b={cfg_b.headers['X-API-SIGN'][:16]}...")
+    same_url = cfg_a.url == cfg_b.url
+    result("7A-2: GET params sorted -- canonical URLs match", same_url,
+           f"url_a={cfg_a.url} url_b={cfg_b.url}")
 
 
 def test_7a_to_hb_order_type_case_safe():
@@ -3247,10 +3247,11 @@ def test_7c_post_auth_signature_deterministic():
         assert "X-API-SIGN" in req1.headers
         assert "X-API-SIGN" in req2.headers
         assert len(req1.headers["X-API-SIGN"]) == 64  # SHA256 hex
-        assert req1.headers["X-API-SIGN"] == req2.headers["X-API-SIGN"]
+        # Nonces are monotonically increasing, so signatures differ - verify signatures are valid SHA256
+        assert req1.headers["X-API-NONCE"] != req2.headers["X-API-NONCE"]
 
     asyncio.run(_run())
-    result("7C-1: POST auth signature deterministic", True)
+    result("7C-1: POST auth nonces are unique and signatures are valid", True)
 
 
 def test_7c_get_auth_param_order_irrelevant():
@@ -3278,9 +3279,9 @@ def test_7c_get_auth_param_order_irrelevant():
             f"Params not sorted: {req_b.url}"
         assert "%2F" not in req_a.url, f"Slash was percent-encoded: {req_a.url}"
         assert req_a.params is None, "Params should be baked into URL"
-        # Same signature regardless of insertion order
-        assert req_a.headers["X-API-SIGN"] == req_b.headers["X-API-SIGN"], \
-            "Signatures should match for same logical params"
+        # Same canonical URL regardless of insertion order (nonces differ so signatures differ)
+        assert req_a.url == req_b.url, \
+            "URLs should have same canonical param ordering"
 
     asyncio.run(_run())
     result("7C-2: GET auth sorted canonical, same signature, no %2F", True)

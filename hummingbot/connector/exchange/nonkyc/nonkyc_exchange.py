@@ -23,7 +23,7 @@ from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
 from hummingbot.core.utils.async_utils import safe_gather
@@ -394,13 +394,16 @@ class NonkycExchange(ExchangePyBase):
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
         is_maker = is_maker or False
+        fee_pct = None
         if self._trading_fees:
             fee_key = "maker_fee" if is_maker else "taker_fee"
             fee_pct = self._trading_fees.get(fee_key)
-            if fee_pct is not None:
-                return DeductedFromReturnsTradeFee(percent=fee_pct)
-        # Fall back to static defaults from DEFAULT_FEES / fee overrides
-        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
+        if fee_pct is None:
+            fee_pct = self.estimate_fee_pct(is_maker)
+        # BUY fees are charged in quote (added to cost); SELL fees are deducted from returns
+        if order_side == TradeType.BUY:
+            return AddedToCostTradeFee(percent=fee_pct)
+        return DeductedFromReturnsTradeFee(percent=fee_pct)
 
     @staticmethod
     def _extract_fee_token_and_amount(trade_data: Dict[str, Any], quote_asset: str) -> Tuple[str, Decimal]:
@@ -1461,7 +1464,9 @@ class NonkycExchange(ExchangePyBase):
                                 order_type=OrderType.LIMIT,
                                 price=Decimal(trade["price"]),
                                 amount=Decimal(trade["quantity"]),
-                                trade_fee=DeductedFromReturnsTradeFee(
+                                trade_fee=TradeFeeBase.new_spot_fee(
+                                    fee_schema=self.trade_fee_schema(),
+                                    trade_type=TradeType.BUY if trade["side"].lower() == "buy" else TradeType.SELL,
                                     flat_fees=[TokenAmount(_fee_token, _fee_amount)]
                                 ),
                                 exchange_trade_id=str(trade["id"])

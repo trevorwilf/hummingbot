@@ -114,8 +114,8 @@ class TestGetAuthStableWithUnorderedParams(_Base):
         self.assertNotIn("%2F", req_a.url)
         self.assertIsNone(req_a.params)
         self.assertIsNone(req_b.params)
-        # Same signature
-        self.assertEqual(req_a.headers["X-API-SIGN"], req_b.headers["X-API-SIGN"])
+        # Same canonical URL (nonces differ so signatures differ)
+        self.assertEqual(req_a.url, req_b.url)
 
 
 # =========================================================================

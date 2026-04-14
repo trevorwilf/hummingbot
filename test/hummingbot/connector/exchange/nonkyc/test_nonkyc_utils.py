@@ -49,4 +49,4 @@ class NonkycUtilsTests(TestCase):
         from hummingbot.connector.exchange.nonkyc.nonkyc_utils import DEFAULT_FEES
         self.assertEqual(DEFAULT_FEES.maker_percent_fee_decimal, Decimal("0.0015"))
         self.assertEqual(DEFAULT_FEES.taker_percent_fee_decimal, Decimal("0.0015"))
-        self.assertTrue(DEFAULT_FEES.buy_percent_fee_deducted_from_returns)
+        self.assertFalse(DEFAULT_FEES.buy_percent_fee_deducted_from_returns)

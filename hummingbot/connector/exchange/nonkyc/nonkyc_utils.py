@@ -13,7 +13,7 @@ EXAMPLE_PAIR = "BTC-USDT"
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.0015"),
     taker_percent_fee_decimal=Decimal("0.0015"),
-    buy_percent_fee_deducted_from_returns=True
+    buy_percent_fee_deducted_from_returns=False
 )
 
 

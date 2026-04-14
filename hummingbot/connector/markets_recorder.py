@@ -221,7 +221,7 @@ class MarketsRecorder:
                 trading_pairs = []
                 for m in self._markets:
                     trading_pairs.extend(m.trading_pairs)
-                db_backend = self._sql_manager.get_engine().dialect.name
+                db_backend = self._sql_manager.engine.dialect.name
                 with self._sql_manager.get_new_session() as session:
                     with session.begin():
                         bot_run = BotRun(

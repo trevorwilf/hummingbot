@@ -100,8 +100,8 @@ class TestPhase7AGetAuth(unittest.TestCase):
         self.assertIn("status=active&symbol=BTC/USDT", cfg_b.url)
         self.assertIsNone(cfg_a.params)
         self.assertIsNone(cfg_b.params)
-        # Same signature regardless of insertion order
-        self.assertEqual(cfg_a.headers["X-API-SIGN"], cfg_b.headers["X-API-SIGN"])
+        # Same canonical URL regardless of insertion order (nonces differ so signatures differ)
+        self.assertEqual(cfg_a.url, cfg_b.url)
         # Slash must not be percent-encoded
         self.assertNotIn("%2F", cfg_a.url)
         self.assertNotIn("%2F", cfg_b.url)

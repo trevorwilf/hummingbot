@@ -28,7 +28,8 @@ class TestPhase5CDynamicFees(IsolatedAsyncioWrapperTestCase):
     def test_get_fee_falls_back_to_defaults_when_no_computed_rates(self):
         """Phase 5C: _get_fee should use static defaults when _trading_fees is empty."""
         fee = self.exchange._get_fee("BTC", "USDT", OrderType.LIMIT, TradeType.BUY, Decimal("1"))
-        self.assertIsInstance(fee, DeductedFromReturnsTradeFee)
+        from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+        self.assertIsInstance(fee, AddedToCostTradeFee)
         # Should match the DEFAULT_FEES maker rate
         self.assertGreater(fee.percent, Decimal("0"))
 

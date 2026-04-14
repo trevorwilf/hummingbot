@@ -27,12 +27,30 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 class PositionExecutor(ExecutorBase):
     _logger = None
 
-    # Terminal (non-retriable) failure patterns from ExchangePyBase local validation
-    # These are deterministic rejections that will never succeed on retry
+    # Terminal (non-retriable) failure patterns — deterministic rejections that will never succeed on retry
     _TERMINAL_ERROR_PATTERNS = (
+        # Local validation rejects
         "lower than minimum notional size",
         "lower than minimum order size",
         "is not in the list of supported order types",
+        # Exchange-side deterministic rejects
+        "insufficient funds",
+        "insufficient balance",
+        "not enough balance",
+        "oversold",
+        "account has insufficient",
+        "bad nonce",
+        "nonce error",
+        "duplicate clientorderid",
+        "duplicate order",
+        # Auth / permission failures
+        "api key",
+        "invalid signature",
+        "permission denied",
+        # NonKYC specific
+        "20001",
+        # MEXC specific
+        "30005",
     )
 
     @classmethod
