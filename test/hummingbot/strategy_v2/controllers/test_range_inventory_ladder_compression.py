@@ -182,16 +182,23 @@ class TestSellCompressionQuantizationAware(unittest.TestCase):
                 f"Kept sell level {prices[idx]} has notional {notional} < 1")
 
     def test_sell_with_sufficient_base(self):
-        """With 0.003 XMR (quantizes to 0.003), notional at 350 = 1.05 >= 1."""
+        """With enough base to cover level 0's configured share (1/2.5 = 40%).
+
+        Under the stable-denominator policy, each level gets its configured fraction
+        of the deployable budget regardless of which other levels are kept. Level 0
+        share = 1/2.5 = 0.4. Need budget so that quantized(budget * 0.4) * 350 >= 1.
+        That requires quantized_amount >= 0.003, i.e. budget * 0.4 >= 0.003 -> budget >= 0.0075.
+        Use 0.010 for margin.
+        """
         prices = [350, 355, 360]
         weights = [1, 1, 0.5]
         controller = self._make_controller(prices, weights)
 
         kept = controller._compress_sell_level_indexes_for_min_notional(
             candidate_indexes=[0, 1, 2],
-            total_base_budget=Decimal("0.003"),
+            total_base_budget=Decimal("0.010"),
         )
-        self.assertGreater(len(kept), 0, "Should keep at least one sell level with 0.003 XMR")
+        self.assertGreater(len(kept), 0, "Should keep at least one sell level with 0.010 XMR")
 
 
 class TestDetermineExecutorActionsDefersCreates(unittest.TestCase):

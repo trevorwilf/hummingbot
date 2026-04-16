@@ -376,6 +376,18 @@ Run-Test "Strategy: test_range_inventory_ladder_startup.py" `
 Run-Test "Strategy: test_range_inventory_ladder_observability.py" `
     "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_observability.py"
 
+Run-Test "Strategy: test_range_inventory_ladder_shutdown_aware.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_shutdown_aware.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_quote_quota.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_quote_quota.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_weight_denominator.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_weight_denominator.py"
+
+Run-Test "Strategy: test_range_inventory_ladder_post_refresh_settle.py" `
+    "$PYTEST_V $CONTROLLERS/test_range_inventory_ladder_post_refresh_settle.py"
+
 Run-Test "Connector: test_budget_checker.py" `
     "$PYTEST_V test/hummingbot/connector/test_budget_checker.py"
 

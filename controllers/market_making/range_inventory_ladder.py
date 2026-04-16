@@ -14,6 +14,7 @@ from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, T
 from hummingbot.logger.structured_event_logger import get_structured_logger
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
@@ -87,6 +88,24 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         json_schema_extra={
             "prompt": "Enter the hard cap for total deployable fund value in quote (e.g. 1000): ",
             "prompt_on_new": True,
+            "is_updatable": True,
+        },
+    )
+    shared_account_quote_quota: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Maximum quote asset this controller is allowed to assume is available "
+            "when multiple controllers share the same connector account. When set, "
+            "free_buy_budget_quote is clamped to min(available_quote_balance, quota). "
+            "Leave unset (None) to use the current behavior (raw account balance, "
+            "which can be reduced by other controllers on the same account)."
+        ),
+        json_schema_extra={
+            "prompt": (
+                "Optional cap on quote-asset availability for shared-account runs "
+                "(blank = no cap): "
+            ),
+            "prompt_on_new": False,
             "is_updatable": True,
         },
     )
@@ -370,6 +389,15 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         if value is not None:
             if not value.is_finite() or value < Decimal("0"):
                 raise ValueError("claimed_base_amount must be a finite non-negative value")
+        return value
+
+    @field_validator("shared_account_quote_quota")
+    @classmethod
+    def _validate_shared_account_quote_quota(cls, value):
+        if value is None:
+            return value
+        if not value.is_finite() or value < Decimal("0"):
+            raise ValueError("shared_account_quote_quota must be a non-negative finite decimal or null")
         return value
 
     @field_validator("min_order_quote")
@@ -1339,15 +1367,53 @@ class RangeInventoryLadderController(ControllerBase):
             if getattr(executor.config, "type", "") == "order_executor"
         ]
 
+    def _order_executors_active_or_shutting_down(self) -> List[ExecutorInfo]:
+        """
+        Return order executors that still have a real claim on exchange capital
+        and level identity -- i.e. RUNNING, NOT_STARTED, or SHUTTING_DOWN.
+
+        This is deliberately broader than _active_order_executors(), which uses
+        ExecutorInfo.is_active (RUNNING + NOT_STARTED only). We must include
+        SHUTTING_DOWN here because:
+
+          1. OrderExecutor.control_shutdown_process() sleeps 5s after cancel,
+             during which the executor is SHUTTING_DOWN and its order may still
+             be open on the exchange (funds still held).
+          2. ExecutorOrchestrator.execute_actions() refuses new creates for
+             the same (connector, pair, side) while ANY executor in that key
+             is SHUTTING_DOWN (see executor_orchestrator.py _shutdown_in_flight_keys).
+
+        If we exclude SHUTTING_DOWN here, the controller proposes new creates
+        that the orchestrator immediately defers, and the controller's internal
+        reservation & level-blocking go out of sync with the orchestrator's
+        actual behavior.
+        """
+        live_statuses = {
+            RunnableStatus.NOT_STARTED,
+            RunnableStatus.RUNNING,
+            RunnableStatus.SHUTTING_DOWN,
+        }
+        return [
+            executor for executor in self.executors_info
+            if getattr(executor, "status", None) in live_statuses
+            and getattr(executor.config, "type", "") == "order_executor"
+        ]
+
     def _recently_closed_level_ids(self) -> Set[str]:
         now = self.market_data_provider.time()
         self._cleanup_cooldown_bypass()
+        live_statuses = {
+            RunnableStatus.NOT_STARTED,
+            RunnableStatus.RUNNING,
+            RunnableStatus.SHUTTING_DOWN,  # still blocked during shutdown
+        }
         blocked: Set[str] = set()
         for executor in self.executors_info:
             level_id = getattr(executor.config, "level_id", None)
             if level_id is None:
                 continue
-            if executor.is_active:
+            status = getattr(executor, "status", None)
+            if status in live_statuses:
                 blocked.add(level_id)
                 continue
             if self._should_bypass_level_cooldown(level_id):
@@ -1415,7 +1481,9 @@ class RangeInventoryLadderController(ControllerBase):
     def _active_reserved_quote_for_buys(self) -> Decimal:
         total = Decimal("0")
         counts: Dict[str, int] = {}
-        for executor in self._active_order_executors():
+        # Use the shutdown-aware set -- SHUTTING_DOWN executors still hold quote on
+        # the exchange until the cancel settles.
+        for executor in self._order_executors_active_or_shutting_down():
             if self._executor_side(executor) == TradeType.BUY:
                 _, _, remaining_quote, source = self._remaining_open_order_amounts(executor)
                 total += remaining_quote
@@ -1426,7 +1494,9 @@ class RangeInventoryLadderController(ControllerBase):
     def _active_reserved_base_for_sells(self) -> Decimal:
         total = Decimal("0")
         counts: Dict[str, int] = {}
-        for executor in self._active_order_executors():
+        # Use the shutdown-aware set -- SHUTTING_DOWN executors still hold base on
+        # the exchange until the cancel settles.
+        for executor in self._order_executors_active_or_shutting_down():
             if self._executor_side(executor) == TradeType.SELL:
                 _, remaining_base, _, source = self._remaining_open_order_amounts(executor)
                 total += remaining_base
@@ -1711,7 +1781,15 @@ class RangeInventoryLadderController(ControllerBase):
         active_sell_reserved_base = self._active_reserved_base_for_sells()
 
         free_buy_budget_quote = max(Decimal("0"), deployable_quote_total - active_buy_reserved_quote)
-        free_buy_budget_quote = min(free_buy_budget_quote, available_quote_balance)
+
+        # Shared-account clamp: if another controller on this exchange account
+        # consumes the same quote asset, the raw available_quote_balance can drop
+        # below our controller's own ledger. If the user configured an explicit
+        # quota, we respect it as an UPPER bound on what we assume is ours.
+        account_cap = available_quote_balance
+        if self.config.shared_account_quote_quota is not None:
+            account_cap = min(account_cap, self.config.shared_account_quote_quota)
+        free_buy_budget_quote = min(free_buy_budget_quote, account_cap)
 
         free_sell_budget_base = max(Decimal("0"), deployable_base_total - active_sell_reserved_base)
         free_sell_budget_base = min(free_sell_budget_base, available_base_balance)
@@ -1839,6 +1917,11 @@ class RangeInventoryLadderController(ControllerBase):
             managed_base_total=str(managed_base_total),
             managed_fund_value_quote=str(managed_fund_value_quote),
             free_buy_budget_quote=str(free_buy_budget_quote),
+            account_available_quote_cap=str(available_quote_balance),
+            controller_quota_quote=(
+                None if self.config.shared_account_quote_quota is None
+                else str(self.config.shared_account_quote_quota)
+            ),
             free_sell_budget_base=str(free_sell_budget_base),
             inventory_global_pnl_quote=str(perf["inventory_global_pnl_quote"]),
             reconciliation_gap_quote=str(reconciliation_gap_quote),
@@ -2466,6 +2549,9 @@ class RangeInventoryLadderController(ControllerBase):
             f"Managed fund value: {p['managed_fund_value_quote']:.6f} {p['quote_asset']} | Cap factor: {p['cap_factor']:.6f}",
             f"Deployable quote / base: {p['deployable_quote_total']:.6f} {p['quote_asset']} / {p['deployable_base_total']:.6f} {p['base_asset']}",
             f"Free buy budget: {p['free_buy_budget_quote']:.6f} {p['quote_asset']}",
+            f"Shared-account quote quota: "
+            f"{('none' if self.config.shared_account_quote_quota is None else f'{self.config.shared_account_quote_quota:.6f}')} "
+            f"{p['quote_asset']}",
             f"Free sell inventory: {p['free_sell_budget_base']:.6f} {p['base_asset']}",
             f"Inventory PnL (real/unreal/global): {p['inventory_realized_pnl_quote']:.6f} / "
             f"{p['inventory_unrealized_pnl_quote']:.6f} / {p['inventory_global_pnl_quote']:.6f} {p['quote_asset']}",
