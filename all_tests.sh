@@ -186,6 +186,9 @@ run_test "Shared: test_candles_factory.py" \
 run_test "Shared: test_market_data_provider.py" \
     "$PYTEST_V test/hummingbot/data_feed/test_market_data_provider.py"
 
+run_test "Phase 1: test_phase1_wiring.py (controller deployment wiring)" \
+    "$PYTEST_V tests/phase1/test_phase1_wiring.py"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 4: NONKYC CONNECTOR — AGGREGATE PASS
 # ═════════════════════════════════════════════════════════════════════════════

@@ -1,6 +1,7 @@
 # filename: controllers/directional_trading/ema_regime_hold_v1.py
-# custom script for trading XMR-USDT on nonkyc connector
-# requires filename: conf/controllers/nonkyc_xmr_usdt_mean_reversion_bb_rsi_v1.yml
+# EMA regime-hold directional controller for NonKYC spot.
+# Runtime config: conf/controllers/nonkyc_xmr_usdt_ema_regime_hold_v1.yml
+# Loader:         conf/scripts/conf_v2_with_controllers_nonkyc_xmr_usdt_ema.yml
 
 from __future__ import annotations
 

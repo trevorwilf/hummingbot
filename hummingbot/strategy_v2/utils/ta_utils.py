@@ -1,6 +1,7 @@
 # filename: hummingbot/strategy_v2/utils/ta_utils.py
-# required for my custom script for trading XMR-USDT on nonkyc connector
-# requires filename: conf/controllers/nonkyc_xmr_usdt_mean_reversion_bb_rsi_v1.yml
+# Shared technical-analysis utilities used by the custom NonKYC XMR-USDT controllers.
+# Consumers: controllers/directional_trading/mean_reversion_bb_rsi_v1.py
+#            controllers/directional_trading/ema_regime_hold_v1.py
 
 from __future__ import annotations
 

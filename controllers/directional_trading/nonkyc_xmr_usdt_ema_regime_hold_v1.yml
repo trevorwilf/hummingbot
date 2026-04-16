@@ -21,8 +21,8 @@ initial_positions: []
 max_executors_per_side: 1
 cooldown_time: 3600
 
-leverage: 1
-position_mode: ONEWAY
+leverage: 1          # spot: ignored at runtime (only used for perpetuals)
+position_mode: ONEWAY  # spot: ignored at runtime (only used for perpetuals)
 
 stop_loss: "0.04"
 take_profit: "0.03"
