@@ -1,0 +1,45 @@
+# Baseline research/runtime config for ema_regime_hold_v1 on NonKYC XMR-USDT.
+# Separate YAML is required; do not reuse the mean-reversion YAML unchanged.
+#
+# Note:
+# - regime_interval is kept at 4h here because that matches the uploaded controller default.
+# - if the current research dataset only has 12h and not 4h, either:
+#   1) backfill/add 4h candles for parity-safe cross-connector testing, or
+#   2) create a separate NonKYC-first research variant with regime_interval: 12h
+
+id: nonkyc_xmr_usdt_ema_regime_hold_v1
+controller_name: ema_regime_hold_v1
+controller_type: directional_trading
+
+connector_name: nonkyc
+trading_pair: XMR-USDT
+
+total_amount_quote: "300"
+manual_kill_switch: false
+initial_positions: []
+
+max_executors_per_side: 1
+cooldown_time: 3600
+
+leverage: 1
+position_mode: ONEWAY
+
+stop_loss: "0.04"
+take_profit: "0.03"
+time_limit: 172800
+take_profit_order_type: LIMIT
+trailing_stop: ""
+
+candles_connector: ""
+candles_trading_pair: ""
+
+signal_interval: "5m"
+regime_interval: "4h"
+
+regime_ema_fast: 50
+regime_ema_slow: 200
+regime_adx_length: 14
+regime_adx_threshold: 20.0
+
+volume_filter_window: 288
+min_volume_quantile: 0.30

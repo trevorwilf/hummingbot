@@ -184,6 +184,17 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    post_refresh_settle_seconds: int = Field(
+        default=0,
+        json_schema_extra={
+            "prompt": (
+                "After a refresh cancel wave, pause both cancels and creates for "
+                "N seconds to let exchange balances settle. 0 = disabled (default): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     cooldown_time: int = Field(
         default=30,
         json_schema_extra={
@@ -414,6 +425,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             raise ValueError("executor_refresh_time must be greater than zero")
         return value
 
+    @field_validator("post_refresh_settle_seconds")
+    @classmethod
+    def validate_post_refresh_settle_seconds(cls, value: int):
+        if value is None or value < 0:
+            raise ValueError("post_refresh_settle_seconds must be >= 0")
+        return value
+
     @field_validator("cooldown_time")
     @classmethod
     def validate_cooldown_time(cls, value: int):
@@ -572,6 +590,7 @@ class RangeInventoryLadderController(ControllerBase):
         self._session_expired_logged: bool = False
 
         self._last_diagnostic_heartbeat_ts: float = 0.0
+        self._refresh_quiet_until: float = 0.0
         self._last_live_runtime_settings_signature: Optional[tuple] = None
 
 
@@ -2062,14 +2081,17 @@ class RangeInventoryLadderController(ControllerBase):
             return []
 
         while kept_indexes:
+            # Match the placement loop in _create_buy_actions: each level's
+            # allocation is its CONFIGURED fraction of deployable budget, not its
+            # fraction of the currently-kept subset.
             kept_weight_total = sum(self.config.normalized_buy_weights[idx] for idx in kept_indexes)
             if kept_weight_total <= Decimal("0"):
                 return []
 
             all_kept_levels_feasible = True
             for idx in kept_indexes:
-                relative_weight = self.config.normalized_buy_weights[idx] / kept_weight_total
-                level_quote = total_quote_budget * relative_weight
+                level_weight = self.config.normalized_buy_weights[idx]
+                level_quote = total_quote_budget * level_weight
                 # Quantization-aware feasibility: simulate what _build_buy_executor_action does
                 price = self.config.buy_prices[idx]
                 quantized_price = Decimal(
@@ -2114,14 +2136,17 @@ class RangeInventoryLadderController(ControllerBase):
             return []
 
         while kept_indexes:
+            # Match the placement loop in _create_sell_actions: each level's
+            # allocation is its CONFIGURED fraction of deployable budget, not its
+            # fraction of the currently-kept subset.
             kept_weight_total = sum(self.config.normalized_sell_weights[idx] for idx in kept_indexes)
             if kept_weight_total <= Decimal("0"):
                 return []
 
             all_kept_levels_feasible = True
             for idx in kept_indexes:
-                relative_weight = self.config.normalized_sell_weights[idx] / kept_weight_total
-                level_base = total_base_budget * relative_weight
+                level_weight = self.config.normalized_sell_weights[idx]
+                level_base = total_base_budget * level_weight
                 # Quantization-aware feasibility: simulate what _build_sell_executor_action does
                 price = self.config.sell_prices[idx]
                 quantized_price = Decimal(
@@ -2300,16 +2325,28 @@ class RangeInventoryLadderController(ControllerBase):
         passive_execution_strategy = self._passive_execution_strategy()
         pending_indexes = list(kept_buy_indexes)
 
+        # Stable denominator: use the deployable budget and each level's configured
+        # fraction of the full ladder (normalized_buy_weights already sum to 1.0).
+        # Using the subset sum of eligible weights inflates every eligible level's
+        # share when some levels are temporarily blocked, which starves those
+        # blocked levels once they become eligible again.
+        deployable_quote_total = self.processed_data.get(
+            "deployable_quote_total", remaining_quote_budget
+        )
+
         while pending_indexes and remaining_quote_budget >= self.config.min_order_quote:
             idx = pending_indexes.pop(0)
             price = self.config.buy_prices[idx]
             level_id = self._buy_level_id(idx)
-            remaining_weight_total = sum(self.config.normalized_buy_weights[i] for i in [idx] + pending_indexes)
-            if remaining_weight_total <= Decimal("0"):
-                break
+            level_weight = self.config.normalized_buy_weights[idx]
+            if level_weight <= Decimal("0"):
+                continue
 
-            relative_weight = self.config.normalized_buy_weights[idx] / remaining_weight_total
-            target_quote = remaining_quote_budget * relative_weight
+            target_quote = deployable_quote_total * level_weight
+
+            # Never request more than what's actually free right now.
+            target_quote = min(target_quote, remaining_quote_budget)
+
             if target_quote < self.config.min_order_quote:
                 continue
 
@@ -2383,16 +2420,22 @@ class RangeInventoryLadderController(ControllerBase):
         passive_execution_strategy = self._passive_execution_strategy()
         pending_indexes = list(kept_sell_indexes)
 
+        # Stable denominator (see _create_buy_actions for rationale).
+        deployable_base_total = self.processed_data.get(
+            "deployable_base_total", remaining_base_budget
+        )
+
         while pending_indexes and remaining_base_budget > Decimal("0"):
             idx = pending_indexes.pop(0)
             price = self.config.sell_prices[idx]
             level_id = self._sell_level_id(idx)
-            remaining_weight_total = sum(self.config.normalized_sell_weights[i] for i in [idx] + pending_indexes)
-            if remaining_weight_total <= Decimal("0"):
-                break
+            level_weight = self.config.normalized_sell_weights[idx]
+            if level_weight <= Decimal("0"):
+                continue
 
-            relative_weight = self.config.normalized_sell_weights[idx] / remaining_weight_total
-            target_base = remaining_base_budget * relative_weight
+            target_base = deployable_base_total * level_weight
+            target_base = min(target_base, remaining_base_budget)
+
             if target_base * price < self.config.min_order_quote:
                 continue
 
@@ -2440,6 +2483,18 @@ class RangeInventoryLadderController(ControllerBase):
                 "range_ladder_rebuild_waiting_for_cancels",
                 active_order_executors=len(self._active_order_executors()),
                 rebuild_reason=self._config_rebuild_reason,
+            )
+            return []
+
+        # Post-refresh settle gate: after a refresh cancel wave, let the exchange
+        # release collateral before we try to place new orders. When disabled
+        # (post_refresh_settle_seconds=0), _refresh_quiet_until stays at 0 and
+        # this check is always a no-op.
+        now = self.market_data_provider.time()
+        if now < self._refresh_quiet_until:
+            self._emit_structured(
+                "range_ladder_create_blocked_post_refresh_settle",
+                remaining_s=round(self._refresh_quiet_until - now, 3),
             )
             return []
 
@@ -2520,6 +2575,15 @@ class RangeInventoryLadderController(ControllerBase):
         # Refresh policy: cancel and recreate resting orders after executor_refresh_time seconds.
         # This ensures orders track the latest ladder prices and budget allocations.
         now = self.market_data_provider.time()
+
+        # Post-refresh settle gate: if we recently emitted refresh cancels, don't
+        # emit more until the configured settle window expires. This gives the
+        # exchange time to release collateral and balances to converge before
+        # the next create wave.
+        if now < self._refresh_quiet_until:
+            return actions
+
+        refresh_stopped_any = False
         for executor in active_order_executors:
             age = now - executor.timestamp
             if age >= self.config.executor_refresh_time:
@@ -2530,6 +2594,17 @@ class RangeInventoryLadderController(ControllerBase):
                     level_id=getattr(executor.config, "level_id", ""),
                     age_s=round(age, 3),
                 )
+                refresh_stopped_any = True
+
+        if refresh_stopped_any and self.config.post_refresh_settle_seconds > 0:
+            self._refresh_quiet_until = now + self.config.post_refresh_settle_seconds
+            self._emit_structured(
+                "range_ladder_refresh_settle_window_opened",
+                quiet_until_ts=self._refresh_quiet_until,
+                settle_s=self.config.post_refresh_settle_seconds,
+                stops_this_cycle=len([a for a in actions if hasattr(a, "executor_id")]),
+            )
+
         return actions
 
     def to_format_status(self) -> List[str]:
@@ -2553,6 +2628,15 @@ class RangeInventoryLadderController(ControllerBase):
             f"{('none' if self.config.shared_account_quote_quota is None else f'{self.config.shared_account_quote_quota:.6f}')} "
             f"{p['quote_asset']}",
             f"Free sell inventory: {p['free_sell_budget_base']:.6f} {p['base_asset']}",
+            (
+                f"Post-refresh settle: active for {round(self._refresh_quiet_until - self.market_data_provider.time(), 1)}s more"
+                if self._refresh_quiet_until > self.market_data_provider.time()
+                else (
+                    f"Post-refresh settle: idle (configured={self.config.post_refresh_settle_seconds}s)"
+                    if self.config.post_refresh_settle_seconds > 0
+                    else "Post-refresh settle: disabled"
+                )
+            ),
             f"Inventory PnL (real/unreal/global): {p['inventory_realized_pnl_quote']:.6f} / "
             f"{p['inventory_unrealized_pnl_quote']:.6f} / {p['inventory_global_pnl_quote']:.6f} {p['quote_asset']}",
             f"Inventory fees: {p['inventory_cum_fees_quote']:.6f} {p['quote_asset']} | "

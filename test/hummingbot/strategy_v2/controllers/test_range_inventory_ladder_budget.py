@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
 # Add the controller source path so we can import it
-_CONTROLLER_DIR = Path(r"E:\tradingsoftware\dockerscripts\apps\hummingbot\api\data\bots\controllers\market_making")
+_CONTROLLER_DIR = Path(__file__).resolve().parents[4] / "controllers" / "market_making"
 if str(_CONTROLLER_DIR) not in sys.path:
     sys.path.insert(0, str(_CONTROLLER_DIR))
 

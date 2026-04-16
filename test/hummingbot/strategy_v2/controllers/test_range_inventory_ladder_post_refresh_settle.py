@@ -5,16 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Portable path discovery. Prefer the dockerscripts copy (authoritative) then fall back.
-_REPO_ROOT = Path(__file__).resolve().parents[4]
-_CANDIDATES = [
-    Path(r"E:\tradingsoftware\dockerscripts\apps\hummingbot\api\data\bots\controllers\market_making"),
-    _REPO_ROOT / "controllers" / "market_making",
-    _REPO_ROOT / "api" / "data" / "bots" / "controllers" / "market_making",
-]
-_CTRL_DIR = next((p for p in _CANDIDATES if (p / "range_inventory_ladder.py").exists()), None)
-if _CTRL_DIR is None:
-    raise RuntimeError(f"Could not locate range_inventory_ladder.py. Tried: {[str(p) for p in _CANDIDATES]}")
+_CTRL_DIR = Path(__file__).resolve().parents[4] / "controllers" / "market_making"
 if str(_CTRL_DIR) not in sys.path:
     sys.path.insert(0, str(_CTRL_DIR))
 
