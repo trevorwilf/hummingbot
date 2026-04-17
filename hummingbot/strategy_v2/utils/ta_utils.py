@@ -16,13 +16,38 @@ def ema(series: pd.Series, length: int) -> pd.Series:
 
 
 def rsi_wilder(close: pd.Series, length: int) -> pd.Series:
+    """
+    Wilder-smoothed RSI with correct edge-case handling.
+
+    Classical RSI semantics:
+      gain > 0 and loss == 0 -> RSI = 100  (all-gain window)
+      gain == 0 and loss > 0 -> RSI = 0    (all-loss window)
+      gain == 0 and loss == 0 -> RSI = 50  (flat window)
+
+    The naive formula 100 - 100/(1 + gain/loss) produces NaN on all-gain
+    and flat windows; this implementation handles those explicitly.
+    """
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
-    avg_gain = gain.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    return 100.0 - (100.0 / (1.0 + rs))
+    avg_gain = gain.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+
+    rs = avg_gain / avg_loss.where(avg_loss > 0.0)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    gain_only = (avg_gain > 0.0) & (avg_loss == 0.0)
+    loss_only = (avg_gain == 0.0) & (avg_loss > 0.0)
+    flat = (avg_gain == 0.0) & (avg_loss == 0.0)
+
+    rsi = rsi.mask(gain_only, 100.0)
+    rsi = rsi.mask(loss_only, 0.0)
+    rsi = rsi.mask(flat, 50.0)
+
+    warmup_mask = avg_gain.isna() | avg_loss.isna()
+    rsi = rsi.where(~warmup_mask, other=np.nan)
+
+    return rsi
 
 
 def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:

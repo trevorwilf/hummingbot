@@ -114,12 +114,14 @@ class NonKYCSpotCandles(CandlesBase):
         Without this override the base class rejects any non-contiguous
         data and enters an infinite reset loop.
         """
-        if len(self._candles) <= 1:
+        if len(candles) <= 1:
             return
         timestamps = candles[:, 0].astype(float)
         diffs = np.diff(timestamps)
-        if not np.all(diffs >= 0):
-            self.logger().warning("Candles are not sorted by timestamp in ascending order.")
+        if not np.all(diffs > 0):
+            self.logger().warning(
+                "NonKYC candles are not strictly sorted ascending (duplicate or out-of-order timestamps)."
+            )
             self._reset_candles()
             return
         interval_seconds = self.get_seconds_from_interval(self.interval)

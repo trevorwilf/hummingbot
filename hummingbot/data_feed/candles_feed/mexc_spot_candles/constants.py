@@ -35,7 +35,7 @@ WS_INTERVALS = {
     "1M": "Month1"
 }
 
-MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 1000
+MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 500
 
 RATE_LIMITS = [
     RateLimit(CANDLES_ENDPOINT, limit=20000, time_interval=60, linked_limits=[LinkedLimitWeightPair("raw", 1)]),

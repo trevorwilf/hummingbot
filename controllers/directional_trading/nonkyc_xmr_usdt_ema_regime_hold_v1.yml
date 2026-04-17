@@ -43,3 +43,11 @@ regime_adx_threshold: 20.0
 
 volume_filter_window: 288
 min_volume_quantile: 0.30
+
+# --- Hold semantics ---
+# reentry (default): re-enter on every eligible bar when flat; TP/SL/time_limit
+#                    close positions; after any exit, may re-enter while regime on.
+# hold             : enter once when regime turns on; force-close when regime turns off.
+#                    For this mode, recommended YAML: take_profit: "", time_limit: "",
+#                    keep stop_loss as emergency brake only.
+hold_mode: reentry

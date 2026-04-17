@@ -189,6 +189,30 @@ run_test "Shared: test_market_data_provider.py" \
 run_test "Phase 1: test_phase1_wiring.py (controller deployment wiring)" \
     "$PYTEST_V tests/phase1/test_phase1_wiring.py"
 
+run_test "Phase 2: test_mean_reversion.py (MR controller correctness)" \
+    "$PYTEST_V tests/phase2/test_mean_reversion.py"
+
+run_test "Phase 3: test_ema_regime_hold.py (EMA controller correctness)" \
+    "$PYTEST_V tests/phase3/test_ema_regime_hold.py"
+
+run_test "Phase 4: test_mexc_spot_candles.py (MEXC adapter)" \
+    "$PYTEST_V tests/phase4/test_mexc_spot_candles.py"
+
+run_test "Phase 4: test_nonkyc_validator.py (NonKYC validator)" \
+    "$PYTEST_V tests/phase4/test_nonkyc_validator.py"
+
+run_test "Phase 4: test_rsi_wilder.py (shared TA utility)" \
+    "$PYTEST_V tests/phase4/test_rsi_wilder.py"
+
+run_test "Phase 5: test_loader_to_factory_route.py (integration routing)" \
+    "$PYTEST_V tests/phase5/test_loader_to_factory_route.py"
+
+run_test "Phase 5: test_candle_feed_reuse.py (feed reuse contract)" \
+    "$PYTEST_V tests/phase5/test_candle_feed_reuse.py"
+
+run_test "Phase 5: test_decision_trace.py (MR/EMA trace emission)" \
+    "$PYTEST_V tests/phase5/test_decision_trace.py"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 4: NONKYC CONNECTOR — AGGREGATE PASS
 # ═════════════════════════════════════════════════════════════════════════════

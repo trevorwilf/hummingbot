@@ -12,7 +12,8 @@ import pandas as pd
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
-from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerBase,
@@ -69,14 +70,22 @@ class MeanReversionBBRSIV1Config(DirectionalTradingControllerConfigBase):
         return v
 
     @property
+    def required_records(self) -> int:
+        return max(
+            self.bb_length,
+            self.trend_ema_length,
+            self.rsi_length,
+            self.atr_length,
+        ) + 500
+
+    @property
     def candles_config(self) -> List[CandlesConfig]:
-        max_records = max(self.bb_length, self.trend_ema_length, self.rsi_length, self.atr_length) + 400
         return [
             CandlesConfig(
                 connector=self.candles_connector,
                 trading_pair=self.candles_trading_pair,
                 interval=self.interval,
-                max_records=max_records,
+                max_records=self.required_records,
             )
         ]
 
@@ -84,27 +93,44 @@ class MeanReversionBBRSIV1Config(DirectionalTradingControllerConfigBase):
 class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
     def __init__(self, config: MeanReversionBBRSIV1Config, *args, **kwargs):
         self.config = config
-        self.max_records = max(config.bb_length, config.trend_ema_length, config.rsi_length, config.atr_length) + 500
+        self.max_records = config.required_records
         super().__init__(config, *args, **kwargs)
 
     def get_candles_config(self) -> List[CandlesConfig]:
         return self.config.candles_config
 
     def _safe_spread_ok(self) -> bool:
+        """
+        Return True iff (ask-bid)/mid is within the configured max. Logs the
+        reason when gating fails so operators can distinguish a wide-spread
+        reject from a missing-data reject.
+        """
         if self.config.max_spread_pct <= 0:
             return True
         try:
-            bid = self.market_data_provider.get_price_by_type(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
-            ask = self.market_data_provider.get_price_by_type(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+            bid = self.market_data_provider.get_price_by_type(
+                self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+            ask = self.market_data_provider.get_price_by_type(
+                self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
             bid_f = float(bid)
             ask_f = float(ask)
-            mid = (bid_f + ask_f) / 2.0
-            if mid <= 0:
-                return False
-            spread_pct = (ask_f - bid_f) / mid
-            return spread_pct <= float(self.config.max_spread_pct)
-        except Exception:
+        except Exception as e:
+            self.logger().warning(f"MR spread gate: could not read bid/ask for "
+                                  f"{self.config.connector_name}:{self.config.trading_pair}: {e}")
             return False
+
+        if not (bid_f > 0 and ask_f > 0):
+            self.logger().warning(f"MR spread gate: non-positive bid/ask "
+                                  f"(bid={bid_f}, ask={ask_f}) — treating as gate=fail")
+            return False
+
+        mid = (bid_f + ask_f) / 2.0
+        if mid <= 0:
+            return False
+        spread_pct = (ask_f - bid_f) / mid
+        if spread_pct > float(self.config.max_spread_pct):
+            return False
+        return True
 
     async def update_processed_data(self):
         df = self.market_data_provider.get_candles_df(
@@ -116,12 +142,23 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
 
         if df is None or df.empty:
             self.processed_data = {"signal": 0, "features": pd.DataFrame()}
+            self._emit_decision_trace(None)
             return
 
         df = df.copy().sort_values("timestamp")
 
+        # Only drop the last bar if it's still forming. On sparse NonKYC feeds,
+        # the newest available bar may already be closed even when no newer bar
+        # has appeared yet; in that case we must KEEP it.
         if len(df) > 2:
-            df = df.iloc[:-1].copy()
+            interval_seconds = CandlesBase.interval_to_seconds.get(self.config.interval)
+            if interval_seconds is None:
+                df = df.iloc[:-1].copy()
+            else:
+                last_ts = float(df["timestamp"].iloc[-1])
+                now = self.market_data_provider.time()
+                if last_ts + interval_seconds > now:
+                    df = df.iloc[:-1].copy()
 
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -164,19 +201,98 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
 
         self.processed_data["signal"] = int(df["signal"].iloc[-1]) if len(df) else 0
         self.processed_data["features"] = df
+        self._emit_decision_trace(df)
+
+    def _emit_decision_trace(self, df) -> None:
+        """
+        Emit one INFO-level structured summary per controller update. Designed so
+        operators can diagnose live signal behavior from plain logs without DEBUG.
+        """
+        if df is None or len(df) == 0:
+            self.logger().info("MR tick: features_empty=true signal=0")
+            return
+        last = df.iloc[-1]
+        ts = last.get("timestamp")
+        bar_age_s = None
+        try:
+            bar_age_s = self.market_data_provider.time() - float(ts)
+        except Exception:
+            pass
+
+        def _f(x):
+            try:
+                fx = float(x)
+                return f"{fx:.4f}"
+            except Exception:
+                return "nan"
+
+        bar_age_str = f"{bar_age_s:.1f}" if bar_age_s is not None else "na"
+        self.logger().info(
+            f"MR tick: signal={int(last.get('signal', 0))} "
+            f"bar_ts={ts} bar_age_s={bar_age_str} "
+            f"bbp={_f(last.get('bbp'))} rsi={_f(last.get('rsi'))} "
+            f"atr_pct={_f(last.get('atr_pct'))} ema_slope={_f(last.get('ema_slope'))} "
+            f"volume_ok={bool(last.get('volume_ok', False))} "
+            f"rows={len(df)}"
+        )
+
+    def _log_gate_reason(self, signal: int, gate: str, ok: bool, **extra) -> None:
+        side = "BUY" if signal > 0 else "SELL"
+        if ok:
+            self.logger().debug(f"MR gate OK [{side}]: {gate}")
+        else:
+            extras = " ".join(f"{k}={v}" for k, v in extra.items())
+            self.logger().debug(f"MR gate BLOCKED [{side}]: {gate} {extras}")
+
+    def _last_same_side_reference_ts(self, signal: int) -> float:
+        """
+        Return the timestamp of the most recent same-side executor event,
+        preferring close_timestamp for closed executors and falling back
+        to timestamp (creation) for executors that are still active.
+        Returns 0.0 if no same-side executor is present in executors_info.
+
+        Note: executors_info is a rolling buffer bounded by closed_executors_buffer
+        (default 30 in v2_with_controllers.py). For MR's current config
+        (max_trades_per_day=6, cooldown_time=3600), this buffer is more than
+        sufficient to enforce the 1-hour cooldown. If either of those config
+        values changes materially, this assumption should be re-validated.
+        """
+        target_side = TradeType.BUY if signal > 0 else TradeType.SELL
+        relevant = [e for e in self.executors_info if e.side == target_side]
+        if not relevant:
+            return 0.0
+        return max((e.close_timestamp if e.close_timestamp is not None else e.timestamp)
+                   for e in relevant)
 
     def can_create_executor(self, signal: int) -> bool:
+        # The base class correctly enforces max_executors_per_side via
+        # active_executors_condition, but its cooldown check collapses to
+        # "now - 0 > cooldown_time" once no executors are active. We honor
+        # the max-executors gate and impose our own cooldown on top.
         if not super().can_create_executor(signal):
+            self._log_gate_reason(signal, gate="super", ok=False)
+            return False
+
+        last_ts = self._last_same_side_reference_ts(signal)
+        now = self.market_data_provider.time()
+        cooldown_ok = (last_ts == 0.0) or (now - last_ts > self.config.cooldown_time)
+        if not cooldown_ok:
+            self._log_gate_reason(signal, gate="cooldown", ok=False,
+                                  last_ts=last_ts,
+                                  remaining=self.config.cooldown_time - (now - last_ts))
             return False
 
         if not self._safe_spread_ok():
+            self._log_gate_reason(signal, gate="spread", ok=False)
             return False
 
         if self.config.max_trades_per_day and self.config.max_trades_per_day > 0:
-            now = self.market_data_provider.time()
             cutoff = now - 86400
             recent = [e for e in self.executors_info if getattr(e, "timestamp", 0) >= cutoff]
             if len(recent) >= self.config.max_trades_per_day:
+                self._log_gate_reason(signal, gate="daily_cap", ok=False,
+                                      count=len(recent), cap=self.config.max_trades_per_day)
                 return False
 
+        self._log_gate_reason(signal, gate="all", ok=True)
         return True

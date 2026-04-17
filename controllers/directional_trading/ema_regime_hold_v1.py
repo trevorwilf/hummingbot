@@ -12,11 +12,15 @@ import pandas as pd
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.utils.ta_utils import adx_wilder, ema, rolling_volume_quantile_ok
 
 
@@ -36,6 +40,24 @@ class EMARegimeHoldV1Config(DirectionalTradingControllerConfigBase):
 
     volume_filter_window: int = Field(default=288, ge=0)
     min_volume_quantile: float = Field(default=0.30, ge=0.0, le=1.0)
+
+    hold_mode: str = Field(
+        default="reentry",
+        description="'reentry' (Option A): re-enter on every eligible bar when flat; TP/SL/time_limit handle exits. "
+                    "'hold'    (Option B): enter once, hold until trend_on flips False, then force-close. "
+                    "For 'hold' mode set take_profit and time_limit to \"\" in YAML so the triple barrier "
+                    "does not fight the regime-hold intent.",
+    )
+
+    @field_validator("hold_mode", mode="before")
+    @classmethod
+    def validate_hold_mode(cls, v):
+        if v is None:
+            return "reentry"
+        v_norm = str(v).strip().lower()
+        if v_norm not in ("reentry", "hold"):
+            raise ValueError(f"hold_mode must be 'reentry' or 'hold', got {v!r}")
+        return v_norm
 
     @field_validator("candles_connector", mode="before")
     @classmethod
@@ -67,6 +89,23 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
     def get_candles_config(self) -> List[CandlesConfig]:
         return self.config.candles_config
 
+    def _drop_incomplete_last_bar(self, df: pd.DataFrame, interval: str) -> pd.DataFrame:
+        """
+        Drop the last bar only when it's still forming. On sparse feeds
+        (e.g., NonKYC at 4h on a low-volume pair), the newest available bar
+        may already be closed even when no newer bar exists yet; keep it.
+        """
+        if len(df) <= 2:
+            return df
+        interval_seconds = CandlesBase.interval_to_seconds.get(interval)
+        if interval_seconds is None:
+            return df.iloc[:-1].copy()
+        last_ts = float(df["timestamp"].iloc[-1])
+        now = self.market_data_provider.time()
+        if last_ts + interval_seconds > now:
+            return df.iloc[:-1].copy()
+        return df
+
     async def update_processed_data(self):
         df_fast = self.market_data_provider.get_candles_df(
             connector_name=self.config.candles_connector,
@@ -83,15 +122,14 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
 
         if df_fast is None or df_fast.empty or df_slow is None or df_slow.empty:
             self.processed_data = {"signal": 0, "features": pd.DataFrame()}
+            self._emit_decision_trace(None)
             return
 
         df_fast = df_fast.copy().sort_values("timestamp")
         df_slow = df_slow.copy().sort_values("timestamp")
 
-        if len(df_fast) > 2:
-            df_fast = df_fast.iloc[:-1].copy()
-        if len(df_slow) > 2:
-            df_slow = df_slow.iloc[:-1].copy()
+        df_fast = self._drop_incomplete_last_bar(df_fast, self.config.signal_interval)
+        df_slow = self._drop_incomplete_last_bar(df_slow, self.config.regime_interval)
 
         for col in ["open", "high", "low", "close", "volume"]:
             df_fast[col] = pd.to_numeric(df_fast[col], errors="coerce")
@@ -116,11 +154,126 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
         merged.index = df_fast.index
 
         trend = merged["trend_on"].fillna(False)
-        merged["signal"] = ((~trend.shift(1).fillna(False)) & trend).astype(int)
+        vol_ok = rolling_volume_quantile_ok(
+            df_fast["volume"], self.config.volume_filter_window, self.config.min_volume_quantile
+        )
+        # Eligibility is stateful: true whenever we WANT a long position, regardless
+        # of whether we have one yet.
+        eligible = (trend & vol_ok).astype(bool)
 
-        vol_ok = rolling_volume_quantile_ok(df_fast["volume"], self.config.volume_filter_window, self.config.min_volume_quantile)
-        merged["signal"] = (merged["signal"] & vol_ok).astype(int)
+        merged["trend_on_bool"] = trend.astype(bool).values
+        merged["vol_ok"] = vol_ok.astype(bool).values
+        merged["eligible"] = eligible.astype(int).values
+        merged["signal"] = eligible.astype(int).values  # stateful long signal
         merged["regime"] = np.where(trend, "trend", "off")
 
         self.processed_data["signal"] = int(merged["signal"].iloc[-1]) if len(merged) else 0
         self.processed_data["features"] = merged
+        self._emit_decision_trace(merged)
+
+    def _emit_decision_trace(self, merged) -> None:
+        if merged is None or len(merged) == 0:
+            self.logger().info(
+                f"EMA tick: features_empty=true signal=0 hold_mode={self.config.hold_mode}"
+            )
+            return
+        last = merged.iloc[-1]
+        ts = last.get("timestamp")
+        bar_age_s = None
+        try:
+            bar_age_s = self.market_data_provider.time() - float(ts)
+        except Exception:
+            pass
+        bar_age_str = f"{bar_age_s:.1f}" if bar_age_s is not None else "na"
+        self.logger().info(
+            f"EMA tick: signal={int(last.get('signal', 0))} "
+            f"hold_mode={self.config.hold_mode} "
+            f"trend_on={bool(last.get('trend_on_bool', False))} "
+            f"vol_ok={bool(last.get('vol_ok', False))} "
+            f"eligible={int(last.get('eligible', 0))} "
+            f"bar_ts={ts} bar_age_s={bar_age_str} "
+            f"rows={len(merged)}"
+        )
+
+    def _log_gate_reason(self, signal: int, gate: str, ok: bool, **extra) -> None:
+        side = "BUY" if signal > 0 else "SELL"
+        if ok:
+            self.logger().debug(f"EMA gate OK [{side}]: {gate}")
+        else:
+            extras = " ".join(f"{k}={v}" for k, v in extra.items())
+            self.logger().debug(f"EMA gate BLOCKED [{side}]: {gate} {extras}")
+
+    def _last_same_side_reference_ts(self, signal: int) -> float:
+        """
+        Timestamp of the most recent same-side executor event, preferring
+        close_timestamp for closed executors and falling back to timestamp
+        for still-active ones. Returns 0.0 if no same-side history exists.
+
+        Assumes the closed_executors_buffer (default 30 in v2_with_controllers.py)
+        retains enough history for the configured cooldown. For EMA's regime cadence
+        (typically <1 entry per day), this is effectively guaranteed.
+        """
+        target_side = TradeType.BUY if signal > 0 else TradeType.SELL
+        relevant = [e for e in self.executors_info if e.side == target_side]
+        if not relevant:
+            return 0.0
+        return max(
+            (e.close_timestamp if e.close_timestamp is not None else e.timestamp)
+            for e in relevant
+        )
+
+    def can_create_executor(self, signal: int) -> bool:
+        # super() correctly gates max_executors_per_side; its cooldown clause is vacuous
+        # after executor close, so we re-enforce with close_timestamp.
+        if not super().can_create_executor(signal):
+            self._log_gate_reason(signal, gate="super", ok=False)
+            return False
+        last_ts = self._last_same_side_reference_ts(signal)
+        now = self.market_data_provider.time()
+        cooldown_ok = (last_ts == 0.0) or (now - last_ts > self.config.cooldown_time)
+        if not cooldown_ok:
+            self._log_gate_reason(
+                signal, gate="cooldown", ok=False,
+                last_ts=last_ts, remaining=self.config.cooldown_time - (now - last_ts),
+            )
+            return False
+        self._log_gate_reason(signal, gate="all", ok=True)
+        return True
+
+    def stop_actions_proposal(self) -> List[ExecutorAction]:
+        if self.config.hold_mode != "hold":
+            return []
+
+        features = self.processed_data.get("features")
+        if features is None or len(features) == 0:
+            return []
+        last_trend_on = (
+            bool(features["trend_on_bool"].iloc[-1])
+            if "trend_on_bool" in features.columns
+            else False
+        )
+        if last_trend_on:
+            return []
+
+        target_side = TradeType.BUY  # EMA is long-only by design
+        actions: List[ExecutorAction] = []
+        for ex in self.executors_info:
+            if not ex.is_active:
+                continue
+            if ex.side != target_side:
+                continue
+            if ex.status == RunnableStatus.SHUTTING_DOWN:
+                continue
+            actions.append(
+                StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=ex.id,
+                    keep_position=False,
+                )
+            )
+        if actions:
+            self.logger().info(
+                f"EMA hold mode: regime turned off — issuing early_stop for "
+                f"{len(actions)} active executor(s)."
+            )
+        return actions

@@ -82,24 +82,28 @@ class MexcSpotCandles(CandlesBase):
                                  end_time: Optional[int] = None,
                                  limit: Optional[int] = CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST) -> dict:
         """
-        For API documentation, please refer to:
-        https://mexcdevelop.github.io/apidocs/spot_v3_en/#kline-candlestick-data
+        Build query params for GET /api/v3/klines.
 
-        startTime and endTime must be used at the same time.
+        Confirmed via live probe (2026-04):
+          - limit max is 500 (requests above are silently clamped by MEXC).
+          - startTime and endTime both supported; when both are provided, MEXC
+            returns bars strictly within the window (order: ascending by ts).
+          - Historical depth is effectively unlimited for practical purposes
+            (served BTCUSDT 4h bars from ~3 years ago without issue).
+
+        See: https://www.mexc.com/api-docs/spot-v3/market-data-endpoints
         """
-        now = self._round_timestamp_to_interval_multiple(self._time())
-        max_duration = 500
-        if (now - start_time) / self.interval_in_seconds >= max_duration:
-            raise ValueError(
-                f"{self.interval} candles are only available for the last {max_duration} bars from now.")
-
+        effective_limit = min(limit or CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST,
+                              CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST)
         params = {
             "symbol": self._ex_trading_pair,
             "interval": CONSTANTS.INTERVALS[self.interval],
-            "limit": limit
+            "limit": effective_limit,
         }
-        if end_time:
-            params["endTime"] = end_time * 1000
+        if start_time is not None:
+            params["startTime"] = int(start_time) * 1000
+        if end_time is not None:
+            params["endTime"] = int(end_time) * 1000
         return params
 
     def _get_rest_candles_headers(self):
