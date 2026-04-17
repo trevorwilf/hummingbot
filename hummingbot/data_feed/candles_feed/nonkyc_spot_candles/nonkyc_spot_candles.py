@@ -114,7 +114,7 @@ class NonKYCSpotCandles(CandlesBase):
         Without this override the base class rejects any non-contiguous
         data and enters an infinite reset loop.
         """
-        if len(candles) <= 1:
+        if len(self._candles) <= 1:
             return
         timestamps = candles[:, 0].astype(float)
         diffs = np.diff(timestamps)
