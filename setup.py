@@ -79,7 +79,11 @@ def main():
         "ujson>=5.7.0",
         "urllib3>=1.26.15,<2.0",
         "web3",
-        "xrpl-py>=4.4.0",
+        # Cap below 5.0.0: xrpl-py 5.0.0 (2026-06-03) is a breaking major bump that
+        # removed require_kwargs_on_init from xrpl.models.utils, which xrpl_utils.py
+        # imports at module load. An unbounded pin makes pip-based installs (e.g. the
+        # hummingbot-api container) resolve 5.0.0 and crash on connector-settings load.
+        "xrpl-py>=4.4.0,<5.0.0",
         "PyYaml>=0.2.5",
     ]
 
