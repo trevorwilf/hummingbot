@@ -941,6 +941,15 @@ class RangeInventoryLadderController(ControllerBase):
         if "owned_base" not in validated:
             initial_base = Decimal(validated.get("initial_claimed_base_amount", "0"))
             validated["owned_base"] = str(initial_base)
+        # Self-balance hardening: derive the seed value (deploy-ceiling floor) for
+        # states written before seed_value_quote existed. The realized seed value is
+        # the initial managed quote plus the initial claimed base valued at the
+        # initial reference price.
+        if "seed_value_quote" not in validated:
+            initial_managed = Decimal(validated.get("initial_managed_quote", "0"))
+            initial_base = Decimal(validated.get("initial_claimed_base_amount", "0"))
+            initial_ref = Decimal(validated.get("initial_reference_price", "0"))
+            validated["seed_value_quote"] = str(initial_managed + initial_base * initial_ref)
 
         validated["schema_version"] = self.STATE_SCHEMA_VERSION
         if schema_version != self.STATE_SCHEMA_VERSION:
@@ -1059,21 +1068,44 @@ class RangeInventoryLadderController(ControllerBase):
         self._initialization_blocked_reason = None
         self._initialization_blocked_logged = False
 
-        managed_quote_claim = min(available_quote_balance, Decimal(self.config.total_amount_quote))
+        # Seed claim (one-time, first init only). The base sleeve is carved OUT of
+        # total_amount_quote -- it is a SUBSET, not additive. claimed_base_value_quote
+        # (or claimed_base_amount) is a one-time STARTING seed only; after seeding it
+        # never influences deployment again (deployment tracks the live wallet).
+        #
+        #   base_seed_value  = min(available_base * ref, claimed_base_value_quote)
+        #   base_seed_amount = base_seed_value / ref   (quantized)
+        #   quote_seed       = min(available_quote, total_amount_quote - base_seed_value)
+        #   total seed value = quote_seed + base_seed_value  <=  total_amount_quote
+        base_seed_value = Decimal("0")
         claimed_base_amount = Decimal("0")
         claim_source = "none"
-        if self.config.use_wallet_balance:
+        if self.config.use_wallet_balance and reference_price > Decimal("0"):
+            available_base_value = available_base_balance * reference_price
             if self.config.claimed_base_amount is not None and self.config.claimed_base_amount > Decimal("0"):
-                # Explicit base amount claim -- no quote-to-base conversion needed
-                claimed_base_amount = min(available_base_balance, self.config.claimed_base_amount)
+                # Explicit base amount claim, still bounded as a subset of total_amount_quote.
+                desired_base_value = min(available_base_balance, self.config.claimed_base_amount) * reference_price
+                base_seed_value = min(desired_base_value, Decimal(self.config.total_amount_quote))
                 claim_source = "claimed_base_amount"
-            elif self.config.claimed_base_value_quote > Decimal("0") and reference_price > Decimal("0"):
-                # Legacy: convert quote value to base using startup reference price
-                claimed_base_amount = min(
-                    available_base_balance,
-                    Decimal(self.config.claimed_base_value_quote) / reference_price,
-                )
+            elif self.config.claimed_base_value_quote > Decimal("0"):
+                base_seed_value = min(available_base_value, Decimal(self.config.claimed_base_value_quote))
                 claim_source = "claimed_base_value_quote"
+            base_seed_value = max(Decimal("0"), base_seed_value)
+            if base_seed_value > Decimal("0"):
+                claimed_base_amount = Decimal(
+                    self.market_data_provider.quantize_order_amount(
+                        self.config.connector_name, self.config.trading_pair, base_seed_value / reference_price
+                    )
+                )
+                # Re-derive value from the quantized amount so seed_value stays consistent.
+                base_seed_value = claimed_base_amount * reference_price
+
+        quote_seed = min(
+            available_quote_balance,
+            max(Decimal("0"), Decimal(self.config.total_amount_quote) - base_seed_value),
+        )
+        managed_quote_claim = quote_seed
+        seed_value_quote = quote_seed + base_seed_value
 
         self._state = {
             "schema_version": self.STATE_SCHEMA_VERSION,
@@ -1096,6 +1128,7 @@ class RangeInventoryLadderController(ControllerBase):
             ),
             "owned_quote": str(managed_quote_claim),
             "owned_base": str(claimed_base_amount),
+            "seed_value_quote": str(seed_value_quote),
             "tracked_fill_executor_ids": [],
         }
         self._save_state()
@@ -1143,7 +1176,49 @@ class RangeInventoryLadderController(ControllerBase):
             reserve_base=str(self._state["reserve_base_balance"]),
             state_file=str(self.state_path),
             schema_version=str(self.STATE_SCHEMA_VERSION),
+            seed_value_quote=str(seed_value_quote),
         )
+
+        # Diagnostics: surface a side that starts essentially unfunded so that
+        # "no buys" / "no sells" is never a silent mystery. A side is unfunded when
+        # the wallet cannot fund even a single minimum-notional order on that side.
+        # This is EXPECTED for a lopsided wallet (policy 3.6: wait for fills to
+        # convert), not an error -- the strategy will run one-sided until the market
+        # moves a fill into the starved side.
+        unfunded_threshold = self.config.min_order_quote
+        available_base_value = available_base_balance * reference_price if reference_price > Decimal("0") else Decimal("0")
+        if available_quote_balance < unfunded_threshold:
+            self.logger().warning(
+                f"{self.config.id}: BUY side initializes essentially unfunded "
+                f"(available_quote={available_quote_balance} {quote_asset} < min_order_quote="
+                f"{unfunded_threshold}). No buy orders will be placed until quote balance grows "
+                "(e.g. via a sell fill or deposit). This is expected for a one-sided wallet."
+            )
+            self._emit_structured(
+                "range_ladder_side_unfunded_at_init",
+                side="buy",
+                claimed_value=str(quote_seed),
+                available_balance=str(available_quote_balance),
+                available_value_quote=str(available_quote_balance),
+                min_order_quote=str(unfunded_threshold),
+            )
+        if available_base_value < unfunded_threshold:
+            self.logger().warning(
+                f"{self.config.id}: SELL side initializes essentially unfunded "
+                f"(available_base={available_base_balance} {base_asset}, value={available_base_value} "
+                f"{quote_asset} < min_order_quote={unfunded_threshold}). No sell orders will be placed "
+                "until base inventory grows (e.g. via a buy fill or deposit). This is expected for a "
+                "one-sided wallet."
+            )
+            self._emit_structured(
+                "range_ladder_side_unfunded_at_init",
+                side="sell",
+                claimed_value=str(base_seed_value),
+                available_balance=str(available_base_balance),
+                available_value_quote=str(available_base_value),
+                min_order_quote=str(unfunded_threshold),
+            )
+
         # Startup feasibility check: warn if no sell level is placeable after quantization
         if claimed_base_amount > Decimal("0"):
             try:
@@ -1327,6 +1402,9 @@ class RangeInventoryLadderController(ControllerBase):
             "managed_base_total": managed_base_total,
             "managed_fund_value_quote": managed_fund_value_quote,
             "cap_factor": Decimal("0"),
+            "seed_value_quote": self._seed_value_quote() if self._state_loaded else Decimal("0"),
+            "deploy_ceiling_quote": Decimal("0"),
+            "deploy_headroom_quote": Decimal("0"),
             "deployable_quote_total": Decimal("0"),
             "deployable_base_total": Decimal("0"),
             "active_buy_reserved_quote": Decimal("0"),
@@ -1576,6 +1654,73 @@ class RangeInventoryLadderController(ControllerBase):
         }
 
 
+    def _seed_value_quote(self) -> Decimal:
+        """Realized seed value captured at first init (deploy-ceiling floor).
+
+        Falls back to the initial managed-quote + initial-claimed-base value for
+        states written before seed_value_quote was persisted.
+        """
+        if self._state.get("seed_value_quote") is not None:
+            return max(Decimal("0"), self._d(self._state.get("seed_value_quote"), "0"))
+        initial_managed = self._d(self._state.get("initial_managed_quote"), "0")
+        initial_base = self._d(self._state.get("initial_claimed_base_amount"), "0")
+        initial_ref = self._d(self._state.get("initial_reference_price"), "0")
+        return max(Decimal("0"), initial_managed + initial_base * initial_ref)
+
+    def _compute_deploy_ceiling(self, seed_value_quote: Decimal, managed_fund_value_quote: Decimal) -> Decimal:
+        """Ceiling on total deployed fund value.
+
+        Starts at the realized seed value and ratchets up with the fills-only managed
+        fund value as the strategy compounds earned profit, hard-capped at
+        max_fund_value_quote. It never shrinks deployment below what the fund is
+        actually worth (max(seed, managed)) and never exceeds the configured cap.
+        """
+        floor = max(Decimal("0"), seed_value_quote)
+        managed = max(Decimal("0"), managed_fund_value_quote)
+        cap = Decimal(self.config.max_fund_value_quote)
+        return min(cap, max(floor, managed))
+
+    def _compute_deploy_budgets(
+        self,
+        *,
+        reference_price: Decimal,
+        available_quote: Decimal,
+        available_base: Decimal,
+        active_buy_reserved_quote: Decimal,
+        active_sell_reserved_base: Decimal,
+        deploy_ceiling: Decimal,
+    ):
+        """Size each side's deployable budget from the LIVE wallet, bounded by the ceiling.
+
+        No fixed base/quote ratio after seed: the buy side deploys whatever quote is
+        available, the sell side deploys whatever base is available. The COMBINED new
+        deployed value plus what is already on the book is throttled (pro-rata) so the
+        total deployed value never exceeds deploy_ceiling.
+
+        Returns (free_buy_budget_quote, free_sell_budget_base, throttle_scale, headroom).
+        """
+        ref = max(Decimal("0"), reference_price)
+        account_quote_cap = max(Decimal("0"), available_quote)
+        if self.config.shared_account_quote_quota is not None:
+            account_quote_cap = min(account_quote_cap, Decimal(self.config.shared_account_quote_quota))
+        buy_budget_quote = account_quote_cap
+        sell_budget_base = max(Decimal("0"), available_base)
+
+        active_reserved_value = (
+            max(Decimal("0"), active_buy_reserved_quote)
+            + max(Decimal("0"), active_sell_reserved_base) * ref
+        )
+        headroom = max(Decimal("0"), deploy_ceiling - active_reserved_value)
+        desired_new_value = buy_budget_quote + sell_budget_base * ref
+
+        throttle_scale = Decimal("1")
+        if desired_new_value > headroom and desired_new_value > Decimal("0"):
+            throttle_scale = headroom / desired_new_value
+            buy_budget_quote = buy_budget_quote * throttle_scale
+            sell_budget_base = sell_budget_base * throttle_scale
+
+        return buy_budget_quote, sell_budget_base, throttle_scale, headroom
+
     async def update_processed_data(self):
         now = self.market_data_provider.time()
         base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
@@ -1773,64 +1918,85 @@ class RangeInventoryLadderController(ControllerBase):
         managed_base_total = max(Decimal("0"), owned_base)
         managed_fund_value_quote = managed_quote_total + managed_base_total * reference_price
 
-        # Reconciliation alert: warn if wallet-derived differs significantly from ledger
-        # Throttled: only on transition (drift crossing threshold) or every 5 minutes
+        # Reconciliation alert (self-balance model):
+        # Under the self-balance model, deployment INTENTIONALLY tracks the live wallet,
+        # so the wallet legitimately exceeds the fills-only ledger (idle reserve, later
+        # deposits, un-booked fill proceeds). That positive surplus is EXPECTED and must
+        # NOT spam warnings. The only genuine accounting fault is the inverse: the ledger
+        # believing it owns MORE than the wallet physically holds (an over-claim), which
+        # would cause the controller to size orders against money that isn't there.
         RECONCILIATION_ALERT_THRESHOLD_QUOTE = Decimal("0.5")
         wallet_derived_quote = max(Decimal("0"), total_quote_balance - reserve_quote_balance)
         wallet_derived_base = max(Decimal("0"), total_base_balance - reserve_base_balance)
         ledger_quote_drift = wallet_derived_quote - owned_quote
         ledger_base_drift = wallet_derived_base - owned_base
-        drift_above_threshold = abs(ledger_quote_drift) > RECONCILIATION_ALERT_THRESHOLD_QUOTE
+        # Over-claim: ledger value beyond what the TOTAL wallet can back.
+        quote_overclaim = max(Decimal("0"), owned_quote - total_quote_balance)
+        base_overclaim = max(Decimal("0"), owned_base - total_base_balance)
+        ledger_overclaim_quote = quote_overclaim + base_overclaim * reference_price
+        overclaim_above_threshold = ledger_overclaim_quote > RECONCILIATION_ALERT_THRESHOLD_QUOTE
         now_ts = self.market_data_provider.time()
         should_warn = False
-        if drift_above_threshold:
+        if overclaim_above_threshold:
             if not self._last_drift_above_threshold:
                 should_warn = True
             elif (now_ts - self._last_drift_warning_time) >= self._drift_warning_interval:
                 should_warn = True
-        self._last_drift_above_threshold = drift_above_threshold
+        self._last_drift_above_threshold = overclaim_above_threshold
         if should_warn:
             self._last_drift_warning_time = now_ts
             self.logger().warning(
-                f"{self.config.id}: external quote delta detected. "
-                f"owned_quote={owned_quote} wallet_derived={wallet_derived_quote} "
-                f"drift={ledger_quote_drift}"
+                f"{self.config.id}: ledger over-claim detected — the fills-only ledger believes it "
+                f"holds more than the wallet physically contains. "
+                f"owned_quote={owned_quote} total_quote={total_quote_balance} "
+                f"owned_base={owned_base} total_base={total_base_balance} "
+                f"overclaim_quote={ledger_overclaim_quote}"
             )
             self._emit_structured(
-                "range_ladder_reconciliation_drift",
+                "range_ladder_reconciliation_overclaim",
                 owned_quote=str(owned_quote),
+                total_quote_balance=str(total_quote_balance),
                 wallet_derived_quote=str(wallet_derived_quote),
                 drift_quote=str(ledger_quote_drift),
                 owned_base=str(owned_base),
+                total_base_balance=str(total_base_balance),
                 wallet_derived_base=str(wallet_derived_base),
                 drift_base=str(ledger_base_drift),
+                overclaim_quote=str(ledger_overclaim_quote),
             )
 
         self._cycles_seen += 1
 
-        cap_factor = Decimal("1")
-        if managed_fund_value_quote > Decimal("0") and self.config.max_fund_value_quote > Decimal("0"):
-            cap_factor = min(Decimal("1"), Decimal(self.config.max_fund_value_quote) / managed_fund_value_quote)
-
-        deployable_quote_total = managed_quote_total * cap_factor
-        deployable_base_total = managed_base_total
-
         active_buy_reserved_quote = self._active_reserved_quote_for_buys()
         active_sell_reserved_base = self._active_reserved_base_for_sells()
 
-        free_buy_budget_quote = max(Decimal("0"), deployable_quote_total - active_buy_reserved_quote)
+        # Self-balance deployment model:
+        #   - The PnL ledger (owned_quote/owned_base) stays fills-only and invariant
+        #     to deposits (managed_fund_value_quote above).
+        #   - Deployment each cycle sizes from the LIVE available wallet balance,
+        #     bounded by a growth ceiling that starts at the realized seed value and
+        #     compounds with the managed fund value, hard-capped at max_fund_value_quote.
+        #   - No fixed base/quote ratio after seed: each side deploys what it holds;
+        #     the combined deployed value is throttled to the ceiling.
+        # This makes idle reserve, later deposits, and fill proceeds all usable on the
+        # next cycle without ever deleting the state file.
+        seed_value_quote = self._seed_value_quote()
+        deploy_ceiling = self._compute_deploy_ceiling(seed_value_quote, managed_fund_value_quote)
 
-        # Shared-account clamp: if another controller on this exchange account
-        # consumes the same quote asset, the raw available_quote_balance can drop
-        # below our controller's own ledger. If the user configured an explicit
-        # quota, we respect it as an UPPER bound on what we assume is ours.
-        account_cap = available_quote_balance
-        if self.config.shared_account_quote_quota is not None:
-            account_cap = min(account_cap, self.config.shared_account_quote_quota)
-        free_buy_budget_quote = min(free_buy_budget_quote, account_cap)
+        free_buy_budget_quote, free_sell_budget_base, throttle_scale, deploy_headroom = self._compute_deploy_budgets(
+            reference_price=reference_price,
+            available_quote=available_quote_balance,
+            available_base=available_base_balance,
+            active_buy_reserved_quote=active_buy_reserved_quote,
+            active_sell_reserved_base=active_sell_reserved_base,
+            deploy_ceiling=deploy_ceiling,
+        )
 
-        free_sell_budget_base = max(Decimal("0"), deployable_base_total - active_sell_reserved_base)
-        free_sell_budget_base = min(free_sell_budget_base, available_base_balance)
+        # cap_factor is the throttle scale applied this cycle (1.0 = no throttle).
+        cap_factor = throttle_scale
+        # deployable_*_total feed the placement loops as the stable per-cycle base.
+        deployable_quote_total = free_buy_budget_quote
+        deployable_base_total = free_sell_budget_base
 
         initial_managed_quote = self._d(self._state.get("initial_managed_quote"))
         initial_claimed_base_amount = self._d(self._state.get("initial_claimed_base_amount"))
@@ -1891,6 +2057,9 @@ class RangeInventoryLadderController(ControllerBase):
             "managed_base_total": managed_base_total,
             "managed_fund_value_quote": managed_fund_value_quote,
             "cap_factor": cap_factor,
+            "seed_value_quote": seed_value_quote,
+            "deploy_ceiling_quote": deploy_ceiling,
+            "deploy_headroom_quote": deploy_headroom,
             "deployable_quote_total": deployable_quote_total,
             "deployable_base_total": deployable_base_total,
             "active_buy_reserved_quote": active_buy_reserved_quote,
@@ -2089,27 +2258,31 @@ class RangeInventoryLadderController(ControllerBase):
         total_quote_budget: Decimal,
     ) -> List[int]:
         """
-        Drop the lowest eligible buy levels until every kept level can be seeded above min_order_quote.
+        Concentrate the available budget into the nearest kept buy levels.
 
-        Example with equal weights and a ladder like 320,315,310,...,280:
-        when free buy budget gets too small, this method will keep the higher-priority prices and
-        progressively drop 280, then 285, then 290, and so on.
+        Drop the farthest (lowest-priced) eligible buy levels until every kept level
+        can be seeded above min_order_quote, RE-NORMALIZING the weights over the kept
+        subset so the available budget is fully deployed across the levels we keep
+        (nearest first). A budget that can fund at least one level always keeps at
+        least one level -- it never strands a small balance by spreading it across
+        far levels that each fall below min notional.
         """
         kept_indexes = list(candidate_indexes)
         if total_quote_budget < self.config.min_order_quote:
             return []
 
         while kept_indexes:
-            # Match the placement loop in _create_buy_actions: each level's
-            # allocation is its CONFIGURED fraction of deployable budget, not its
-            # fraction of the currently-kept subset.
+            # Concentrate: each kept level's allocation is its weight RE-NORMALIZED
+            # over the currently-kept subset, so the whole budget is deployed across
+            # the nearest levels. This must match the placement loop in
+            # _create_buy_actions.
             kept_weight_total = sum(self.config.normalized_buy_weights[idx] for idx in kept_indexes)
             if kept_weight_total <= Decimal("0"):
                 return []
 
             all_kept_levels_feasible = True
             for idx in kept_indexes:
-                level_weight = self.config.normalized_buy_weights[idx]
+                level_weight = self.config.normalized_buy_weights[idx] / kept_weight_total
                 level_quote = total_quote_budget * level_weight
                 # Quantization-aware feasibility: simulate what _build_buy_executor_action does
                 price = self.config.buy_prices[idx]
@@ -2145,26 +2318,28 @@ class RangeInventoryLadderController(ControllerBase):
         total_base_budget: Decimal,
     ) -> List[int]:
         """
-        Drop the highest / farthest eligible sell levels until every kept level can be seeded above min_order_quote.
+        Concentrate the available base inventory into the nearest kept sell levels.
 
-        This mirrors buy-side compression: when managed sell inventory is too small to support the full sell ladder,
-        the controller keeps the nearer sell levels first (for example 340, 345, 350) and drops 360, then 355, etc.
+        Mirrors buy-side compression: drop the farthest (highest-priced) eligible sell
+        levels until every kept level clears min_order_quote, RE-NORMALIZING the weights
+        over the kept subset so the available base is fully deployed across the nearest
+        sell levels (340, 345, ... first). A budget that can fund one level keeps one.
         """
         kept_indexes = list(candidate_indexes)
         if total_base_budget <= Decimal("0"):
             return []
 
         while kept_indexes:
-            # Match the placement loop in _create_sell_actions: each level's
-            # allocation is its CONFIGURED fraction of deployable budget, not its
-            # fraction of the currently-kept subset.
+            # Concentrate: each kept level's allocation is its weight RE-NORMALIZED
+            # over the currently-kept subset. This must match the placement loop in
+            # _create_sell_actions.
             kept_weight_total = sum(self.config.normalized_sell_weights[idx] for idx in kept_indexes)
             if kept_weight_total <= Decimal("0"):
                 return []
 
             all_kept_levels_feasible = True
             for idx in kept_indexes:
-                level_weight = self.config.normalized_sell_weights[idx]
+                level_weight = self.config.normalized_sell_weights[idx] / kept_weight_total
                 level_base = total_base_budget * level_weight
                 # Quantization-aware feasibility: simulate what _build_sell_executor_action does
                 price = self.config.sell_prices[idx]
@@ -2344,20 +2519,24 @@ class RangeInventoryLadderController(ControllerBase):
         passive_execution_strategy = self._passive_execution_strategy()
         pending_indexes = list(kept_buy_indexes)
 
-        # Stable denominator: use the deployable budget and each level's configured
-        # fraction of the full ladder (normalized_buy_weights already sum to 1.0).
-        # Using the subset sum of eligible weights inflates every eligible level's
-        # share when some levels are temporarily blocked, which starves those
-        # blocked levels once they become eligible again.
+        # Concentrate: deploy the full available budget across the KEPT (nearest)
+        # levels by re-normalizing each kept level's weight over the kept subset.
+        # This matches _compress_buy_level_indexes_for_min_notional so that placement
+        # actually deploys the concentrated amounts the compression check assumed --
+        # a small balance funds the nearest level(s) fully instead of stranding budget
+        # on far levels that fall below min notional.
         deployable_quote_total = self.processed_data.get(
             "deployable_quote_total", remaining_quote_budget
         )
+        kept_weight_total = sum(self.config.normalized_buy_weights[i] for i in kept_buy_indexes)
 
         while pending_indexes and remaining_quote_budget >= self.config.min_order_quote:
             idx = pending_indexes.pop(0)
             price = self.config.buy_prices[idx]
             level_id = self._buy_level_id(idx)
-            level_weight = self.config.normalized_buy_weights[idx]
+            if kept_weight_total <= Decimal("0"):
+                break
+            level_weight = self.config.normalized_buy_weights[idx] / kept_weight_total
             if level_weight <= Decimal("0"):
                 continue
 
@@ -2439,16 +2618,19 @@ class RangeInventoryLadderController(ControllerBase):
         passive_execution_strategy = self._passive_execution_strategy()
         pending_indexes = list(kept_sell_indexes)
 
-        # Stable denominator (see _create_buy_actions for rationale).
+        # Concentrate over the kept subset (see _create_buy_actions for rationale).
         deployable_base_total = self.processed_data.get(
             "deployable_base_total", remaining_base_budget
         )
+        kept_weight_total = sum(self.config.normalized_sell_weights[i] for i in kept_sell_indexes)
 
         while pending_indexes and remaining_base_budget > Decimal("0"):
             idx = pending_indexes.pop(0)
             price = self.config.sell_prices[idx]
             level_id = self._sell_level_id(idx)
-            level_weight = self.config.normalized_sell_weights[idx]
+            if kept_weight_total <= Decimal("0"):
+                break
+            level_weight = self.config.normalized_sell_weights[idx] / kept_weight_total
             if level_weight <= Decimal("0"):
                 continue
 
@@ -2640,7 +2822,8 @@ class RangeInventoryLadderController(ControllerBase):
             f"Initialization ready: {p.get('initialization_ready', True)} | Session expired: {p.get('session_expired', False)}",
             f"Wallet avail / total: {p['available_quote_balance']:.6f} / {p['total_quote_balance']:.6f} {p['quote_asset']} | {p['available_base_balance']:.6f} / {p['total_base_balance']:.6f} {p['base_asset']}",
             f"Managed quote / base: {p['managed_quote_total']:.6f} {p['quote_asset']} / {p['managed_base_total']:.6f} {p['base_asset']}",
-            f"Managed fund value: {p['managed_fund_value_quote']:.6f} {p['quote_asset']} | Cap factor: {p['cap_factor']:.6f}",
+            f"Managed fund value: {p['managed_fund_value_quote']:.6f} {p['quote_asset']} | Throttle factor: {p['cap_factor']:.6f}",
+            f"Seed value / Deploy ceiling: {p.get('seed_value_quote', Decimal('0')):.6f} / {p.get('deploy_ceiling_quote', Decimal('0')):.6f} {p['quote_asset']} (cap {self.config.max_fund_value_quote})",
             f"Deployable quote / base: {p['deployable_quote_total']:.6f} {p['quote_asset']} / {p['deployable_base_total']:.6f} {p['base_asset']}",
             f"Free buy budget: {p['free_buy_budget_quote']:.6f} {p['quote_asset']}",
             f"Shared-account quote quota: "
@@ -2716,6 +2899,9 @@ class RangeInventoryLadderController(ControllerBase):
             "managed_base_total": str(p["managed_base_total"]),
             "managed_fund_value_quote": str(p["managed_fund_value_quote"]),
             "cap_factor": str(p["cap_factor"]),
+            "seed_value_quote": str(p.get("seed_value_quote", Decimal("0"))),
+            "deploy_ceiling_quote": str(p.get("deploy_ceiling_quote", Decimal("0"))),
+            "deploy_headroom_quote": str(p.get("deploy_headroom_quote", Decimal("0"))),
             "deployable_quote_total": str(p["deployable_quote_total"]),
             "deployable_base_total": str(p["deployable_base_total"]),
             "free_buy_budget_quote": str(p["free_buy_budget_quote"]),
