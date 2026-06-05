@@ -234,6 +234,114 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(custom_info["order_id"], "OID-INFO")
         self.assertEqual(custom_info["held_position_orders"], [])
 
+    @staticmethod
+    def _make_filled_tracked_order(base, quote, fees, order_id="OID", last_update=123.0):
+        """Build a TrackedOrder mock whose executed amounts and quote fees are non-zero."""
+        tracked = MagicMock(spec=TrackedOrder)
+        tracked.executed_amount_base = Decimal(str(base))
+        tracked.executed_amount_quote = Decimal(str(quote))
+        tracked.cum_fees_quote = Decimal(str(fees))
+        tracked.order_id = order_id
+        tracked.last_update_timestamp = last_update
+        return tracked
+
+    def test_get_custom_info_reports_exact_fills(self):
+        """get_custom_info must publish the executor's real fills (base/quote/fees + side)."""
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.SELL,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("0.08"),
+            price=Decimal("320"),
+            execution_strategy=ExecutionStrategy.LIMIT,
+        )
+        executor = self.get_order_executor_from_config(config)
+        executor._order = self._make_filled_tracked_order("0.08", "27.72", "0.05", order_id="OID-SELL")
+
+        info = executor.get_custom_info()
+        self.assertEqual(info["filled_amount_base"], Decimal("0.08"))
+        self.assertEqual(info["filled_amount_quote"], Decimal("27.72"))
+        self.assertEqual(info["cum_fees_quote"], Decimal("0.05"))
+        self.assertEqual(info["side"], TradeType.SELL)
+        # New fields must be Decimals, not floats/strings.
+        self.assertIsInstance(info["filled_amount_base"], Decimal)
+        self.assertIsInstance(info["filled_amount_quote"], Decimal)
+        self.assertIsInstance(info["cum_fees_quote"], Decimal)
+
+    def test_get_custom_info_sums_partial_and_live_orders(self):
+        """_aggregate_fills must sum a live order plus orders cancelled after a partial fill."""
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.BUY,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("1"),
+            price=Decimal("320"),
+            execution_strategy=ExecutionStrategy.LIMIT,
+        )
+        executor = self.get_order_executor_from_config(config)
+        executor._order = self._make_filled_tracked_order("0.5", "160", "0.10", order_id="OID-LIVE")
+        executor._partial_filled_orders = [
+            self._make_filled_tracked_order("0.25", "80", "0.05", order_id="OID-PARTIAL")
+        ]
+
+        info = executor.get_custom_info()
+        self.assertEqual(info["filled_amount_base"], Decimal("0.75"))
+        self.assertEqual(info["filled_amount_quote"], Decimal("240"))
+        self.assertEqual(info["cum_fees_quote"], Decimal("0.15"))
+        self.assertEqual(info["side"], TradeType.BUY)
+
+    def test_get_custom_info_with_unattached_order_reports_zero(self):
+        """A TrackedOrder created before its InFlightOrder is attached must not crash; reports 0."""
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.BUY,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            execution_strategy=ExecutionStrategy.LIMIT,
+        )
+        executor = self.get_order_executor_from_config(config)
+        executor._order = TrackedOrder("OID-NOORDER")  # no underlying InFlightOrder yet
+
+        info = executor.get_custom_info()
+        self.assertEqual(info["filled_amount_base"], Decimal("0"))
+        self.assertEqual(info["filled_amount_quote"], Decimal("0"))
+        self.assertEqual(info["cum_fees_quote"], Decimal("0"))
+
+    def test_position_hold_public_filled_zero_but_custom_info_populated(self):
+        """For a POSITION_HOLD full fill the public filled_amount_quote stays 0,
+        while custom_info reports the real fill (orchestrator semantics untouched)."""
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.SELL,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("0.08"),
+            price=Decimal("320"),
+            execution_strategy=ExecutionStrategy.LIMIT,
+        )
+        executor = self.get_order_executor_from_config(config)
+        executor._order = self._make_filled_tracked_order("0.08", "27.72", "0.05", order_id="OID-HOLD")
+        executor.close_type = CloseType.POSITION_HOLD
+
+        # Public property must remain 0 (we did NOT disturb orchestrator aggregation).
+        self.assertEqual(executor.filled_amount_quote, Decimal("0"))
+        self.assertEqual(executor.get_cum_fees_quote(), Decimal("0"))
+        self.assertEqual(executor.get_net_pnl_quote(), Decimal("0"))
+
+        # But custom_info reflects the real fill.
+        info = executor.get_custom_info()
+        self.assertEqual(info["filled_amount_quote"], Decimal("27.72"))
+        self.assertEqual(info["filled_amount_base"], Decimal("0.08"))
+        self.assertEqual(info["cum_fees_quote"], Decimal("0.05"))
+
     def test_to_format_status(self):
         config = OrderExecutorConfig(
             id="test",

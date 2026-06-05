@@ -55,10 +55,22 @@ class TestBudgetInvariance(unittest.TestCase):
         self.assertAlmostEqual(float(old_managed), 106.71, places=1)
 
 
-class TestFillAccounting(unittest.TestCase):
-    """Fill accounting: buy reduces owned_quote, increases owned_base."""
+class TestFillAccountingFormula(unittest.TestCase):
+    """PURE-FORMULA sanity checks for the buy/sell ledger arithmetic.
 
-    def test_buy_fill_accounting(self):
+    IMPORTANT: these tests re-implement the arithmetic inline; they do NOT construct
+    the controller or feed it an ExecutorInfo, so they cannot catch a broken data
+    source (the exact failure mode of the original 45-hour run, where the ledger never
+    moved because the controller read an always-zero field). They are kept only as
+    documentation of the expected math.
+
+    The real, controller-driving fill-accounting tests live in
+    ``test_range_inventory_ladder_fill_ledger.py`` and exercise
+    ``RangeInventoryLadderController._update_ledger_from_completed_executors()``
+    end-to-end with real ExecutorInfo objects.
+    """
+
+    def test_buy_fill_formula(self):
         """
         Buy executor fills 10 USDT at price 320.
         owned_quote -= (10 + fees), owned_base += 10/320.
@@ -76,7 +88,7 @@ class TestFillAccounting(unittest.TestCase):
         self.assertAlmostEqual(float(owned_quote), 89.95, places=2)
         self.assertAlmostEqual(float(owned_base), 0.53125, places=5)
 
-    def test_sell_fill_accounting(self):
+    def test_sell_fill_formula(self):
         """Sell: owned_base decreases, owned_quote increases."""
         owned_quote = Decimal("50")
         owned_base = Decimal("1.0")
@@ -91,7 +103,7 @@ class TestFillAccounting(unittest.TestCase):
         self.assertEqual(owned_base, Decimal("0"))
         self.assertAlmostEqual(float(owned_quote), 369.84, places=2)
 
-    def test_floor_at_zero(self):
+    def test_floor_at_zero_formula(self):
         """owned_quote/owned_base should never go negative (clamped to 0)."""
         owned_quote = Decimal("5")
         filled_quote = Decimal("10")

@@ -1218,22 +1218,40 @@ class RangeInventoryLadderController(ControllerBase):
             if level_id is None:
                 continue  # not ours
 
-            filled_quote = max(Decimal("0"), executor.filled_amount_quote)
-            if filled_quote <= Decimal("0"):
+            # Prefer the executor's exact fill accounting published via custom_info.
+            # OrderExecutor exposes filled_amount_base/quote + cum_fees_quote there because
+            # its public filled_amount_quote property is hardcoded to 0 (POSITION_HOLD
+            # semantics, co-designed with the orchestrator). Fall back to the legacy public
+            # fields only for other executor types or state written by older runs.
+            info = getattr(executor, "custom_info", {}) or {}
+            side = getattr(executor.config, "side", None) or info.get("side")
+            config_price = self._d(getattr(executor.config, "price", "0") or "0")
+
+            filled_quote = self._d(info.get("filled_amount_quote"), "0")
+            filled_base = self._d(info.get("filled_amount_base"), "0")
+            fees = self._d(info.get("cum_fees_quote"), "0")
+
+            if filled_quote <= Decimal("0") and filled_base <= Decimal("0"):
+                # legacy fallback: derive base from the public fields + config price
+                filled_quote = max(Decimal("0"), executor.filled_amount_quote)
+                fees = max(Decimal("0"), executor.cum_fees_quote)
+                if filled_quote > Decimal("0") and config_price > Decimal("0"):
+                    filled_base = filled_quote / config_price
+
+            if filled_quote <= Decimal("0") and filled_base <= Decimal("0"):
                 tracked_executor_ids.add(executor.id)
-                continue  # no fill happened
+                continue  # genuinely no fill
 
-            side = getattr(executor.config, "side", None)
-            price = self._d(getattr(executor.config, "price", "0") or "0")
-            fees = max(Decimal("0"), executor.cum_fees_quote)
+            # Clamp to non-negative in case of malformed custom_info / fallback data.
+            filled_quote = max(Decimal("0"), filled_quote)
+            filled_base = max(Decimal("0"), filled_base)
+            fees = max(Decimal("0"), fees)
 
-            if side == TradeType.BUY and price > Decimal("0"):
-                filled_base = filled_quote / price
+            if side == TradeType.BUY:
                 owned_quote -= (filled_quote + fees)
                 owned_base += filled_base
                 changed = True
-            elif side == TradeType.SELL and price > Decimal("0"):
-                filled_base = filled_quote / price
+            elif side == TradeType.SELL:
                 owned_base -= filled_base
                 owned_quote += (filled_quote - fees)
                 changed = True
@@ -1669,8 +1687,9 @@ class RangeInventoryLadderController(ControllerBase):
         # Update owned ledger from completed executor fills
         try:
             self._update_ledger_from_completed_executors()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger().exception(f"{self.config.id}: ledger update from fills failed")
+            self._emit_structured("range_ladder_ledger_update_error", error=str(e))
 
         if self._session_started_ts is None:
             self._session_started_ts = now

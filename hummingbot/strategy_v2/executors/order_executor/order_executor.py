@@ -273,12 +273,39 @@ class OrderExecutor(ExecutorBase):
             self.logger().error(f"Order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
             self._current_retries += 1
 
+    def _aggregate_fills(self):
+        """Sum executed base/quote and quote fees across this executor's fill-bearing orders.
+
+        The executor places one order at a time. ``self._order`` is retained on a full fill
+        (``process_order_completed_event`` sets ``POSITION_HOLD`` without clearing it), and
+        ``self._partial_filled_orders`` holds orders cancelled after a partial fill. Cancelled
+        and failed orders carry no fills, so they are intentionally excluded.
+        """
+        tracked = []
+        if self._order is not None:
+            tracked.append(self._order)
+        tracked.extend(self._partial_filled_orders)
+
+        filled_base = Decimal("0")
+        filled_quote = Decimal("0")
+        cum_fees_quote = Decimal("0")
+        for t in tracked:
+            try:
+                filled_base += Decimal(str(t.executed_amount_base or 0))
+                filled_quote += Decimal(str(t.executed_amount_quote or 0))
+                cum_fees_quote += Decimal(str(t.cum_fees_quote or 0))
+            except Exception:
+                # A tracked order without an underlying InFlightOrder yet; skip it.
+                continue
+        return filled_base, filled_quote, cum_fees_quote
+
     def get_custom_info(self) -> Dict:
         """
         Get custom information about the executor.
 
         :return: A dictionary containing custom information.
         """
+        filled_base, filled_quote, cum_fees_quote = self._aggregate_fills()
         return {
             "level_id": self.config.level_id,
             "current_retries": self._current_retries,
@@ -286,6 +313,14 @@ class OrderExecutor(ExecutorBase):
             "order_id": self._order.order_id if self._order else None,
             "order_last_update": self._order.last_update_timestamp if self._order else None,
             "held_position_orders": self._held_position_orders,
+            # --- exact, controller-consumable fill accounting ---
+            # These are stored by the orchestrator but NOT aggregated into performance
+            # metrics (volume_traded / global_pnl), so exposing real fills here is safe
+            # while the public filled_amount_quote property stays 0 for POSITION_HOLD.
+            "side": self.config.side,
+            "filled_amount_base": filled_base,
+            "filled_amount_quote": filled_quote,
+            "cum_fees_quote": cum_fees_quote,
         }
 
     def to_format_status(self, scale=1.0):
