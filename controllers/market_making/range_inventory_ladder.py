@@ -572,6 +572,12 @@ class RangeInventoryLadderController(ControllerBase):
         self._last_price_regime: Optional[str] = None
         self._cooldown_bypass_until_by_level: Dict[str, float] = {}
 
+        # Per-level last filter reason (None = eligible, "blocked", "not_passive").
+        # Filter events are emitted only on reason TRANSITIONS, not every cycle --
+        # per-cycle emission produced ~271 MB/day of diagnostic JSONL.
+        self._buy_level_filter_reasons: Dict[str, Optional[str]] = {}
+        self._sell_level_filter_reasons: Dict[str, Optional[str]] = {}
+
         self._initialization_blocked_reason: Optional[str] = None
         self._initialization_blocked_logged: bool = False
         self._last_market_data_error: Optional[str] = None
@@ -702,6 +708,12 @@ class RangeInventoryLadderController(ControllerBase):
             active_order_executors=len(self._active_order_executors()),
             tracked_positions=len(self.positions_held or []),
             blocked_level_ids=sorted(list(p.get("blocked_level_ids", set()))),
+            not_passive_buy_level_ids=sorted(
+                lid for lid, reason in self._buy_level_filter_reasons.items() if reason == "not_passive"
+            ),
+            not_passive_sell_level_ids=sorted(
+                lid for lid, reason in self._sell_level_filter_reasons.items() if reason == "not_passive"
+            ),
             reconciliation_gap_quote=p.get("reconciliation_gap_quote", Decimal("0")),
             inventory_global_pnl_quote=p.get("inventory_global_pnl_quote", Decimal("0")),
             reservation_sources_buy=self._buy_reservation_sources,
@@ -2484,24 +2496,39 @@ class RangeInventoryLadderController(ControllerBase):
         remaining_quote_budget = self.processed_data["free_buy_budget_quote"]
 
         eligible_buy_indexes: List[int] = []
+        previous_filter_reasons = self._buy_level_filter_reasons
+        current_filter_reasons: Dict[str, Optional[str]] = {}
         for idx, price in enumerate(self.config.buy_prices):
             level_id = self._buy_level_id(idx)
             if level_id in blocked_levels:
-                self._emit_structured(
-                    "range_ladder_buy_level_filtered_blocked",
-                    level_id=level_id,
-                    price=str(price),
-                )
+                current_filter_reasons[level_id] = "blocked"
+                if previous_filter_reasons.get(level_id) != "blocked":
+                    self._emit_structured(
+                        "range_ladder_buy_level_filtered_blocked",
+                        level_id=level_id,
+                        price=str(price),
+                    )
                 continue
             if not self._can_place_buy_level(price):
+                current_filter_reasons[level_id] = "not_passive"
+                if previous_filter_reasons.get(level_id) != "not_passive":
+                    self._emit_structured(
+                        "range_ladder_buy_level_filtered_not_passive",
+                        level_id=level_id,
+                        price=str(price),
+                        best_bid=str(self.processed_data["best_bid"]),
+                    )
+                continue
+            current_filter_reasons[level_id] = None
+            if previous_filter_reasons.get(level_id) is not None:
                 self._emit_structured(
-                    "range_ladder_buy_level_filtered_not_passive",
+                    "range_ladder_buy_level_eligible_again",
                     level_id=level_id,
                     price=str(price),
-                    best_bid=str(self.processed_data["best_bid"]),
+                    previous_reason=previous_filter_reasons.get(level_id),
                 )
-                continue
             eligible_buy_indexes.append(idx)
+        self._buy_level_filter_reasons = current_filter_reasons
 
         kept_buy_indexes = self._compress_buy_level_indexes_for_min_notional(
             candidate_indexes=eligible_buy_indexes,
@@ -2583,24 +2610,39 @@ class RangeInventoryLadderController(ControllerBase):
         remaining_base_budget = self.processed_data["free_sell_budget_base"]
 
         eligible_sell_indexes: List[int] = []
+        previous_filter_reasons = self._sell_level_filter_reasons
+        current_filter_reasons: Dict[str, Optional[str]] = {}
         for idx, price in enumerate(self.config.sell_prices):
             level_id = self._sell_level_id(idx)
             if level_id in blocked_levels:
-                self._emit_structured(
-                    "range_ladder_sell_level_filtered_blocked",
-                    level_id=level_id,
-                    price=str(price),
-                )
+                current_filter_reasons[level_id] = "blocked"
+                if previous_filter_reasons.get(level_id) != "blocked":
+                    self._emit_structured(
+                        "range_ladder_sell_level_filtered_blocked",
+                        level_id=level_id,
+                        price=str(price),
+                    )
                 continue
             if not self._can_place_sell_level(price):
+                current_filter_reasons[level_id] = "not_passive"
+                if previous_filter_reasons.get(level_id) != "not_passive":
+                    self._emit_structured(
+                        "range_ladder_sell_level_filtered_not_passive",
+                        level_id=level_id,
+                        price=str(price),
+                        best_ask=str(self.processed_data["best_ask"]),
+                    )
+                continue
+            current_filter_reasons[level_id] = None
+            if previous_filter_reasons.get(level_id) is not None:
                 self._emit_structured(
-                    "range_ladder_sell_level_filtered_not_passive",
+                    "range_ladder_sell_level_eligible_again",
                     level_id=level_id,
                     price=str(price),
-                    best_ask=str(self.processed_data["best_ask"]),
+                    previous_reason=previous_filter_reasons.get(level_id),
                 )
-                continue
             eligible_sell_indexes.append(idx)
+        self._sell_level_filter_reasons = current_filter_reasons
 
         kept_sell_indexes = self._compress_sell_level_indexes_for_min_notional(
             candidate_indexes=eligible_sell_indexes,
