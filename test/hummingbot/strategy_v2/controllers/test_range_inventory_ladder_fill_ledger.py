@@ -153,7 +153,7 @@ class TestFillLedgerIntegration(unittest.TestCase):
         # owned_quote += (filled_quote - fees); owned_base -= filled_base
         self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("127.67"))
         self.assertEqual(self._d(controller._state["owned_base"]), Decimal("0.42"))
-        self.assertIn("EX-SELL", controller._state["tracked_fill_executor_ids"])
+        self.assertIn("EX-SELL", controller._state["booked_fill_progress"])
         self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 1)
 
     # ------------------------------------------------------------------ BUY
@@ -171,7 +171,7 @@ class TestFillLedgerIntegration(unittest.TestCase):
         # owned_quote -= (filled_quote + fees); owned_base += filled_base
         self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("89.95"))
         self.assertEqual(self._d(controller._state["owned_base"]), Decimal("0.53"))
-        self.assertIn("EX-BUY", controller._state["tracked_fill_executor_ids"])
+        self.assertIn("EX-BUY", controller._state["booked_fill_progress"])
         self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 1)
 
     # ------------------------------------------------------------ idempotency
@@ -193,7 +193,9 @@ class TestFillLedgerIntegration(unittest.TestCase):
 
         self.assertEqual(self._d(controller._state["owned_quote"]), first_quote)
         self.assertEqual(self._d(controller._state["owned_base"]), first_base)
-        self.assertEqual(controller._state["tracked_fill_executor_ids"].count("EX-SELL"), 1)
+        # Booked once: the per-order progress entry reflects the single fill, not re-applied.
+        self.assertIn("EX-SELL", controller._state["booked_fill_progress"])
+        self.assertEqual(self._d(controller._state["booked_fill_progress"]["EX-SELL"]["base"]), Decimal("0.08"))
         # Event emitted exactly once across both calls.
         self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 1)
 
@@ -220,33 +222,34 @@ class TestFillLedgerIntegration(unittest.TestCase):
 
         self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("127.67"))
         self.assertEqual(self._d(controller._state["owned_base"]), Decimal("0.42"))
-        self.assertIn("EX-BUGGY", controller._state["tracked_fill_executor_ids"])
+        self.assertIn("EX-BUGGY", controller._state["booked_fill_progress"])
         self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 1)
 
-    # --------------------------------------------------------- legacy fallback
+    # --------------------------------------------------------- v13 source policy
 
-    def test_legacy_fallback_books_from_public_fields(self):
-        """When custom_info lacks the new fields but executor.filled_amount_quote > 0,
-        the legacy path still books the fill (back-compat with other executor types)."""
+    def test_public_only_fields_not_booked_in_v13(self):
+        """v13 books from the in-flight order / custom_info, NOT the executor's public
+        filled_amount_quote (OrderExecutor hardcodes that to 0). A fill signalled ONLY by the
+        public field is therefore not booked -- v13 never relies on a field that is always 0."""
         controller = self._make_controller(owned_quote="50", owned_base="1.0")
         executor = self._make_executor_info(
             "EX-LEGACY",
             TradeType.SELL,
             price="320",
             level_id="sell_0",
-            custom_info={},               # no exact fill fields
-            public_filled_quote="320",    # legacy public fill
+            custom_info={},               # no custom_info fill fields
+            public_filled_quote="320",    # only the (unreliable) public field
             public_fees="0.16",
         )
         controller.executors_info = [executor]
 
         controller._update_ledger_from_completed_executors()
 
-        # filled_base derived as filled_quote / config_price = 320 / 320 = 1
-        self.assertEqual(self._d(controller._state["owned_base"]), Decimal("0"))
-        self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("369.84"))
-        self.assertIn("EX-LEGACY", controller._state["tracked_fill_executor_ids"])
-        self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 1)
+        # Unchanged: the public field is not a v13 booking source (no double-count risk, and no
+        # phantom fund growth from OrderExecutor's hardcoded-0 public property).
+        self.assertEqual(self._d(controller._state["owned_base"]), Decimal("1.0"))
+        self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("50"))
+        self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 0)
 
     # ----------------------------------------------------------- not-ours guard
 
@@ -266,9 +269,12 @@ class TestFillLedgerIntegration(unittest.TestCase):
         self.assertNotIn("EX-FOREIGN", controller._state["tracked_fill_executor_ids"])
         self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 0)
 
-    # ----------------------------------------------------------- active guard
+    # ----------------------------------------------------- active partial booking
 
-    def test_active_executor_is_not_booked(self):
+    def test_active_executor_partial_is_booked(self):
+        """v13: partials are booked AS THEY ACCRUE, so an ACTIVE executor's reported fill IS
+        booked. The v12 'skip while active' gate is gone -- that gate is exactly why partial
+        fills were missed and the fund never compounded."""
         controller = self._make_controller(owned_quote="100", owned_base="0.5")
         info = self._exact_fill_custom_info(TradeType.SELL, "0.08", "27.72", "0.05")
         executor = self._make_executor_info(
@@ -279,9 +285,10 @@ class TestFillLedgerIntegration(unittest.TestCase):
 
         controller._update_ledger_from_completed_executors()
 
-        self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("100"))
-        self.assertEqual(self._d(controller._state["owned_base"]), Decimal("0.5"))
-        self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 0)
+        self.assertEqual(self._d(controller._state["owned_quote"]), Decimal("127.67"))
+        self.assertEqual(self._d(controller._state["owned_base"]), Decimal("0.42"))
+        self.assertIn("EX-ACTIVE", controller._state["booked_fill_progress"])
+        self.assertEqual(self._emit_count(controller, "range_ladder_ledger_updated"), 1)
 
     # --------------------------------------------------------------- floor at 0
 
@@ -332,7 +339,7 @@ class TestFillLedgerIntegration(unittest.TestCase):
             persisted = json.load(f)
         self.assertEqual(self._d(persisted["owned_quote"]), Decimal("127.67"))
         self.assertEqual(self._d(persisted["owned_base"]), Decimal("0.42"))
-        self.assertIn("EX-SELL", persisted["tracked_fill_executor_ids"])
+        self.assertIn("EX-SELL", persisted["booked_fill_progress"])
 
 
 if __name__ == "__main__":

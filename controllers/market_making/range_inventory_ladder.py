@@ -302,6 +302,104 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
 
+    # v12 Part B: fast directional recycle window. While open, the targeted side's
+    # per-level cooldowns are bypassed so the offsetting order from the proceeds of a
+    # fill on the OTHER side is created within this many seconds of that fill.
+    recycle_max_latency_seconds: int = Field(
+        default=60,
+        json_schema_extra={
+            "prompt": (
+                "Maximum seconds to wait before recycling fill proceeds into the opposite side "
+                "(directional cooldown bypass window, default 60): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    # v12 Issue 1: grace period an over-claim must persist before the fills-only ledger
+    # is self-healed (re-anchored DOWN) to wallet truth.
+    ledger_overclaim_reanchor_seconds: int = Field(
+        default=120,
+        json_schema_extra={
+            "prompt": (
+                "Grace period (seconds) an over-claim must persist before the ledger is "
+                "re-anchored down to the wallet (default 120): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    # v12 Issue 1: over-claim magnitude (in quote) above which re-anchoring/warning applies.
+    ledger_reconcile_threshold_quote: Decimal = Field(
+        default=Decimal("0.5"),
+        json_schema_extra={
+            "prompt": (
+                "Over-claim magnitude in quote above which ledger reconciliation/re-anchoring "
+                "applies (default 0.5): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
+    # v13 Part A: fallback per-fill fee rate (fraction of filled quote) used ONLY when the
+    # connector does not report an actual fee for an order. NonKYC's order object carries no
+    # fee field; a silent 0 would slowly overstate the fund. Ledger-accuracy only -- this
+    # NEVER affects order sizing or prices.
+    fee_rate: Decimal = Field(
+        default=Decimal("0.002"),
+        json_schema_extra={
+            "prompt": (
+                "Fallback per-fill fee rate (fraction of filled quote, e.g. 0.002 = 0.2%) used "
+                "only when the connector does not report an actual fee: "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
+    # v13 Part C: guarded one-shot managed-fund re-seed. When True AND this exact reseed token
+    # (reseed_generation + reseed_fund_target_quote) has not already been applied, the fund is
+    # re-seeded from the CURRENT wallet and the booking progress is cleared. Idempotent: it
+    # never repeats for the same token even if left True. Bump reseed_generation to re-arm.
+    reseed_fund_from_wallet_once: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": (
+                "Re-seed the managed fund from the current wallet once on next start? "
+                "(True/False, idempotent per reseed_generation): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    reseed_fund_target_quote: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Optional quote value to target when reseed_fund_from_wallet_once runs. If set, the "
+            "re-seed claims up to this quote value from the wallet (mirroring total_amount_quote "
+            "seed logic). If unset, it re-runs the normal seed claim against total_amount_quote."
+        ),
+        json_schema_extra={
+            "prompt": (
+                "Optional quote value to target on re-seed (blank = use total_amount_quote): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    reseed_generation: int = Field(
+        default=0,
+        json_schema_extra={
+            "prompt": (
+                "Re-seed generation counter -- bump this integer to re-arm a one-shot re-seed "
+                "with reseed_fund_from_wallet_once left True (default 0): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
     @field_validator("buy_prices", "sell_prices", mode="before")
     @classmethod
     def parse_price_lists(cls, value, validation_info: ValidationInfo):
@@ -337,6 +435,8 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         "max_fund_value_quote",
         "min_order_quote",
         "max_session_duration_hours",
+        "ledger_reconcile_threshold_quote",
+        "fee_rate",
         mode="before",
     )
     @classmethod
@@ -345,7 +445,28 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             value = value.strip()
         return _safe_decimal(value, validation_info.field_name, default="0")
 
-    @field_validator("executor_refresh_time", "cooldown_time", "max_market_data_unavailable_seconds", "diagnostic_heartbeat_interval_seconds", mode="before")
+    @field_validator("reseed_fund_target_quote", mode="before")
+    @classmethod
+    def parse_optional_reseed_target(cls, value):
+        # Blank / unset -> None (re-seed falls back to total_amount_quote).
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+        return _safe_decimal(value, "reseed_fund_target_quote")
+
+    @field_validator(
+        "executor_refresh_time",
+        "cooldown_time",
+        "max_market_data_unavailable_seconds",
+        "diagnostic_heartbeat_interval_seconds",
+        "recycle_max_latency_seconds",
+        "ledger_overclaim_reanchor_seconds",
+        "reseed_generation",
+        mode="before",
+    )
     @classmethod
     def parse_int_fields(cls, value):
         if isinstance(value, str):
@@ -460,6 +581,50 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             raise ValueError("diagnostic_heartbeat_interval_seconds must be greater than zero")
         return value
 
+    @field_validator("recycle_max_latency_seconds")
+    @classmethod
+    def validate_recycle_max_latency_seconds(cls, value: int):
+        if value <= 0:
+            raise ValueError("recycle_max_latency_seconds must be greater than zero")
+        return value
+
+    @field_validator("ledger_overclaim_reanchor_seconds")
+    @classmethod
+    def validate_ledger_overclaim_reanchor_seconds(cls, value: int):
+        if value < 0:
+            raise ValueError("ledger_overclaim_reanchor_seconds cannot be negative")
+        return value
+
+    @field_validator("ledger_reconcile_threshold_quote")
+    @classmethod
+    def validate_ledger_reconcile_threshold_quote(cls, value: Decimal):
+        if not value.is_finite() or value <= Decimal("0"):
+            raise ValueError("ledger_reconcile_threshold_quote must be a finite value greater than zero")
+        return value
+
+    @field_validator("fee_rate")
+    @classmethod
+    def validate_fee_rate(cls, value: Decimal):
+        if not value.is_finite() or value < Decimal("0") or value >= Decimal("1"):
+            raise ValueError("fee_rate must be a finite fraction in [0, 1)")
+        return value
+
+    @field_validator("reseed_fund_target_quote")
+    @classmethod
+    def validate_reseed_fund_target_quote(cls, value):
+        if value is None:
+            return value
+        if not value.is_finite() or value < Decimal("0"):
+            raise ValueError("reseed_fund_target_quote must be a non-negative finite decimal or null")
+        return value
+
+    @field_validator("reseed_generation")
+    @classmethod
+    def validate_reseed_generation(cls, value: int):
+        if value < 0:
+            raise ValueError("reseed_generation cannot be negative")
+        return value
+
     @field_validator("buy_prices")
     @classmethod
     def validate_buy_prices(cls, value: List[Decimal]):
@@ -539,6 +704,52 @@ class RangeInventoryLadderController(ControllerBase):
     - Adds sequential redistribution so quantization/min-notional skips do not strand capital for a full cycle.
     - Adds session-duration and prolonged-market-data-outage safety pauses for short unattended runs.
     - Writes a dedicated JSONL diagnostic log with heartbeat snapshots for post-run review.
+
+    V12 changes (ledger reconciliation + fast directional recycle):
+    - Issue 1: self-healing ledger re-anchor. A persistent over-claim (the fills-only
+      ledger believing it holds more than the wallet physically does) is corrected DOWN to
+      wallet truth after `ledger_overclaim_reanchor_seconds`. Only ever corrects downward;
+      a wallet that exceeds the ledger stays a no-op (legitimate under the self-balance model).
+    - Issue 2: a refresh cancel now bypass-marks its level, so re-pricing an order never
+      parks the level on cooldown (only genuine fills/closes do).
+    - Issue 3: create deferral after a stop is now side-specific -- a stop on one side no
+      longer blocks creates on the other.
+    - Issue 4: status eligible-price lists index levels via enumerate (no O(n^2) value lookup).
+    - Issue 5: `owned_quote`/`owned_base`/`seed_value_quote` and `tracked_fill_executor_ids`
+      are validated/coerced on state load (corrupt values quarantine instead of loading).
+    - Part B: fast directional recycle. A fill on one side raises the TOTAL balance of the
+      asset received (immune to our own refresh cancels, which only move reserved->available);
+      that opens a short `recycle_max_latency_seconds` window during which the OPPOSITE side's
+      per-level cooldowns are bypassed, so freed funds redeploy within ~1 minute. A one-sided
+      wobble with no offsetting fill opens no window, so its cooldown (over-accumulation
+      protection) stays fully intact. STATE_SCHEMA_VERSION is intentionally unchanged (10).
+
+    V13 changes (robust fill booking + self-growing managed fund):
+    - Part A: fills are now booked per-order from each of OUR orders' cumulative executed
+      amounts (sampled every cycle via _book_fills_from_orders), not from transient custom_info
+      at close. Partial fills accrue; external transfers are ignored by construction (a deposit
+      is not an order); per-order progress lives in the new optional state key
+      "booked_fill_progress" (no schema bump). Base comes from the in-flight order's
+      executed_amount_base; quote prefers executed_amount_quote and else derives
+      filled_base*price; fee prefers the connector's actual fee and else falls back to the new
+      `fee_rate` (NonKYC orders carry no fee field). Fees in a third asset (alternateFeeAsset)
+      are recorded but never subtracted from the two-asset ledger. Monotonic guards prevent a
+      momentary 0 read from un-booking. Booking now runs AFTER the balance reads and BEFORE
+      managed_* so the deploy ceiling reflects fills the same cycle.
+    - Part B: the fund grows with realized success off the now-accurate ledger
+      (managed_fund_value_quote -> deploy_ceiling, capped at max_fund_value_quote). Deposits do
+      NOT inflate it; a withdrawal of fund money shrinks it via the v12 re-anchor. The recycle
+      windows are now driven by BOOKED fills (sell fill -> buy window, buy fill -> sell window),
+      with only a two-sided wallet backstop -- a pure one-sided deposit/withdrawal opens NO
+      window (replacing the v12 one-sided-total heuristic).
+    - Part C: a guarded, one-shot `reseed_fund_from_wallet_once` (+ optional
+      `reseed_fund_target_quote`, re-armable via `reseed_generation`) re-seeds the managed
+      baseline from the CURRENT wallet and clears the booking progress. Idempotent per token.
+
+    OPERATOR NOTE: the fund deliberately ignores deposits, so simply transferring money in will
+    NOT raise the managed baseline. To change the baseline: deposit to the intended amount, then
+    either set reseed_fund_from_wallet_once=True (bump reseed_generation to re-arm), or stop the
+    bot, fund the wallet, quarantine/remove the state file, and restart (re-init from wallet).
     """
 
     STATE_SCHEMA_VERSION = 10
@@ -598,6 +809,36 @@ class RangeInventoryLadderController(ControllerBase):
         self._last_diagnostic_heartbeat_ts: float = 0.0
         self._refresh_quiet_until: float = 0.0
         self._last_live_runtime_settings_signature: Optional[tuple] = None
+
+        # v12 Issue 1: timestamp at which a persistent ledger over-claim was first
+        # observed above threshold. Reset to None whenever the over-claim clears or is
+        # re-anchored; used to enforce the ledger_overclaim_reanchor_seconds grace period.
+        self._overclaim_since: Optional[float] = None
+
+        # v12 Issue 3: per-cycle, side-specific create-deferral flags. Set when a stop is
+        # proposed on that side this cycle so creates on the SAME side are skipped while
+        # the unaffected side is still free to place. Reset every determine_executor_actions.
+        self._defer_buy_creates_this_cycle: bool = False
+        self._defer_sell_creates_this_cycle: bool = False
+
+        # v12 Part B: previous-cycle TOTAL balances + directional recycle windows.
+        # A rise in TOTAL balance (immune to our own refresh cancels, which only move
+        # reserved->available with no total change) signals a fill/deposit and opens a
+        # short window during which the targeted side's level cooldowns are bypassed.
+        self._prev_total_quote_balance: Optional[Decimal] = None
+        self._prev_total_base_balance: Optional[Decimal] = None
+        self._recycle_bypass_buy_until: float = 0.0
+        self._recycle_bypass_sell_until: float = 0.0
+
+        # v13 Part A: which side(s) had a fill BOOKED this cycle (set by _book_fills_from_orders).
+        # These drive the recycle windows (a booked sell fill funds buys; a booked buy fill funds
+        # sells) -- a deposit is not an order, so it never sets these and opens no window.
+        self._booked_buy_fill_this_cycle: bool = False
+        self._booked_sell_fill_this_cycle: bool = False
+        # v13 Part C: set for one cycle right after a guarded re-seed so booking re-baselines
+        # open orders to their current cumulative executed amount instead of retroactively
+        # re-booking already-realized fills.
+        self._reseed_just_applied: bool = False
 
 
     @property
@@ -739,6 +980,7 @@ class RangeInventoryLadderController(ControllerBase):
             int(self.config.cooldown_time),
             str(self.config.max_session_duration_hours),
             int(self.config.max_market_data_unavailable_seconds),
+            int(self.config.recycle_max_latency_seconds),
         )
 
     def _handle_live_runtime_settings_update(self):
@@ -756,7 +998,8 @@ class RangeInventoryLadderController(ControllerBase):
             f"executor_refresh_time={self.config.executor_refresh_time}, "
             f"cooldown_time={self.config.cooldown_time}, "
             f"max_session_duration_hours={self.config.max_session_duration_hours}, "
-            f"max_market_data_unavailable_seconds={self.config.max_market_data_unavailable_seconds}"
+            f"max_market_data_unavailable_seconds={self.config.max_market_data_unavailable_seconds}, "
+            f"recycle_max_latency_seconds={self.config.recycle_max_latency_seconds}"
         )
         self._emit_structured(
             "range_ladder_live_runtime_settings_updated",
@@ -766,6 +1009,7 @@ class RangeInventoryLadderController(ControllerBase):
             cooldown_time=self.config.cooldown_time,
             max_session_duration_hours=self.config.max_session_duration_hours,
             max_market_data_unavailable_seconds=self.config.max_market_data_unavailable_seconds,
+            recycle_max_latency_seconds=self.config.recycle_max_latency_seconds,
         )
 
     def _cleanup_cooldown_bypass(self):
@@ -963,6 +1207,24 @@ class RangeInventoryLadderController(ControllerBase):
             initial_ref = Decimal(validated.get("initial_reference_price", "0"))
             validated["seed_value_quote"] = str(initial_managed + initial_base * initial_ref)
 
+        # v12 Issue 5: validate the ledger fields now that the v9->v10 migration defaults
+        # guarantee the keys exist. A corrupt (negative / NaN / non-numeric) ledger value
+        # must trip the quarantine path instead of loading silently and corrupting every
+        # reported figure (managed fund value, PnL, deploy ceiling, reconciliation gap).
+        for key in ["owned_quote", "owned_base", "seed_value_quote"]:
+            try:
+                parsed = _safe_decimal(validated.get(key), f"state field '{key}'")
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            if parsed < Decimal("0"):
+                raise ValueError(f"State field '{key}' must be non-negative")
+            validated[key] = str(parsed)
+
+        # v12 Issue 5: tracked_fill_executor_ids must be a list; coerce anything else
+        # (missing, null, scalar, dict) to an empty list so the fills-loop never crashes.
+        if not isinstance(validated.get("tracked_fill_executor_ids"), list):
+            validated["tracked_fill_executor_ids"] = []
+
         validated["schema_version"] = self.STATE_SCHEMA_VERSION
         if schema_version != self.STATE_SCHEMA_VERSION:
             validated["migrated_from_schema_version"] = schema_version
@@ -1027,6 +1289,52 @@ class RangeInventoryLadderController(ControllerBase):
             raise
 
 
+    def _compute_seed_claim(self, *, reference_price: Decimal, available_quote_balance: Decimal,
+                            available_base_balance: Decimal, target_quote: Decimal):
+        """Compute the one-time seed claim as a SUBSET of target_quote. The base sleeve is
+        carved OUT of target_quote (not additive); claimed_base_value_quote / claimed_base_amount
+        is a one-time STARTING seed only -- after seeding, deployment tracks the live wallet.
+
+            base_seed_value  = min(available_base * ref, claimed_base_value_quote)
+            base_seed_amount = base_seed_value / ref   (quantized)
+            quote_seed       = min(available_quote, target_quote - base_seed_value)
+            total seed value = quote_seed + base_seed_value  <=  target_quote
+
+        Shared by first-init (_ensure_initialized) and the v13 guarded re-seed (_maybe_reseed_fund).
+        Returns (managed_quote_claim, claimed_base_amount, base_seed_value, quote_seed,
+        seed_value_quote, claim_source).
+        """
+        base_seed_value = Decimal("0")
+        claimed_base_amount = Decimal("0")
+        claim_source = "none"
+        if self.config.use_wallet_balance and reference_price > Decimal("0"):
+            available_base_value = available_base_balance * reference_price
+            if self.config.claimed_base_amount is not None and self.config.claimed_base_amount > Decimal("0"):
+                # Explicit base amount claim, still bounded as a subset of target_quote.
+                desired_base_value = min(available_base_balance, self.config.claimed_base_amount) * reference_price
+                base_seed_value = min(desired_base_value, Decimal(target_quote))
+                claim_source = "claimed_base_amount"
+            elif self.config.claimed_base_value_quote > Decimal("0"):
+                base_seed_value = min(available_base_value, Decimal(self.config.claimed_base_value_quote))
+                claim_source = "claimed_base_value_quote"
+            base_seed_value = max(Decimal("0"), base_seed_value)
+            if base_seed_value > Decimal("0"):
+                claimed_base_amount = Decimal(
+                    self.market_data_provider.quantize_order_amount(
+                        self.config.connector_name, self.config.trading_pair, base_seed_value / reference_price
+                    )
+                )
+                # Re-derive value from the quantized amount so seed_value stays consistent.
+                base_seed_value = claimed_base_amount * reference_price
+
+        quote_seed = min(
+            available_quote_balance,
+            max(Decimal("0"), Decimal(target_quote) - base_seed_value),
+        )
+        managed_quote_claim = quote_seed
+        seed_value_quote = quote_seed + base_seed_value
+        return managed_quote_claim, claimed_base_amount, base_seed_value, quote_seed, seed_value_quote, claim_source
+
     def _ensure_initialized(self, reference_price: Decimal) -> bool:
         self._load_state()
         if self._state.get("initialized"):
@@ -1081,43 +1389,14 @@ class RangeInventoryLadderController(ControllerBase):
         self._initialization_blocked_logged = False
 
         # Seed claim (one-time, first init only). The base sleeve is carved OUT of
-        # total_amount_quote -- it is a SUBSET, not additive. claimed_base_value_quote
-        # (or claimed_base_amount) is a one-time STARTING seed only; after seeding it
-        # never influences deployment again (deployment tracks the live wallet).
-        #
-        #   base_seed_value  = min(available_base * ref, claimed_base_value_quote)
-        #   base_seed_amount = base_seed_value / ref   (quantized)
-        #   quote_seed       = min(available_quote, total_amount_quote - base_seed_value)
-        #   total seed value = quote_seed + base_seed_value  <=  total_amount_quote
-        base_seed_value = Decimal("0")
-        claimed_base_amount = Decimal("0")
-        claim_source = "none"
-        if self.config.use_wallet_balance and reference_price > Decimal("0"):
-            available_base_value = available_base_balance * reference_price
-            if self.config.claimed_base_amount is not None and self.config.claimed_base_amount > Decimal("0"):
-                # Explicit base amount claim, still bounded as a subset of total_amount_quote.
-                desired_base_value = min(available_base_balance, self.config.claimed_base_amount) * reference_price
-                base_seed_value = min(desired_base_value, Decimal(self.config.total_amount_quote))
-                claim_source = "claimed_base_amount"
-            elif self.config.claimed_base_value_quote > Decimal("0"):
-                base_seed_value = min(available_base_value, Decimal(self.config.claimed_base_value_quote))
-                claim_source = "claimed_base_value_quote"
-            base_seed_value = max(Decimal("0"), base_seed_value)
-            if base_seed_value > Decimal("0"):
-                claimed_base_amount = Decimal(
-                    self.market_data_provider.quantize_order_amount(
-                        self.config.connector_name, self.config.trading_pair, base_seed_value / reference_price
-                    )
-                )
-                # Re-derive value from the quantized amount so seed_value stays consistent.
-                base_seed_value = claimed_base_amount * reference_price
-
-        quote_seed = min(
-            available_quote_balance,
-            max(Decimal("0"), Decimal(self.config.total_amount_quote) - base_seed_value),
+        # total_amount_quote -- it is a SUBSET, not additive (see _compute_seed_claim).
+        (managed_quote_claim, claimed_base_amount, base_seed_value,
+         quote_seed, seed_value_quote, claim_source) = self._compute_seed_claim(
+            reference_price=reference_price,
+            available_quote_balance=available_quote_balance,
+            available_base_balance=available_base_balance,
+            target_quote=Decimal(self.config.total_amount_quote),
         )
-        managed_quote_claim = quote_seed
-        seed_value_quote = quote_seed + base_seed_value
 
         self._state = {
             "schema_version": self.STATE_SCHEMA_VERSION,
@@ -1280,92 +1559,319 @@ class RangeInventoryLadderController(ControllerBase):
                 self.logger().debug(f"Startup sell feasibility check failed (non-critical): {e}")
         return True
 
-    def _update_ledger_from_completed_executors(self):
-        """Scan executors for newly completed fills and update owned_quote/owned_base."""
+    @staticmethod
+    def _safe_order_decimal(obj, attr) -> Optional[Decimal]:
+        """Read a numeric attribute off an order/fee object, returning None if it is missing,
+        None, or non-numeric (so a weird/absent value never crashes the booking sweep)."""
+        if obj is None:
+            return None
+        value = getattr(obj, attr, None)
+        if value is None:
+            return None
+        try:
+            return _safe_decimal(value, attr)
+        except (ValueError, TypeError, InvalidOperation):
+            return None
+
+    def _order_fee_breakdown(self, order, info: Dict, quote_asset: str, base_asset: str, exec_quote: Decimal):
+        """Cumulative fee for an order, source-robust. Returns (fee_in_quote, alt_fees) where
+        alt_fees maps any NON-quote fee asset -> cumulative amount (recorded for visibility but
+        NOT folded into the two-asset ledger -- see the alternateFeeAsset edge case).
+
+        Preference: per-fill TradeUpdate fee tokens (NonKYC: quote-denominated flat fees) ->
+        connector cumulative_fee_paid(quote) -> property-style cumulative fee ->
+        custom_info.cum_fees_quote -> fee_rate fallback (NOT 0; NonKYC orders carry no fee).
+        """
+        alt_fees: Dict[str, Decimal] = {}
+        fee_in_quote: Optional[Decimal] = None
+
+        order_fills = getattr(order, "order_fills", None) if order is not None else None
+        if isinstance(order_fills, dict) and order_fills:
+            fee_in_quote = Decimal("0")
+            for trade_update in order_fills.values():
+                fee_obj = getattr(trade_update, "fee", None)
+                flat_fees = getattr(fee_obj, "flat_fees", None) or []
+                for token_amount in flat_fees:
+                    token = getattr(token_amount, "token", None)
+                    amount = self._safe_order_decimal(token_amount, "amount") or Decimal("0")
+                    if amount <= Decimal("0"):
+                        continue
+                    if token == quote_asset:
+                        fee_in_quote += amount
+                    else:
+                        # Fee charged in the base asset or a third asset: it must NOT be
+                        # subtracted from owned_quote. Record it for visibility only.
+                        alt_fees[str(token)] = alt_fees.get(str(token), Decimal("0")) + amount
+
+        if fee_in_quote is None and order is not None:
+            method = getattr(order, "cumulative_fee_paid", None)
+            if callable(method):
+                try:
+                    paid = method(quote_asset)
+                    if paid is not None:
+                        fee_in_quote = max(Decimal("0"), self._d(paid, "0"))
+                except Exception:
+                    fee_in_quote = None
+
+        if fee_in_quote is None:
+            for attr in ("cumulative_fee_in_quote", "cum_fees_quote"):
+                val = self._safe_order_decimal(order, attr)
+                if val is not None:
+                    fee_in_quote = max(Decimal("0"), val)
+                    break
+
+        if fee_in_quote is None and info.get("cum_fees_quote") is not None:
+            fee_in_quote = max(Decimal("0"), self._d(info.get("cum_fees_quote"), "0"))
+
+        if fee_in_quote is None:
+            # Fallback: NonKYC orders carry no fee field; derive from the configured rate so a
+            # silent 0 never slowly overstates the fund.
+            fee_in_quote = max(Decimal("0"), exec_quote * Decimal(self.config.fee_rate))
+
+        return fee_in_quote, alt_fees
+
+    def _sample_order_execution(self, executor: ExecutorInfo, quote_asset: str, base_asset: str):
+        """Sample one of OUR orders' CUMULATIVE executed figures, source-robust.
+
+        Returns (exec_base, exec_quote, exec_fees_quote, alt_fees). These are cumulative
+        totals (not increments); the booking loop diffs them against the persisted progress.
+        """
+        order = self._get_executor_in_flight_order(executor)
+        info = getattr(executor, "custom_info", {}) or {}
+        order_price = self._d(getattr(executor.config, "price", "0") or "0")
+
+        # exec_base: in-flight executed_amount_base -> custom_info.filled_amount_base
+        #            -> derive from custom_info.filled_amount_quote / price -> 0
+        exec_base = self._safe_order_decimal(order, "executed_amount_base")
+        if exec_base is None and info.get("filled_amount_base") is not None:
+            exec_base = self._d(info.get("filled_amount_base"), "0")
+        if exec_base is None and info.get("filled_amount_quote") is not None and order_price > Decimal("0"):
+            exec_base = self._d(info.get("filled_amount_quote"), "0") / order_price
+        if exec_base is None:
+            exec_base = Decimal("0")
+        exec_base = max(Decimal("0"), exec_base)
+
+        # exec_quote: in-flight executed_amount_quote -> custom_info.filled_amount_quote
+        #             -> exec_base * order_price (exact for resting maker fills)
+        exec_quote = self._safe_order_decimal(order, "executed_amount_quote")
+        if exec_quote is None and info.get("filled_amount_quote") is not None:
+            exec_quote = self._d(info.get("filled_amount_quote"), "0")
+        if exec_quote is None:
+            exec_quote = exec_base * order_price
+        exec_quote = max(Decimal("0"), exec_quote)
+
+        exec_fees, alt_fees = self._order_fee_breakdown(order, info, quote_asset, base_asset, exec_quote)
+        return exec_base, exec_quote, exec_fees, alt_fees
+
+    def _book_fills_from_orders(self):
+        """v13 Part A: robust per-order incremental fill booking.
+
+        Book each of OUR OWN orders' CUMULATIVE executed amounts (sampled every cycle) into
+        owned_quote / owned_base. Partial fills accrue correctly; external transfers (a deposit
+        or withdrawal is not an order) are ignored by construction; only orders carrying a
+        level_id are booked, so a shared account's other activity is irrelevant.
+
+        Per-order cumulative progress is persisted in state under "booked_fill_progress" (a new
+        OPTIONAL key -- no schema bump). Monotonic guards mean a momentary 0/missing read never
+        un-books. A closing executor gets a final sampling pass before its progress entry is
+        pruned (so the map never grows unbounded).
+        """
         if not self._state.get("initialized"):
             return
 
-        tracked_executor_ids = set(self._state.get("tracked_fill_executor_ids", []))
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
         owned_quote = self._d(self._state.get("owned_quote"), "0")
         owned_base = self._d(self._state.get("owned_base"), "0")
-        changed = False
+        progress_raw = self._state.get("booked_fill_progress")
+        progress: Dict[str, Dict[str, str]] = dict(progress_raw) if isinstance(progress_raw, dict) else {}
 
-        # Prune tracked IDs for executors no longer in executors_info
-        current_executor_ids = {e.id for e in self.executors_info}
-        stale_ids = tracked_executor_ids - current_executor_ids
-        if stale_ids:
-            tracked_executor_ids -= stale_ids
+        # Reset the per-cycle booked-fill side flags (drive the recycle windows).
+        self._booked_buy_fill_this_cycle = False
+        self._booked_sell_fill_this_cycle = False
+
+        # One cycle after a re-seed, re-baseline open orders to their current cumulative WITHOUT
+        # booking, so already-realized fills (already reflected in the re-seeded wallet) are not
+        # retroactively re-booked. Subsequent cycles book normally from that baseline.
+        reseed_priming = self._reseed_just_applied
+        self._reseed_just_applied = False
+
+        changed = False
+        current_ids = set()
 
         for executor in self.executors_info:
-            if executor.id in tracked_executor_ids:
-                continue
-            if executor.is_active:
-                continue  # not done yet
             level_id = getattr(executor.config, "level_id", None)
             if level_id is None:
                 continue  # not ours
+            eid = executor.id
+            current_ids.add(eid)
+            side = getattr(executor.config, "side", None)
 
-            # Prefer the executor's exact fill accounting published via custom_info.
-            # OrderExecutor exposes filled_amount_base/quote + cum_fees_quote there because
-            # its public filled_amount_quote property is hardcoded to 0 (POSITION_HOLD
-            # semantics, co-designed with the orchestrator). Fall back to the legacy public
-            # fields only for other executor types or state written by older runs.
-            info = getattr(executor, "custom_info", {}) or {}
-            side = getattr(executor.config, "side", None) or info.get("side")
-            config_price = self._d(getattr(executor.config, "price", "0") or "0")
+            exec_base, exec_quote, exec_fees, alt_fees = self._sample_order_execution(
+                executor, quote_asset, base_asset
+            )
 
-            filled_quote = self._d(info.get("filled_amount_quote"), "0")
-            filled_base = self._d(info.get("filled_amount_base"), "0")
-            fees = self._d(info.get("cum_fees_quote"), "0")
+            entry = progress.get(eid) or {}
+            booked_base = self._d(entry.get("base"), "0")
+            booked_quote = self._d(entry.get("quote"), "0")
+            booked_fees = self._d(entry.get("fees"), "0")
 
-            if filled_quote <= Decimal("0") and filled_base <= Decimal("0"):
-                # legacy fallback: derive base from the public fields + config price
-                filled_quote = max(Decimal("0"), executor.filled_amount_quote)
-                fees = max(Decimal("0"), executor.cum_fees_quote)
-                if filled_quote > Decimal("0") and config_price > Decimal("0"):
-                    filled_base = filled_quote / config_price
+            # Monotonic: never let a momentary low/missing read un-book a prior sample.
+            exec_base = max(exec_base, booked_base)
+            exec_quote = max(exec_quote, booked_quote)
+            exec_fees = max(exec_fees, booked_fees)
 
-            if filled_quote <= Decimal("0") and filled_base <= Decimal("0"):
-                tracked_executor_ids.add(executor.id)
-                continue  # genuinely no fill
+            if reseed_priming:
+                # Establish the post-reseed baseline; book nothing this cycle.
+                progress[eid] = {"base": str(exec_base), "quote": str(exec_quote), "fees": str(exec_fees)}
+                continue
 
-            # Clamp to non-negative in case of malformed custom_info / fallback data.
-            filled_quote = max(Decimal("0"), filled_quote)
-            filled_base = max(Decimal("0"), filled_base)
-            fees = max(Decimal("0"), fees)
+            d_base = max(Decimal("0"), exec_base - booked_base)
+            d_quote = max(Decimal("0"), exec_quote - booked_quote)
+            d_fees = max(Decimal("0"), exec_fees - booked_fees)
+
+            if d_base <= Decimal("0") and d_quote <= Decimal("0"):
+                continue  # nothing new for this order
 
             if side == TradeType.BUY:
-                owned_quote -= (filled_quote + fees)
-                owned_base += filled_base
-                changed = True
+                owned_base += d_base
+                owned_quote -= (d_quote + d_fees)
+                self._booked_buy_fill_this_cycle = True
             elif side == TradeType.SELL:
-                owned_base -= filled_base
-                owned_quote += (filled_quote - fees)
-                changed = True
+                owned_base -= d_base
+                owned_quote += (d_quote - d_fees)
+                self._booked_sell_fill_this_cycle = True
+            else:
+                continue  # unknown side -- do not book
 
-            tracked_executor_ids.add(executor.id)
-
-        if changed:
             owned_quote = max(Decimal("0"), owned_quote)
             owned_base = max(Decimal("0"), owned_base)
-            self._state["owned_quote"] = str(owned_quote)
-            self._state["owned_base"] = str(owned_base)
-            self._state["tracked_fill_executor_ids"] = sorted(list(tracked_executor_ids))
-            self._save_state()
-            self.logger().info(
-                f"{self.config.id}: ledger updated from fills. "
-                f"owned_quote={owned_quote} owned_base={owned_base}"
-            )
+            progress[eid] = {"base": str(exec_base), "quote": str(exec_quote), "fees": str(exec_fees)}
+            changed = True
+
             self._emit_structured(
-                "range_ladder_ledger_updated",
+                "range_ladder_fill_booked",
+                executor_id=eid,
+                level_id=level_id,
+                side=(side.name if side is not None else ""),
+                d_base=str(d_base),
+                d_quote=str(d_quote),
+                d_fees=str(d_fees),
                 owned_quote=str(owned_quote),
                 owned_base=str(owned_base),
-                tracked_fill_executor_ids=len(tracked_executor_ids),
+                alt_fees={k: str(v) for k, v in alt_fees.items()},
             )
-        elif stale_ids:
-            # Save pruned list even if no fill changes
-            self._state["tracked_fill_executor_ids"] = sorted(list(tracked_executor_ids))
+
+        # Prune progress entries for executors that have left executors_info (after the final
+        # capture pass above), so the map does not grow without bound.
+        pruned_ids = [eid for eid in progress if eid not in current_ids]
+        for eid in pruned_ids:
+            del progress[eid]
+
+        if changed or pruned_ids or reseed_priming:
+            self._state["owned_quote"] = str(owned_quote)
+            self._state["owned_base"] = str(owned_base)
+            self._state["booked_fill_progress"] = progress
             self._save_state()
+            if changed:
+                self.logger().info(
+                    f"{self.config.id}: ledger updated from fills. "
+                    f"owned_quote={owned_quote} owned_base={owned_base}"
+                )
+                self._emit_structured(
+                    "range_ladder_ledger_updated",
+                    owned_quote=str(owned_quote),
+                    owned_base=str(owned_base),
+                    booked_orders=len(progress),
+                )
+
+    def _update_ledger_from_completed_executors(self):
+        """Deprecated v12 name; thin alias for the v13 per-order booking. Kept so any external
+        caller (and the existing integration tests) still resolve."""
+        return self._book_fills_from_orders()
+
+    def _maybe_reseed_fund(self, reference_price: Decimal):
+        """v13 Part C: guarded, one-shot managed-fund re-seed from the CURRENT wallet.
+
+        Re-seeding is the intended way to change the managed baseline, because deposits are
+        deliberately ignored by the fund (a transfer is not an order). Idempotent per
+        (reseed_generation, reseed_fund_target_quote) token: it never repeats for the same token
+        even if reseed_fund_from_wallet_once is left True. Bump reseed_generation to re-arm once.
+        """
+        if not self.config.reseed_fund_from_wallet_once:
+            return
+        if not self._state.get("initialized"):
+            return  # first init handles the seed; nothing to re-seed yet
+        if reference_price <= Decimal("0"):
+            return
+
+        target_quote = (
+            Decimal(self.config.reseed_fund_target_quote)
+            if self.config.reseed_fund_target_quote is not None
+            else Decimal(self.config.total_amount_quote)
+        )
+        reseed_token = f"{int(self.config.reseed_generation)}:{target_quote}"
+        if self._state.get("last_reseed_token") == reseed_token:
+            return  # this exact re-seed already applied -> idempotent no-op
+
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        total_quote_balance = self._safe_get_balance(quote_asset)
+        total_base_balance = self._safe_get_balance(base_asset)
+        available_quote_balance = self._safe_get_available_balance(quote_asset)
+        available_base_balance = self._safe_get_available_balance(base_asset)
+
+        (managed_quote_claim, claimed_base_amount, base_seed_value,
+         quote_seed, seed_value_quote, claim_source) = self._compute_seed_claim(
+            reference_price=reference_price,
+            available_quote_balance=available_quote_balance,
+            available_base_balance=available_base_balance,
+            target_quote=target_quote,
+        )
+
+        old_owned_quote = self._d(self._state.get("owned_quote"), "0")
+        old_owned_base = self._d(self._state.get("owned_base"), "0")
+        old_seed_value = self._d(self._state.get("seed_value_quote"), "0")
+
+        # Recompute owned_*/seed_value/initial_*/reserve_* from the current wallet; clear the
+        # fills bookkeeping so the new baseline books forward cleanly. Never wipe unrelated state.
+        self._state["reserve_quote_balance"] = str(max(Decimal("0"), total_quote_balance - managed_quote_claim))
+        self._state["reserve_base_balance"] = str(max(Decimal("0"), total_base_balance - claimed_base_amount))
+        self._state["initial_managed_quote"] = str(managed_quote_claim)
+        self._state["initial_claimed_base_amount"] = str(claimed_base_amount)
+        self._state["initial_reference_price"] = str(reference_price)
+        self._state["owned_quote"] = str(managed_quote_claim)
+        self._state["owned_base"] = str(claimed_base_amount)
+        self._state["seed_value_quote"] = str(seed_value_quote)
+        self._state["booked_fill_progress"] = {}
+        self._state["tracked_fill_executor_ids"] = []
+        self._state["last_reseed_token"] = reseed_token
+        self._save_state()
+
+        # Next booking pass re-baselines open orders to their current cumulative WITHOUT booking,
+        # so already-realized fills (already reflected in the re-seeded wallet) are not re-booked.
+        self._reseed_just_applied = True
+
+        self.logger().warning(
+            f"{self.config.id}: managed fund RE-SEEDED from wallet (token={reseed_token}, "
+            f"claim_source={claim_source}). owned_quote {old_owned_quote}->{managed_quote_claim} "
+            f"owned_base {old_owned_base}->{claimed_base_amount} "
+            f"seed_value {old_seed_value}->{seed_value_quote}"
+        )
+        self._emit_structured(
+            "range_ladder_fund_reseeded",
+            reseed_token=reseed_token,
+            reseed_generation=int(self.config.reseed_generation),
+            target_quote=str(target_quote),
+            claim_source=claim_source,
+            old_owned_quote=str(old_owned_quote),
+            new_owned_quote=str(managed_quote_claim),
+            old_owned_base=str(old_owned_base),
+            new_owned_base=str(claimed_base_amount),
+            old_seed_value_quote=str(old_seed_value),
+            new_seed_value_quote=str(seed_value_quote),
+            reserve_quote=self._state["reserve_quote_balance"],
+            reserve_base=self._state["reserve_base_balance"],
+            reference_price=str(reference_price),
+        )
 
     def _set_unavailable_processed_data(
         self,
@@ -1541,9 +2047,19 @@ class RangeInventoryLadderController(ControllerBase):
                 continue
             status = getattr(executor, "status", None)
             if status in live_statuses:
+                # An order already exists at this level -- still blocked (the window only
+                # bypasses the cooldown-AFTER-close, never a live/shutting-down level).
                 blocked.add(level_id)
                 continue
             if self._should_bypass_level_cooldown(level_id):
+                continue
+            # v12 Part B: directional recycle window bypass. Level IDs are buy_<token> /
+            # sell_<token>; if this level's side has an open recycle window (opened by a
+            # TOTAL-balance increase from a fill on the OTHER side), skip its cooldown so the
+            # offsetting order deploys within recycle_max_latency_seconds.
+            if level_id.startswith("buy_") and now < self._recycle_bypass_buy_until:
+                continue
+            if level_id.startswith("sell_") and now < self._recycle_bypass_sell_until:
                 continue
             if executor.close_timestamp is not None and (now - executor.close_timestamp) < self.config.cooldown_time:
                 blocked.add(level_id)
@@ -1841,12 +2357,8 @@ class RangeInventoryLadderController(ControllerBase):
             self._emit_diagnostic_heartbeat_if_due()
             return
 
-        # Update owned ledger from completed executor fills
-        try:
-            self._update_ledger_from_completed_executors()
-        except Exception as e:
-            self.logger().exception(f"{self.config.id}: ledger update from fills failed")
-            self._emit_structured("range_ladder_ledger_update_error", error=str(e))
+        # v13: fill booking moved DOWN to after the balance reads (so the re-seed and the
+        # booked owned_* both feed managed_* the same cycle). See the booking call below.
 
         if self._session_started_ts is None:
             self._session_started_ts = now
@@ -1920,12 +2432,111 @@ class RangeInventoryLadderController(ControllerBase):
         available_quote_balance = self._safe_get_available_balance(quote_asset)
         available_base_balance = self._safe_get_available_balance(base_asset)
 
+        # v13 Part C: guarded one-shot managed-fund re-seed from the CURRENT wallet (idempotent
+        # per token). Runs before booking so the freshly seeded owned_* feed managed_* this cycle.
+        try:
+            self._maybe_reseed_fund(reference_price)
+        except Exception as e:
+            self.logger().exception(f"{self.config.id}: fund re-seed failed")
+            self._emit_structured("range_ladder_ledger_update_error", error=str(e))
+
+        # v13 Part A: book fills from our OWN orders' cumulative executed amounts. Runs AFTER the
+        # balance reads and BEFORE owned_* is loaded for managed_* below, so the ceiling and the
+        # re-anchor see freshly booked values THIS cycle. It mutates and persists owned_*.
+        try:
+            self._book_fills_from_orders()
+        except Exception as e:
+            self.logger().exception(f"{self.config.id}: fill booking failed")
+            self._emit_structured("range_ladder_ledger_update_error", error=str(e))
+
+        # v13: open directional recycle windows from BOOKED fills (a sell fill brought quote in
+        # -> deploy to BUYS; a buy fill brought base in -> deploy to SELLS). A pure one-sided
+        # total change (a deposit or withdrawal) is NOT an order and opens NO window. As a
+        # backstop in case booking missed a fill, a TWO-SIDED wallet move with a genuine trade
+        # signature (quote up & base down, or base up & quote down) may also open a window;
+        # a one-sided change never does. Window duration stays recycle_max_latency_seconds.
+        base_increase_threshold = (
+            self.config.min_order_quote / reference_price if reference_price > Decimal("0") else Decimal("0")
+        )
+        open_buy_window = self._booked_sell_fill_this_cycle
+        open_sell_window = self._booked_buy_fill_this_cycle
+        if (
+            self._prev_total_quote_balance is not None
+            and self._prev_total_base_balance is not None
+            and base_increase_threshold > Decimal("0")
+        ):
+            quote_delta = total_quote_balance - self._prev_total_quote_balance
+            base_delta = total_base_balance - self._prev_total_base_balance
+            # genuine SELL signature: quote up AND base down -> fund buys
+            if quote_delta >= self.config.min_order_quote and base_delta <= -base_increase_threshold:
+                open_buy_window = True
+            # genuine BUY signature: base up AND quote down -> fund sells
+            if base_delta >= base_increase_threshold and quote_delta <= -self.config.min_order_quote:
+                open_sell_window = True
+        if open_buy_window:
+            self._recycle_bypass_buy_until = now + self.config.recycle_max_latency_seconds
+            self._emit_structured(
+                "range_ladder_recycle_window_opened",
+                side="buy",
+                trigger=("booked_fill" if self._booked_sell_fill_this_cycle else "wallet_two_sided"),
+                window_s=self.config.recycle_max_latency_seconds,
+            )
+        if open_sell_window:
+            self._recycle_bypass_sell_until = now + self.config.recycle_max_latency_seconds
+            self._emit_structured(
+                "range_ladder_recycle_window_opened",
+                side="sell",
+                trigger=("booked_fill" if self._booked_buy_fill_this_cycle else "wallet_two_sided"),
+                window_s=self.config.recycle_max_latency_seconds,
+            )
+
         reserve_quote_balance = self._d(self._state.get("reserve_quote_balance"))
         reserve_base_balance = self._d(self._state.get("reserve_base_balance"))
 
-        # Use controller-owned ledger instead of wallet-derived totals
+        # Use controller-owned ledger instead of wallet-derived totals (freshly booked above)
         owned_quote = self._d(self._state.get("owned_quote"), "0")
         owned_base = self._d(self._state.get("owned_base"), "0")
+
+        # v12 Issue 1: self-heal a persistently over-claimed ledger by re-anchoring DOWN to
+        # wallet truth. Runs right after owned_* are loaded and BEFORE managed_* are computed
+        # so the corrected values flow into the deploy ceiling and all reporting THIS cycle.
+        # Only ever correct downward (the over-claimed side); a wallet that exceeds the ledger
+        # is legitimate under the self-balance model (idle reserve, deposits, un-booked
+        # proceeds) and stays a no-op. The booking loop's downward math is untouched -- this
+        # is the safety net for fills that loop misses.
+        reanchor_wallet_derived_quote = max(Decimal("0"), total_quote_balance - reserve_quote_balance)
+        reanchor_wallet_derived_base = max(Decimal("0"), total_base_balance - reserve_base_balance)
+        reanchor_quote_overclaim = max(Decimal("0"), owned_quote - total_quote_balance)
+        reanchor_base_overclaim = max(Decimal("0"), owned_base - total_base_balance)
+        reanchor_overclaim_quote = reanchor_quote_overclaim + reanchor_base_overclaim * reference_price
+        if reanchor_overclaim_quote > self.config.ledger_reconcile_threshold_quote:
+            if self._overclaim_since is None:
+                self._overclaim_since = now
+            elif (now - self._overclaim_since) >= self.config.ledger_overclaim_reanchor_seconds:
+                new_owned_quote = max(Decimal("0"), min(owned_quote, reanchor_wallet_derived_quote))
+                new_owned_base = max(Decimal("0"), min(owned_base, reanchor_wallet_derived_base))
+                if new_owned_quote < owned_quote or new_owned_base < owned_base:
+                    self.logger().warning(
+                        f"{self.config.id}: re-anchoring over-claimed ledger to wallet. "
+                        f"owned_quote {owned_quote}->{new_owned_quote} owned_base {owned_base}->{new_owned_base}"
+                    )
+                    self._emit_structured(
+                        "range_ladder_ledger_reanchored",
+                        old_owned_quote=str(owned_quote), new_owned_quote=str(new_owned_quote),
+                        old_owned_base=str(owned_base), new_owned_base=str(new_owned_base),
+                        wallet_derived_quote=str(reanchor_wallet_derived_quote),
+                        wallet_derived_base=str(reanchor_wallet_derived_base),
+                        overclaim_quote=str(reanchor_overclaim_quote),
+                        grace_seconds=self.config.ledger_overclaim_reanchor_seconds,
+                    )
+                    owned_quote, owned_base = new_owned_quote, new_owned_base
+                    self._state["owned_quote"] = str(owned_quote)
+                    self._state["owned_base"] = str(owned_base)
+                    self._save_state()
+                self._overclaim_since = None
+        else:
+            self._overclaim_since = None
+
         managed_quote_total = max(Decimal("0"), owned_quote)
         managed_base_total = max(Decimal("0"), owned_base)
         managed_fund_value_quote = managed_quote_total + managed_base_total * reference_price
@@ -1937,7 +2548,10 @@ class RangeInventoryLadderController(ControllerBase):
         # NOT spam warnings. The only genuine accounting fault is the inverse: the ledger
         # believing it owns MORE than the wallet physically holds (an over-claim), which
         # would cause the controller to size orders against money that isn't there.
-        RECONCILIATION_ALERT_THRESHOLD_QUOTE = Decimal("0.5")
+        # v12 Issue 1: single threshold source -- the same config value gates the re-anchor
+        # above and this warning. Once re-anchored, owned_* <= wallet truth so the over-claim
+        # below computes to zero and this warning falls silent on its own.
+        RECONCILIATION_ALERT_THRESHOLD_QUOTE = self.config.ledger_reconcile_threshold_quote
         wallet_derived_quote = max(Decimal("0"), total_quote_balance - reserve_quote_balance)
         wallet_derived_base = max(Decimal("0"), total_base_balance - reserve_base_balance)
         ledger_quote_drift = wallet_derived_quote - owned_quote
@@ -1983,15 +2597,23 @@ class RangeInventoryLadderController(ControllerBase):
         active_sell_reserved_base = self._active_reserved_base_for_sells()
 
         # Self-balance deployment model:
-        #   - The PnL ledger (owned_quote/owned_base) stays fills-only and invariant
-        #     to deposits (managed_fund_value_quote above).
+        #   - The fund ledger (owned_quote/owned_base) is fills-only and invariant to deposits
+        #     (a transfer is not an order, so v13 booking never touches it). It grows with
+        #     realized success and shrinks on withdrawal of fund money (via the v12 re-anchor).
         #   - Deployment each cycle sizes from the LIVE available wallet balance,
         #     bounded by a growth ceiling that starts at the realized seed value and
         #     compounds with the managed fund value, hard-capped at max_fund_value_quote.
         #   - No fixed base/quote ratio after seed: each side deploys what it holds;
         #     the combined deployed value is throttled to the ceiling.
-        # This makes idle reserve, later deposits, and fill proceeds all usable on the
-        # next cycle without ever deleting the state file.
+        # This makes idle reserve and fill proceeds usable on the next cycle without ever
+        # deleting the state file. (Deposits are deliberately NOT pulled into trading -- to
+        # change the managed baseline, re-seed via reseed_fund_from_wallet_once or re-init.)
+        #
+        # v13 NOTE (realized vs. unrealized): managed_fund_value_quote marks held base at the
+        # CURRENT reference_price, so the ceiling moves with UNREALIZED price action on held
+        # inventory as well as with realized round-trip profit. This existing market-value
+        # behavior is intentionally preserved; switch to realized-only PnL only if explicitly
+        # asked. (Surfaced here so the operator can decide later.)
         seed_value_quote = self._seed_value_quote()
         deploy_ceiling = self._compute_deploy_ceiling(seed_value_quote, managed_fund_value_quote)
 
@@ -2150,6 +2772,14 @@ class RangeInventoryLadderController(ControllerBase):
             session_expired=str(self._session_expired),
             market_data_hard_pause=str(self._market_data_hard_pause),
         )
+
+        # v12 Part B: store this cycle's TOTAL balances for next-cycle delta comparison.
+        # Only reached on a fully-processed cycle (the market-data-unavailable and
+        # not-initialized early returns above intentionally do not advance these, so a
+        # transient outage never fabricates a spurious delta on recovery).
+        self._prev_total_quote_balance = total_quote_balance
+        self._prev_total_base_balance = total_base_balance
+
         self._emit_diagnostic_heartbeat_if_due()
 
 
@@ -2161,13 +2791,19 @@ class RangeInventoryLadderController(ControllerBase):
         return None
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
+        # v12 Issue 3: reset the side-specific defer flags every cycle so a cycle with no
+        # stops never inherits a stale defer from a previous one.
+        self._defer_buy_creates_this_cycle = False
+        self._defer_sell_creates_this_cycle = False
+
         actions: List[ExecutorAction] = []
         stop_actions = self.stop_actions_proposal()
         actions.extend(stop_actions)
 
-        # If we are stopping executors this cycle, defer create decisions until the next
-        # cycle when budgets will reflect the freed capital. This prevents compression
-        # from running against stale reservations from soon-to-be-cancelled orders.
+        # v12 Issue 3: if we are stopping executors this cycle, defer create decisions only
+        # for the SIDE(S) that have stops -- a stop on one side must not block creates on the
+        # other. This still prevents sizing against stale reservations from soon-to-be-
+        # cancelled orders on the SAME side (the original compression rationale).
         if stop_actions:
             has_buy_stops = any(
                 self._executor_side(self._find_executor_by_id(a.executor_id)) == TradeType.BUY
@@ -2179,6 +2815,8 @@ class RangeInventoryLadderController(ControllerBase):
                 for a in stop_actions
                 if hasattr(a, 'executor_id')
             )
+            self._defer_buy_creates_this_cycle = has_buy_stops
+            self._defer_sell_creates_this_cycle = has_sell_stops
             if has_buy_stops or has_sell_stops:
                 self._emit_structured(
                     "range_ladder_create_deferred_for_stops",
@@ -2186,8 +2824,7 @@ class RangeInventoryLadderController(ControllerBase):
                     sell_stops=has_sell_stops,
                     stop_count=len(stop_actions),
                 )
-                return actions
-
+        # Do NOT return early: fall through so the unaffected side can still place this cycle.
         actions.extend(self.create_actions_proposal())
         return actions
 
@@ -2491,6 +3128,9 @@ class RangeInventoryLadderController(ControllerBase):
         return CreateExecutorAction(controller_id=self.config.id, executor_config=executor_config), quantized_amount
 
     def _create_buy_actions(self) -> List[CreateExecutorAction]:
+        # v12 Issue 3: a buy stop this cycle defers only buy creates (sell creates proceed).
+        if self._defer_buy_creates_this_cycle:
+            return []
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
         remaining_quote_budget = self.processed_data["free_buy_budget_quote"]
@@ -2605,6 +3245,9 @@ class RangeInventoryLadderController(ControllerBase):
         return actions
 
     def _create_sell_actions(self) -> List[CreateExecutorAction]:
+        # v12 Issue 3: a sell stop this cycle defers only sell creates (buy creates proceed).
+        if self._defer_sell_creates_this_cycle:
+            return []
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
         remaining_base_budget = self.processed_data["free_sell_budget_base"]
@@ -2830,6 +3473,11 @@ class RangeInventoryLadderController(ControllerBase):
         for executor in active_order_executors:
             age = now - executor.timestamp
             if age >= self.config.executor_refresh_time:
+                # v12 Issue 2: a refresh cancel must NEVER start a cooldown -- nothing
+                # filled, the order is merely being re-priced. Bypass-mark the level before
+                # the stop (identical to the hard-pause, session-end, and config-rebuild
+                # stop branches) so _recently_closed_level_ids does not park it on cooldown.
+                self._mark_bypass_cooldown_for_level(getattr(executor.config, "level_id", ""))
                 actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
                 self._emit_structured(
                     "range_ladder_refresh_stop",
@@ -2913,16 +3561,18 @@ class RangeInventoryLadderController(ControllerBase):
             lines.append(f"Blocked/cooldown levels: {', '.join(blocked)}")
         else:
             lines.append("Blocked/cooldown levels: none")
-        # Show eligible price levels based on current bid/ask
+        # Show eligible price levels based on current bid/ask.
+        # v12 Issue 4: take the level index directly via enumerate -- never look it up by
+        # value (buy_prices.index(price)), which is O(n^2) and silently wrong with dup prices.
         eligible_buys = [
-            str(price) for price in self.config.buy_prices
+            str(price) for idx, price in enumerate(self.config.buy_prices)
             if self._can_place_buy_level(price)
-            and self._buy_level_id(self.config.buy_prices.index(price)) not in p["blocked_level_ids"]
+            and self._buy_level_id(idx) not in p["blocked_level_ids"]
         ]
         eligible_sells = [
-            str(price) for price in self.config.sell_prices
+            str(price) for idx, price in enumerate(self.config.sell_prices)
             if self._can_place_sell_level(price)
-            and self._sell_level_id(self.config.sell_prices.index(price)) not in p["blocked_level_ids"]
+            and self._sell_level_id(idx) not in p["blocked_level_ids"]
         ]
         lines.append(f"Eligible buy prices: {', '.join(eligible_buys) if eligible_buys else 'none'}")
         lines.append(f"Eligible sell prices: {', '.join(eligible_sells) if eligible_sells else 'none'}")

@@ -59,6 +59,10 @@ def _make_controller(executors, cooldown_time=30):
 
     controller._cleanup_cooldown_bypass = MagicMock()
     controller._should_bypass_level_cooldown = MagicMock(return_value=False)
+    # v12 Part B: _recently_closed_level_ids reads these recycle-window deadlines.
+    # 0.0 (their real __init__ default) means "no window open" -> cooldown logic unchanged.
+    controller._recycle_bypass_buy_until = 0.0
+    controller._recycle_bypass_sell_until = 0.0
 
     # Bind the real methods under test
     controller._order_executors_active_or_shutting_down = (

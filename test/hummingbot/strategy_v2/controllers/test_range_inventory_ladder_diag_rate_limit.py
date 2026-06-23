@@ -41,6 +41,9 @@ def _make_buy_controller(buy_prices, blocked=None, best_bid="340"):
     controller._compress_buy_level_indexes_for_min_notional = MagicMock(return_value=[])
     controller._emit_compression_event_if_changed = MagicMock()
     controller._buy_level_filter_reasons = {}
+    # v12 Issue 3: _create_buy_actions checks the side-specific defer flags; False = place.
+    controller._defer_buy_creates_this_cycle = False
+    controller._defer_sell_creates_this_cycle = False
     controller._price_level_token = RangeInventoryLadderController._price_level_token
     for name in ("_create_buy_actions", "_buy_level_id", "_can_place_buy_level"):
         setattr(
@@ -68,6 +71,9 @@ def _make_sell_controller(sell_prices, blocked=None, best_ask="330"):
     controller._compress_sell_level_indexes_for_min_notional = MagicMock(return_value=[])
     controller._emit_compression_event_if_changed = MagicMock()
     controller._sell_level_filter_reasons = {}
+    # v12 Issue 3: _create_sell_actions checks the side-specific defer flags; False = place.
+    controller._defer_buy_creates_this_cycle = False
+    controller._defer_sell_creates_this_cycle = False
     controller._price_level_token = RangeInventoryLadderController._price_level_token
     for name in ("_create_sell_actions", "_sell_level_id", "_can_place_sell_level"):
         setattr(

@@ -202,9 +202,14 @@ class TestSellCompressionQuantizationAware(unittest.TestCase):
 
 
 class TestDetermineExecutorActionsDefersCreates(unittest.TestCase):
-    """Verify that create proposals are deferred when same-cycle stops exist."""
+    """v12 Issue 3: create proposals are deferred PER-SIDE when same-cycle stops exist.
 
-    def test_stop_actions_defer_creates(self):
+    A stop on one side must set only that side's defer flag and must NOT block the other
+    side: create_actions_proposal still runs (the old global early-return was removed, so a
+    sell stop no longer needlessly suppresses buy creates and vice versa).
+    """
+
+    def _run(self, stop_side):
         from range_inventory_ladder import RangeInventoryLadderController
         controller = MagicMock(spec=RangeInventoryLadderController)
 
@@ -215,11 +220,9 @@ class TestDetermineExecutorActionsDefersCreates(unittest.TestCase):
 
         mock_executor = MagicMock()
         mock_executor.config = MagicMock()
-        mock_executor.config.side = MagicMock()
 
-        from hummingbot.core.data_type.common import TradeType
         controller._find_executor_by_id = MagicMock(return_value=mock_executor)
-        controller._executor_side = MagicMock(return_value=TradeType.BUY)
+        controller._executor_side = MagicMock(return_value=stop_side)
         controller._emit_structured = MagicMock()
         controller.executors_info = [mock_executor]
 
@@ -228,11 +231,29 @@ class TestDetermineExecutorActionsDefersCreates(unittest.TestCase):
                 controller, RangeInventoryLadderController
             )
         )
-
         actions = controller.determine_executor_actions()
+        return controller, actions
 
+    def test_buy_stop_defers_only_buy_side_and_creates_still_run(self):
+        from hummingbot.core.data_type.common import TradeType
+        controller, actions = self._run(TradeType.BUY)
+        # the stop itself is still returned
         self.assertEqual(len(actions), 1)
-        controller.create_actions_proposal.assert_not_called()
+        # v12: creates are NO LONGER globally skipped -- the proposal runs (fall-through)
+        controller.create_actions_proposal.assert_called_once()
+        # only the BUY side is deferred
+        self.assertTrue(controller._defer_buy_creates_this_cycle)
+        self.assertFalse(controller._defer_sell_creates_this_cycle)
+        emitted = [c.args[0] for c in controller._emit_structured.call_args_list]
+        self.assertIn("range_ladder_create_deferred_for_stops", emitted)
+
+    def test_sell_stop_defers_only_sell_side_and_creates_still_run(self):
+        from hummingbot.core.data_type.common import TradeType
+        controller, actions = self._run(TradeType.SELL)
+        self.assertEqual(len(actions), 1)
+        controller.create_actions_proposal.assert_called_once()
+        self.assertFalse(controller._defer_buy_creates_this_cycle)
+        self.assertTrue(controller._defer_sell_creates_this_cycle)
 
 
 if __name__ == "__main__":
