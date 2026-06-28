@@ -136,6 +136,10 @@ class _V13Harness(unittest.TestCase):
             sell_amounts_pct=[Decimal("1"), Decimal("1"), Decimal("1")],
             min_order_quote=Decimal("5"),
             cooldown_time=3600,
+            # v13 booking/fund tests predate the per-side refresh model; the recycle-window
+            # trigger tests exercise the LEGACY recycle path. Pin the legacy mode so booking,
+            # fund-growth and recycle assertions stay valid (booking itself is mode-independent).
+            event_refresh_enabled=False,
         )
         defaults.update(config_overrides)
         config = RangeInventoryLadderConfig(**defaults)

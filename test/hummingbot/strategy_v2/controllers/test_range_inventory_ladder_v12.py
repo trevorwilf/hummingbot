@@ -72,6 +72,10 @@ def _make_config(**overrides):
         sell_amounts_pct=[Decimal("1"), Decimal("1"), Decimal("1")],
         min_order_quote=Decimal("5"),
         cooldown_time=3600,
+        # v12 behavior (per-level cooldown + directional recycle window + per-executor-age
+        # refresh) is the LEGACY path; the per-side refresh model supersedes it. These tests
+        # validate that legacy path, so they pin event_refresh_enabled=False.
+        event_refresh_enabled=False,
     )
     defaults.update(overrides)
     return RangeInventoryLadderConfig(**defaults)

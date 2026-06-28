@@ -34,6 +34,8 @@ def _make_controller(post_refresh_settle_seconds=0, now_ts=1_000.0, executors=No
 
     controller.config = MagicMock()
     controller.config.executor_refresh_time = 600
+    # These tests validate the LEGACY per-executor-age refresh in stop_actions_proposal.
+    controller.config.event_refresh_enabled = False
     controller.config.post_refresh_settle_seconds = post_refresh_settle_seconds
     controller.config.cancel_orders_on_market_data_hard_pause = False
     controller.config.cancel_orders_on_session_end = False

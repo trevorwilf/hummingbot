@@ -84,9 +84,9 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
     max_fund_value_quote: Decimal = Field(
-        default=Decimal("1000"),
+        default=Decimal("5000"),
         json_schema_extra={
-            "prompt": "Enter the hard cap for total deployable fund value in quote (e.g. 1000): ",
+            "prompt": "Enter the hard cap for total deployable fund value in quote (e.g. 5000): ",
             "prompt_on_new": True,
             "is_updatable": True,
         },
@@ -104,6 +104,24 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "prompt": (
                 "Optional cap on quote-asset availability for shared-account runs "
                 "(blank = no cap): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    ledger_funded_budgets: bool = Field(
+        default=True,
+        description=(
+            "Fund new buy/sell orders from THIS controller's own managed-fund ledger "
+            "(owned_quote/owned_base minus its resting reservations), bounded by the live wallet "
+            "as a safety floor, instead of from the raw shared wallet balance. Lets multiple "
+            "controllers share one exchange account without `shared_account_quote_quota`. Set "
+            "False for legacy wallet-funded behavior."
+        ),
+        json_schema_extra={
+            "prompt": (
+                "Fund new orders from this controller's own managed-fund ledger (lets multiple "
+                "controllers share one account without quotas)? (True/False): "
             ),
             "prompt_on_new": False,
             "is_updatable": True,
@@ -179,8 +197,29 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     executor_refresh_time: int = Field(
         default=60 * 10,
         json_schema_extra={
-            "prompt": "Refresh/cancel stale working orders after how many seconds? ",
+            # Per-side-refresh model (event_refresh_enabled=True): this is now a GLOBAL periodic
+            # timer. It fires every executor_refresh_time seconds from session start / last global
+            # fire -- independent of fills and the per-side cooldowns -- and refreshes BOTH ladders
+            # (re-pricing to current config and redeploying idle budget). Legacy mode
+            # (event_refresh_enabled=False) keeps the original per-executor-age refresh.
+            "prompt": "Global ladder refresh interval in seconds (refreshes both sides)? ",
             "prompt_on_new": True,
+            "is_updatable": True,
+        },
+    )
+    event_refresh_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master toggle for the per-side cooldown + immediate cross-side refresh model. "
+            "True (default): a fill on one side immediately refreshes the OPPOSITE ladder "
+            "(deploying the new proceeds) and resets that side's cooldown; each side re-centers "
+            "only after its own cooldown lapses; executor_refresh_time is a global periodic "
+            "refresh of both sides. False: revert to the legacy per-executor-age refresh + "
+            "per-level cooldown + directional recycle window."
+        ),
+        json_schema_extra={
+            "prompt": "Enable per-side cooldown + immediate cross-side refresh? (True/False): ",
+            "prompt_on_new": False,
             "is_updatable": True,
         },
     )
@@ -198,8 +237,31 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     cooldown_time: int = Field(
         default=30,
         json_schema_extra={
-            "prompt": "Cooldown after a level closes before recreating it (seconds): ",
+            # Legacy per-level cooldown (event_refresh_enabled=False only). Also the BACKWARD-COMPAT
+            # default for buy_cooldown_time / sell_cooldown_time when those are left blank, so an
+            # existing config that only sets cooldown_time keeps working under the per-side model.
+            "prompt": "Per-level cooldown / default per-side cooldown after a level closes (seconds): ",
             "prompt_on_new": True,
+            "is_updatable": True,
+        },
+    )
+    # Per-side cooldown timers (event_refresh_enabled=True). After a fill on a side, that side
+    # waits its own cooldown with no further fill before re-centering ONCE; a cross-side refresh
+    # from the opposite side's fill is immediate and never waits on these. Left blank (None) they
+    # default to cooldown_time (see effective_buy_cooldown_time / effective_sell_cooldown_time).
+    buy_cooldown_time: Optional[int] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": "Buy-side cooldown before a quiet buy ladder re-centers (blank = cooldown_time): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    sell_cooldown_time: Optional[int] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": "Sell-side cooldown before a quiet sell ladder re-centers (blank = cooldown_time): ",
+            "prompt_on_new": False,
             "is_updatable": True,
         },
     )
@@ -457,6 +519,19 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
                 return None
         return _safe_decimal(value, "reseed_fund_target_quote")
 
+    @field_validator("buy_cooldown_time", "sell_cooldown_time", mode="before")
+    @classmethod
+    def parse_optional_cooldown(cls, value):
+        # Blank / unset -> None (falls back to cooldown_time via the effective_* properties).
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+            return int(value)
+        return value
+
     @field_validator(
         "executor_refresh_time",
         "cooldown_time",
@@ -558,6 +633,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     def validate_cooldown_time(cls, value: int):
         if value < 0:
             raise ValueError("cooldown_time cannot be negative")
+        return value
+
+    @field_validator("buy_cooldown_time", "sell_cooldown_time")
+    @classmethod
+    def validate_optional_cooldown(cls, value, validation_info: ValidationInfo):
+        if value is not None and value < 0:
+            raise ValueError(f"{validation_info.field_name} cannot be negative")
         return value
 
     @field_validator("max_session_duration_hours")
@@ -675,6 +757,18 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
     @property
+    def effective_buy_cooldown_time(self) -> int:
+        """Buy-side cooldown actually in force: the explicit buy_cooldown_time when set,
+        else the legacy cooldown_time default (backward compatible)."""
+        return int(self.buy_cooldown_time if self.buy_cooldown_time is not None else self.cooldown_time)
+
+    @property
+    def effective_sell_cooldown_time(self) -> int:
+        """Sell-side cooldown actually in force: the explicit sell_cooldown_time when set,
+        else the legacy cooldown_time default (backward compatible)."""
+        return int(self.sell_cooldown_time if self.sell_cooldown_time is not None else self.cooldown_time)
+
+    @property
     def normalized_buy_weights(self) -> List[Decimal]:
         total = sum(self.buy_amounts_pct)
         if total <= Decimal("0"):
@@ -745,6 +839,34 @@ class RangeInventoryLadderController(ControllerBase):
     - Part C: a guarded, one-shot `reseed_fund_from_wallet_once` (+ optional
       `reseed_fund_target_quote`, re-armable via `reseed_generation`) re-seeds the managed
       baseline from the CURRENT wallet and clears the booking progress. Idempotent per token.
+
+    Per-side cooldown + immediate cross-side refresh (event_refresh_enabled=True, the default):
+    - A "refresh" is a per-side operation: cancel the side's resting orders (bypass-marked so no
+      residual cooldown) and recreate that side from its CURRENT managed budget (free + the budget
+      its own cancelled orders return), distributed by the YAML weights welded to their configured
+      price rungs, with min-notional compression dropping the FARTHEST rung from price first (so a
+      small budget lands nearest the market -- the 305->312 re-center).
+    - Five triggers: (1) a booked BUY fill immediately refreshes the SELL ladder (deploy the new
+      base) and arms the buy cooldown; (2) a booked SELL fill immediately refreshes the BUY ladder
+      (deploy the new quote) and arms the sell cooldown; (3) buy_cooldown_time lapsing with no buy
+      fill re-centers the BUY ladder once; (4) sell_cooldown_time lapsing re-centers the SELL
+      ladder once; (5) executor_refresh_time is a GLOBAL periodic timer that refreshes BOTH sides
+      independent of fills/cooldowns. A fill NEVER refreshes its own side, and a placement is not a
+      fill, so the loop cannot self-trigger. Two guards apply to every refresh: a no-op guard (skip
+      the cancel/recreate when the rebuild would reproduce the resting book within tolerance) and a
+      dust guard (a sub-min_order_quote freed amount changes nothing -> skip), preventing churn.
+    - Setting event_refresh_enabled=False reverts cleanly to the legacy per-executor-age refresh +
+      per-level cooldown + directional recycle window.
+
+    Ledger-funded budgets (ledger_funded_budgets=True, the default): new buy/sell orders are sized
+    from THIS controller's own managed-fund ledger -- its un-reserved owned quote/base (owned minus
+    its own resting reservations) -- bounded by the live wallet as a safety floor, instead of from
+    the raw shared wallet balance. This lets MULTIPLE CONTROLLERS SHARE ONE EXCHANGE ACCOUNT WITHOUT
+    `shared_account_quote_quota` (each spends only what it owns), and lets a controller redeploy its
+    own proceeds (e.g. re-buying with the USDT it just sold into) with no quota change because its
+    own ledger grew. `shared_account_quote_quota` remains available as an optional additional hard
+    cap. Deposits still raise only the wallet floor, never owned, so deposit-exclusion is preserved.
+    Set ledger_funded_budgets=False for the legacy raw-wallet-funded behavior (byte-for-byte).
 
     OPERATOR NOTE: the fund deliberately ignores deposits, so simply transferring money in will
     NOT raise the managed baseline. To change the baseline: deposit to the intended amount, then
@@ -839,6 +961,30 @@ class RangeInventoryLadderController(ControllerBase):
         # open orders to their current cumulative executed amount instead of retroactively
         # re-booking already-realized fills.
         self._reseed_just_applied: bool = False
+
+        # Per-side cooldown + immediate cross-side refresh model (event_refresh_enabled=True).
+        # A booked fill on one side immediately marks the OPPOSITE side dirty (deploy the new
+        # proceeds) and arms its OWN cooldown; that side re-centers only after its cooldown
+        # lapses with no further fill; executor_refresh_time is a global periodic refresh of both
+        # sides. A placement is NOT a fill -- only booked fills touch the *_fill_ts / *_armed
+        # state, so recreating orders can never self-trigger a loop.
+        self._last_buy_fill_ts: float = 0.0
+        self._last_sell_fill_ts: float = 0.0
+        self._buy_cooldown_armed: bool = False
+        self._sell_cooldown_armed: bool = False
+        self._last_global_refresh_ts: float = 0.0
+        self._buy_side_dirty: bool = False
+        self._sell_side_dirty: bool = False
+        # Why each side is currently dirty (surfaced on the range_ladder_side_refresh event).
+        self._buy_dirty_reason: str = ""
+        self._sell_dirty_reason: str = ""
+        # First fully-processed cycle seeds the global timer and places both ladders.
+        self._refresh_timers_initialized: bool = False
+
+        # Ledger-funded budgets: per-side latch for the wallet-floor-binding diagnostic so it
+        # warns once per binding episode (transition-based), not every cycle.
+        self._buy_wallet_floor_bound: bool = False
+        self._sell_wallet_floor_bound: bool = False
 
 
     @property
@@ -944,6 +1090,11 @@ class RangeInventoryLadderController(ControllerBase):
             managed_fund_value_quote=p.get("managed_fund_value_quote", Decimal("0")),
             free_buy_budget_quote=p.get("free_buy_budget_quote", Decimal("0")),
             free_sell_budget_base=p.get("free_sell_budget_base", Decimal("0")),
+            ledger_funded_budgets=p.get("ledger_funded_budgets", bool(self.config.ledger_funded_budgets)),
+            owned_quote_free=p.get("owned_quote_free", Decimal("0")),
+            owned_base_free=p.get("owned_base_free", Decimal("0")),
+            available_quote_balance=p.get("available_quote_balance", Decimal("0")),
+            available_base_balance=p.get("available_base_balance", Decimal("0")),
             active_buy_reserved_quote=p.get("active_buy_reserved_quote", Decimal("0")),
             active_sell_reserved_base=p.get("active_sell_reserved_base", Decimal("0")),
             active_order_executors=len(self._active_order_executors()),
@@ -1789,6 +1940,119 @@ class RangeInventoryLadderController(ControllerBase):
         caller (and the existing integration tests) still resolve."""
         return self._book_fills_from_orders()
 
+    def _evaluate_refresh_triggers(self, now: float):
+        """Per-side cooldown + immediate cross-side refresh state machine (control-flow steps
+        1-4). Called once per fully-processed cycle, AFTER _book_fills_from_orders has set the
+        per-cycle booked-fill flags. Only sets the *_side_dirty intents; the cancel/recreate is
+        applied later in stop_actions_proposal / create_actions_proposal.
+
+        Contract:
+          - Buy fill  -> dirty the SELL side (deploy the new base) + arm the BUY cooldown.
+          - Sell fill -> dirty the BUY side (deploy the new quote) + arm the SELL cooldown.
+          - buy_cooldown lapses (no buy fill for its duration) -> re-center the BUY side once.
+          - sell_cooldown lapses -> re-center the SELL side once.
+          - executor_refresh_time elapses -> global refresh of BOTH sides.
+        A fill NEVER dirties its own side; a placement is not a fill (see _book_fills_from_orders),
+        so this can never self-trigger a loop.
+        """
+        if not self.config.event_refresh_enabled:
+            return
+
+        triggers: List[str] = []
+
+        # Step 4: initial placement -- both sides start dirty; seed the global timer so its
+        # first fire is one full interval after session start (not immediately).
+        if not self._refresh_timers_initialized:
+            self._refresh_timers_initialized = True
+            self._last_global_refresh_ts = now
+            self._mark_side_dirty("buy", "initial_placement")
+            self._mark_side_dirty("sell", "initial_placement")
+            triggers.append("initial_placement")
+
+        # Step 1: fills -> reset own cooldown (arm it) + dirty the OPPOSITE side immediately.
+        if self._booked_buy_fill_this_cycle:
+            self._last_buy_fill_ts = now
+            self._buy_cooldown_armed = True
+            self._mark_side_dirty("sell", "buy_fill")
+            triggers.append("buy_fill->sell_refresh")
+        if self._booked_sell_fill_this_cycle:
+            self._last_sell_fill_ts = now
+            self._sell_cooldown_armed = True
+            self._mark_side_dirty("buy", "sell_fill")
+            triggers.append("sell_fill->buy_refresh")
+
+        # Step 2: cooldown lapse -> dirty the SAME side once, then disarm (re-arms on next fill).
+        if self._buy_cooldown_armed and (now - self._last_buy_fill_ts) >= float(self.config.effective_buy_cooldown_time):
+            self._buy_cooldown_armed = False
+            self._mark_side_dirty("buy", "buy_cooldown_lapsed")
+            triggers.append("buy_cooldown_lapsed")
+        if self._sell_cooldown_armed and (now - self._last_sell_fill_ts) >= float(self.config.effective_sell_cooldown_time):
+            self._sell_cooldown_armed = False
+            self._mark_side_dirty("sell", "sell_cooldown_lapsed")
+            triggers.append("sell_cooldown_lapsed")
+
+        # Step 3: global periodic timer -> dirty BOTH sides.
+        if (now - self._last_global_refresh_ts) >= float(self.config.executor_refresh_time):
+            self._last_global_refresh_ts = now
+            self._mark_side_dirty("buy", "global_timer")
+            self._mark_side_dirty("sell", "global_timer")
+            triggers.append("global_timer")
+
+        if triggers:
+            self._emit_structured(
+                "range_ladder_refresh_triggers",
+                triggers=triggers,
+                buy_side_dirty=self._buy_side_dirty,
+                sell_side_dirty=self._sell_side_dirty,
+                buy_cooldown_armed=self._buy_cooldown_armed,
+                sell_cooldown_armed=self._sell_cooldown_armed,
+            )
+
+    def _mark_side_dirty(self, side: str, reason: str):
+        """Mark a side as needing a refresh. The FIRST reason in a cycle wins for the event
+        label (initial/fill reasons fire before cooldown/global, which is the useful ordering)."""
+        if side == "buy":
+            if not self._buy_side_dirty:
+                self._buy_dirty_reason = reason
+            self._buy_side_dirty = True
+        else:
+            if not self._sell_side_dirty:
+                self._sell_dirty_reason = reason
+            self._sell_side_dirty = True
+
+    def _refresh_status_fields(self, now: float) -> Dict[str, Any]:
+        """Per-side refresh state surfaced in processed_data (and thence status / custom_info):
+        the toggle, effective per-side cooldowns, seconds-until each cooldown lapse (None when a
+        side is not armed / not counting down), both dirty flags, and the global-timer clock."""
+        buy_cd = self.config.effective_buy_cooldown_time
+        sell_cd = self.config.effective_sell_cooldown_time
+        buy_cd_remaining = (
+            max(0.0, float(buy_cd) - (now - self._last_buy_fill_ts))
+            if self._buy_cooldown_armed else None
+        )
+        sell_cd_remaining = (
+            max(0.0, float(sell_cd) - (now - self._last_sell_fill_ts))
+            if self._sell_cooldown_armed else None
+        )
+        global_remaining = max(
+            0.0, float(self.config.executor_refresh_time) - (now - self._last_global_refresh_ts)
+        )
+        return {
+            "event_refresh_enabled": bool(self.config.event_refresh_enabled),
+            "buy_cooldown_time": buy_cd,
+            "sell_cooldown_time": sell_cd,
+            "buy_cooldown_armed": self._buy_cooldown_armed,
+            "sell_cooldown_armed": self._sell_cooldown_armed,
+            "buy_cooldown_remaining_s": buy_cd_remaining,
+            "sell_cooldown_remaining_s": sell_cd_remaining,
+            "buy_side_dirty": self._buy_side_dirty,
+            "sell_side_dirty": self._sell_side_dirty,
+            "buy_dirty_reason": self._buy_dirty_reason,
+            "sell_dirty_reason": self._sell_dirty_reason,
+            "last_global_refresh_ts": self._last_global_refresh_ts,
+            "global_refresh_remaining_s": global_remaining,
+        }
+
     def _maybe_reseed_fund(self, reference_price: Decimal):
         """v13 Part C: guarded, one-shot managed-fund re-seed from the CURRENT wallet.
 
@@ -2041,19 +2305,27 @@ class RangeInventoryLadderController(ControllerBase):
             RunnableStatus.SHUTTING_DOWN,  # still blocked during shutdown
         }
         blocked: Set[str] = set()
+        event_mode = bool(self.config.event_refresh_enabled)
         for executor in self.executors_info:
             level_id = getattr(executor.config, "level_id", None)
             if level_id is None:
                 continue
             status = getattr(executor, "status", None)
             if status in live_statuses:
-                # An order already exists at this level -- still blocked (the window only
-                # bypasses the cooldown-AFTER-close, never a live/shutting-down level).
+                # An order already exists at this level -- always blocked from a duplicate create
+                # (in BOTH modes), whether RUNNING, NOT_STARTED, or still SHUTTING_DOWN.
                 blocked.add(level_id)
+                continue
+            if event_mode:
+                # Per-side model: a CLOSED level carries no per-level cooldown. When (and whether)
+                # its side rebuilds is governed entirely by the per-side cooldown + immediate
+                # cross-side refresh -- a filled buy level does not re-buy until the BUY cooldown
+                # lapses or the global timer fires, not via a per-level block here. This replaces
+                # (does not double-act with) the legacy cooldown + recycle window below.
                 continue
             if self._should_bypass_level_cooldown(level_id):
                 continue
-            # v12 Part B: directional recycle window bypass. Level IDs are buy_<token> /
+            # v12 Part B (legacy): directional recycle window bypass. Level IDs are buy_<token> /
             # sell_<token>; if this level's side has an open recycle window (opened by a
             # TOTAL-balance increase from a fill on the OTHER side), skip its cooldown so the
             # offsetting order deploys within recycle_max_latency_seconds.
@@ -2217,22 +2489,61 @@ class RangeInventoryLadderController(ControllerBase):
         active_buy_reserved_quote: Decimal,
         active_sell_reserved_base: Decimal,
         deploy_ceiling: Decimal,
+        owned_quote: Optional[Decimal] = None,
+        owned_base: Optional[Decimal] = None,
     ):
-        """Size each side's deployable budget from the LIVE wallet, bounded by the ceiling.
+        """Size each side's deployable budget, bounded by the deploy ceiling.
 
-        No fixed base/quote ratio after seed: the buy side deploys whatever quote is
-        available, the sell side deploys whatever base is available. The COMBINED new
-        deployed value plus what is already on the book is throttled (pro-rata) so the
-        total deployed value never exceeds deploy_ceiling.
+        Budget SOURCE (ledger_funded_budgets=True, default): THIS controller's OWN managed-fund
+        ledger -- the un-reserved owned quote/base (owned minus its own resting reservations) --
+        bounded by the live wallet as a SAFETY FLOOR. This lets many controllers share one
+        exchange account with no contention (each spends only what it owns) and lets a controller
+        redeploy its own proceeds with no quota change, while never trying to place orders for
+        funds not physically free in the wallet. A deposit raises only the floor, never owned, so
+        deposit-exclusion is preserved (the budget is capped at owned_*_free).
+
+        Budget SOURCE (ledger_funded_budgets=False, legacy): the raw wallet available balance,
+        quota-capped -- byte-for-byte the prior behavior.
+
+        `shared_account_quote_quota`, when set, is an ADDITIONAL hard cap on the buy budget in
+        BOTH modes. No fixed base/quote ratio after seed; the COMBINED new deployed value plus
+        what is already on the book is throttled (pro-rata) so total deployed never exceeds
+        deploy_ceiling.
 
         Returns (free_buy_budget_quote, free_sell_budget_base, throttle_scale, headroom).
         """
         ref = max(Decimal("0"), reference_price)
-        account_quote_cap = max(Decimal("0"), available_quote)
+        avail_quote = max(Decimal("0"), available_quote)
+        avail_base = max(Decimal("0"), available_base)
+
+        # Ledger funding needs the owned figures; without them (legacy or a bare unit-test call)
+        # fall back to the wallet-funded path so behavior is unchanged.
+        use_ledger = (
+            bool(self.config.ledger_funded_budgets)
+            and owned_quote is not None
+            and owned_base is not None
+        )
+
+        if use_ledger:
+            owned_quote_free = max(Decimal("0"), Decimal(owned_quote) - max(Decimal("0"), active_buy_reserved_quote))
+            owned_base_free = max(Decimal("0"), Decimal(owned_base) - max(Decimal("0"), active_sell_reserved_base))
+            # Wallet floor: never size above what is physically free in the wallet.
+            buy_budget_quote = min(owned_quote_free, avail_quote)
+            sell_budget_base = min(owned_base_free, avail_base)
+            # The floor BINDING (owned_free > available) signals ledger/wallet divergence
+            # (unsettled deposit, drift, or an unexpected external spend) -- warn once per episode.
+            self._note_wallet_floor("buy", owned_quote_free, avail_quote, buy_budget_quote)
+            self._note_wallet_floor("sell", owned_base_free, avail_base, sell_budget_base)
+        else:
+            # Legacy: raw wallet available (byte-for-byte the prior behavior).
+            buy_budget_quote = avail_quote
+            sell_budget_base = avail_base
+
+        # shared_account_quote_quota: an additional hard cap on the BUY budget in BOTH modes.
         if self.config.shared_account_quote_quota is not None:
-            account_quote_cap = min(account_quote_cap, Decimal(self.config.shared_account_quote_quota))
-        buy_budget_quote = account_quote_cap
-        sell_budget_base = max(Decimal("0"), available_base)
+            buy_budget_quote = min(
+                buy_budget_quote, max(Decimal("0"), Decimal(self.config.shared_account_quote_quota))
+            )
 
         active_reserved_value = (
             max(Decimal("0"), active_buy_reserved_quote)
@@ -2248,6 +2559,32 @@ class RangeInventoryLadderController(ControllerBase):
             sell_budget_base = sell_budget_base * throttle_scale
 
         return buy_budget_quote, sell_budget_base, throttle_scale, headroom
+
+    def _note_wallet_floor(self, side: str, owned_free: Decimal, available: Decimal,
+                           clamped_budget: Decimal):
+        """Transition-based diagnostic: warn the FIRST cycle the wallet floor binds on a side
+        (owned_free > available), then stay silent until it clears -- no per-cycle spam. Ongoing
+        divergence stays visible via the diagnostic heartbeat (which reports owned_free vs avail).
+        """
+        attr = "_buy_wallet_floor_bound" if side == "buy" else "_sell_wallet_floor_bound"
+        binds = owned_free > available
+        was_binding = getattr(self, attr, False)
+        if binds and not was_binding:
+            self.logger().warning(
+                f"{self.config.id}: wallet floor binding on {side} side -- the managed-fund ledger "
+                f"shows more free ({owned_free}) than the wallet has available ({available}); "
+                f"clamping the {side} budget to {clamped_budget}. Likely an unsettled deposit, "
+                "ledger/wallet drift, or an external spend."
+            )
+            self._emit_structured(
+                "range_ladder_wallet_floor_binding",
+                side=side,
+                owned_free=str(owned_free),
+                available=str(available),
+                clamped_budget=str(clamped_budget),
+                reason="ledger_free_exceeds_wallet_available",
+            )
+        setattr(self, attr, binds)
 
     async def update_processed_data(self):
         now = self.market_data_provider.time()
@@ -2449,46 +2786,53 @@ class RangeInventoryLadderController(ControllerBase):
             self.logger().exception(f"{self.config.id}: fill booking failed")
             self._emit_structured("range_ladder_ledger_update_error", error=str(e))
 
-        # v13: open directional recycle windows from BOOKED fills (a sell fill brought quote in
-        # -> deploy to BUYS; a buy fill brought base in -> deploy to SELLS). A pure one-sided
-        # total change (a deposit or withdrawal) is NOT an order and opens NO window. As a
-        # backstop in case booking missed a fill, a TWO-SIDED wallet move with a genuine trade
-        # signature (quote up & base down, or base up & quote down) may also open a window;
-        # a one-sided change never does. Window duration stays recycle_max_latency_seconds.
-        base_increase_threshold = (
-            self.config.min_order_quote / reference_price if reference_price > Decimal("0") else Decimal("0")
-        )
-        open_buy_window = self._booked_sell_fill_this_cycle
-        open_sell_window = self._booked_buy_fill_this_cycle
-        if (
-            self._prev_total_quote_balance is not None
-            and self._prev_total_base_balance is not None
-            and base_increase_threshold > Decimal("0")
-        ):
-            quote_delta = total_quote_balance - self._prev_total_quote_balance
-            base_delta = total_base_balance - self._prev_total_base_balance
-            # genuine SELL signature: quote up AND base down -> fund buys
-            if quote_delta >= self.config.min_order_quote and base_delta <= -base_increase_threshold:
-                open_buy_window = True
-            # genuine BUY signature: base up AND quote down -> fund sells
-            if base_delta >= base_increase_threshold and quote_delta <= -self.config.min_order_quote:
-                open_sell_window = True
-        if open_buy_window:
-            self._recycle_bypass_buy_until = now + self.config.recycle_max_latency_seconds
-            self._emit_structured(
-                "range_ladder_recycle_window_opened",
-                side="buy",
-                trigger=("booked_fill" if self._booked_sell_fill_this_cycle else "wallet_two_sided"),
-                window_s=self.config.recycle_max_latency_seconds,
+        if self.config.event_refresh_enabled:
+            # Per-side cooldown + immediate cross-side refresh: a booked fill on one side dirties
+            # the OPPOSITE side now and arms its own cooldown; cooldown lapse re-centers the same
+            # side once; executor_refresh_time refreshes both. Booking already set the per-cycle
+            # fill flags above; this only sets the dirty intents (applied in the action proposals).
+            self._evaluate_refresh_triggers(now)
+        else:
+            # LEGACY (event_refresh_enabled=False): v12/v13 directional recycle windows. A booked
+            # fill on one side (a sell fill brought quote in -> deploy to BUYS; a buy fill brought
+            # base in -> deploy to SELLS) opens a short cooldown-bypass window on the opposite side.
+            # A pure one-sided total change (a deposit/withdrawal) is NOT an order and opens NO
+            # window. As a backstop, a TWO-SIDED wallet move with a genuine trade signature may also
+            # open a window. Window duration stays recycle_max_latency_seconds.
+            base_increase_threshold = (
+                self.config.min_order_quote / reference_price if reference_price > Decimal("0") else Decimal("0")
             )
-        if open_sell_window:
-            self._recycle_bypass_sell_until = now + self.config.recycle_max_latency_seconds
-            self._emit_structured(
-                "range_ladder_recycle_window_opened",
-                side="sell",
-                trigger=("booked_fill" if self._booked_buy_fill_this_cycle else "wallet_two_sided"),
-                window_s=self.config.recycle_max_latency_seconds,
-            )
+            open_buy_window = self._booked_sell_fill_this_cycle
+            open_sell_window = self._booked_buy_fill_this_cycle
+            if (
+                self._prev_total_quote_balance is not None
+                and self._prev_total_base_balance is not None
+                and base_increase_threshold > Decimal("0")
+            ):
+                quote_delta = total_quote_balance - self._prev_total_quote_balance
+                base_delta = total_base_balance - self._prev_total_base_balance
+                # genuine SELL signature: quote up AND base down -> fund buys
+                if quote_delta >= self.config.min_order_quote and base_delta <= -base_increase_threshold:
+                    open_buy_window = True
+                # genuine BUY signature: base up AND quote down -> fund sells
+                if base_delta >= base_increase_threshold and quote_delta <= -self.config.min_order_quote:
+                    open_sell_window = True
+            if open_buy_window:
+                self._recycle_bypass_buy_until = now + self.config.recycle_max_latency_seconds
+                self._emit_structured(
+                    "range_ladder_recycle_window_opened",
+                    side="buy",
+                    trigger=("booked_fill" if self._booked_sell_fill_this_cycle else "wallet_two_sided"),
+                    window_s=self.config.recycle_max_latency_seconds,
+                )
+            if open_sell_window:
+                self._recycle_bypass_sell_until = now + self.config.recycle_max_latency_seconds
+                self._emit_structured(
+                    "range_ladder_recycle_window_opened",
+                    side="sell",
+                    trigger=("booked_fill" if self._booked_buy_fill_this_cycle else "wallet_two_sided"),
+                    window_s=self.config.recycle_max_latency_seconds,
+                )
 
         reserve_quote_balance = self._d(self._state.get("reserve_quote_balance"))
         reserve_base_balance = self._d(self._state.get("reserve_base_balance"))
@@ -2624,7 +2968,14 @@ class RangeInventoryLadderController(ControllerBase):
             active_buy_reserved_quote=active_buy_reserved_quote,
             active_sell_reserved_base=active_sell_reserved_base,
             deploy_ceiling=deploy_ceiling,
+            owned_quote=owned_quote,
+            owned_base=owned_base,
         )
+
+        # Un-reserved owned figures (the ledger-funded budget source), surfaced for diagnostics so
+        # shared-account behavior is observable: owned_*_free vs the wallet available_*.
+        owned_quote_free = max(Decimal("0"), owned_quote - active_buy_reserved_quote)
+        owned_base_free = max(Decimal("0"), owned_base - active_sell_reserved_base)
 
         # cap_factor is the throttle scale applied this cycle (1.0 = no throttle).
         cap_factor = throttle_scale
@@ -2700,6 +3051,9 @@ class RangeInventoryLadderController(ControllerBase):
             "active_sell_reserved_base": active_sell_reserved_base,
             "free_buy_budget_quote": free_buy_budget_quote,
             "free_sell_budget_base": free_sell_budget_base,
+            "ledger_funded_budgets": bool(self.config.ledger_funded_budgets),
+            "owned_quote_free": owned_quote_free,
+            "owned_base_free": owned_base_free,
             "blocked_level_ids": self._recently_closed_level_ids(),
             "initial_fund_value_quote": initial_fund_value_quote,
             "fund_growth_quote": fund_growth_quote,
@@ -2718,8 +3072,10 @@ class RangeInventoryLadderController(ControllerBase):
             "session_expired_reason": self._session_expired_reason,
             "max_session_duration_hours": self.config.max_session_duration_hours,
             "max_market_data_unavailable_seconds": self.config.max_market_data_unavailable_seconds,
+            "max_fund_value_quote": Decimal(self.config.max_fund_value_quote),
             "reservation_sources_buy": dict(self._buy_reservation_sources),
             "reservation_sources_sell": dict(self._sell_reservation_sources),
+            **self._refresh_status_fields(now),
             **perf,
         }
 
@@ -3127,9 +3483,182 @@ class RangeInventoryLadderController(ControllerBase):
         )
         return CreateExecutorAction(controller_id=self.config.id, executor_config=executor_config), quantized_amount
 
+    # ---------------------------------------------------------------- per-side refresh planner
+    # The planner mirrors the create path's eligibility (passive filter) + compression + weight
+    # distribution + quantization PURELY (no events, no actions). It answers "what book would a
+    # fresh rebuild of this side rest right now?" -- used by the no-op/dust guard (skip churn when
+    # the rebuild reproduces the resting book) and the dirty-clear convergence check. A unit test
+    # cross-checks the planner against the live create path on a fresh build so they never drift.
+
+    def _side_rebuild_budget_quote(self) -> Decimal:
+        """Quote a fresh BUY rebuild would deploy: the side's current free budget PLUS the quote
+        that cancelling its own resting buys would return to availability (the ceiling already
+        bounds free + reserved). This matches the budget the create path will actually see once
+        the side's resting orders are cancelled."""
+        p = self.processed_data or {}
+        free = self._d(p.get("free_buy_budget_quote", "0"), "0")
+        reserved = self._d(p.get("active_buy_reserved_quote", "0"), "0")
+        return max(Decimal("0"), free + reserved)
+
+    def _side_rebuild_budget_base(self) -> Decimal:
+        """Base a fresh SELL rebuild would deploy (free + this side's own resting reservation)."""
+        p = self.processed_data or {}
+        free = self._d(p.get("free_sell_budget_base", "0"), "0")
+        reserved = self._d(p.get("active_sell_reserved_base", "0"), "0")
+        return max(Decimal("0"), free + reserved)
+
+    def _quantize_buy_level(self, price: Decimal, order_quote: Decimal):
+        """Pure quantization mirror of _build_buy_executor_action; returns (qamount, notional,
+        qprice) or None when the level is infeasible (zero amount / sub-min-notional)."""
+        qprice = self._d(self.market_data_provider.quantize_order_price(
+            self.config.connector_name, self.config.trading_pair, price), "0")
+        if qprice <= Decimal("0"):
+            return None
+        qamount = self._d(self.market_data_provider.quantize_order_amount(
+            self.config.connector_name, self.config.trading_pair, order_quote / qprice), "0")
+        notional = qamount * qprice
+        if qamount <= Decimal("0") or notional < self.config.min_order_quote:
+            return None
+        return qamount, notional, qprice
+
+    def _quantize_sell_level(self, price: Decimal, order_base: Decimal):
+        """Pure quantization mirror of _build_sell_executor_action."""
+        qprice = self._d(self.market_data_provider.quantize_order_price(
+            self.config.connector_name, self.config.trading_pair, price), "0")
+        qamount = self._d(self.market_data_provider.quantize_order_amount(
+            self.config.connector_name, self.config.trading_pair, order_base), "0")
+        notional = qamount * qprice
+        if qamount <= Decimal("0") or notional < self.config.min_order_quote:
+            return None
+        return qamount, notional, qprice
+
+    def _plan_buy_book(self) -> Dict[str, Decimal]:
+        """The BUY book a fresh rebuild would rest, as {level_id: quantized_base_amount}."""
+        p = self.processed_data
+        if not p or "best_bid" not in p:
+            return {}
+        budget = self._side_rebuild_budget_quote()
+        if budget < self.config.min_order_quote:
+            return {}
+        eligible = [idx for idx, price in enumerate(self.config.buy_prices)
+                    if self._can_place_buy_level(price)]
+        kept = self._compress_buy_level_indexes_for_min_notional(eligible, budget)
+        if not kept:
+            return {}
+        kept_weight_total = sum(self.config.normalized_buy_weights[i] for i in kept)
+        if kept_weight_total <= Decimal("0"):
+            return {}
+        book: Dict[str, Decimal] = {}
+        remaining = budget
+        pending = list(kept)
+        while pending and remaining >= self.config.min_order_quote:
+            idx = pending.pop(0)
+            price = self.config.buy_prices[idx]
+            level_weight = self.config.normalized_buy_weights[idx] / kept_weight_total
+            if level_weight <= Decimal("0"):
+                continue
+            target_quote = min(budget * level_weight, remaining)
+            quantized = None
+            if target_quote >= self.config.min_order_quote:
+                quantized = self._quantize_buy_level(price, target_quote)
+            if quantized is None and self.config.allow_partial_levels and not pending and remaining >= self.config.min_order_quote:
+                quantized = self._quantize_buy_level(price, remaining)
+            if quantized is None:
+                continue
+            qamount, notional, _ = quantized
+            book[self._buy_level_id(idx)] = qamount
+            remaining = max(Decimal("0"), remaining - notional)
+        return book
+
+    def _plan_sell_book(self) -> Dict[str, Decimal]:
+        """The SELL book a fresh rebuild would rest, as {level_id: quantized_base_amount}."""
+        p = self.processed_data
+        if not p or "best_ask" not in p:
+            return {}
+        budget = self._side_rebuild_budget_base()
+        if budget <= Decimal("0"):
+            return {}
+        eligible = [idx for idx, price in enumerate(self.config.sell_prices)
+                    if self._can_place_sell_level(price)]
+        kept = self._compress_sell_level_indexes_for_min_notional(eligible, budget)
+        if not kept:
+            return {}
+        kept_weight_total = sum(self.config.normalized_sell_weights[i] for i in kept)
+        if kept_weight_total <= Decimal("0"):
+            return {}
+        book: Dict[str, Decimal] = {}
+        remaining = budget
+        pending = list(kept)
+        while pending and remaining > Decimal("0"):
+            idx = pending.pop(0)
+            price = self.config.sell_prices[idx]
+            level_weight = self.config.normalized_sell_weights[idx] / kept_weight_total
+            if level_weight <= Decimal("0"):
+                continue
+            target_base = min(budget * level_weight, remaining)
+            quantized = None
+            if target_base * price >= self.config.min_order_quote:
+                quantized = self._quantize_sell_level(price, target_base)
+            if quantized is None and self.config.allow_partial_levels and not pending and (remaining * price) >= self.config.min_order_quote:
+                quantized = self._quantize_sell_level(price, remaining)
+            if quantized is None:
+                continue
+            qamount, _, _ = quantized
+            book[self._sell_level_id(idx)] = qamount
+            remaining = max(Decimal("0"), remaining - qamount)
+        return book
+
+    def _resting_side_book(self, side: TradeType) -> Dict[str, Decimal]:
+        """{level_id: configured base amount} for this side's currently-resting (active) orders."""
+        book: Dict[str, Decimal] = {}
+        for executor in self._active_order_executors():
+            if self._executor_side(executor) != side:
+                continue
+            level_id = getattr(executor.config, "level_id", None)
+            if not level_id:
+                continue
+            amount = self._d(getattr(executor.config, "amount", "0") or "0")
+            book[level_id] = book.get(level_id, Decimal("0")) + max(Decimal("0"), amount)
+        return book
+
+    def _side_refresh_converged(self, side: TradeType) -> bool:
+        """True when refreshing `side` would NOT meaningfully change its book -> skip the
+        cancel/recreate (no churn). This is BOTH guards in one test:
+          - No-op guard: the rebuild rests the SAME rungs and the total deployed value differs by
+            less than min_order_quote (one order's worth) -> nothing worth churning for.
+          - Dust guard: a sub-min_order_quote freed amount can neither add a rung nor shift the
+            total by a whole order, so it falls under the same threshold -> skip.
+        A changed rung SET (a rung became eligible/ineligible, or compression added/dropped one --
+        e.g. the 305->312 re-center) is always a real change -> refresh.
+        """
+        if side == TradeType.BUY:
+            planned, resting = self._plan_buy_book(), self._resting_side_book(TradeType.BUY)
+            prices = {self._buy_level_id(i): self.config.buy_prices[i] for i in range(len(self.config.buy_prices))}
+        else:
+            planned, resting = self._plan_sell_book(), self._resting_side_book(TradeType.SELL)
+            prices = {self._sell_level_id(i): self.config.sell_prices[i] for i in range(len(self.config.sell_prices))}
+        if set(planned.keys()) != set(resting.keys()):
+            return False
+        planned_notional = sum(amt * prices.get(lid, Decimal("0")) for lid, amt in planned.items())
+        resting_notional = sum(amt * prices.get(lid, Decimal("0")) for lid, amt in resting.items())
+        return abs(planned_notional - resting_notional) < Decimal(self.config.min_order_quote)
+
+    def _nearest_eligible_rung(self, side: TradeType) -> str:
+        """Anchor rung for the refresh event: nearest-to-price eligible rung on `side`."""
+        if side == TradeType.BUY:
+            elig = [p for p in self.config.buy_prices if self._can_place_buy_level(p)]
+            return str(max(elig)) if elig else ""
+        elig = [p for p in self.config.sell_prices if self._can_place_sell_level(p)]
+        return str(min(elig)) if elig else ""
+
     def _create_buy_actions(self) -> List[CreateExecutorAction]:
         # v12 Issue 3: a buy stop this cycle defers only buy creates (sell creates proceed).
         if self._defer_buy_creates_this_cycle:
+            return []
+        # Per-side model: only (re)build the BUY side when it is dirty (a trigger fired). When
+        # the side is quiet, empty rungs stay empty -- a filled buy level is not instantly re-
+        # bought; it waits for the BUY cooldown to lapse or the global timer (the contract).
+        if self.config.event_refresh_enabled and not self._buy_side_dirty:
             return []
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
@@ -3247,6 +3776,9 @@ class RangeInventoryLadderController(ControllerBase):
     def _create_sell_actions(self) -> List[CreateExecutorAction]:
         # v12 Issue 3: a sell stop this cycle defers only sell creates (buy creates proceed).
         if self._defer_sell_creates_this_cycle:
+            return []
+        # Per-side model: only (re)build the SELL side when it is dirty (see _create_buy_actions).
+        if self.config.event_refresh_enabled and not self._sell_side_dirty:
             return []
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
@@ -3385,8 +3917,27 @@ class RangeInventoryLadderController(ControllerBase):
             return []
 
         actions: List[CreateExecutorAction] = []
-        actions.extend(self._create_buy_actions())
-        actions.extend(self._create_sell_actions())
+        buy_actions = self._create_buy_actions()
+        sell_actions = self._create_sell_actions()
+        actions.extend(buy_actions)
+        actions.extend(sell_actions)
+
+        # Per-side model: a side's refresh is complete once its rebuild has been ISSUED -- clear
+        # its dirty flag so it is not rebuilt again next cycle (no self-trigger loop). We treat a
+        # build as issued when it produced actions OR there is genuinely nothing to place (dust /
+        # no eligible rung). If the planner still wants orders but none were placed this cycle
+        # (e.g. the just-cancelled levels are still SHUTTING_DOWN and thus blocked), the side stays
+        # dirty and retries next cycle. Sides that were deferred this cycle keep their dirty flag.
+        if self.config.event_refresh_enabled:
+            if self._buy_side_dirty and not self._defer_buy_creates_this_cycle:
+                if buy_actions or not self._plan_buy_book():
+                    self._buy_side_dirty = False
+                    self._buy_dirty_reason = ""
+            if self._sell_side_dirty and not self._defer_sell_creates_this_cycle:
+                if sell_actions or not self._plan_sell_book():
+                    self._sell_side_dirty = False
+                    self._sell_dirty_reason = ""
+
         if not actions:
             self._emit_structured(
                 "range_ladder_noop_cycle",
@@ -3398,6 +3949,70 @@ class RangeInventoryLadderController(ControllerBase):
                 market_data_hard_pause=str(self._market_data_hard_pause),
             )
         return actions
+
+    def _append_dirty_side_cancels(self, now: float, actions: List[StopExecutorAction],
+                                   active_order_executors: List[ExecutorInfo]) -> bool:
+        """Per-side refresh APPLY step (event_refresh_enabled=True). For each DIRTY side:
+          - No-op / dust guard: if a fresh rebuild would reproduce the resting book (e.g. nothing
+            changed, or a sub-min_order_quote freed amount can't fund a new rung), clear the dirty
+            flag WITHOUT cancelling -- no churn.
+          - Otherwise cancel ALL resting executors on that side, bypass-marking each level so the
+            cancel starts no residual cooldown. The create path rebuilds the side from its current
+            managed budget next cycle (cancel cycle N -> recreate cycle N+1 via the per-side defer).
+        Returns whether any stop was emitted. Skips entirely on a non-ready cycle so a market-data
+        blip never cancels the book against stale/empty processed_data.
+        """
+        if (not self.processed_data
+                or not self.processed_data.get("market_data_ready", True)
+                or not self.processed_data.get("initialization_ready", True)):
+            return False
+
+        stopped = False
+        for side, dirty_attr, reason_attr in (
+            (TradeType.BUY, "_buy_side_dirty", "_buy_dirty_reason"),
+            (TradeType.SELL, "_sell_side_dirty", "_sell_dirty_reason"),
+        ):
+            if not getattr(self, dirty_attr):
+                continue
+            reason = getattr(self, reason_attr) or "refresh"
+            side_name = "buy" if side == TradeType.BUY else "sell"
+
+            if self._side_refresh_converged(side):
+                # The resting book already equals what a rebuild would place -> nothing to do.
+                setattr(self, dirty_attr, False)
+                setattr(self, reason_attr, "")
+                self._emit_structured(
+                    "range_ladder_side_refresh_skipped",
+                    side=side_name, reason=reason, guard="noop_or_dust",
+                )
+                continue
+
+            resting = [e for e in active_order_executors if self._executor_side(e) == side]
+            if not resting:
+                # Nothing to cancel; the create path (re)builds this side this cycle and then
+                # clears the dirty flag (initial placement / post-cancel follow-through).
+                continue
+
+            budget = (self._side_rebuild_budget_quote() if side == TradeType.BUY
+                      else self._side_rebuild_budget_base())
+            planned = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
+            for executor in resting:
+                level_id = getattr(executor.config, "level_id", "")
+                self._mark_bypass_cooldown_for_level(level_id)
+                actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
+                stopped = True
+            # Dirty flag stays set: the rebuild lands next cycle (creates are deferred on a side
+            # that has stops this cycle), and create_actions_proposal clears it once issued.
+            self._emit_structured(
+                "range_ladder_side_refresh",
+                side=side_name,
+                reason=reason,
+                budget=str(budget),
+                anchor_rung=self._nearest_eligible_rung(side),
+                levels_cancelled=len(resting),
+                levels_created=len(planned),
+            )
+        return stopped
 
     def stop_actions_proposal(self) -> List[StopExecutorAction]:
         actions: List[StopExecutorAction] = []
@@ -3458,8 +4073,7 @@ class RangeInventoryLadderController(ControllerBase):
                 trading_pair=self.config.trading_pair,
             )
 
-        # Refresh policy: cancel and recreate resting orders after executor_refresh_time seconds.
-        # This ensures orders track the latest ladder prices and budget allocations.
+        # Refresh policy: cancel and recreate resting orders to track current prices/budgets.
         now = self.market_data_provider.time()
 
         # Post-refresh settle gate: if we recently emitted refresh cancels, don't
@@ -3469,23 +4083,31 @@ class RangeInventoryLadderController(ControllerBase):
         if now < self._refresh_quiet_until:
             return actions
 
-        refresh_stopped_any = False
-        for executor in active_order_executors:
-            age = now - executor.timestamp
-            if age >= self.config.executor_refresh_time:
-                # v12 Issue 2: a refresh cancel must NEVER start a cooldown -- nothing
-                # filled, the order is merely being re-priced. Bypass-mark the level before
-                # the stop (identical to the hard-pause, session-end, and config-rebuild
-                # stop branches) so _recently_closed_level_ids does not park it on cooldown.
-                self._mark_bypass_cooldown_for_level(getattr(executor.config, "level_id", ""))
-                actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
-                self._emit_structured(
-                    "range_ladder_refresh_stop",
-                    executor_id=executor.id,
-                    level_id=getattr(executor.config, "level_id", ""),
-                    age_s=round(age, 3),
-                )
-                refresh_stopped_any = True
+        if self.config.event_refresh_enabled:
+            # Per-side model: cancel the resting orders on whichever side(s) a trigger marked
+            # dirty (fill cross-side, cooldown lapse, or the global timer), skipping the cancel
+            # when the rebuild would reproduce the same book (no-op / dust guard).
+            refresh_stopped_any = self._append_dirty_side_cancels(now, actions, active_order_executors)
+        else:
+            # LEGACY (event_refresh_enabled=False): per-executor-age refresh -- cancel any order
+            # older than executor_refresh_time.
+            refresh_stopped_any = False
+            for executor in active_order_executors:
+                age = now - executor.timestamp
+                if age >= self.config.executor_refresh_time:
+                    # v12 Issue 2: a refresh cancel must NEVER start a cooldown -- nothing
+                    # filled, the order is merely being re-priced. Bypass-mark the level before
+                    # the stop (identical to the hard-pause, session-end, and config-rebuild
+                    # stop branches) so _recently_closed_level_ids does not park it on cooldown.
+                    self._mark_bypass_cooldown_for_level(getattr(executor.config, "level_id", ""))
+                    actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
+                    self._emit_structured(
+                        "range_ladder_refresh_stop",
+                        executor_id=executor.id,
+                        level_id=getattr(executor.config, "level_id", ""),
+                        age_s=round(age, 3),
+                    )
+                    refresh_stopped_any = True
 
         if refresh_stopped_any and self.config.post_refresh_settle_seconds > 0:
             self._refresh_quiet_until = now + self.config.post_refresh_settle_seconds
@@ -3514,7 +4136,18 @@ class RangeInventoryLadderController(ControllerBase):
             f"Managed quote / base: {p['managed_quote_total']:.6f} {p['quote_asset']} / {p['managed_base_total']:.6f} {p['base_asset']}",
             f"Managed fund value: {p['managed_fund_value_quote']:.6f} {p['quote_asset']} | Throttle factor: {p['cap_factor']:.6f}",
             f"Seed value / Deploy ceiling: {p.get('seed_value_quote', Decimal('0')):.6f} / {p.get('deploy_ceiling_quote', Decimal('0')):.6f} {p['quote_asset']} (cap {self.config.max_fund_value_quote})",
+            f"Refresh model: {'event / per-side' if p.get('event_refresh_enabled', self.config.event_refresh_enabled) else 'legacy / per-executor-age'} | "
+            f"global refresh in {p.get('global_refresh_remaining_s', 0.0):.0f}s (every {self.config.executor_refresh_time}s)",
+            f"Buy cooldown {p.get('buy_cooldown_time', self.config.effective_buy_cooldown_time)}s "
+            f"({'lapses in %.0fs' % p['buy_cooldown_remaining_s'] if p.get('buy_cooldown_armed') and p.get('buy_cooldown_remaining_s') is not None else 'idle'}) | "
+            f"dirty={p.get('buy_side_dirty', False)}{(' (%s)' % p.get('buy_dirty_reason')) if p.get('buy_side_dirty') and p.get('buy_dirty_reason') else ''}",
+            f"Sell cooldown {p.get('sell_cooldown_time', self.config.effective_sell_cooldown_time)}s "
+            f"({'lapses in %.0fs' % p['sell_cooldown_remaining_s'] if p.get('sell_cooldown_armed') and p.get('sell_cooldown_remaining_s') is not None else 'idle'}) | "
+            f"dirty={p.get('sell_side_dirty', False)}{(' (%s)' % p.get('sell_dirty_reason')) if p.get('sell_side_dirty') and p.get('sell_dirty_reason') else ''}",
             f"Deployable quote / base: {p['deployable_quote_total']:.6f} {p['quote_asset']} / {p['deployable_base_total']:.6f} {p['base_asset']}",
+            f"Funding mode: {'ledger (own owned_*_free, wallet-floored)' if p.get('ledger_funded_budgets', self.config.ledger_funded_budgets) else 'legacy (raw wallet)'} | "
+            f"owned_free q/b: {p.get('owned_quote_free', Decimal('0')):.6f} / {p.get('owned_base_free', Decimal('0')):.6f} | "
+            f"wallet avail q/b: {p.get('available_quote_balance', Decimal('0')):.6f} / {p.get('available_base_balance', Decimal('0')):.6f}",
             f"Free buy budget: {p['free_buy_budget_quote']:.6f} {p['quote_asset']}",
             f"Shared-account quote quota: "
             f"{('none' if self.config.shared_account_quote_quota is None else f'{self.config.shared_account_quote_quota:.6f}')} "
@@ -3594,10 +4227,27 @@ class RangeInventoryLadderController(ControllerBase):
             "seed_value_quote": str(p.get("seed_value_quote", Decimal("0"))),
             "deploy_ceiling_quote": str(p.get("deploy_ceiling_quote", Decimal("0"))),
             "deploy_headroom_quote": str(p.get("deploy_headroom_quote", Decimal("0"))),
+            "max_fund_value_quote": str(self.config.max_fund_value_quote),
+            "event_refresh_enabled": str(p.get("event_refresh_enabled", self.config.event_refresh_enabled)),
+            "buy_cooldown_time": str(p.get("buy_cooldown_time", self.config.effective_buy_cooldown_time)),
+            "sell_cooldown_time": str(p.get("sell_cooldown_time", self.config.effective_sell_cooldown_time)),
+            "buy_cooldown_armed": str(p.get("buy_cooldown_armed", False)),
+            "sell_cooldown_armed": str(p.get("sell_cooldown_armed", False)),
+            "buy_cooldown_remaining_s": str(p.get("buy_cooldown_remaining_s")),
+            "sell_cooldown_remaining_s": str(p.get("sell_cooldown_remaining_s")),
+            "buy_side_dirty": str(p.get("buy_side_dirty", False)),
+            "sell_side_dirty": str(p.get("sell_side_dirty", False)),
+            "buy_dirty_reason": str(p.get("buy_dirty_reason", "")),
+            "sell_dirty_reason": str(p.get("sell_dirty_reason", "")),
+            "last_global_refresh_ts": str(p.get("last_global_refresh_ts", 0.0)),
+            "global_refresh_remaining_s": str(p.get("global_refresh_remaining_s", 0.0)),
             "deployable_quote_total": str(p["deployable_quote_total"]),
             "deployable_base_total": str(p["deployable_base_total"]),
             "free_buy_budget_quote": str(p["free_buy_budget_quote"]),
             "free_sell_budget_base": str(p["free_sell_budget_base"]),
+            "ledger_funded_budgets": str(p.get("ledger_funded_budgets", self.config.ledger_funded_budgets)),
+            "owned_quote_free": str(p.get("owned_quote_free", Decimal("0"))),
+            "owned_base_free": str(p.get("owned_base_free", Decimal("0"))),
             "available_quote_balance": str(p.get("available_quote_balance", "0")),
             "available_base_balance": str(p.get("available_base_balance", "0")),
             "total_quote_balance": str(p.get("total_quote_balance", "0")),

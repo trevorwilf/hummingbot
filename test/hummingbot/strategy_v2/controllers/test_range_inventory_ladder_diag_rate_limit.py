@@ -44,6 +44,10 @@ def _make_buy_controller(buy_prices, blocked=None, best_bid="340"):
     # v12 Issue 3: _create_buy_actions checks the side-specific defer flags; False = place.
     controller._defer_buy_creates_this_cycle = False
     controller._defer_sell_creates_this_cycle = False
+    # Per-side refresh model: _create_buy_actions only builds a DIRTY side. Mark it dirty so the
+    # eligibility/filter-event path under test runs (these events are mode-independent).
+    controller._buy_side_dirty = True
+    controller._sell_side_dirty = True
     controller._price_level_token = RangeInventoryLadderController._price_level_token
     for name in ("_create_buy_actions", "_buy_level_id", "_can_place_buy_level"):
         setattr(
@@ -74,6 +78,10 @@ def _make_sell_controller(sell_prices, blocked=None, best_ask="330"):
     # v12 Issue 3: _create_sell_actions checks the side-specific defer flags; False = place.
     controller._defer_buy_creates_this_cycle = False
     controller._defer_sell_creates_this_cycle = False
+    # Per-side refresh model: _create_sell_actions only builds a DIRTY side. Mark it dirty so the
+    # eligibility/filter-event path under test runs (these events are mode-independent).
+    controller._buy_side_dirty = True
+    controller._sell_side_dirty = True
     controller._price_level_token = RangeInventoryLadderController._price_level_token
     for name in ("_create_sell_actions", "_sell_level_id", "_can_place_sell_level"):
         setattr(

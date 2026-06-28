@@ -49,6 +49,9 @@ def _make_controller(executors, cooldown_time=30):
     controller.executors_info = executors
     controller.config = MagicMock()
     controller.config.cooldown_time = cooldown_time
+    # These tests validate the LEGACY per-level cooldown in _recently_closed_level_ids; pin the
+    # legacy mode (event mode neutralizes the per-level cooldown in favor of the per-side model).
+    controller.config.event_refresh_enabled = False
     controller._buy_reservation_sources = {}
     controller._sell_reservation_sources = {}
 
