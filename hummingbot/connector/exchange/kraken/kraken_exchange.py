@@ -660,6 +660,12 @@ class KrakenExchange(ExchangePyBase):
                         locked[convert_from_exchange_symbol(quote)] += vol_locked * Decimal(details.get("price"))
 
         for asset_name, balance in balances.items():
+            # Skip Kraken non-spot sub-balances: staked (".S"), bonded / opt-in rewards (".B"),
+            # on-hold (".HOLD") and any other ".<suffix>" that is not Flex/earn (".F"). These funds are
+            # not spot-tradable, so counting them would surface phantom assets (e.g. "SOL03.S") and
+            # overstate available balances. Flex (".F") IS spot-liquid and is folded into its base below.
+            if "." in asset_name and not asset_name.endswith(".F"):
+                continue
             cleaned_name = convert_from_exchange_symbol(asset_name).upper()
             total_balance = Decimal(balance)
             free_balance = total_balance - Decimal(locked[cleaned_name])

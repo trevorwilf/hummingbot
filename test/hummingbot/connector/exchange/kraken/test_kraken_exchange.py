@@ -1531,6 +1531,35 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.assertEqual(Decimal("100"), self.exchange.available_balances["USDT"])
 
     @aioresponses()
+    def test_update_balances_excludes_non_spot_subbalances(self, mocked_api):
+        # BAL-LIVE-1: staked (.S), bonded (.B) and on-hold (.HOLD) sub-balances are not spot-tradable
+        # and must not surface as phantom available assets (observed live: SOL03.S, XBT.B, USD.HOLD).
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.ASSET_PAIRS_PATH_URL}"
+        mocked_api.get(url, body=json.dumps(self.get_asset_pairs_mock()))
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.BALANCE_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {
+            "SOL": "1.0", "SOL03.S": "5.0", "XBT.B": "0.5", "USD.HOLD": "10.0",
+            "ZUSD": "100.0", "XBT.F": "2.0",
+        }}))
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.OPEN_ORDERS_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {"open": {}}}))
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+        avail = self.exchange.available_balances
+
+        self.assertNotIn("SOL03.S", avail)
+        self.assertNotIn("XBT.B", avail)
+        self.assertNotIn("USD.HOLD", avail)
+        self.assertEqual([], [a for a in avail if "." in a])  # no phantom dotted assets at all
+        self.assertEqual(Decimal("1.0"), avail["SOL"])
+        self.assertEqual(Decimal("100.0"), avail["USD"])
+        self.assertEqual(Decimal("2.0"), avail["BTC"])  # liquid .F folds into base; .B does NOT
+
+    @aioresponses()
     def test_update_balances_skips_unresolvable_open_order_pair(self, mocked_api):
         # UTILSCFG-3: a single open order whose pair cannot be resolved must not crash balance polling.
         url = f"{CONSTANTS.BASE_URL}{CONSTANTS.ASSET_PAIRS_PATH_URL}"
