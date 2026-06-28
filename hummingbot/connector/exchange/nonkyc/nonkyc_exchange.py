@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +34,10 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 class NonkycExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    # Cap of the persisted processed-trade-id dedupe set (FIFO eviction of the oldest ids).
+    _PROCESSED_TRADE_IDS_MAX = 5000
+    # Reserved key under which the dedupe set is persisted inside tracking_states.
+    _PROCESSED_TRADE_IDS_STATE_KEY = "__nonkyc_processed_trade_ids__"
     ENABLE_BALANCE_WS = True  # Undocumented WS methods (subscribeBalances/currentBalances/balanceUpdate).
                                # Confirmed working 2026-03-29. Auto-disables if no response within 60s.
                                # unsubscribeBalances does NOT exist (404). Do not attempt to unsubscribe.
@@ -86,6 +91,11 @@ class NonkycExchange(ExchangePyBase):
         self._last_server_disconnect_time: float = 0.0
         self._SERVER_DISCONNECT_BACKOFF: float = 10.0
         self._balance_recheck_in_progress: bool = False
+        # Persisted, bounded FIFO dedupe of already-processed exchange trade ids. /account/trades
+        # returns the GLOBAL account trade list (the symbol filter is ignored), so the reconciliation
+        # path can otherwise see and re-process the same trade many times across pairs and poll cycles.
+        # Persisted via tracking_states so it survives restarts.
+        self._processed_trade_ids: "OrderedDict[str, None]" = OrderedDict()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.logger().info(
             "NonKYC connector supports LIMIT and MARKET order types. "
@@ -137,6 +147,59 @@ class NonkycExchange(ExchangePyBase):
             self._emit_structured_event("balance_settling_exited", {
                 "duration_s": round(elapsed, 1),
             })
+
+    @property
+    def is_balance_settling(self) -> bool:
+        """True while a post-reconnect / post-fill REST balance sync is still in flight. Controllers
+        should DEFER ledger/wallet over-claim reconciliation while this is True, since the cached
+        wallet balance can be transiently stale-low and produce false over-claim positives."""
+        return self._balance_settling
+
+    # --- Persisted, bounded dedupe of processed exchange trade ids -------------------------------
+
+    def _is_trade_processed(self, trade_id: str) -> bool:
+        return str(trade_id) in self._processed_trade_ids
+
+    def _mark_trade_processed(self, trade_id: str) -> None:
+        tid = str(trade_id)
+        if tid in self._processed_trade_ids:
+            return
+        self._processed_trade_ids[tid] = None
+        while len(self._processed_trade_ids) > self._PROCESSED_TRADE_IDS_MAX:
+            self._processed_trade_ids.popitem(last=False)  # FIFO: evict oldest
+
+    @property
+    def tracking_states(self) -> Dict[str, Any]:
+        # Persist the dedupe set alongside the in-flight order states so it survives restarts.
+        states = super().tracking_states
+        states[self._PROCESSED_TRADE_IDS_STATE_KEY] = list(self._processed_trade_ids.keys())
+        return states
+
+    def restore_tracking_states(self, saved_states: Dict[str, Any]):
+        processed = None
+        if isinstance(saved_states, dict) and self._PROCESSED_TRADE_IDS_STATE_KEY in saved_states:
+            # Copy + strip the reserved key so the order tracker only ever sees order states.
+            saved_states = dict(saved_states)
+            processed = saved_states.pop(self._PROCESSED_TRADE_IDS_STATE_KEY, None)
+        super().restore_tracking_states(saved_states)
+        if processed:
+            for tid in processed:
+                self._mark_trade_processed(str(tid))
+
+    async def _safe_resolve_trading_pair(self, trade: Dict[str, Any]) -> Optional[str]:
+        """Resolve a trade record's actual hb trading pair from its ``market.symbol`` (never from the
+        loop/poll pair). Returns None if the symbol is missing or unknown to the symbol map."""
+        symbol = None
+        market = trade.get("market")
+        if isinstance(market, dict):
+            symbol = market.get("symbol")
+        symbol = symbol or trade.get("symbol")
+        if not symbol:
+            return None
+        try:
+            return await self.trading_pair_associated_to_exchange_symbol(symbol=str(symbol))
+        except Exception:
+            return None
 
     async def _reconcile_active_orders_after_reconnect(self):
         """Fetch active orders from exchange after reconnect and reconcile with tracked orders."""
@@ -1386,7 +1449,8 @@ class NonkycExchange(ExchangePyBase):
             self._last_trades_poll_nonkyc_timestamp = self._time_synchronizer.time()
             order_by_exchange_id_map = {}
             for order in self._order_tracker.all_fillable_orders.values():
-                order_by_exchange_id_map[order.exchange_order_id] = order
+                if order.exchange_order_id is not None:
+                    order_by_exchange_id_map[str(order.exchange_order_id)] = order
             tasks = []
             trading_pairs = self.trading_pairs
             for trading_pair in trading_pairs:
@@ -1405,20 +1469,38 @@ class NonkycExchange(ExchangePyBase):
             self.logger().debug(f"Polling for order fills of {len(tasks)} trading pairs.")
             results = await safe_gather(*tasks, return_exceptions=True)
 
-            for trades, trading_pair in zip(results, trading_pairs):
-                base_asset, quote_asset = split_hb_trading_pair(trading_pair=trading_pair)
-
+            # IMPORTANT: /account/trades IGNORES the symbol param and returns the GLOBAL account trade
+            # list, so every per-pair response is the same full list. Attribute each trade to its OWN
+            # order (by orderid) / its OWN market (resolved from market.symbol) -- NEVER the poll pair --
+            # and dedupe by trade id so each trade is processed exactly once. This eliminates both the
+            # cross-pair fill leak and the duplicate-fill re-insert.
+            for trades, poll_pair in zip(results, trading_pairs):
                 if isinstance(trades, Exception):
                     self.logger().network(
-                        f"Error fetching trades update for {trading_pair}: {trades}.",
-                        app_warning_msg=f"Failed to fetch trade update for {trading_pair}."
+                        f"Error fetching trades update for {poll_pair}: {trades}.",
+                        app_warning_msg=f"Failed to fetch trade update for {poll_pair}."
                     )
                     continue
+                if not isinstance(trades, list):
+                    continue
                 for trade in trades:
+                    trade_id = str(trade["id"])
+                    if self._is_trade_processed(trade_id):
+                        continue
                     exchange_order_id = str(trade["orderid"])
                     if exchange_order_id in order_by_exchange_id_map:
-                        # This is a fill for a tracked order
+                        # Fill for a currently-tracked order. The ORDER (not the poll pair) is
+                        # authoritative for the trading pair.
                         tracked_order = order_by_exchange_id_map[exchange_order_id]
+                        order_pair = tracked_order.trading_pair
+                        # Secondary guard: if the trade's market resolves and disagrees with the order's
+                        # pair, skip it -- never attribute a trade to the wrong market.
+                        resolved_pair = await self._safe_resolve_trading_pair(trade)
+                        if resolved_pair is not None and resolved_pair != order_pair:
+                            self.logger().debug(
+                                f"Skipping trade {trade_id}: market {resolved_pair} != order pair {order_pair}.")
+                            continue
+                        _, quote_asset = split_hb_trading_pair(trading_pair=order_pair)
                         fee_token, fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
@@ -1431,10 +1513,10 @@ class NonkycExchange(ExchangePyBase):
                         _triggered_by = str(trade.get("triggeredBy", "")).lower()
                         _is_taker = (_side == _triggered_by) if (_side and _triggered_by) else True
                         trade_update = TradeUpdate(
-                            trade_id=str(trade["id"]),
+                            trade_id=trade_id,
                             client_order_id=tracked_order.client_order_id,
                             exchange_order_id=exchange_order_id,
-                            trading_pair=trading_pair,
+                            trading_pair=order_pair,
                             fee=fee,
                             fill_base_amount=Decimal(trade["quantity"]),
                             fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
@@ -1446,32 +1528,45 @@ class NonkycExchange(ExchangePyBase):
                         )
                         self._order_tracker.process_trade_update(trade_update)
                         # Tag fill source for provenance tracking
-                        tracked_order.fill_sources[str(trade["id"])] = "rest_poll"
-                    elif self.is_confirmed_new_order_filled_event(str(trade["id"]), exchange_order_id, trading_pair):
-                        # This is a fill of an order registered in the DB but not tracked any more
-                        self._current_trade_fills.add(TradeFillOrderDetails(
-                            market=self.display_name,
-                            exchange_trade_id=str(trade["id"]),
-                            symbol=trading_pair))
-                        _fee_token, _fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
-                        self.trigger_event(
-                            MarketEvent.OrderFilled,
-                            OrderFilledEvent(
-                                timestamp=float(trade["timestamp"]) * 1e-3,
-                                order_id=self._exchange_order_ids.get(str(trade["orderid"]), None),
-                                trading_pair=trading_pair,
-                                trade_type=TradeType.BUY if trade["side"].lower() == "buy" else TradeType.SELL,
-                                order_type=OrderType.LIMIT,
-                                price=Decimal(trade["price"]),
-                                amount=Decimal(trade["quantity"]),
-                                trade_fee=TradeFeeBase.new_spot_fee(
-                                    fee_schema=self.trade_fee_schema(),
-                                    trade_type=TradeType.BUY if trade["side"].lower() == "buy" else TradeType.SELL,
-                                    flat_fees=[TokenAmount(_fee_token, _fee_amount)]
-                                ),
-                                exchange_trade_id=str(trade["id"])
-                            ))
-                        self.logger().info(f"Recreating missing trade in TradeFill: {trade}")
+                        tracked_order.fill_sources[trade_id] = "rest_poll"
+                        self._mark_trade_processed(trade_id)
+                    else:
+                        # Fill for an order registered in the DB but no longer tracked. Recover it ONLY
+                        # for the trade's ACTUAL market (resolved from market.symbol) -- never fan it out
+                        # across every connector market, and never use the poll pair.
+                        resolved_pair = await self._safe_resolve_trading_pair(trade)
+                        if resolved_pair is None:
+                            self.logger().debug(
+                                f"Skipping untracked trade {trade_id}: cannot resolve its market.")
+                            continue
+                        if self.is_confirmed_new_order_filled_event(trade_id, exchange_order_id, resolved_pair):
+                            self._current_trade_fills.add(TradeFillOrderDetails(
+                                market=self.display_name,
+                                exchange_trade_id=trade_id,
+                                symbol=resolved_pair))
+                            _, quote_asset = split_hb_trading_pair(trading_pair=resolved_pair)
+                            _fee_token, _fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
+                            _trade_type = TradeType.BUY if str(trade["side"]).lower() == "buy" else TradeType.SELL
+                            self.trigger_event(
+                                MarketEvent.OrderFilled,
+                                OrderFilledEvent(
+                                    timestamp=float(trade["timestamp"]) * 1e-3,
+                                    order_id=self._exchange_order_ids.get(exchange_order_id, None),
+                                    trading_pair=resolved_pair,
+                                    trade_type=_trade_type,
+                                    order_type=OrderType.LIMIT,
+                                    price=Decimal(trade["price"]),
+                                    amount=Decimal(trade["quantity"]),
+                                    trade_fee=TradeFeeBase.new_spot_fee(
+                                        fee_schema=self.trade_fee_schema(),
+                                        trade_type=_trade_type,
+                                        flat_fees=[TokenAmount(_fee_token, _fee_amount)]
+                                    ),
+                                    exchange_trade_id=trade_id
+                                ))
+                            self._mark_trade_processed(trade_id)
+                            self.logger().info(
+                                f"Recreating missing trade in TradeFill (pair={resolved_pair}): {trade}")
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         # Skip per-order fill fetching if bulk _update_order_fills_from_trades()
@@ -1501,7 +1596,13 @@ class NonkycExchange(ExchangePyBase):
                 params=params,
                 is_auth_required=True,)
 
-            filtered_trades = [trade for trade in all_fills_response if trade["orderid"] == exchange_order_id]
+            # Filter the GLOBAL trade list to THIS order (orderid match), and skip any trade already
+            # processed by the bulk reconciliation path (dedupe by exchange trade id).
+            filtered_trades = [
+                trade for trade in (all_fills_response if isinstance(all_fills_response, list) else [])
+                if str(trade.get("orderid")) == exchange_order_id
+                and not self._is_trade_processed(str(trade["id"]))
+            ]
 
             for trade in filtered_trades:
                 fee_token, fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)

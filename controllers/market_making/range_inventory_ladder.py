@@ -2491,6 +2491,9 @@ class RangeInventoryLadderController(ControllerBase):
         deploy_ceiling: Decimal,
         owned_quote: Optional[Decimal] = None,
         owned_base: Optional[Decimal] = None,
+        held_quote: Decimal = Decimal("0"),
+        held_base: Decimal = Decimal("0"),
+        balance_settling: bool = False,
     ):
         """Size each side's deployable budget, bounded by the deploy ceiling.
 
@@ -2530,10 +2533,15 @@ class RangeInventoryLadderController(ControllerBase):
             # Wallet floor: never size above what is physically free in the wallet.
             buy_budget_quote = min(owned_quote_free, avail_quote)
             sell_budget_base = min(owned_base_free, avail_base)
-            # The floor BINDING (owned_free > available) signals ledger/wallet divergence
-            # (unsettled deposit, drift, or an unexpected external spend) -- warn once per episode.
-            self._note_wallet_floor("buy", owned_quote_free, avail_quote, buy_budget_quote)
-            self._note_wallet_floor("sell", owned_base_free, avail_base, sell_budget_base)
+            # Warn only on a GENUINE shortfall: the ledger owns more than the wallet TOTAL
+            # (available + held) can back. Inventory locked in our own resting orders shows up as
+            # `held`, not as missing, so it must not trip the warning; and the warning is deferred
+            # while balances are settling (a post-fill/post-reconnect race can make the cached wallet
+            # transiently stale-low). The budget clamp `min(owned_free, available)` above is unchanged.
+            self._note_wallet_floor("buy", Decimal(owned_quote), avail_quote, held_quote,
+                                    buy_budget_quote, balance_settling)
+            self._note_wallet_floor("sell", Decimal(owned_base), avail_base, held_base,
+                                    sell_budget_base, balance_settling)
         else:
             # Legacy: raw wallet available (byte-for-byte the prior behavior).
             buy_budget_quote = avail_quote
@@ -2560,31 +2568,54 @@ class RangeInventoryLadderController(ControllerBase):
 
         return buy_budget_quote, sell_budget_base, throttle_scale, headroom
 
-    def _note_wallet_floor(self, side: str, owned_free: Decimal, available: Decimal,
-                           clamped_budget: Decimal):
-        """Transition-based diagnostic: warn the FIRST cycle the wallet floor binds on a side
-        (owned_free > available), then stay silent until it clears -- no per-cycle spam. Ongoing
-        divergence stays visible via the diagnostic heartbeat (which reports owned_free vs avail).
+    def _is_balance_settling(self) -> bool:
+        """True while the connector reports a post-fill / post-reconnect REST balance sync in flight.
+        Strict identity check (``is True``): a connector without the attribute reports False via the
+        default, and an auto-truthy MagicMock attribute (in tests) is NOT mistaken for settling."""
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            return getattr(connector, "is_balance_settling", False) is True
+        except Exception:
+            return False
+
+    def _note_wallet_floor(self, side: str, owned: Decimal, available: Decimal, held: Decimal,
+                           clamped_budget: Decimal, settling: bool = False):
+        """Transition-based diagnostic: warn the FIRST cycle a GENUINE wallet-floor shortfall appears
+        on a side, then stay silent until it clears -- no per-cycle spam.
+
+        A shortfall is genuine only when the ledger owns MORE than the wallet TOTAL can back, i.e.
+        owned > available + held. Inventory locked in our own resting orders is `held` (not missing),
+        so it never trips this; and the check is deferred while balances are settling (a post-fill /
+        post-reconnect race can make the cached wallet transiently stale-low). This is purely
+        diagnostic -- the budget clamp `min(owned_free, available)` is applied separately and unchanged.
         """
         attr = "_buy_wallet_floor_bound" if side == "buy" else "_sell_wallet_floor_bound"
-        binds = owned_free > available
+        total = max(Decimal("0"), available) + max(Decimal("0"), held)
+        # Small relative+absolute tolerance so Decimal noise never raises a false alarm.
+        tolerance = total * Decimal("0.005") + Decimal("1e-12")
+        binds = (not settling) and (owned > total + tolerance)
         was_binding = getattr(self, attr, False)
         if binds and not was_binding:
             self.logger().warning(
                 f"{self.config.id}: wallet floor binding on {side} side -- the managed-fund ledger "
-                f"shows more free ({owned_free}) than the wallet has available ({available}); "
-                f"clamping the {side} budget to {clamped_budget}. Likely an unsettled deposit, "
-                "ledger/wallet drift, or an external spend."
+                f"owns more ({owned}) than the wallet TOTAL can back (available {available} + held "
+                f"{held} = {total}); clamping the {side} budget to {clamped_budget}. Likely an "
+                "unsettled deposit, ledger/wallet drift, or an external spend."
             )
             self._emit_structured(
                 "range_ladder_wallet_floor_binding",
                 side=side,
-                owned_free=str(owned_free),
+                owned=str(owned),
                 available=str(available),
+                held=str(held),
+                total=str(total),
                 clamped_budget=str(clamped_budget),
-                reason="ledger_free_exceeds_wallet_available",
+                reason="ledger_owned_exceeds_wallet_total",
             )
-        setattr(self, attr, binds)
+        # Only update the latch when NOT settling, so a genuine shortfall that first appears during
+        # settling still warns on the first post-settle cycle.
+        if not settling:
+            setattr(self, attr, binds)
 
     async def update_processed_data(self):
         now = self.market_data_provider.time()
@@ -2841,6 +2872,11 @@ class RangeInventoryLadderController(ControllerBase):
         owned_quote = self._d(self._state.get("owned_quote"), "0")
         owned_base = self._d(self._state.get("owned_base"), "0")
 
+        # v14: defer all ledger/wallet over-claim reconciliation (re-anchor + warnings) while the
+        # connector's balances are still settling. Right after a fill books or a WS reconnect the
+        # cached wallet can be transiently stale-low, which would falsely read as an over-claim.
+        balance_settling = self._is_balance_settling()
+
         # v12 Issue 1: self-heal a persistently over-claimed ledger by re-anchoring DOWN to
         # wallet truth. Runs right after owned_* are loaded and BEFORE managed_* are computed
         # so the corrected values flow into the deploy ceiling and all reporting THIS cycle.
@@ -2853,7 +2889,11 @@ class RangeInventoryLadderController(ControllerBase):
         reanchor_quote_overclaim = max(Decimal("0"), owned_quote - total_quote_balance)
         reanchor_base_overclaim = max(Decimal("0"), owned_base - total_base_balance)
         reanchor_overclaim_quote = reanchor_quote_overclaim + reanchor_base_overclaim * reference_price
-        if reanchor_overclaim_quote > self.config.ledger_reconcile_threshold_quote:
+        if balance_settling:
+            # Defer the over-claim self-heal while balances are settling -- do not touch the grace
+            # timer; it resumes next cycle once the wallet has synced.
+            pass
+        elif reanchor_overclaim_quote > self.config.ledger_reconcile_threshold_quote:
             if self._overclaim_since is None:
                 self._overclaim_since = now
             elif (now - self._overclaim_since) >= self.config.ledger_overclaim_reanchor_seconds:
@@ -2907,12 +2947,15 @@ class RangeInventoryLadderController(ControllerBase):
         overclaim_above_threshold = ledger_overclaim_quote > RECONCILIATION_ALERT_THRESHOLD_QUOTE
         now_ts = self.market_data_provider.time()
         should_warn = False
-        if overclaim_above_threshold:
+        # Defer the over-claim warning while balances settle (a post-fill/reconnect race can read as a
+        # false over-claim). The latch is not set during settling, so a GENUINE persistent over-claim
+        # still warns on the first post-settle cycle (test 6 -> defer, test 7 -> fires after RESOLVED).
+        if overclaim_above_threshold and not balance_settling:
             if not self._last_drift_above_threshold:
                 should_warn = True
             elif (now_ts - self._last_drift_warning_time) >= self._drift_warning_interval:
                 should_warn = True
-        self._last_drift_above_threshold = overclaim_above_threshold
+        self._last_drift_above_threshold = overclaim_above_threshold and not balance_settling
         if should_warn:
             self._last_drift_warning_time = now_ts
             self.logger().warning(
@@ -2961,6 +3004,10 @@ class RangeInventoryLadderController(ControllerBase):
         seed_value_quote = self._seed_value_quote()
         deploy_ceiling = self._compute_deploy_ceiling(seed_value_quote, managed_fund_value_quote)
 
+        # Wallet inventory locked in resting orders ("held") backs the ledger just like available cash,
+        # so the wallet-floor warning must compare owned against available + held (not available alone).
+        held_quote = max(Decimal("0"), total_quote_balance - available_quote_balance)
+        held_base = max(Decimal("0"), total_base_balance - available_base_balance)
         free_buy_budget_quote, free_sell_budget_base, throttle_scale, deploy_headroom = self._compute_deploy_budgets(
             reference_price=reference_price,
             available_quote=available_quote_balance,
@@ -2970,6 +3017,9 @@ class RangeInventoryLadderController(ControllerBase):
             deploy_ceiling=deploy_ceiling,
             owned_quote=owned_quote,
             owned_base=owned_base,
+            held_quote=held_quote,
+            held_base=held_base,
+            balance_settling=balance_settling,
         )
 
         # Un-reserved owned figures (the ledger-funded budget source), surfaced for diagnostics so

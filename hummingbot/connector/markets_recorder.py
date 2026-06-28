@@ -11,6 +11,7 @@ from shutil import move
 from typing import Dict, List, Optional, Tuple, Union
 
 import pandas as pd
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session
 
 from hummingbot import data_path
@@ -568,107 +569,132 @@ class MarketsRecorder:
         order_id: str = evt.order_id
 
         event_data = {}
-        with self._sql_manager.get_new_session() as session:
-            with session.begin():
-                # Try to find the order record, and update it if necessary.
-                order_record: Optional[Order] = session.query(Order).filter(Order.id == order_id).one_or_none()
-                if order_record is not None:
-                    order_record.last_status = event_type.name
-                    order_record.last_update_timestamp = timestamp
+        try:
+            with self._sql_manager.get_new_session() as session:
+                with session.begin():
+                    # Try to find the order record, and update it if necessary.
+                    order_record: Optional[Order] = session.query(Order).filter(Order.id == order_id).one_or_none()
+                    if order_record is not None:
+                        order_record.last_status = event_type.name
+                        order_record.last_update_timestamp = timestamp
 
-                # Order status and trade fill record should be added even if the order record is not found, because it's
-                # possible for fill event to come in before the order created event for market orders.
-                order_status: OrderStatus = OrderStatus(order_id=order_id,
-                                                        timestamp=timestamp,
-                                                        status=event_type.name,
-                                                        bot_run_id=self._bot_run_id)
-                try:
-                    fee_in_quote = evt.trade_fee.fee_amount_in_token(
-                        trading_pair=evt.trading_pair,
+                    # Order status and trade fill record should be added even if the order record is not found, because it's
+                    # possible for fill event to come in before the order created event for market orders.
+                    order_status: OrderStatus = OrderStatus(order_id=order_id,
+                                                            timestamp=timestamp,
+                                                            status=event_type.name,
+                                                            bot_run_id=self._bot_run_id)
+                    try:
+                        fee_in_quote = evt.trade_fee.fee_amount_in_token(
+                            trading_pair=evt.trading_pair,
+                            price=evt.price,
+                            order_amount=evt.amount,
+                            token=quote_asset,
+                            exchange=market
+                        )
+                    except Exception as e:
+                        self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
+                        fee_in_quote = 0
+                    trade_fill_record: TradeFill = TradeFill(
+                        config_file_path=self.config_file_path,
+                        strategy=self.strategy_name,
+                        market=market.display_name,
+                        symbol=evt.trading_pair,
+                        base_asset=base_asset,
+                        quote_asset=quote_asset,
+                        timestamp=timestamp,
+                        order_id=order_id,
+                        trade_type=evt.trade_type.name,
+                        order_type=evt.order_type.name,
                         price=evt.price,
-                        order_amount=evt.amount,
-                        token=quote_asset,
-                        exchange=market
+                        amount=evt.amount,
+                        leverage=evt.leverage if evt.leverage else 1,
+                        trade_fee=evt.trade_fee.to_json(),
+                        trade_fee_in_quote=fee_in_quote,
+                        exchange_trade_id=evt.exchange_trade_id,
+                        position=evt.position if evt.position else PositionAction.NIL.value,
+                        exchange_order_id=getattr(evt, 'exchange_order_id', None),
+                        bot_run_id=self._bot_run_id,
                     )
-                except Exception as e:
-                    self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
-                    fee_in_quote = 0
-                trade_fill_record: TradeFill = TradeFill(
-                    config_file_path=self.config_file_path,
-                    strategy=self.strategy_name,
-                    market=market.display_name,
-                    symbol=evt.trading_pair,
-                    base_asset=base_asset,
-                    quote_asset=quote_asset,
-                    timestamp=timestamp,
-                    order_id=order_id,
-                    trade_type=evt.trade_type.name,
-                    order_type=evt.order_type.name,
-                    price=evt.price,
-                    amount=evt.amount,
-                    leverage=evt.leverage if evt.leverage else 1,
-                    trade_fee=evt.trade_fee.to_json(),
-                    trade_fee_in_quote=fee_in_quote,
-                    exchange_trade_id=evt.exchange_trade_id,
-                    position=evt.position if evt.position else PositionAction.NIL.value,
-                    exchange_order_id=getattr(evt, 'exchange_order_id', None),
-                    bot_run_id=self._bot_run_id,
-                )
-                # Enrich with provenance data from the in-flight order tracker
-                try:
-                    tracked_order = market._order_tracker.all_orders.get(order_id)
-                    if tracked_order is None:
-                        tracked_order = market._order_tracker._lost_orders.get(order_id)
-                    if tracked_order is not None:
-                        trade_update = tracked_order.order_fills.get(evt.exchange_trade_id)
-                        if trade_update is not None:
-                            trade_fill_record.exchange_timestamp_ms = getattr(trade_update, 'received_timestamp_ms', None) or int(trade_update.fill_timestamp * 1e3)
-                            trade_fill_record.received_timestamp_ms = getattr(trade_update, 'received_timestamp_ms', None) or int(time.time() * 1e3)
-                            trade_fill_record.liquidity_role = "taker" if trade_update.is_taker else "maker"
-                        # Prefer source_channel from TradeUpdate if available, else fall back to fill_sources
-                        if trade_update is not None and getattr(trade_update, 'source_channel', None):
-                            trade_fill_record.source_channel = trade_update.source_channel
-                        else:
-                            trade_fill_record.source_channel = tracked_order.fill_sources.get(
-                                evt.exchange_trade_id, "unknown")
-                        # Propagate controller/executor/level IDs
-                        trade_fill_record.controller_id = tracked_order.controller_id
-                        trade_fill_record.executor_id = tracked_order.executor_id
-                        trade_fill_record.level_id = getattr(tracked_order, 'level_id', None)
-                        order_status.level_id = getattr(tracked_order, 'level_id', None)
-                        order_status.exchange_order_id = getattr(evt, 'exchange_order_id', None)
-                except Exception:
-                    pass  # Never let provenance enrichment break fill recording
+                    # Enrich with provenance data from the in-flight order tracker
+                    try:
+                        tracked_order = market._order_tracker.all_orders.get(order_id)
+                        if tracked_order is None:
+                            tracked_order = market._order_tracker._lost_orders.get(order_id)
+                        if tracked_order is not None:
+                            trade_update = tracked_order.order_fills.get(evt.exchange_trade_id)
+                            if trade_update is not None:
+                                trade_fill_record.exchange_timestamp_ms = getattr(trade_update, 'received_timestamp_ms', None) or int(trade_update.fill_timestamp * 1e3)
+                                trade_fill_record.received_timestamp_ms = getattr(trade_update, 'received_timestamp_ms', None) or int(time.time() * 1e3)
+                                trade_fill_record.liquidity_role = "taker" if trade_update.is_taker else "maker"
+                            # Prefer source_channel from TradeUpdate if available, else fall back to fill_sources
+                            if trade_update is not None and getattr(trade_update, 'source_channel', None):
+                                trade_fill_record.source_channel = trade_update.source_channel
+                            else:
+                                trade_fill_record.source_channel = tracked_order.fill_sources.get(
+                                    evt.exchange_trade_id, "unknown")
+                            # Propagate controller/executor/level IDs
+                            trade_fill_record.controller_id = tracked_order.controller_id
+                            trade_fill_record.executor_id = tracked_order.executor_id
+                            trade_fill_record.level_id = getattr(tracked_order, 'level_id', None)
+                            order_status.level_id = getattr(tracked_order, 'level_id', None)
+                            order_status.exchange_order_id = getattr(evt, 'exchange_order_id', None)
+                    except Exception:
+                        pass  # Never let provenance enrichment break fill recording
 
-                # Enrich OrderStatus with receive timestamp
-                order_status.received_timestamp_ms = int(time.time() * 1e3)
+                    # Enrich OrderStatus with receive timestamp
+                    order_status.received_timestamp_ms = int(time.time() * 1e3)
 
-                session.add(order_status)
-                session.add(trade_fill_record)
-                self.save_market_states(self._config_file_path, market, session=session)
+                    session.add(order_status)
+                    session.add(trade_fill_record)
+                    self.save_market_states(self._config_file_path, market, session=session)
 
-                market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(trade_fill_record.market,
-                                                                                   trade_fill_record.exchange_trade_id,
-                                                                                   trade_fill_record.symbol)})
+                    market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(trade_fill_record.market,
+                                                                                       trade_fill_record.exchange_trade_id,
+                                                                                       trade_fill_record.symbol)})
 
-                event_data = {
-                    "order_id": order_id,
-                    "exchange_trade_id": evt.exchange_trade_id,
-                    "trading_pair": evt.trading_pair,
-                    "trade_type": evt.trade_type.name,
-                    "order_type": evt.order_type.name,
-                    "price": str(evt.price),
-                    "amount": str(evt.amount),
-                    "exchange_order_id": trade_fill_record.exchange_order_id,
-                    "exchange_timestamp_ms": trade_fill_record.exchange_timestamp_ms,
-                    "received_timestamp_ms": trade_fill_record.received_timestamp_ms,
-                    "liquidity_role": trade_fill_record.liquidity_role,
-                    "source_channel": trade_fill_record.source_channel,
-                    "controller_id": trade_fill_record.controller_id,
-                    "executor_id": trade_fill_record.executor_id,
-                    "connector": market.display_name,
-                    "fee_json": evt.trade_fee.to_json(),
-                }
+                    event_data = {
+                        "order_id": order_id,
+                        "exchange_trade_id": evt.exchange_trade_id,
+                        "trading_pair": evt.trading_pair,
+                        "trade_type": evt.trade_type.name,
+                        "order_type": evt.order_type.name,
+                        "price": str(evt.price),
+                        "amount": str(evt.amount),
+                        "exchange_order_id": trade_fill_record.exchange_order_id,
+                        "exchange_timestamp_ms": trade_fill_record.exchange_timestamp_ms,
+                        "received_timestamp_ms": trade_fill_record.received_timestamp_ms,
+                        "liquidity_role": trade_fill_record.liquidity_role,
+                        "source_channel": trade_fill_record.source_channel,
+                        "controller_id": trade_fill_record.controller_id,
+                        "executor_id": trade_fill_record.executor_id,
+                        "connector": market.display_name,
+                        "fee_json": evt.trade_fee.to_json(),
+                    }
+        except IntegrityError as integrity_error:
+            # ONLY a duplicate TradeFill (its primary key is market, order_id, exchange_trade_id) is
+            # benign here -- the fill is already recorded. ANY OTHER integrity error (a foreign-key or
+            # NOT NULL violation, a different table, etc.) MUST propagate unchanged so a real fault is
+            # never silently masked. This keeps _did_fill_order behaviour identical to before for every
+            # other connector (e.g. MEXC, Kraken) on every path except the exact duplicate-fill case.
+            _err = str(integrity_error).lower()
+            is_duplicate_trade_fill = ("unique" in _err or "duplicate" in _err) and "tradefill" in _err
+            if not is_duplicate_trade_fill:
+                raise
+            # The transaction is rolled back by the context manager; re-checkpoint the market states in a
+            # SEPARATE session so a benign duplicate never silently skips save_market_states (which
+            # previously aborted together with the failed transaction).
+            self.logger().debug(
+                f"Duplicate TradeFill ignored for order {order_id} trade {evt.exchange_trade_id} "
+                f"({evt.trading_pair}); market-state checkpoint preserved.")
+            try:
+                with self._sql_manager.get_new_session() as recovery_session:
+                    with recovery_session.begin():
+                        self.save_market_states(self._config_file_path, market, session=recovery_session)
+            except Exception:
+                self.logger().warning(
+                    "Failed to re-save market states after a duplicate fill.", exc_info=True)
+            return
         # Emit structured event AFTER commit
         try:
             get_structured_logger().emit("trade_fill_persisted", **event_data)

@@ -130,7 +130,8 @@ class _Harness(unittest.TestCase):
 
     def _budgets(self, ctrl, *, ref="300", avail_quote="0", avail_base="0",
                  reserved_quote="0", reserved_base="0", ceiling="100000",
-                 owned_quote=None, owned_base=None):
+                 owned_quote=None, owned_base=None,
+                 held_quote="0", held_base="0", settling=False):
         kwargs = dict(
             reference_price=D(ref),
             available_quote=D(avail_quote),
@@ -138,6 +139,9 @@ class _Harness(unittest.TestCase):
             active_buy_reserved_quote=D(reserved_quote),
             active_sell_reserved_base=D(reserved_base),
             deploy_ceiling=D(ceiling),
+            held_quote=D(held_quote),
+            held_base=D(held_base),
+            balance_settling=settling,
         )
         if owned_quote is not None:
             kwargs["owned_quote"] = D(owned_quote)
@@ -259,8 +263,11 @@ class TestWalletFloor(_Harness):
         warns = self._events(ctrl, "range_ladder_wallet_floor_binding")
         self.assertEqual(1, len(warns))
         self.assertEqual(warns[0].kwargs["side"], "buy")
-        self.assertEqual(warns[0].kwargs["owned_free"], "300")
+        # v14 semantics: warn on a genuine shortfall (owned > available + held). Here held defaults to
+        # 0, so owned 300 > available 50 still binds. Event keys are now owned/available/held.
+        self.assertEqual(warns[0].kwargs["owned"], "300")
         self.assertEqual(warns[0].kwargs["available"], "50")
+        self.assertEqual(warns[0].kwargs["held"], "0")
         self.assertEqual(warns[0].kwargs["clamped_budget"], "50")
 
     def test_floor_warning_is_not_spammed(self):
@@ -397,6 +404,58 @@ class TestLedgerFundedRegression(_Harness):
             sell_prices=[Decimal("340")], sell_amounts_pct=[Decimal("1")],
             ledger_funded_budgets=False)
         self.assertIs(cfg.ledger_funded_budgets, False)
+
+
+# =================================================== over-claim / wallet-floor reconciliation (v14)
+
+class TestOverClaimReconciliation(_Harness):
+
+    def _mdp(self):
+        return _make_mdp(balances={"XMR": (D(0), D(0)), "USDT": (D(0), D(0))}, mid=300, bid=299, ask=301)
+
+    def test_no_false_overclaim_when_held_backs_ledger(self):
+        # Test 5: ledger owns 28.84 ZANO; wallet available=0.02, held=28.82 -> fully backed, no warning.
+        ctrl = self._build(self._mdp())
+        self._budgets(ctrl, owned_quote="0", owned_base="28.84",
+                      avail_base="0.02", held_base="28.82", settling=False)
+        self.assertEqual([], self._events(ctrl, "range_ladder_wallet_floor_binding"))
+
+    def test_overclaim_deferred_while_settling(self):
+        # Test 6: a GENUINE shortfall, but balances are settling -> defer (no warning this cycle).
+        ctrl = self._build(self._mdp())
+        self._budgets(ctrl, owned_quote="0", owned_base="100",
+                      avail_base="1", held_base="1", settling=True)
+        self.assertEqual([], self._events(ctrl, "range_ladder_wallet_floor_binding"))
+
+    def test_real_overclaim_still_warns_after_settling(self):
+        # Test 7: genuine over-claim (owned 100 > available 1 + held 1) and NOT settling -> warns.
+        ctrl = self._build(self._mdp())
+        self._budgets(ctrl, owned_quote="0", owned_base="100",
+                      avail_base="1", held_base="1", settling=False)
+        warns = self._events(ctrl, "range_ladder_wallet_floor_binding")
+        self.assertEqual(1, len(warns))
+        self.assertEqual("sell", warns[0].kwargs["side"])
+        self.assertEqual("100", warns[0].kwargs["owned"])
+        self.assertEqual("2", warns[0].kwargs["total"])
+
+    def test_deferred_overclaim_warns_on_first_post_settle_cycle(self):
+        # The latch is NOT set during settling, so a persistent genuine shortfall first seen while
+        # settling still warns on the first post-settle cycle.
+        ctrl = self._build(self._mdp())
+        self._budgets(ctrl, owned_quote="0", owned_base="100", avail_base="1", held_base="1", settling=True)
+        self.assertEqual([], self._events(ctrl, "range_ladder_wallet_floor_binding"))
+        self._budgets(ctrl, owned_quote="0", owned_base="100", avail_base="1", held_base="1", settling=False)
+        self.assertEqual(1, len(self._events(ctrl, "range_ladder_wallet_floor_binding")))
+
+    def test_is_balance_settling_reads_connector_strictly(self):
+        mdp = self._mdp()
+        ctrl = self._build(mdp)
+        # An auto-truthy MagicMock attribute must NOT be read as settling.
+        self.assertFalse(ctrl._is_balance_settling())
+        mdp.get_connector.return_value.is_balance_settling = True
+        self.assertTrue(ctrl._is_balance_settling())
+        mdp.get_connector.return_value.is_balance_settling = False
+        self.assertFalse(ctrl._is_balance_settling())
 
 
 if __name__ == "__main__":
