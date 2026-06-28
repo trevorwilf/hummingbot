@@ -102,8 +102,10 @@ class KrakenSpotCandles(CandlesBase):
         For API documentation, please refer to:
         https://docs.kraken.com/rest/#tag/Spot-Market-Data/operation/getOHLCData
 
-        This endpoint allows you to return up to 3600 candles ago.
+        This endpoint allows you to return up to 720 candles ago.
         """
+        if start_time is None:
+            raise ValueError("Kraken candles require a start_time (since).")
         candles_ago = (int(time.time()) - start_time) // self.interval_in_seconds
         if candles_ago > CONSTANTS.MAX_CANDLES_AGO:
             raise ValueError("Kraken REST API does not support fetching more than 720 candles ago.")
@@ -111,7 +113,13 @@ class KrakenSpotCandles(CandlesBase):
                 "since": start_time}
 
     def _parse_rest_candles(self, data: dict, end_time: Optional[int] = None) -> List[List[float]]:
-        data: List = next(iter(data["result"].values()))
+        # Surface Kraken error payloads explicitly instead of an opaque KeyError on the missing 'result'.
+        if data.get("error"):
+            raise ValueError(f"Kraken OHLC error: {data['error']}")
+        result = data.get("result")
+        if not result:
+            raise ValueError(f"Kraken OHLC returned no result: {data}")
+        data: List = next(iter(result.values()))
         new_hb_candles = []
         for i in data:
             timestamp = self.ensure_timestamp_in_seconds(float(i[0]))
@@ -121,7 +129,8 @@ class KrakenSpotCandles(CandlesBase):
             close = i[4]
             volume = i[6]
             quote_asset_volume = float(volume) * float(i[5])
-            n_trades = 0
+            # Kraken OHLC rows are [time, open, high, low, close, vwap, volume, count]; index 7 is trade count.
+            n_trades = i[7] if len(i) > 7 else 0
             taker_buy_base_volume = 0
             taker_buy_quote_volume = 0
             new_hb_candles.append([timestamp, open, high, low, close, volume,
@@ -139,17 +148,20 @@ class KrakenSpotCandles(CandlesBase):
 
     def _parse_websocket_message(self, data: dict):
         candles_row_dict = {}
-        if not (type(data) is dict and "event" in data.keys() and
-                data["event"] in ["heartbeat", "systemStatus", "subscriptionStatus"]):
-            if data[-2][:4] == "ohlc":
-                candles_row_dict["timestamp"] = self.ensure_timestamp_in_seconds(data[1][1]) - self.interval_in_seconds
-                candles_row_dict["open"] = data[1][2]
-                candles_row_dict["high"] = data[1][3]
-                candles_row_dict["low"] = data[1][4]
-                candles_row_dict["close"] = data[1][5]
-                candles_row_dict["volume"] = data[1][7]
-                candles_row_dict["quote_asset_volume"] = float(data[1][7]) * float(data[1][6])
-                candles_row_dict["n_trades"] = 0
-                candles_row_dict["taker_buy_base_volume"] = 0
-                candles_row_dict["taker_buy_quote_volume"] = 0
-                return candles_row_dict
+        # Only Kraken WS ohlc list frames carry candle data. Guard against dict control frames
+        # (heartbeat / systemStatus / subscriptionStatus / error) and non-ohlc list channels (e.g. trade),
+        # any of which would otherwise raise on the data[-2] index / slice.
+        if (isinstance(data, list) and len(data) >= 2 and isinstance(data[-2], str)
+                and data[-2].startswith("ohlc")):
+            candles_row_dict["timestamp"] = self.ensure_timestamp_in_seconds(data[1][1]) - self.interval_in_seconds
+            candles_row_dict["open"] = data[1][2]
+            candles_row_dict["high"] = data[1][3]
+            candles_row_dict["low"] = data[1][4]
+            candles_row_dict["close"] = data[1][5]
+            candles_row_dict["volume"] = data[1][7]
+            candles_row_dict["quote_asset_volume"] = float(data[1][7]) * float(data[1][6])
+            # Kraken WS ohlc payload data[1] is [begin, end, open, high, low, close, vwap, volume, count].
+            candles_row_dict["n_trades"] = data[1][8] if len(data[1]) > 8 else 0
+            candles_row_dict["taker_buy_base_volume"] = 0
+            candles_row_dict["taker_buy_quote_volume"] = 0
+            return candles_row_dict

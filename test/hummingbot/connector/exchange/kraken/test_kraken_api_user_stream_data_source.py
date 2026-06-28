@@ -176,3 +176,32 @@ class KrakenAPIUserStreamDataSourceTest(IsolatedAsyncioWrapperTestCase):
         ret = await (output_queue.get())
 
         self.assertEqual(ret, resp)
+
+    async def test_subscribe_channels_refreshes_token_each_call(self):
+        # USERSTREAM-1: a fresh WS token is minted on every (re)subscribe, never reused after a reconnect.
+        ws = AsyncMock()
+        with patch.object(self.data_source, "get_auth_token",
+                          new=AsyncMock(side_effect=["token-1", "token-2"])) as mock_get_token:
+            await self.data_source._subscribe_channels(ws)
+            first_token = self.data_source._current_auth_token
+            await self.data_source._subscribe_channels(ws)
+            second_token = self.data_source._current_auth_token
+
+        self.assertEqual(2, mock_get_token.call_count)
+        self.assertEqual("token-1", first_token)
+        self.assertEqual("token-2", second_token)
+
+    async def test_process_event_message_ignores_short_and_malformed_frames(self):
+        # USERSTREAM-5: a short/malformed list must not raise IndexError, and a list must not be probed
+        # for errorMessage (AttributeError); only dict frames carry errorMessage.
+        queue = asyncio.Queue()
+
+        await self.data_source._process_event_message(["only-one"], queue)
+        self.assertTrue(queue.empty())
+
+        own = self.get_own_trades_mock()
+        await self.data_source._process_event_message(own, queue)
+        self.assertEqual(own, await queue.get())
+
+        with self.assertRaises(IOError):
+            await self.data_source._process_event_message({"errorMessage": "boom"}, queue)

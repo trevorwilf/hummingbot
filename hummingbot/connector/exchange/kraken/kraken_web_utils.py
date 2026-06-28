@@ -15,8 +15,10 @@ def public_rest_url(*args, **kwargs) -> str:
     return rest_url(*args, **kwargs)
 
 
-def rest_url(path_url: str, domain: str = "kraken"):
-    base_url = CONSTANTS.BASE_URL
+def rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN):
+    # Kraken exposes a single REST base; the domain argument is accepted for interface parity with other
+    # connectors and resolved through a mapping so it is honoured rather than silently ignored.
+    base_url = CONSTANTS.DOMAIN_TO_BASE_URL.get(domain, CONSTANTS.BASE_URL)
     return base_url + path_url
 
 
@@ -42,6 +44,12 @@ def is_exchange_information_valid(trading_pair_details) -> bool:
     For more info, please check
     https://support.kraken.com/hc/en-us/articles/360001391906-Introducing-the-Kraken-Dark-Pool
     """
+    # Exclude pairs that are not fully tradable. Kraken's AssetPairs entries carry a 'status' field
+    # ('online' / 'cancel_only' / 'post_only' / ...); only 'online' pairs accept normal order flow.
+    # Entries without a status field (older API shape / test fixtures) are treated as valid.
+    status = trading_pair_details.get('status')
+    if status is not None and status != 'online':
+        return False
     if trading_pair_details.get('altname'):
         return not trading_pair_details.get('altname').endswith('.d')
     return True
@@ -51,4 +59,7 @@ async def get_current_server_time(
         throttler,
         domain
 ) -> float:
+    # Kraken authenticates with a monotonically increasing nonce rather than a synchronized timestamp
+    # (see KrakenAuth.get_tracking_nonce), so the connector does not depend on the exchange clock and
+    # intentionally returns local time here instead of issuing a /0/public/Time request on startup.
     return time.time()

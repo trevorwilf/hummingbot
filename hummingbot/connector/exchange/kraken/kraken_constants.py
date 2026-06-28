@@ -42,7 +42,21 @@ KRAKEN_TO_HB_MAP = {
     "XDG": "DOGE",
 }
 
+# Kraken's legacy 4-character asset codes carry a redundant leading "X" (crypto) or "Z" (fiat) that is
+# stripped to recover the canonical ticker (e.g. "XXBT" -> "XBT", "ZUSD" -> "USD"). This is an explicit
+# allow-list rather than a blind "first char is X/Z and len == 4" heuristic, which corrupts modern
+# 4-letter tickers that legitimately start with X/Z (e.g. "ZEUS", "XAUT", "XCN", "ZETA"). The set is
+# derived from Kraken's /0/public/Assets endpoint (codes where altname == code[1:]).
+KRAKEN_LEGACY_PREFIXED_ASSETS = frozenset({
+    # Crypto (X-prefixed)
+    "XETC", "XETH", "XLTC", "XMLN", "XREP", "XXBT", "XXDG", "XXLM", "XXMR", "XXRP", "XZEC",
+    # Fiat (Z-prefixed)
+    "ZARS", "ZAUD", "ZCAD", "ZCLP", "ZCOP", "ZDKK", "ZEUR", "ZGBP", "ZGEL", "ZGHS", "ZJPY",
+    "ZLKR", "ZMXN", "ZPLN", "ZSEK", "ZUGX", "ZUSD", "ZVND", "ZXOF",
+})
+
 BASE_URL = "https://api.kraken.com"
+DOMAIN_TO_BASE_URL = {DEFAULT_DOMAIN: BASE_URL}
 TICKER_PATH_URL = "/0/public/Ticker"
 SNAPSHOT_PATH_URL = "/0/public/Depth"
 ASSET_PAIRS_PATH_URL = "/0/public/AssetPairs"

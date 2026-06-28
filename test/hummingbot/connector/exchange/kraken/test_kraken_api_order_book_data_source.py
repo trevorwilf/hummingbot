@@ -353,6 +353,22 @@ class KrakenAPIOrderBookDataSourceTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(diff_event[1]["a"][0][2], str(msg.update_id))
 
+    async def test_parse_order_book_diff_message_update_id_is_monotonic(self):
+        # OB-1: update_id derives from per-level timestamps, which can move backwards across messages;
+        # the data source must clamp it to a monotonic non-decreasing value.
+        queue: asyncio.Queue = asyncio.Queue()
+        first = [1234, {"a": [["5541.30000", "2.50700000", "1534614248.456738"]], "c": "1"}, "book-10", "XBT/USD"]
+        second = [1234, {"a": [["5541.30000", "2.50700000", "1534614200.000000"]], "c": "2"}, "book-10", "XBT/USD"]
+
+        await self.data_source._parse_order_book_diff_message(first, queue)
+        await self.data_source._parse_order_book_diff_message(second, queue)
+
+        msg1 = await queue.get()
+        msg2 = await queue.get()
+        self.assertEqual(1534614248.456738, msg1.update_id)
+        # The older-timestamped second message must not regress the update_id.
+        self.assertEqual(msg1.update_id, msg2.update_id)
+
     @aioresponses()
     async def test_listen_for_order_book_snapshots_cancelled_when_fetching_snapshot(self, mock_api):
         url = web_utils.public_rest_url(path_url=CONSTANTS.SNAPSHOT_PATH_URL)

@@ -39,4 +39,45 @@ class KrakenUtilTestCases(unittest.TestCase):
         self.assertEqual(self.trading_pair, utils.convert_from_exchange_trading_pair(self.ex_ws_trading_pair))
 
     def test_build_rate_limits_by_tier(self):
-        self.assertIsNotNone(utils.build_rate_limits_by_tier())
+        rate_limits = utils.build_rate_limits_by_tier()
+        self.assertIsNotNone(rate_limits)
+        limit_ids = {rl.limit_id for rl in rate_limits}
+        # The pools and the order-placement matching-engine limit must be present.
+        self.assertIn("PrivateEndpointLimitID", limit_ids)
+        self.assertIn("MatchingEngineLimitID", limit_ids)
+        self.assertIn("/0/private/AddOrder", limit_ids)
+
+    def test_convert_from_exchange_symbol_strips_only_legacy_prefixes(self):
+        # Legacy prefixed codes ARE stripped (and remapped where applicable).
+        self.assertEqual("BTC", utils.convert_from_exchange_symbol("XXBT"))
+        self.assertEqual("USD", utils.convert_from_exchange_symbol("ZUSD"))
+        self.assertEqual("ETH", utils.convert_from_exchange_symbol("XETH"))
+        self.assertEqual("EUR", utils.convert_from_exchange_symbol("ZEUR"))
+        self.assertEqual("DOGE", utils.convert_from_exchange_symbol("XXDG"))
+        # Modern 4-letter tickers that merely start with X/Z must NOT be stripped (UTILSCFG-1 regression).
+        self.assertEqual("ZEUS", utils.convert_from_exchange_symbol("ZEUS"))
+        self.assertEqual("XAUT", utils.convert_from_exchange_symbol("XAUT"))
+        self.assertEqual("ZETA", utils.convert_from_exchange_symbol("ZETA"))
+        self.assertEqual("XCAD", utils.convert_from_exchange_symbol("XCAD"))
+        # Shorter codes are untouched.
+        self.assertEqual("XTZ", utils.convert_from_exchange_symbol("XTZ"))
+
+    def test_convert_from_exchange_symbol_empty_string(self):
+        # BAL-8: empty asset code must not raise IndexError.
+        self.assertEqual("", utils.convert_from_exchange_symbol(""))
+
+    def test_convert_from_exchange_trading_pair_without_available_pairs(self):
+        # UTILSCFG-2: a bare token with no available pairs returns None instead of raising TypeError.
+        self.assertIsNone(utils.convert_from_exchange_trading_pair("XBTUSDT"))
+        self.assertIsNone(utils.convert_from_exchange_trading_pair("XBTUSDT", ()))
+
+    def test_api_tier_validation(self):
+        from pydantic import ValidationError
+
+        from hummingbot.connector.exchange.kraken.kraken_utils import KrakenConfigMap
+        with self.assertRaises(ValidationError):
+            KrakenConfigMap(kraken_api_key="k", kraken_secret_key="s", kraken_api_tier="NotATier")
+        with self.assertRaises(ValidationError):  # UTILSCFG-8: non-string input must not AttributeError
+            KrakenConfigMap(kraken_api_key="k", kraken_secret_key="s", kraken_api_tier=123)
+        cfg = KrakenConfigMap(kraken_api_key="k", kraken_secret_key="s", kraken_api_tier="Pro")
+        self.assertEqual("Pro", cfg.kraken_api_tier)

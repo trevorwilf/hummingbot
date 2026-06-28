@@ -5,6 +5,7 @@ import hmac
 import json
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlencode, urlparse
 
 from typing_extensions import Awaitable
 
@@ -63,3 +64,50 @@ class KrakenAuthTests(TestCase):
         # self.assertEqual(now * 1e3, configured_request.params["timestamp"])
         self.assertEqual(str(expected_signature, 'utf-8'), configured_request.headers["API-Sign"])
         self.assertEqual(self._api_key, configured_request.headers["API-Key"])
+
+    @patch("hummingbot.connector.exchange.kraken.kraken_auth.KrakenAuth.get_tracking_nonce")
+    def test_rest_authenticate_signs_urlencoded_body(self, mocked_nonce):
+        # AUTH-4: the signature must be computed over urlencode(postDict) — exactly what aiohttp puts on
+        # the wire for a dict body — so a value needing URL-encoding still yields a valid signature.
+        mocked_nonce.return_value = "1700000000000000"
+        params = {"pair": "XBT/USDT", "ordertype": "limit", "type": "buy"}  # '/' needs URL-encoding
+        auth = KrakenAuth(api_key=self._api_key, secret_key=self._secret, time_provider=MagicMock())
+        request = RESTRequest(method=RESTMethod.POST, data=json.dumps(params), is_auth_required=True)
+        request.url = "https://api.kraken.com/0/private/AddOrder"
+
+        configured = self.async_run_with_timeout(auth.rest_authenticate(request))
+
+        post_dict = {"nonce": "1700000000000000", **params}
+        api_post = urlencode(post_dict)
+        api_secret = base64.b64decode(self._secret)
+        api_path = bytes(urlparse(request.url).path, "utf-8")
+        api_sha256 = hashlib.sha256(bytes("1700000000000000" + api_post, "utf-8")).digest()
+        expected = base64.b64encode(hmac.new(api_secret, api_path + api_sha256, hashlib.sha512).digest())
+
+        self.assertEqual(str(expected, "utf-8"), configured.headers["API-Sign"])
+        # request.data is the postDict (dict); aiohttp form-encodes it to exactly urlencode(post_dict).
+        self.assertEqual(post_dict, configured.data)
+
+    @patch("hummingbot.connector.exchange.kraken.kraken_auth.time.time")
+    def test_nonce_is_microsecond_granular_and_strictly_increasing(self, mock_time):
+        # AUTH-1: nonce is microsecond-granular and strictly increasing even within the same second.
+        mock_time.return_value = 1700000000.0
+        KrakenAuth._last_tracking_nonce = 0
+        nonces = [int(KrakenAuth.get_tracking_nonce()) for _ in range(50)]
+
+        self.assertTrue(all(b > a for a, b in zip(nonces, nonces[1:])))
+        self.assertGreaterEqual(nonces[0], 1700000000 * 1_000_000)
+
+    @patch("hummingbot.connector.exchange.kraken.kraken_auth.time.time")
+    def test_nonce_stays_ahead_after_restart(self, mock_time):
+        # AUTH-1: after a process restart (class state reset) the nonce must remain above the last value
+        # the exchange already saw, given microsecond granularity and an advancing wall clock.
+        mock_time.return_value = 1700000000.0
+        KrakenAuth._last_tracking_nonce = 0
+        first = int(KrakenAuth.get_tracking_nonce())
+
+        KrakenAuth._last_tracking_nonce = 0  # simulate restart
+        mock_time.return_value = 1700000001.0
+        after_restart = int(KrakenAuth.get_tracking_nonce())
+
+        self.assertGreater(after_restart, first)

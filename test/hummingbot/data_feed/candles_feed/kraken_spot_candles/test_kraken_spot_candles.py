@@ -164,3 +164,29 @@ class TestKrakenSpotCandles(TestCandlesBase):
 
     def _success_subscription_mock(self):
         return {}
+
+    def test_parse_rest_candles_includes_real_n_trades(self):
+        # CANDLES-1 / CANDLES-2 / TEST-3: the trade count (REST index 7) must be parsed, not hardcoded 0.
+        parsed = self.data_feed._parse_rest_candles(self.get_candles_rest_data_mock())
+        self.assertEqual([763, 1022, 746, 702], [row[7] for row in parsed])
+
+    def test_parse_rest_candles_raises_on_error_payload(self):
+        # CANDLES-4: a Kraken error payload surfaces a clear ValueError, not an opaque KeyError('result').
+        with self.assertRaises(ValueError):
+            self.data_feed._parse_rest_candles({"error": ["EQuery:Unknown asset pair"]})
+
+    def test_get_rest_candles_params_requires_start_time(self):
+        # CANDLES-5: a missing start_time raises a clear ValueError instead of a latent TypeError.
+        with self.assertRaises(ValueError):
+            self.data_feed._get_rest_candles_params(start_time=None)
+
+    def test_parse_websocket_message_includes_real_n_trades(self):
+        # CANDLES-1: the WS trade count (data[1][8]) must be parsed, not hardcoded 0.
+        parsed = self.data_feed._parse_websocket_message(self.get_candles_ws_data_mock_1())
+        self.assertEqual(2, parsed["n_trades"])
+
+    def test_parse_websocket_message_ignores_control_frames(self):
+        # CANDLES-3: dict control frames (error/heartbeat/unknown) must be ignored, not raise KeyError(-2).
+        self.assertIsNone(self.data_feed._parse_websocket_message({"event": "error", "errorMessage": "bad"}))
+        self.assertIsNone(self.data_feed._parse_websocket_message({"event": "heartbeat"}))
+        self.assertIsNone(self.data_feed._parse_websocket_message({"errorMessage": "no event key"}))

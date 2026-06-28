@@ -4,7 +4,7 @@ import hmac
 import json
 import time
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
@@ -20,10 +20,14 @@ class KrakenAuth(AuthBase):
         self.time_provider = time_provider
 
     @classmethod
-    def get_tracking_nonce(self) -> str:
-        nonce = int(time.time())
-        self._last_tracking_nonce = nonce if nonce > self._last_tracking_nonce else self._last_tracking_nonce + 1
-        return str(self._last_tracking_nonce)
+    def get_tracking_nonce(cls) -> str:
+        # Microsecond granularity (matching the connector's NonceCreator.for_microseconds() used for client
+        # order ids) gives ~1,000,000x headroom over wall-clock so realistic request bursts never drift the
+        # nonce ahead of real time, and a post-restart nonce (int(time.time() * 1e6)) stays far above any
+        # value Kraken last saw — avoiding the EAPI:Invalid nonce lockout that seconds-granularity caused.
+        nonce = int(time.time() * 1_000_000)
+        cls._last_tracking_nonce = nonce if nonce > cls._last_tracking_nonce else cls._last_tracking_nonce + 1
+        return str(cls._last_tracking_nonce)
 
     async def rest_authenticate(self, request: RESTRequest) -> RESTRequest:
 
@@ -54,11 +58,13 @@ class KrakenAuth(AuthBase):
         # Variables (API method, nonce, and POST data)
         api_path: bytes = bytes(uri, 'utf-8')
         api_nonce: str = self.get_tracking_nonce()
-        api_post: str = "nonce=" + api_nonce
 
-        if data is not None:
-            for key, value in data.items():
-                api_post += f"&{key}={value}"
+        # The signed POST body must be byte-for-byte what aiohttp puts on the wire. aiohttp form-encodes a
+        # dict payload with urlencode, so sign over urlencode(post_dict) (which already includes the nonce)
+        # rather than a hand-rolled f-string concat that would diverge from the sent body for any value
+        # that needs URL-encoding (producing an invalid signature -> EAPI:Invalid signature).
+        post_dict: Dict[str, Any] = {"nonce": api_nonce, **data} if data is not None else {"nonce": api_nonce}
+        api_post: str = urlencode(post_dict)
 
         # Cryptographic hash algorithms
         api_sha256: bytes = hashlib.sha256(bytes(api_nonce + api_post, 'utf-8')).digest()
@@ -73,5 +79,5 @@ class KrakenAuth(AuthBase):
                 "API-Sign": str(api_signature, 'utf-8')
             },
             "post": api_post,
-            "postDict": {"nonce": api_nonce, **data} if data is not None else {"nonce": api_nonce}
+            "postDict": post_dict
         }

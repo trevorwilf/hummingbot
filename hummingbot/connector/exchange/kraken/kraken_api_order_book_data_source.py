@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 
 class KrakenAPIOrderBookDataSource(OrderBookTrackerDataSource):
     MESSAGE_TIMEOUT = 30.0
-    _DYNAMIC_SUBSCRIBE_ID_START = 100
-    _next_subscribe_id: int = _DYNAMIC_SUBSCRIBE_ID_START
 
     # PING_TIMEOUT = 10.0
 
@@ -40,6 +38,8 @@ class KrakenAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._rest_assistant = None
         self._ws_assistant = None
         self._order_book_create_function = lambda: OrderBook()
+        # Highest update_id emitted so far on the diff/snapshot WS path, used to keep update_id monotonic.
+        self._last_diff_update_id: float = 0.0
 
     _kraobds_logger: Optional[HummingbotLogger] = None
 
@@ -157,9 +157,14 @@ class KrakenAPIOrderBookDataSource(OrderBookTrackerDataSource):
         msg_dict = {"trading_pair": convert_from_exchange_trading_pair(raw_message[-1]),
                     "asks": raw_message[1].get("a", []) or raw_message[1].get("as", []) or [],
                     "bids": raw_message[1].get("b", []) or raw_message[1].get("bs", []) or []}
-        msg_dict["update_id"] = max(
+        raw_update_id = max(
             [*map(lambda x: float(x[2]), msg_dict["bids"] + msg_dict["asks"])], default=0.
         )
+        # Kraken derives update_id from per-level lastchange timestamps, which can momentarily move
+        # backwards between messages; clamp to a monotonic non-decreasing value so the order-book tracker
+        # does not discard a newer diff as stale.
+        self._last_diff_update_id = max(raw_update_id, self._last_diff_update_id)
+        msg_dict["update_id"] = self._last_diff_update_id
         if "as" in raw_message[1] and "bs" in raw_message[1]:
             order_book_message: OrderBookMessage = (
                 KrakenOrderBook.snapshot_ws_message_from_exchange(msg_dict, time.time())
@@ -256,10 +261,3 @@ class KrakenAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception:
             self.logger().exception(f"Error unsubscribing from {trading_pair}")
             return False
-
-    @classmethod
-    def _get_next_subscribe_id(cls) -> int:
-        """Returns the next subscription ID and increments the counter."""
-        current_id = cls._next_subscribe_id
-        cls._next_subscribe_id += 1
-        return current_id

@@ -1,12 +1,14 @@
+import asyncio
 import json
 import logging
 import re
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
+from bidict import bidict
 
 from hummingbot.connector.exchange.kraken import kraken_constants as CONSTANTS, kraken_web_utils as web_utils
 from hummingbot.connector.exchange.kraken.kraken_exchange import KrakenExchange
@@ -17,6 +19,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 
 class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
@@ -944,7 +947,7 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
                 f"Order {order.client_order_id} has failed. Order Update: OrderUpdate(trading_pair='{self.trading_pair}',"
                 f" update_timestamp={self.exchange.current_timestamp}, new_state={repr(OrderState.FAILED)}, "
                 f"client_order_id='{order.client_order_id}', exchange_order_id='{order.exchange_order_id}', "
-                "misc_updates=None)")
+                "misc_updates=None, exchange_timestamp_ms=None, received_timestamp_ms=None, source_channel=None)")
         )
 
     @patch("hummingbot.connector.exchange.kraken.kraken_exchange.get_new_numeric_client_order_id")
@@ -1369,3 +1372,248 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
 
             # Verify the result
             self.assertEqual(self.latest_prices_request_mock_response["result"], ticker_data)
+
+    # ------------------------------------------------------------------
+    # Regression tests for audited bug fixes
+    # ------------------------------------------------------------------
+
+    def _track_simple_order(self, order_id: str, exchange_order_id: str,
+                            trade_type: TradeType = TradeType.BUY,
+                            price: Decimal = Decimal("100"),
+                            amount: Decimal = Decimal("1")) -> InFlightOrder:
+        self.exchange.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=trade_type,
+            price=price,
+            amount=amount,
+        )
+        return self.exchange.in_flight_orders[order_id]
+
+    async def test_process_order_message_batch_skips_untracked_order(self):
+        # ORDERS-1: the first openOrders snapshot includes every account order (incl. foreign ones). An
+        # untracked order earlier in the batch must NOT drop the status update of a later tracked order.
+        self.exchange._set_current_timestamp(1640780000)
+        tracked = self._track_simple_order("OID-TRACKED", "OUR-TXID")
+        self.exchange._set_current_timestamp(1640780100)
+
+        # The foreign (untracked) order is FIRST in the batch; with the old `return` bug the tracked
+        # order's update that follows it would be dropped and the order would stay PENDING_CREATE.
+        message = [
+            [
+                {"FOREIGN-TXID": {"userref": 999999, "status": "open"}},
+                {tracked.exchange_order_id: {"userref": tracked.client_order_id, "status": "open"}},
+            ],
+            "openOrders",
+            {"sequence": 1},
+        ]
+        self.exchange._process_order_message(message)
+        # process_order_update schedules the state change via safe_ensure_future; let it run.
+        await asyncio.sleep(0.1)
+        self.assertEqual(OrderState.OPEN, tracked.current_state)
+
+    def test_process_trade_message_ws_fill_timestamp_is_float(self):
+        # ORDERS-2: WS ownTrades 'time' arrives as a string; it must be cast to float so downstream
+        # timestamp math/telemetry does not break and the order timestamp stays numeric.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order(
+            "OID-FILL", "OUR-TXID-2", trade_type=TradeType.SELL,
+            price=Decimal("34.5"), amount=Decimal("10.00345345"))
+        trade_msg = self.trade_event_for_full_fill_websocket_update(order)
+
+        self.exchange._process_trade_message(trade_msg[0])
+
+        self.assertIsInstance(order.last_update_timestamp, float)
+        self.assertEqual(1560516023.070651, order.last_update_timestamp)
+
+    async def test_all_trade_updates_reraises_unexpected_error(self):
+        # ORDERS-3: a transient error (non "Unknown order") must propagate, not be swallowed as "no fills".
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-3", "TXID-3")
+        with patch.object(self.exchange, "_api_request_with_retry",
+                          new=AsyncMock(side_effect=IOError("Error, HTTP status is 503."))):
+            with self.assertRaises(IOError):
+                await self.exchange._all_trade_updates_for_order(order)
+
+    async def test_all_trade_updates_returns_empty_on_unknown_order(self):
+        # ORDERS-3 companion: an unknown/invalid order id legitimately has no fills -> empty list.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-3b", "TXID-3b")
+        with patch.object(self.exchange, "_api_request_with_retry",
+                          new=AsyncMock(side_effect=IOError("EOrder:Unknown order"))):
+            result = await self.exchange._all_trade_updates_for_order(order)
+        self.assertEqual([], result)
+
+    async def test_request_order_status_raises_when_order_absent(self):
+        # ORDERS-7: a QueryOrders result lacking our txid must raise a clean IOError, not a TypeError.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-7", "TXID-7")
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(return_value={})):
+            with self.assertRaises(IOError):
+                await self.exchange._request_order_status(order)
+
+    async def test_place_cancel_true_on_count_false_otherwise(self):
+        # ORDERS-8: cancellation success is keyed solely on count >= 1 (the dead error clause is removed).
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-8", "TXID-8")
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(return_value={"count": 1})):
+            self.assertTrue(await self.exchange._place_cancel("OID-8", order))
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(return_value={"count": 0})):
+            self.assertFalse(await self.exchange._place_cancel("OID-8", order))
+
+    async def test_api_request_with_retry_accepts_empty_result(self):
+        # AUTH-5: an empty-but-present result (Balance {} for a zero-balance account) is a success.
+        with patch.object(self.exchange, "_api_request",
+                          new=AsyncMock(return_value={"error": [], "result": {}})):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
+        self.assertEqual({}, result)
+
+    async def test_api_request_with_retry_retries_on_invalid_nonce(self):
+        # AUTH-3: invalid-nonce errors (a LIST) are detected via serialized matching and retried.
+        api_request_mock = AsyncMock(side_effect=[
+            {"error": ["EAPI:Invalid nonce"], "result": None},
+            {"error": [], "result": {"ok": 1}},
+        ])
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
+        self.assertEqual({"ok": 1}, result)
+        self.assertEqual(2, api_request_mock.call_count)
+
+    async def test_place_order_recovers_from_cloudflare_via_open_orders(self):
+        # AUTH-2: on a Cloudflare 5xx during AddOrder, recover the (possibly live) order via OpenOrders and
+        # return an AddOrder-shaped result so the caller reads result["txid"][0] instead of KeyError.
+        client_order_id = "12345"
+        recovered = {
+            "open": {
+                "OABC-123-XYZ": {
+                    "userref": int(client_order_id),
+                    "status": "open",
+                    "descr": {"order": "buy 1 ETH/USDT @ limit 100"},
+                },
+            }
+        }
+        with patch.object(self.exchange, "_api_request",
+                          new=AsyncMock(side_effect=IOError("Error, HTTP status is 520."))), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value=recovered)), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                data={"userref": client_order_id}, is_auth_required=True)
+        self.assertEqual(["OABC-123-XYZ"], result["txid"])
+        self.assertEqual("OABC-123-XYZ", result["txid"][0])
+
+    @aioresponses()
+    def test_update_balances_folds_flex_without_spot(self, mocked_api):
+        # BAL-1/BAL-2: a Flex/earn (.F) balance held without a co-held spot balance must fold in cleanly
+        # (no "dictionary changed size during iteration" crash) and leave no phantom .F entry behind.
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.ASSET_PAIRS_PATH_URL}"
+        mocked_api.get(url, body=json.dumps(self.get_asset_pairs_mock()))
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.BALANCE_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {"XBT.F": "5", "USDT": "100"}}))
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.OPEN_ORDERS_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {"open": {}}}))
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+
+        self.assertEqual(Decimal("5"), self.exchange.available_balances["BTC"])
+        self.assertEqual(Decimal("5"), self.exchange.get_balance("BTC"))
+        self.assertNotIn("XBT.F", self.exchange.available_balances)
+        self.assertEqual(Decimal("100"), self.exchange.available_balances["USDT"])
+
+    @aioresponses()
+    def test_update_balances_skips_unresolvable_open_order_pair(self, mocked_api):
+        # UTILSCFG-3: a single open order whose pair cannot be resolved must not crash balance polling.
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.ASSET_PAIRS_PATH_URL}"
+        mocked_api.get(url, body=json.dumps(self.get_asset_pairs_mock()))
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.BALANCE_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {"USDT": "100"}}))
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.OPEN_ORDERS_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        open_orders = {"error": [], "result": {"open": {
+            "BADORDER": {"status": "open", "descr": {"ordertype": "limit", "pair": "ZZZUNKNOWNPAIR",
+                                                     "type": "buy", "price": "1"}},
+        }}}
+        mocked_api.post(regex_url, body=json.dumps(open_orders))
+
+        # Must not raise despite the unresolvable open-order pair.
+        self.async_run_with_timeout(self.exchange._update_balances())
+        self.assertEqual(Decimal("100"), self.exchange.available_balances["USDT"])
+
+    @aioresponses()
+    def test_get_asset_pairs_skips_entries_missing_base_or_quote(self, mocked_api):
+        # BAL-7: AssetPairs entries lacking base/quote must be skipped, not raise KeyError.
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.ASSET_PAIRS_PATH_URL}"
+        resp = {
+            "error": [],
+            "result": {
+                "XBTUSDT": {"altname": "XBTUSDT", "wsname": "XBT/USDT", "base": "XXBT", "quote": "USDT"},
+                "BADPAIR": {"altname": "BADPAIR", "wsname": "BAD/PAIR", "quote": "USDT"},  # missing base
+            },
+        }
+        mocked_api.get(url, body=json.dumps(resp))
+        result = self.async_run_with_timeout(self.exchange.get_asset_pairs())
+        self.assertIn("XXBT-USDT", result)
+        self.assertEqual(1, len(result))
+
+    async def test_get_last_traded_prices_none_or_empty_returns_empty(self):
+        # USERSTREAM-3: None (and []) must return {} instead of raising TypeError on len(None).
+        self.assertEqual({}, await self.exchange.get_last_traded_prices(None))
+        self.assertEqual({}, await self.exchange.get_last_traded_prices([]))
+
+    async def test_format_trading_rules_uses_costmin_and_tick_size(self):
+        # BAL-5/BAL-6: min_notional from costmin and min_price_increment from tick_size (with fallback).
+        altname = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        self.exchange._set_trading_pair_symbol_map(bidict({altname: self.trading_pair}))
+        exchange_info = {
+            altname: {
+                "altname": altname,
+                "wsname": f"{self.base_asset}/{self.quote_asset}",
+                "base": self.base_asset,
+                "quote": self.quote_asset,
+                "pair_decimals": 1,
+                "lot_decimals": 8,
+                "ordermin": "0.5",
+                "costmin": "5",
+                "tick_size": "0.01",
+                "status": "online",
+            }
+        }
+        rules = await self.exchange._format_trading_rules(exchange_info)
+        self.assertEqual(1, len(rules))
+        rule = rules[0]
+        self.assertEqual(Decimal("0.5"), rule.min_order_size)
+        self.assertEqual(Decimal("0.01"), rule.min_price_increment)
+        self.assertEqual(Decimal("5"), rule.min_notional_size)
+        self.assertEqual(Decimal("1e-8"), rule.min_base_amount_increment)
+
+    async def test_format_trading_rules_falls_back_to_pair_decimals(self):
+        # BAL-6 fallback: without tick_size/costmin, behavior matches the legacy pair_decimals path.
+        altname = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        self.exchange._set_trading_pair_symbol_map(bidict({altname: self.trading_pair}))
+        exchange_info = {
+            altname: {
+                "altname": altname,
+                "wsname": f"{self.base_asset}/{self.quote_asset}",
+                "base": self.base_asset,
+                "quote": self.quote_asset,
+                "pair_decimals": 2,
+                "lot_decimals": 8,
+                "ordermin": "0.5",
+            }
+        }
+        rules = await self.exchange._format_trading_rules(exchange_info)
+        self.assertEqual(Decimal("1e-2"), rules[0].min_price_increment)
+        self.assertEqual(Decimal("0"), rules[0].min_notional_size)

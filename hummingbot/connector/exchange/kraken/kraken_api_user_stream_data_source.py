@@ -52,8 +52,10 @@ class KrakenAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         try:
 
-            if self._current_auth_token is None:
-                self._current_auth_token = await self.get_auth_token()
+            # Always mint a fresh WS token on (re)subscribe. Kraken tokens expire ~15 minutes and are only
+            # valid to ESTABLISH a connection within that window; reusing a cached token after a reconnect
+            # would fail the subscription and trap the private stream in a permanent reconnect loop.
+            self._current_auth_token = await self.get_auth_token()
 
             orders_change_payload = {
                 "event": "subscribe",
@@ -84,15 +86,16 @@ class KrakenAPIUserStreamDataSource(UserStreamTrackerDataSource):
             raise
 
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
-        if type(event_message) is list and event_message[-2] in [
-            CONSTANTS.USER_TRADES_ENDPOINT_NAME,
-            CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
-        ]:
+        if (isinstance(event_message, list) and len(event_message) >= 2 and event_message[-2] in (
+                CONSTANTS.USER_TRADES_ENDPOINT_NAME,
+                CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
+        )):
             queue.put_nowait(event_message)
-        else:
-            if event_message.get("errorMessage") is not None:
-                err_msg = event_message.get("errorMessage")
-                raise IOError({
-                    "label": "WSS_ERROR",
-                    "message": f"Error received via websocket - {err_msg}."
-                })
+        elif isinstance(event_message, dict) and event_message.get("errorMessage") is not None:
+            # Only dict control frames carry errorMessage; a short/unknown list frame is safely ignored
+            # (the length check above prevents IndexError, this branch prevents AttributeError on lists).
+            err_msg = event_message.get("errorMessage")
+            raise IOError({
+                "label": "WSS_ERROR",
+                "message": f"Error received via websocket - {err_msg}."
+            })

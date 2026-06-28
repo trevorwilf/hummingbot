@@ -20,8 +20,12 @@ DEFAULT_FEES = TradeFeeSchema(
 
 
 def convert_from_exchange_symbol(symbol: str) -> str:
-    # Assuming if starts with Z or X and has 4 letters then Z/X is removable
-    if (symbol[0] == "X" or symbol[0] == "Z") and len(symbol) == 4:
+    # Kraken's legacy 4-char asset codes carry a redundant leading X (crypto) / Z (fiat) that is
+    # stripped to recover the canonical ticker. Only strip for known legacy codes (allow-list) so that
+    # modern 4-letter tickers that legitimately start with X/Z (e.g. ZEUS, XAUT, ZETA) are left intact.
+    if not symbol:
+        return symbol
+    if symbol in CONSTANTS.KRAKEN_LEGACY_PREFIXED_ASSETS:
         symbol = symbol[1:]
     return CONSTANTS.KRAKEN_TO_HB_MAP.get(symbol, symbol)
 
@@ -43,7 +47,7 @@ def convert_from_exchange_trading_pair(exchange_trading_pair: str, available_tra
         base, quote = split_to_base_quote(exchange_trading_pair)
     elif "/" in exchange_trading_pair:
         base, quote = exchange_trading_pair.split("/")
-    elif len(available_trading_pairs) > 0:
+    elif available_trading_pairs is not None and len(available_trading_pairs) > 0:
         # If trading pair has no spaces (i.e. ETHUSDT). Then it will have to match with the existing pairs
         # Option 1: Using traditional naming convention
         connector_trading_pair = {''.join(convert_from_exchange_trading_pair(tp).split('-')): tp for tp in
@@ -137,6 +141,14 @@ def _build_private_rate_limits(tier: KrakenAPITier = KrakenAPITier.STARTER) -> L
 
     # Matching Engine Limits
     private_rate_limits.extend([
+        # Shared matching-engine pool. AddOrder and CancelOrder both draw from Kraken's single
+        # matching-engine budget; without this pool RateLimit the linked_limits below would dangle and
+        # the shared budget would not be enforced (each endpoint would be limited independently).
+        RateLimit(
+            limit_id=CONSTANTS.MATCHING_ENGINE_LIMIT_ID,
+            limit=MATCHING_ENGINE_LIMIT,
+            time_interval=CONSTANTS.MATCHING_ENGINE_LIMIT_INTERVAL,
+        ),
         RateLimit(
             limit_id=CONSTANTS.ADD_ORDER_PATH_URL,
             limit=MATCHING_ENGINE_LIMIT,
@@ -198,6 +210,8 @@ class KrakenConfigMap(BaseConnectorConfigMap):
         """
         Determines if input value is a valid API tier
         """
+        if not isinstance(value, str):
+            raise ValueError("No such Kraken API Tier.")
         try:
             KrakenAPITier(value.upper())
             return value

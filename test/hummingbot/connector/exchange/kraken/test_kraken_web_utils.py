@@ -41,3 +41,18 @@ class KrakenUtilTestCases(unittest.TestCase):
         }
 
         self.assertTrue(web_utils.is_exchange_information_valid(valid_info_1["XBTUSDT"]))
+
+    def test_is_exchange_information_valid_filters_non_online_status(self):
+        # UTILSCFG-4 / BAL-3: only 'online' pairs are tradable; cancel_only / post_only are excluded,
+        # and entries without a status field stay valid for back-compat.
+        self.assertTrue(web_utils.is_exchange_information_valid({"altname": "XBTUSDT", "status": "online"}))
+        self.assertFalse(web_utils.is_exchange_information_valid({"altname": "XBTUSDT", "status": "cancel_only"}))
+        self.assertFalse(web_utils.is_exchange_information_valid({"altname": "XBTUSDT", "status": "post_only"}))
+        self.assertTrue(web_utils.is_exchange_information_valid({"altname": "XBTUSDT"}))
+        # Dark-pool filtering still applies even when the pair is online.
+        self.assertFalse(web_utils.is_exchange_information_valid({"altname": "XBTUSDT.d", "status": "online"}))
+
+    def test_rest_url_honours_domain(self):
+        # UTILSCFG-10: the domain argument resolves through a mapping instead of being silently ignored.
+        self.assertEqual(CONSTANTS.BASE_URL + "/x", web_utils.rest_url("/x", domain=CONSTANTS.DEFAULT_DOMAIN))
+        self.assertEqual(CONSTANTS.BASE_URL + "/x", web_utils.rest_url("/x", domain="unknown-domain"))

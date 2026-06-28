@@ -277,8 +277,9 @@ class KrakenExchange(ExchangePyBase):
             asset_pairs = await self._api_request_with_retry(method=RESTMethod.GET,
                                                              path_url=CONSTANTS.ASSET_PAIRS_PATH_URL)
             self._asset_pairs = {f"{details['base']}-{details['quote']}": details
-                                 for _, details in asset_pairs.items() if
-                                 web_utils.is_exchange_information_valid(details)}
+                                 for _, details in asset_pairs.items()
+                                 if web_utils.is_exchange_information_valid(details)
+                                 and details.get('base') and details.get('quote')}
         return self._asset_pairs
 
     async def _place_order(self,
@@ -325,12 +326,22 @@ class KrakenExchange(ExchangePyBase):
                 response_json = await self._api_request(path_url=path_url, method=method, params=params, data=data,
                                                         is_auth_required=is_auth_required)
 
-                if response_json.get("error") and "EAPI:Invalid nonce" in response_json.get("error", ""):
-                    self.logger().error(f"Invalid nonce error from {path_url}. " +
-                                        "Please ensure your Kraken API key nonce window is at least 10, " +
-                                        "and if needed reset your API key.")
+                # Kraken returns errors as a LIST, so serialize before substring-matching (a plain `in`
+                # check would only match an exact list element and miss decorated variants).
+                error = response_json.get("error") or []
+                error_str = " ".join(error) if isinstance(error, list) else str(error)
+                if "EAPI:Invalid nonce" in error_str:
+                    self.logger().error(
+                        f"Invalid nonce error from {path_url}. "
+                        "Please ensure your Kraken API key nonce window is at least 10, "
+                        "and if needed reset your API key.")
+                    # The next attempt generates a fresh, larger nonce, so retry instead of failing hard.
+                    await asyncio.sleep(retry_interval ** retry_attempt)
+                    continue
                 result = response_json.get("result")
-                if not result or response_json.get("error"):
+                # Treat an empty-but-present result (e.g. Balance {} for a zero-balance account) as success;
+                # a genuine Kraken error omits the result key entirely and is caught by the error check.
+                if result is None or error:
                     raise IOError({"error": response_json})
                 break
             except IOError as e:
@@ -338,9 +349,21 @@ class KrakenExchange(ExchangePyBase):
                     if path_url == CONSTANTS.ADD_ORDER_PATH_URL:
                         self.logger().info(f"Retrying {path_url}")
                         # Order placement could have been successful despite the IOError, so check for the open order.
-                        response = await self.get_open_orders_with_userref(data.get('userref'))
-                        if any(response.get("open").values()):
-                            return response
+                        userref = data.get('userref')
+                        response = await self.get_open_orders_with_userref(userref)
+                        open_orders = response.get("open", {}) or {}
+                        # Only adopt orders that actually carry our userref (Kraken returns userref as an int).
+                        matched_txids = [
+                            txid for txid, order in open_orders.items()
+                            if str(order.get("userref", "")) == str(userref)
+                        ]
+                        if matched_txids:
+                            # Return an AddOrder-shaped result so _place_order can read result["txid"][0],
+                            # marking the order OPEN rather than crashing with KeyError('txid') and FAILED.
+                            return {
+                                "descr": open_orders[matched_txids[0]].get("descr", {}),
+                                "txid": matched_txids,
+                            }
                     self.logger().warning(
                         f"Cloudflare error. Attempt {retry_attempt + 1}/{self.REQUEST_ATTEMPTS}"
                         f" API command {method}: {path_url}"
@@ -349,7 +372,7 @@ class KrakenExchange(ExchangePyBase):
                     continue
                 else:
                     raise e
-        if not result:
+        if result is None:
             raise IOError(f"Error fetching data from {path_url}, msg is {response_json}.")
         return result
 
@@ -363,11 +386,10 @@ class KrakenExchange(ExchangePyBase):
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
             data=api_params,
             is_auth_required=True)
-        if isinstance(cancel_result, dict) and (
-                cancel_result.get("count") == 1 or
-                cancel_result.get("error") is not None):
-            return True
-        return False
+        # _api_request_with_retry raises on any Kraken error payload, so a returned dict is always a
+        # success result. count >= 1 means at least one order was cancelled. An already-gone order surfaces
+        # as a raised "Unknown order" error and is classified by _is_order_not_found_during_cancelation_error.
+        return isinstance(cancel_result, dict) and cancel_result.get("count", 0) >= 1
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
@@ -421,14 +443,24 @@ class KrakenExchange(ExchangePyBase):
             try:
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("altname"))
                 min_order_size = Decimal(rule.get('ordermin', 0))
-                min_price_increment = Decimal(f"1e-{rule.get('pair_decimals')}")
+                # Prefer Kraken's explicit tick_size (the true minimum price increment) and fall back to
+                # 10^-pair_decimals (display precision) when it is absent.
+                tick_size = rule.get('tick_size')
+                if tick_size is not None:
+                    min_price_increment = Decimal(str(tick_size))
+                else:
+                    min_price_increment = Decimal(f"1e-{rule.get('pair_decimals')}")
                 min_base_amount_increment = Decimal(f"1e-{rule.get('lot_decimals')}")
+                # costmin is Kraken's minimum order cost (notional); orders below it are rejected.
+                costmin = rule.get('costmin')
+                min_notional_size = Decimal(str(costmin)) if costmin is not None else Decimal("0")
                 retval.append(
                     TradingRule(
                         trading_pair,
                         min_order_size=min_order_size,
                         min_price_increment=min_price_increment,
                         min_base_amount_increment=min_base_amount_increment,
+                        min_notional_size=min_notional_size,
                     )
                 )
             except Exception:
@@ -490,7 +522,10 @@ class KrakenExchange(ExchangePyBase):
             fill_base_amount=Decimal(order_fill["vol"]),
             fill_quote_amount=Decimal(order_fill["vol"]) * Decimal(order_fill["price"]),
             fill_price=Decimal(order_fill["price"]),
-            fill_timestamp=order_fill["time"],
+            # Kraken sends 'time' as a numeric string over WS ownTrades (e.g. "1560516023.070651") and as a
+            # number over REST QueryTrades. Cast to float so TradeUpdate.fill_timestamp stays numeric
+            # (otherwise downstream `fill_timestamp * 1e3` telemetry raises and order timestamps corrupt).
+            fill_timestamp=float(order_fill["time"]),
         )
         return trade_update
 
@@ -530,7 +565,10 @@ class KrakenExchange(ExchangePyBase):
                 if not tracked_order:
                     self.logger().debug(
                         f"Ignoring order message with id {order_msg}: not in in_flight_orders.")
-                    return
+                    # The first openOrders message is a snapshot of EVERY open order on the account
+                    # (including manual / other-bot orders sharing the API key). Skip the untracked
+                    # entry and keep processing the rest of the batch instead of returning early.
+                    continue
                 if "status" in order_msg:
                     order_update = self._create_order_update_with_order_status_data(order_status=order_msg,
                                                                                     order=tracked_order)
@@ -559,8 +597,12 @@ class KrakenExchange(ExchangePyBase):
             raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
                           "- waiting for exchange order id.")
         except Exception as e:
+            # An unknown/invalid order id genuinely has no fills (mirrors REST QueryTrades semantics).
+            # Any OTHER error (network failure, Cloudflare 5xx, IOError) must propagate so the base class
+            # logs it and retries next cycle — swallowing it would silently understate executed amounts.
             if "EOrder:Unknown order" in str(e) or "EOrder:Invalid order" in str(e):
                 return trade_updates
+            raise
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
@@ -572,6 +614,8 @@ class KrakenExchange(ExchangePyBase):
             is_auth_required=True)
 
         update = updated_order_data.get(exchange_order_id)
+        if update is None:
+            raise IOError(f"{CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE} {exchange_order_id}")
         new_state = CONSTANTS.ORDER_STATE[update["status"]]
 
         order_update = OrderUpdate(
@@ -601,6 +645,13 @@ class KrakenExchange(ExchangePyBase):
                     pair = convert_from_exchange_trading_pair(
                         details.get("pair"), tuple((await self.get_asset_pairs()).keys())
                     )
+                    if pair is None:
+                        # A single unrecognized open-order pair (delisted / filtered out of asset pairs)
+                        # must not crash account-wide balance polling; skip its locked contribution.
+                        self.logger().warning(
+                            f"Could not resolve trading pair '{details.get('pair')}' for an open order; "
+                            "skipping its locked-balance contribution.")
+                        continue
                     (base, quote) = self.split_trading_pair(pair)
                     vol_locked = Decimal(order.get("vol", 0)) - Decimal(order.get("vol_exec", 0))
                     if details.get("type") == "sell":
@@ -616,21 +667,25 @@ class KrakenExchange(ExchangePyBase):
             self._account_balances[cleaned_name] = total_balance
             remote_asset_names.add(cleaned_name)
 
-        for cleaned_name, ava_balance in self._account_available_balances.items():
+        # Fold Kraken Flex/earn (".F") balances into their spot asset. Iterate over a list() snapshot
+        # because the fold can introduce a brand-new spot key (when a ".F" balance is held without a
+        # co-held spot balance) — mutating the dict mid-iteration would raise RuntimeError. Delete the
+        # ".F" entry after folding rather than zeroing it, so no phantom zero-balance key lingers.
+        for cleaned_name, ava_balance in list(self._account_available_balances.items()):
             if cleaned_name.endswith(".F"):
                 asset_normal_name = cleaned_name.split(".")[0]
                 cleaned_normal_name = convert_from_exchange_symbol(asset_normal_name).upper()
                 new_total_amount = self._account_available_balances.get(cleaned_normal_name, 0) + ava_balance
-                self._account_available_balances.update({cleaned_normal_name: new_total_amount})
-                self._account_available_balances.update({cleaned_name: 0})
+                self._account_available_balances[cleaned_normal_name] = new_total_amount
+                del self._account_available_balances[cleaned_name]
 
-        for cleaned_name, total_balance in self._account_balances.items():
+        for cleaned_name, total_balance in list(self._account_balances.items()):
             if cleaned_name.endswith(".F"):
                 asset_normal_name = cleaned_name.split(".")[0]
                 cleaned_normal_name = convert_from_exchange_symbol(asset_normal_name).upper()
                 new_total_amount = self._account_balances.get(cleaned_normal_name, 0) + total_balance
-                self._account_balances.update({cleaned_normal_name: new_total_amount})
-                self._account_balances.update({cleaned_name: 0})
+                self._account_balances[cleaned_normal_name] = new_total_amount
+                del self._account_balances[cleaned_name]
 
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
@@ -640,7 +695,15 @@ class KrakenExchange(ExchangePyBase):
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
         for symbol_data in filter(web_utils.is_exchange_information_valid, exchange_info.values()):
-            mapping[symbol_data["altname"]] = convert_from_exchange_trading_pair(symbol_data["wsname"])
+            # Guard per entry: a single AssetPairs row missing altname/wsname (or unresolvable) must not
+            # abort the entire symbol-map build and leave the connector with zero tradable pairs.
+            altname = symbol_data.get("altname")
+            wsname = symbol_data.get("wsname")
+            if not altname or not wsname:
+                continue
+            hb_pair = convert_from_exchange_trading_pair(wsname)
+            if hb_pair:
+                mapping[altname] = hb_pair
         self._set_trading_pair_symbol_map(mapping)
 
     async def get_last_traded_prices(self, trading_pairs: List[str] = None) -> Dict[str, float]:
@@ -648,7 +711,7 @@ class KrakenExchange(ExchangePyBase):
         Gets the last traded price for multiple trading pairs in a single API call.
         Assumes trading_pairs is always provided based on exchange_base implementation.
         """
-        if len(trading_pairs) == 0:
+        if not trading_pairs:
             return {}
         if len(trading_pairs) == 1:
             return {trading_pairs[0]: await self._get_last_traded_price(trading_pairs[0])}
