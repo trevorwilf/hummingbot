@@ -391,6 +391,21 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # v15: settle grace after a booked fill. A freshly booked fill credits the ledger
+    # instantly while the wallet snapshot lags one balance poll (up to ~120s on connectors
+    # without push balances, e.g. Kraken). Treat that window like balance settling so the
+    # over-claim re-anchor/warnings and the wallet-floor warning do not false-positive.
+    fill_settle_grace_seconds: int = Field(
+        default=90,
+        json_schema_extra={
+            "prompt": (
+                "Grace period (seconds) after a booked fill during which ledger/wallet "
+                "over-claim checks are deferred (default 90): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     # v12 Issue 1: over-claim magnitude (in quote) above which re-anchoring/warning applies.
     ledger_reconcile_threshold_quote: Decimal = Field(
         default=Decimal("0.5"),
@@ -539,6 +554,7 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         "diagnostic_heartbeat_interval_seconds",
         "recycle_max_latency_seconds",
         "ledger_overclaim_reanchor_seconds",
+        "fill_settle_grace_seconds",
         "reseed_generation",
         mode="before",
     )
@@ -675,6 +691,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     def validate_ledger_overclaim_reanchor_seconds(cls, value: int):
         if value < 0:
             raise ValueError("ledger_overclaim_reanchor_seconds cannot be negative")
+        return value
+
+    @field_validator("fill_settle_grace_seconds")
+    @classmethod
+    def validate_fill_settle_grace_seconds(cls, value: int):
+        if value < 0:
+            raise ValueError("fill_settle_grace_seconds cannot be negative")
         return value
 
     @field_validator("ledger_reconcile_threshold_quote")
@@ -957,6 +980,10 @@ class RangeInventoryLadderController(ControllerBase):
         # sells) -- a deposit is not an order, so it never sets these and opens no window.
         self._booked_buy_fill_this_cycle: bool = False
         self._booked_sell_fill_this_cycle: bool = False
+        # v15: time of the most recent BOOKED fill. The wallet snapshot lags a fill by up to one
+        # balance poll (~120s on poll-only connectors), so over-claim checks defer within
+        # fill_settle_grace_seconds of this timestamp (see _within_fill_settle_grace).
+        self._last_fill_booked_ts: Optional[float] = None
         # v13 Part C: set for one cycle right after a guarded re-seed so booking re-baselines
         # open orders to their current cumulative executed amount instead of retroactively
         # re-booking already-realized fills.
@@ -1918,6 +1945,11 @@ class RangeInventoryLadderController(ControllerBase):
         for eid in pruned_ids:
             del progress[eid]
 
+        if changed:
+            # v15: arm the fill-settle grace window — the wallet snapshot will lag this fill
+            # by up to one balance poll, so over-claim checks defer until it re-syncs.
+            self._last_fill_booked_ts = self.market_data_provider.time()
+
         if changed or pruned_ids or reseed_priming:
             self._state["owned_quote"] = str(owned_quote)
             self._state["owned_base"] = str(owned_base)
@@ -2578,6 +2610,16 @@ class RangeInventoryLadderController(ControllerBase):
         except Exception:
             return False
 
+    def _within_fill_settle_grace(self, now: float) -> bool:
+        """True within fill_settle_grace_seconds of the last BOOKED fill. Connectors without a
+        settling flag (e.g. Kraken, poll-only balances) leave the wallet snapshot one balance
+        poll behind a fill; the ledger books instantly, so the gap reads as a false over-claim
+        until the wallet re-syncs. Deferring the over-claim checks through this window kills
+        that false positive without touching the (conservative) budget clamp."""
+        if self._last_fill_booked_ts is None:
+            return False
+        return (now - self._last_fill_booked_ts) < self.config.fill_settle_grace_seconds
+
     def _note_wallet_floor(self, side: str, owned: Decimal, available: Decimal, held: Decimal,
                            clamped_budget: Decimal, settling: bool = False):
         """Transition-based diagnostic: warn the FIRST cycle a GENUINE wallet-floor shortfall appears
@@ -2875,7 +2917,9 @@ class RangeInventoryLadderController(ControllerBase):
         # v14: defer all ledger/wallet over-claim reconciliation (re-anchor + warnings) while the
         # connector's balances are still settling. Right after a fill books or a WS reconnect the
         # cached wallet can be transiently stale-low, which would falsely read as an over-claim.
-        balance_settling = self._is_balance_settling()
+        # v15: connectors without a settling flag (poll-only balances, e.g. Kraken) get the same
+        # protection from a time-based grace window after each booked fill.
+        balance_settling = self._is_balance_settling() or self._within_fill_settle_grace(now)
 
         # v12 Issue 1: self-heal a persistently over-claimed ledger by re-anchoring DOWN to
         # wallet truth. Runs right after owned_* are loaded and BEFORE managed_* are computed
@@ -3307,6 +3351,66 @@ class RangeInventoryLadderController(ControllerBase):
             **{budget_field: str(total_budget), "budget_asset": budget_asset},
         )
 
+    # ---------------------------------------------------------------- exchange-minimum gate
+    # v15: the connector's quantize_order_amount only snaps to the size quantum — it does NOT
+    # zero amounts below the exchange's min_order_size (that is only enforced connector-side at
+    # order creation, where it raises and burns executor retries). The controller must therefore
+    # enforce the exchange trading rule itself. One shared feasibility gate is used by the
+    # compression, the create path and the planner so the three can never drift.
+
+    def _exchange_trading_rule(self):
+        """The connector's TradingRule for our pair, or None when unavailable (e.g. mocked
+        provider in tests, or rules not yet fetched)."""
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            rules = getattr(connector, "trading_rules", None)
+            if not isinstance(rules, dict):
+                return None
+            return rules.get(self.config.trading_pair)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rule_decimal(rule, attr: str) -> Decimal:
+        """A TradingRule numeric field as a positive finite Decimal, else 0 (missing, NaN, Inf
+        and unparsable values all mean 'no exchange constraint')."""
+        try:
+            value = Decimal(str(getattr(rule, attr, 0) or 0))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0")
+        return value if value.is_finite() and value > Decimal("0") else Decimal("0")
+
+    def _exchange_min_order_size(self) -> Decimal:
+        """Exchange minimum order amount in BASE units (0 when unknown)."""
+        rule = self._exchange_trading_rule()
+        if rule is None:
+            return Decimal("0")
+        return self._rule_decimal(rule, "min_order_size")
+
+    def _exchange_min_notional(self) -> Decimal:
+        """Exchange minimum order value in QUOTE units (0 when unknown). Takes the stricter of
+        min_notional_size and min_order_value — connectors populate one or the other."""
+        rule = self._exchange_trading_rule()
+        if rule is None:
+            return Decimal("0")
+        return max(self._rule_decimal(rule, "min_notional_size"),
+                   self._rule_decimal(rule, "min_order_value"))
+
+    def _level_quantization_failure(self, qamount: Decimal, qprice: Decimal) -> Optional[str]:
+        """Single feasibility gate for a quantized level. Returns a reason string when the level
+        cannot be placed (zero amount, below config min notional, or below the EXCHANGE minimum
+        order size / notional), or None when the level is feasible."""
+        if qamount <= Decimal("0"):
+            return "quantized_amount_zero"
+        if qamount < self._exchange_min_order_size():
+            return "below_exchange_min_order_size"
+        notional = qamount * qprice
+        if notional < self.config.min_order_quote:
+            return "notional_below_min"
+        if notional < self._exchange_min_notional():
+            return "below_exchange_min_notional"
+        return None
+
     def _compress_buy_level_indexes_for_min_notional(
         self,
         candidate_indexes: List[int],
@@ -3355,8 +3459,7 @@ class RangeInventoryLadderController(ControllerBase):
                         self.config.connector_name, self.config.trading_pair, amount
                     )
                 )
-                notional = quantized_amount * quantized_price
-                if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+                if self._level_quantization_failure(quantized_amount, quantized_price) is not None:
                     all_kept_levels_feasible = False
                     break
 
@@ -3408,8 +3511,7 @@ class RangeInventoryLadderController(ControllerBase):
                         self.config.connector_name, self.config.trading_pair, level_base
                     )
                 )
-                notional = quantized_amount * quantized_price
-                if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+                if self._level_quantization_failure(quantized_amount, quantized_price) is not None:
                     all_kept_levels_feasible = False
                     break
 
@@ -3443,7 +3545,8 @@ class RangeInventoryLadderController(ControllerBase):
             )
         )
         notional = quantized_amount * quantized_price
-        if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+        failure_reason = self._level_quantization_failure(quantized_amount, quantized_price)
+        if failure_reason is not None:
             self._emit_structured(
                 "range_ladder_buy_level_skipped_post_quantization",
                 level_id=level_id,
@@ -3453,8 +3556,9 @@ class RangeInventoryLadderController(ControllerBase):
                 quantized_amount=str(quantized_amount),
                 notional=str(notional),
                 min_order_quote=str(self.config.min_order_quote),
+                exchange_min_order_size=str(self._exchange_min_order_size()),
                 allocated_quote=str(order_quote),
-                reason="quantized_amount_zero" if quantized_amount <= Decimal("0") else "notional_below_min",
+                reason=failure_reason,
             )
             return None, Decimal("0")
         executor_config = OrderExecutorConfig(
@@ -3498,7 +3602,8 @@ class RangeInventoryLadderController(ControllerBase):
             )
         )
         notional = quantized_amount * quantized_price
-        if quantized_amount <= Decimal("0") or notional < self.config.min_order_quote:
+        failure_reason = self._level_quantization_failure(quantized_amount, quantized_price)
+        if failure_reason is not None:
             self._emit_structured(
                 "range_ladder_sell_level_skipped_post_quantization",
                 level_id=level_id,
@@ -3508,8 +3613,9 @@ class RangeInventoryLadderController(ControllerBase):
                 quantized_amount=str(quantized_amount),
                 notional=str(notional),
                 min_order_quote=str(self.config.min_order_quote),
+                exchange_min_order_size=str(self._exchange_min_order_size()),
                 allocated_base=str(order_base),
-                reason="quantized_amount_zero" if quantized_amount <= Decimal("0") else "notional_below_min",
+                reason=failure_reason,
             )
             return None, Decimal("0")
         executor_config = OrderExecutorConfig(
@@ -3567,7 +3673,7 @@ class RangeInventoryLadderController(ControllerBase):
         qamount = self._d(self.market_data_provider.quantize_order_amount(
             self.config.connector_name, self.config.trading_pair, order_quote / qprice), "0")
         notional = qamount * qprice
-        if qamount <= Decimal("0") or notional < self.config.min_order_quote:
+        if self._level_quantization_failure(qamount, qprice) is not None:
             return None
         return qamount, notional, qprice
 
@@ -3578,7 +3684,7 @@ class RangeInventoryLadderController(ControllerBase):
         qamount = self._d(self.market_data_provider.quantize_order_amount(
             self.config.connector_name, self.config.trading_pair, order_base), "0")
         notional = qamount * qprice
-        if qamount <= Decimal("0") or notional < self.config.min_order_quote:
+        if self._level_quantization_failure(qamount, qprice) is not None:
             return None
         return qamount, notional, qprice
 

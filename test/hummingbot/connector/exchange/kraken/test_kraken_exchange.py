@@ -1428,6 +1428,79 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.assertIsInstance(order.last_update_timestamp, float)
         self.assertEqual(1560516023.070651, order.last_update_timestamp)
 
+    async def test_ws_fill_triggers_debounced_balance_refresh(self):
+        # BAL-2: Kraken pushes no WS balance updates and, with a healthy user stream, the REST
+        # balance poll runs only every LONG_POLL_INTERVAL (120s). A WS fill must therefore
+        # trigger a debounced REST balance refresh, or cached balances stay one fill stale for
+        # up to 2 minutes (the source of the range-ladder false over-claim on 2026-07-01).
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order(
+            "OID-BAL", "TXID-BAL", trade_type=TradeType.SELL,
+            price=Decimal("34.5"), amount=Decimal("10.00345345"))
+        trade_msg = self.trade_event_for_full_fill_websocket_update(order)
+
+        update_balances_mock = AsyncMock()
+        with patch.object(self.exchange, "_update_balances", new=update_balances_mock), \
+                patch.object(self.exchange, "_sleep", new=AsyncMock()):
+            self.exchange._process_trade_message(trade_msg[0])
+            task = self.exchange._fill_balance_refresh_task
+            self.assertIsNotNone(task)
+            await task
+        update_balances_mock.assert_awaited_once()
+
+    async def test_ws_fill_balance_refresh_debounces_bursts(self):
+        # BAL-2 companion: a burst of fills coalesces into a single pending refresh task.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order(
+            "OID-BAL2", "TXID-BAL2", trade_type=TradeType.SELL,
+            price=Decimal("34.5"), amount=Decimal("10.00345345"))
+        trade_msg = self.trade_event_for_full_fill_websocket_update(order)
+
+        update_balances_mock = AsyncMock()
+        with patch.object(self.exchange, "_update_balances", new=update_balances_mock), \
+                patch.object(self.exchange, "_sleep", new=AsyncMock()):
+            self.exchange._process_trade_message(trade_msg[0])
+            first_task = self.exchange._fill_balance_refresh_task
+            self.exchange._process_trade_message(trade_msg[0])
+            self.assertIs(first_task, self.exchange._fill_balance_refresh_task)
+            await self.exchange._fill_balance_refresh_task
+        update_balances_mock.assert_awaited_once()
+
+    def test_untracked_ws_fill_does_not_trigger_balance_refresh(self):
+        # BAL-2 companion: fills for foreign orders (shared API key) must not spam Balance calls.
+        self.exchange._set_current_timestamp(1640780000)
+        foreign_trades = [{
+            "FOREIGN-TRADE-1": {
+                "ordertxid": "FOREIGN-TXID",
+                "price": "100.0",
+                "fee": "0.1",
+                "time": "1560516023.070651",
+                "type": "sell",
+                "userref": "999999",
+                "vol": "1.0",
+            }
+        }]
+        self.exchange._process_trade_message(foreign_trades)
+        self.assertIsNone(self.exchange._fill_balance_refresh_task)
+
+    async def test_invalid_nonce_logged_as_warning_not_error(self):
+        # AUTH-3 companion: the invalid-nonce message self-heals via retry, so it must log at
+        # WARNING, not ERROR (an ERROR that always self-heals is alert noise).
+        api_request_mock = AsyncMock(side_effect=[
+            {"error": ["EAPI:Invalid nonce"], "result": None},
+            {"error": [], "result": {"ok": 1}},
+        ])
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
+        expected_message = (
+            f"Invalid nonce error from {CONSTANTS.BALANCE_PATH_URL}. "
+            "Please ensure your Kraken API key nonce window is at least 10, "
+            "and if needed reset your API key.")
+        self.assertTrue(self.is_logged("WARNING", expected_message))
+        self.assertFalse(self.is_logged("ERROR", expected_message))
+
     async def test_all_trade_updates_reraises_unexpected_error(self):
         # ORDERS-3: a transient error (non "Unknown order") must propagate, not be swallowed as "no fills".
         self.exchange._set_current_timestamp(1640780000)

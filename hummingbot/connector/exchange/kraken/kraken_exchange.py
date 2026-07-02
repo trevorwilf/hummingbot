@@ -60,6 +60,10 @@ class KrakenExchange(ExchangePyBase):
         self._client_order_id_nonce_provider = NonceCreator.for_microseconds()
         self._rate_limits_share_pct = rate_limits_share_pct
         self._throttler = self._build_async_throttler(api_tier=self._kraken_api_tier)
+        # Kraken has no WS balance push and, with a healthy user stream, the REST balance poll
+        # runs only every LONG_POLL_INTERVAL (120s). A fill therefore leaves cached balances
+        # stale for up to 2 minutes. A WS fill triggers a debounced REST refresh instead.
+        self._fill_balance_refresh_task: Optional[asyncio.Task] = None
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -331,7 +335,10 @@ class KrakenExchange(ExchangePyBase):
                 error = response_json.get("error") or []
                 error_str = " ".join(error) if isinstance(error, list) else str(error)
                 if "EAPI:Invalid nonce" in error_str:
-                    self.logger().error(
+                    # Self-healing: the next attempt generates a fresh, larger nonce. WARNING (not
+                    # ERROR) because a one-off out-of-order arrival between concurrent private
+                    # requests is expected under load and the retry below recovers it.
+                    self.logger().warning(
                         f"Invalid nonce error from {path_url}. "
                         "Please ensure your Kraken API key nonce window is at least 10, "
                         "and if needed reset your API key.")
@@ -530,6 +537,7 @@ class KrakenExchange(ExchangePyBase):
         return trade_update
 
     def _process_trade_message(self, trades: List):
+        any_tracked_fill = False
         for update in trades:
             trade_id: str = next(iter(update))
             trade: Dict[str, str] = update[trade_id]
@@ -545,6 +553,35 @@ class KrakenExchange(ExchangePyBase):
                     order_fill=trade,
                     order=tracked_order)
                 self._order_tracker.process_trade_update(trade_update)
+                any_tracked_fill = True
+        if any_tracked_fill:
+            self._schedule_fill_balance_refresh()
+
+    def _schedule_fill_balance_refresh(self):
+        """Debounced REST balance refresh after a WS fill. Kraken pushes no balance updates and
+        the status poll runs only every LONG_POLL_INTERVAL (120s) while the user stream is
+        healthy, so without this a fill leaves cached balances stale for up to 2 minutes.
+        A short sleep coalesces bursts of fills into a single Balance request."""
+        if self._fill_balance_refresh_task is not None and not self._fill_balance_refresh_task.done():
+            return  # a refresh is already pending; it will pick up this fill too
+
+        async def _refresh_after_debounce():
+            await self._sleep(1.0)
+            try:
+                await self._update_balances()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Best-effort: the periodic status poll remains the fallback sync path.
+                self.logger().warning("Post-fill balance refresh failed; will retry on next poll.")
+
+        self._fill_balance_refresh_task = safe_ensure_future(_refresh_after_debounce())
+
+    async def stop_network(self):
+        if self._fill_balance_refresh_task is not None:
+            self._fill_balance_refresh_task.cancel()
+            self._fill_balance_refresh_task = None
+        await super().stop_network()
 
     def _create_order_update_with_order_status_data(self, order_status: Dict[str, Any], order: InFlightOrder):
         order_update = OrderUpdate(

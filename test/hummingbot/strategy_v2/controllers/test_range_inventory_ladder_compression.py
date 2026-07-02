@@ -10,6 +10,17 @@ if str(_CONTROLLER_DIR) not in sys.path:
     sys.path.insert(0, str(_CONTROLLER_DIR))
 
 
+def _bind_exchange_min_gate(controller, cls):
+    """Bind the real v15 exchange-minimum feasibility chain onto a MagicMock controller.
+    The MagicMock provider has no dict trading_rules, so the exchange minimums resolve to 0
+    and the gate reduces to the original amount>0 + min_order_quote checks."""
+    controller._d = cls._d
+    controller._rule_decimal = cls._rule_decimal
+    for name in ("_exchange_trading_rule", "_exchange_min_order_size",
+                 "_exchange_min_notional", "_level_quantization_failure"):
+        setattr(controller, name, getattr(cls, name).__get__(controller, cls))
+
+
 class TestBuyCompressionQuantizationAware(unittest.TestCase):
     """Verify buy compression accounts for quantization when deciding which levels to keep."""
 
@@ -43,6 +54,7 @@ class TestBuyCompressionQuantizationAware(unittest.TestCase):
                 controller, RangeInventoryLadderController
             )
         )
+        _bind_exchange_min_gate(controller, RangeInventoryLadderController)
         return controller
 
     def test_equal_weight_budget_15_5(self):
@@ -158,6 +170,7 @@ class TestSellCompressionQuantizationAware(unittest.TestCase):
                 controller, RangeInventoryLadderController
             )
         )
+        _bind_exchange_min_gate(controller, RangeInventoryLadderController)
         return controller
 
     def test_sell_startup_issue1_reproduction(self):

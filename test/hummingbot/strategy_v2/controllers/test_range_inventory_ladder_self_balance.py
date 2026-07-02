@@ -39,6 +39,17 @@ from range_inventory_ladder import (  # noqa: E402
 D = lambda v: Decimal(str(v))  # noqa: E731
 
 
+def _bind_exchange_min_gate(controller, cls=RangeInventoryLadderController):
+    """Bind the real v15 exchange-minimum feasibility chain onto a MagicMock controller.
+    The MagicMock provider exposes no dict trading_rules, so exchange minimums resolve to 0
+    and the gate reduces to the original amount>0 + min_order_quote checks."""
+    controller._d = cls._d
+    controller._rule_decimal = cls._rule_decimal
+    for name in ("_exchange_trading_rule", "_exchange_min_order_size",
+                 "_exchange_min_notional", "_level_quantization_failure"):
+        setattr(controller, name, getattr(cls, name).__get__(controller, cls))
+
+
 def _make_mdp(*, balances, mid, bid, ask, now=1_000_000.0):
     """balances: {asset: (total, available)}."""
     mdp = MagicMock()
@@ -309,6 +320,7 @@ class _CompressHarness(unittest.TestCase):
             RangeInventoryLadderController._compress_buy_level_indexes_for_min_notional.__get__(
                 controller, RangeInventoryLadderController)
         )
+        _bind_exchange_min_gate(controller)
         return controller
 
     @staticmethod
@@ -329,6 +341,7 @@ class _CompressHarness(unittest.TestCase):
             RangeInventoryLadderController._compress_sell_level_indexes_for_min_notional.__get__(
                 controller, RangeInventoryLadderController)
         )
+        _bind_exchange_min_gate(controller)
         return controller
 
 

@@ -28,6 +28,17 @@ def _mk_mdp():
     return mdp
 
 
+def _bind_exchange_min_gate(controller, cls):
+    """Bind the real v15 exchange-minimum feasibility chain onto a MagicMock controller.
+    The MagicMock provider exposes no dict trading_rules, so exchange minimums resolve to 0
+    and the gate reduces to the original amount>0 + min_order_quote checks."""
+    controller._d = cls._d
+    controller._rule_decimal = cls._rule_decimal
+    for name in ("_exchange_trading_rule", "_exchange_min_order_size",
+                 "_exchange_min_notional", "_level_quantization_failure"):
+        setattr(controller, name, getattr(cls, name).__get__(controller, cls))
+
+
 def _mk_buy_controller(prices, weights, min_order_quote=Decimal("1")):
     from range_inventory_ladder import RangeInventoryLadderController
     controller = MagicMock(spec=RangeInventoryLadderController)
@@ -51,6 +62,7 @@ def _mk_buy_controller(prices, weights, min_order_quote=Decimal("1")):
             controller, RangeInventoryLadderController
         )
     )
+    _bind_exchange_min_gate(controller, RangeInventoryLadderController)
     return controller
 
 
@@ -77,6 +89,7 @@ def _mk_sell_controller(prices, weights, min_order_quote=Decimal("1")):
             controller, RangeInventoryLadderController
         )
     )
+    _bind_exchange_min_gate(controller, RangeInventoryLadderController)
     return controller
 
 

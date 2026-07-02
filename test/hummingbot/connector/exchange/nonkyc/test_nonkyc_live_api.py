@@ -45,6 +45,16 @@ except ImportError:
 # Find repo root and load .env
 # ---------------------------------------------------------------------------
 
+def _ensure_event_loop():
+    """asyncio.run() (used by several tests above) sets the current event loop to None on exit
+    (Python 3.10+), so a later test that constructs a connector (OrderBookTracker calls
+    asyncio.get_event_loop()) crashes with 'There is no current event loop'. Restore one."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 def find_repo_root():
     """Walk up from __file__ to find the directory containing .env or .git."""
     current = Path(__file__).resolve().parent
@@ -2780,6 +2790,7 @@ def test_7a_trading_rules_new_fields():
     from bidict import bidict
     from decimal import Decimal
 
+    _ensure_event_loop()
     exchange = NonkycExchange(nonkyc_api_key="test", nonkyc_api_secret="test",
                               trading_pairs=["BTC-USDT"], trading_required=False)
     exchange._set_trading_pair_symbol_map(bidict({"BTC/USDT": "BTC-USDT"}))
@@ -2815,6 +2826,7 @@ def test_7a_cancel_all_orders_on_exchange_wraps_dict():
     from hummingbot.connector.exchange.nonkyc.nonkyc_exchange import NonkycExchange
     from bidict import bidict
 
+    _ensure_event_loop()
     exchange = NonkycExchange(nonkyc_api_key="test", nonkyc_api_secret="test",
                               trading_pairs=["BTC-USDT"], trading_required=False)
     exchange._set_trading_pair_symbol_map(bidict({"BTC/USDT": "BTC-USDT"}))

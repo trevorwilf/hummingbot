@@ -87,6 +87,9 @@ class NonkycExchange(ExchangePyBase):
         self._balance_settle_start: float = 0.0
         self._BALANCE_SETTLE_TIMEOUT: float = 15.0
         self._orders_reconciled_after_reconnect: bool = True
+        # Orphan exchange-order ids already warned about: a persistent orphan (e.g. an order
+        # left by a previous session) otherwise re-warns at EVERY reconnect reconciliation.
+        self._warned_orphan_ids: set = set()
         self._nonce_error_cooldown_until: float = 0.0
         self._last_server_disconnect_time: float = 0.0
         self._SERVER_DISCONNECT_BACKOFF: float = 10.0
@@ -229,10 +232,20 @@ class NonkycExchange(ExchangePyBase):
             missing = tracked_exchange_ids - exchange_order_ids
 
             if orphans:
-                self.logger().warning(
-                    f"Post-reconnect reconciliation: {len(orphans)} exchange orders "
-                    f"not tracked locally (orphans): {orphans}"
-                )
+                new_orphans = orphans - self._warned_orphan_ids
+                if new_orphans:
+                    self.logger().warning(
+                        f"Post-reconnect reconciliation: {len(orphans)} exchange orders "
+                        f"not tracked locally (orphans): {orphans}. These hold balance on the "
+                        "exchange; cancel manually if they are not intentional."
+                    )
+                else:
+                    self.logger().debug(
+                        f"Post-reconnect reconciliation: {len(orphans)} known orphan(s) still "
+                        f"active on exchange: {orphans}"
+                    )
+            # Replace (not update) so an orphan that resolves and later reappears warns again.
+            self._warned_orphan_ids = set(orphans)
             if missing:
                 self.logger().warning(
                     f"Post-reconnect reconciliation: {len(missing)} tracked orders "
@@ -1033,7 +1046,14 @@ class NonkycExchange(ExchangePyBase):
         retval = []
         for rule in filter(nonkyc_utils.is_market_active, trading_pair_rules):
             try:
-                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("symbol"))
+                try:
+                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=rule.get("symbol"))
+                except KeyError:
+                    # Not in the symbol map (e.g. filtered out or a race with a fresh listing) —
+                    # nothing to parse; skip quietly instead of dumping the full rule at ERROR.
+                    self.logger().debug(
+                        f"Skipping trading rule for unmapped symbol {rule.get('symbol')}.")
+                    continue
                 price_decimals = Decimal(rule.get("priceDecimals"))
                 quantity_decimals = Decimal(rule.get("quantityDecimals"))
 
@@ -1057,6 +1077,10 @@ class NonkycExchange(ExchangePyBase):
 
     async def _update_trading_rules(self):
         exchange_info = await self._make_trading_rules_request()
+        # Refresh the symbol map BEFORE formatting rules: a pair listed since the last poll is
+        # absent from the old map, and formatting against the old map raised a noisy KeyError
+        # (e.g. a new listing appearing mid-session) while delaying its rules by one full cycle.
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
         trading_rules_list = await self._format_trading_rules(exchange_info)
         # Detect trading rule changes before overwriting (LOG 14)
         for new_rule in trading_rules_list:
@@ -1079,7 +1103,6 @@ class NonkycExchange(ExchangePyBase):
         self._trading_rules.clear()
         for trading_rule in trading_rules_list:
             self._trading_rules[trading_rule.trading_pair] = trading_rule
-        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
 
     async def _status_polling_loop_fetch_updates(self):
         self._bulk_fills_fetched_this_cycle = True
