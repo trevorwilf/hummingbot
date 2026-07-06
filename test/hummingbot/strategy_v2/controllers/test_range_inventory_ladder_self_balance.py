@@ -85,6 +85,9 @@ def _make_config(**overrides):
         sell_prices=[Decimal("350"), Decimal("355"), Decimal("360")],
         sell_amounts_pct=[Decimal("1"), Decimal("1"), Decimal("1")],
         min_order_quote=Decimal("5"),
+        # These tests assert raw budget/ceiling semantics; the buy-side fee haircut is
+        # covered by test_range_inventory_ladder_fee_headroom.py, so pin it off here.
+        fee_rate=Decimal("0"),
     )
     defaults.update(overrides)
     return RangeInventoryLadderConfig(**defaults)

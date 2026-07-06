@@ -1013,6 +1013,10 @@ class RangeInventoryLadderController(ControllerBase):
         self._buy_wallet_floor_bound: bool = False
         self._sell_wallet_floor_bound: bool = False
 
+        # Buy-side fee headroom reserved by the most recent _compute_deploy_budgets call
+        # (quote withheld so the exchange's notional + fee hold fits the budget).
+        self._last_buy_fee_headroom_quote: Decimal = Decimal("0")
+
 
     @property
     def state_path(self) -> Path:
@@ -1117,6 +1121,7 @@ class RangeInventoryLadderController(ControllerBase):
             managed_fund_value_quote=p.get("managed_fund_value_quote", Decimal("0")),
             free_buy_budget_quote=p.get("free_buy_budget_quote", Decimal("0")),
             free_sell_budget_base=p.get("free_sell_budget_base", Decimal("0")),
+            buy_fee_headroom_quote=p.get("buy_fee_headroom_quote", Decimal("0")),
             ledger_funded_budgets=p.get("ledger_funded_budgets", bool(self.config.ledger_funded_budgets)),
             owned_quote_free=p.get("owned_quote_free", Decimal("0")),
             owned_base_free=p.get("owned_base_free", Decimal("0")),
@@ -2225,6 +2230,7 @@ class RangeInventoryLadderController(ControllerBase):
             "active_sell_reserved_base": Decimal("0"),
             "free_buy_budget_quote": Decimal("0"),
             "free_sell_budget_base": Decimal("0"),
+            "buy_fee_headroom_quote": Decimal("0"),
             "blocked_level_ids": self._recently_closed_level_ids(),
             "initial_fund_value_quote": Decimal("0"),
             "fund_growth_quote": Decimal("0"),
@@ -2584,6 +2590,21 @@ class RangeInventoryLadderController(ControllerBase):
             buy_budget_quote = min(
                 buy_budget_quote, max(Decimal("0"), Decimal(self.config.shared_account_quote_quota))
             )
+
+        # Buy-side fee headroom: the exchange holds notional + fee as collateral for a resting
+        # buy (NonKYC computes hold_amount = notional + fee), so deploying 100% of the budget
+        # makes the cumulative hold exceed available quote by the sum of fees and the last
+        # rung(s) reject with insufficient funds. Dividing by (1 + fee_rate) sizes the total
+        # buy notional so notional + fee fits the budget exactly. Applies in BOTH funding
+        # modes. The sell side is NOT haircut: sell fees are deducted from proceeds, never
+        # held as extra collateral.
+        fee_rate = max(Decimal("0"), Decimal(self.config.fee_rate))
+        buy_fee_headroom_quote = Decimal("0")
+        if fee_rate > Decimal("0") and buy_budget_quote > Decimal("0"):
+            pre_haircut_budget = buy_budget_quote
+            buy_budget_quote = buy_budget_quote / (Decimal("1") + fee_rate)
+            buy_fee_headroom_quote = pre_haircut_budget - buy_budget_quote
+        self._last_buy_fee_headroom_quote = buy_fee_headroom_quote
 
         active_reserved_value = (
             max(Decimal("0"), active_buy_reserved_quote)
@@ -3145,6 +3166,7 @@ class RangeInventoryLadderController(ControllerBase):
             "active_sell_reserved_base": active_sell_reserved_base,
             "free_buy_budget_quote": free_buy_budget_quote,
             "free_sell_budget_base": free_sell_budget_base,
+            "buy_fee_headroom_quote": self._last_buy_fee_headroom_quote,
             "ledger_funded_budgets": bool(self.config.ledger_funded_budgets),
             "owned_quote_free": owned_quote_free,
             "owned_base_free": owned_base_free,
@@ -3650,11 +3672,15 @@ class RangeInventoryLadderController(ControllerBase):
         """Quote a fresh BUY rebuild would deploy: the side's current free budget PLUS the quote
         that cancelling its own resting buys would return to availability (the ceiling already
         bounds free + reserved). This matches the budget the create path will actually see once
-        the side's resting orders are cancelled."""
+        the side's resting orders are cancelled. `free` is already fee-haircut by
+        _compute_deploy_budgets; the reserved add-back gets the same haircut, because once the
+        resting notional (and its fee hold) returns to the wallet it is re-haircut before
+        redeployment -- keeping the planner and the live rebuild sized identically."""
         p = self.processed_data or {}
         free = self._d(p.get("free_buy_budget_quote", "0"), "0")
         reserved = self._d(p.get("active_buy_reserved_quote", "0"), "0")
-        return max(Decimal("0"), free + reserved)
+        fee_rate = max(Decimal("0"), Decimal(self.config.fee_rate))
+        return max(Decimal("0"), free + reserved / (Decimal("1") + fee_rate))
 
     def _side_rebuild_budget_base(self) -> Decimal:
         """Base a fresh SELL rebuild would deploy (free + this side's own resting reservation)."""
@@ -4401,6 +4427,7 @@ class RangeInventoryLadderController(ControllerBase):
             "deployable_base_total": str(p["deployable_base_total"]),
             "free_buy_budget_quote": str(p["free_buy_budget_quote"]),
             "free_sell_budget_base": str(p["free_sell_budget_base"]),
+            "buy_fee_headroom_quote": str(p.get("buy_fee_headroom_quote", Decimal("0"))),
             "ledger_funded_budgets": str(p.get("ledger_funded_budgets", self.config.ledger_funded_budgets)),
             "owned_quote_free": str(p.get("owned_quote_free", Decimal("0"))),
             "owned_base_free": str(p.get("owned_base_free", Decimal("0"))),

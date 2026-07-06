@@ -95,6 +95,9 @@ class _Harness(unittest.TestCase):
             sell_amounts_pct=[Decimal("1"), Decimal("1"), Decimal("1")],
             min_order_quote=Decimal("5"),
             ledger_overclaim_reanchor_seconds=999_999,  # re-anchor is out of scope here
+            # These tests assert raw budget-SOURCING semantics; the buy-side fee haircut is
+            # covered by test_range_inventory_ladder_fee_headroom.py, so pin it off here.
+            fee_rate=Decimal("0"),
         )
         defaults.update(config_overrides)
         config = RangeInventoryLadderConfig(**defaults)
