@@ -441,6 +441,14 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     # never repeats for the same token even if left True. Bump reseed_generation to re-arm.
     reseed_fund_from_wallet_once: bool = Field(
         default=False,
+        description=(
+            "One-shot managed-fund re-seed from the current wallet, idempotent per "
+            "(reseed_generation, reseed_fund_target_quote) token. The re-seed WAITS FOR A "
+            "FLAT BOOK: while any of this controller's order executors are active or "
+            "shutting down it is deferred (funds held in resting orders would be excluded "
+            "from the wallet-based claim and stranded), and it applies automatically on the "
+            "first cycle with no live order executors."
+        ),
         json_schema_extra={
             "prompt": (
                 "Re-seed the managed fund from the current wallet once on next start? "
@@ -1016,6 +1024,10 @@ class RangeInventoryLadderController(ControllerBase):
         # Buy-side fee headroom reserved by the most recent _compute_deploy_budgets call
         # (quote withheld so the exchange's notional + fee hold fits the budget).
         self._last_buy_fee_headroom_quote: Decimal = Decimal("0")
+
+        # Re-seed deferral latch: the "deferred while orders rest" warning/event fires once
+        # per reseed token, not per cycle.
+        self._reseed_deferred_warned_token: Optional[str] = None
 
 
     @property
@@ -2113,6 +2125,29 @@ class RangeInventoryLadderController(ControllerBase):
         reseed_token = f"{int(self.config.reseed_generation)}:{target_quote}"
         if self._state.get("last_reseed_token") == reseed_token:
             return  # this exact re-seed already applied -> idempotent no-op
+
+        # The re-seed claims from AVAILABLE balances only, so funds held in this controller's
+        # own resting orders would be excluded from the new seed; when those orders later cancel
+        # the money returns to the wallet, but a cancel is not a fill, so the ledger never
+        # re-grows and the capital strands outside the fund. Defer until the book is flat: the
+        # re-seed applies automatically on the first cycle with no live order executors (e.g.
+        # after a session-end cancel wave). The token is NOT consumed by a deferral.
+        active_executors = self._order_executors_active_or_shutting_down()
+        if active_executors:
+            if self._reseed_deferred_warned_token != reseed_token:
+                self._reseed_deferred_warned_token = reseed_token
+                self.logger().warning(
+                    f"{self.config.id}: re-seed (token={reseed_token}) deferred: "
+                    f"{len(active_executors)} order executor(s) still active or shutting down "
+                    "hold funds that the wallet-based claim would strand. The re-seed applies "
+                    "automatically on the first cycle with a flat book."
+                )
+                self._emit_structured(
+                    "range_ladder_reseed_deferred_active_orders",
+                    reseed_token=reseed_token,
+                    active_executor_count=len(active_executors),
+                )
+            return
 
         base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
         total_quote_balance = self._safe_get_balance(quote_asset)
