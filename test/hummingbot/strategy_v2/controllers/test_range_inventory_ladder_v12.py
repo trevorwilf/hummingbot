@@ -76,6 +76,9 @@ def _make_config(**overrides):
         # refresh) is the LEGACY path; the per-side refresh model supersedes it. These tests
         # validate that legacy path, so they pin event_refresh_enabled=False.
         event_refresh_enabled=False,
+        # Budget assertions here predate the buy-side fee haircut, which has its own suite
+        # (test_range_inventory_ladder_fee_headroom.py) -- pin it off.
+        fee_rate=Decimal("0"),
     )
     defaults.update(overrides)
     return RangeInventoryLadderConfig(**defaults)

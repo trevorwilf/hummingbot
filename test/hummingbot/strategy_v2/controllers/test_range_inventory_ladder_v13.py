@@ -140,6 +140,9 @@ class _V13Harness(unittest.TestCase):
             # trigger tests exercise the LEGACY recycle path. Pin the legacy mode so booking,
             # fund-growth and recycle assertions stay valid (booking itself is mode-independent).
             event_refresh_enabled=False,
+            # Budget assertions here predate the buy-side fee haircut, which has its own suite
+            # (test_range_inventory_ladder_fee_headroom.py) -- pin it off.
+            fee_rate=Decimal("0"),
         )
         defaults.update(config_overrides)
         config = RangeInventoryLadderConfig(**defaults)
@@ -305,7 +308,8 @@ class TestPartAFees(_V13Harness):
     def test_fee_fallback_used_when_connector_reports_none(self):
         # custom_info carries no fee and there is no in-flight order -> derive from fee_rate.
         in_flight = {}
-        ctrl = self._ctrl(in_flight=in_flight, owned_quote="300", owned_base="0")  # fee_rate default 0.002
+        ctrl = self._ctrl(in_flight=in_flight, owned_quote="300", owned_base="0")
+        ctrl.config.fee_rate = Decimal("0.002")  # harness pins 0; this test IS about the fallback
         ctrl.executors_info = [_cust_exec("buy_321", TradeType.BUY, "321", "B1",
                                           filled_base="0.1", filled_quote="32")]  # no fees key
         self._book(ctrl)
