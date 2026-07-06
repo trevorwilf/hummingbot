@@ -909,6 +909,9 @@ class RangeInventoryLadderController(ControllerBase):
     SUPPORTED_STATE_SCHEMA_VERSIONS = {6, 7, 8, 9, 10}
     STATE_MAX_FUTURE_SKEW_SECONDS = Decimal("86400")  # 1 day
     INITIALIZATION_UNAVAILABLE_BALANCE_TOLERANCE = Decimal("0.00000001")
+    # How long a wallet-over-ledger surplus must persist (not settling) before the
+    # understatement diagnostic warns. Diagnostic only -- the ledger is never raised.
+    LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS = 1800.0
 
 
     def __init__(self, config: RangeInventoryLadderConfig, *args, **kwargs):
@@ -1029,6 +1032,12 @@ class RangeInventoryLadderController(ControllerBase):
         # per reseed token, not per cycle.
         self._reseed_deferred_warned_token: Optional[str] = None
 
+        # Ledger-understatement diagnostic (the inverse of the over-claim): timestamp the
+        # wallet-over-ledger surplus first exceeded the threshold, plus its own warning
+        # rate-limit timestamp. Deliberately NOT shared with the over-claim warning state.
+        self._understatement_since: Optional[float] = None
+        self._last_understatement_warning_time: float = 0.0
+
 
     @property
     def state_path(self) -> Path:
@@ -1134,6 +1143,7 @@ class RangeInventoryLadderController(ControllerBase):
             free_buy_budget_quote=p.get("free_buy_budget_quote", Decimal("0")),
             free_sell_budget_base=p.get("free_sell_budget_base", Decimal("0")),
             buy_fee_headroom_quote=p.get("buy_fee_headroom_quote", Decimal("0")),
+            ledger_surplus_quote=p.get("ledger_surplus_quote", Decimal("0")),
             ledger_funded_budgets=p.get("ledger_funded_budgets", bool(self.config.ledger_funded_budgets)),
             owned_quote_free=p.get("owned_quote_free", Decimal("0")),
             owned_base_free=p.get("owned_base_free", Decimal("0")),
@@ -2266,6 +2276,7 @@ class RangeInventoryLadderController(ControllerBase):
             "free_buy_budget_quote": Decimal("0"),
             "free_sell_budget_base": Decimal("0"),
             "buy_fee_headroom_quote": Decimal("0"),
+            "ledger_surplus_quote": Decimal("0"),
             "blocked_level_ids": self._recently_closed_level_ids(),
             "initial_fund_value_quote": Decimal("0"),
             "fund_growth_quote": Decimal("0"),
@@ -3078,6 +3089,51 @@ class RangeInventoryLadderController(ControllerBase):
                 overclaim_quote=str(ledger_overclaim_quote),
             )
 
+        # Ledger-understatement diagnostic (the INVERSE of the over-claim): a missed final
+        # SELL fill understates owned_quote, and the v12 re-anchor is deliberately downward-
+        # only, so understated proceeds strand outside the fund silently. This surfaces a
+        # SUSTAINED wallet-over-ledger surplus for visibility. DIAGNOSTIC ONLY -- the ledger
+        # is never auto-corrected upward: a legitimate idle reserve or deposit also produces
+        # surplus, so this is a visibility aid, not an error.
+        ledger_surplus_quote = (
+            max(Decimal("0"), wallet_derived_quote - owned_quote)
+            + max(Decimal("0"), wallet_derived_base - owned_base) * reference_price
+        )
+        if balance_settling:
+            # Defer while balances settle -- the persistence timer is neither advanced nor
+            # reset, so a genuine surplus first seen during settling resumes counting on the
+            # first post-settle cycle.
+            pass
+        elif ledger_surplus_quote > RECONCILIATION_ALERT_THRESHOLD_QUOTE:
+            if self._understatement_since is None:
+                self._understatement_since = now_ts
+            elif (
+                (now_ts - self._understatement_since) >= self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS
+                and (now_ts - self._last_understatement_warning_time) >= self._drift_warning_interval
+            ):
+                self._last_understatement_warning_time = now_ts
+                self.logger().warning(
+                    f"{self.config.id}: possible ledger understatement — the wallet has held "
+                    f"{ledger_surplus_quote} quote more than the fills-only ledger owns for over "
+                    f"{self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS:.0f}s. "
+                    f"owned_quote={owned_quote} wallet_derived_quote={wallet_derived_quote} "
+                    f"owned_base={owned_base} wallet_derived_base={wallet_derived_base}. "
+                    "This is expected if you hold reserve/deposits; investigate only if this "
+                    "grew after fills (a missed fill leaves proceeds stranded outside the fund)."
+                )
+                self._emit_structured(
+                    "range_ladder_ledger_understatement_suspected",
+                    owned_quote=str(owned_quote),
+                    owned_base=str(owned_base),
+                    wallet_derived_quote=str(wallet_derived_quote),
+                    wallet_derived_base=str(wallet_derived_base),
+                    surplus_quote=str(ledger_surplus_quote),
+                    threshold_quote=str(RECONCILIATION_ALERT_THRESHOLD_QUOTE),
+                    persistence_seconds=self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS,
+                )
+        else:
+            self._understatement_since = None
+
         self._cycles_seen += 1
 
         active_buy_reserved_quote = self._active_reserved_quote_for_buys()
@@ -3202,6 +3258,7 @@ class RangeInventoryLadderController(ControllerBase):
             "free_buy_budget_quote": free_buy_budget_quote,
             "free_sell_budget_base": free_sell_budget_base,
             "buy_fee_headroom_quote": self._last_buy_fee_headroom_quote,
+            "ledger_surplus_quote": ledger_surplus_quote,
             "ledger_funded_budgets": bool(self.config.ledger_funded_budgets),
             "owned_quote_free": owned_quote_free,
             "owned_base_free": owned_base_free,
@@ -4463,6 +4520,7 @@ class RangeInventoryLadderController(ControllerBase):
             "free_buy_budget_quote": str(p["free_buy_budget_quote"]),
             "free_sell_budget_base": str(p["free_sell_budget_base"]),
             "buy_fee_headroom_quote": str(p.get("buy_fee_headroom_quote", Decimal("0"))),
+            "ledger_surplus_quote": str(p.get("ledger_surplus_quote", Decimal("0"))),
             "ledger_funded_budgets": str(p.get("ledger_funded_budgets", self.config.ledger_funded_budgets)),
             "owned_quote_free": str(p.get("owned_quote_free", Decimal("0"))),
             "owned_base_free": str(p.get("owned_base_free", Decimal("0"))),
