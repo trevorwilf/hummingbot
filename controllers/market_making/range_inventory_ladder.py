@@ -1072,11 +1072,28 @@ class RangeInventoryLadderController(ControllerBase):
         # once per _DIAG_SIZE_CHECK_INTERVAL_S so the stat doesn't run on every event).
         self._diag_last_size_check_ts: float = 0.0
 
+        # State-path anchoring: the relative Path("data") default resolved to an absolute
+        # path once at first use (logged so an unexpected CWD is visible post-mortem), and
+        # a once-per-process flag for the <state>.owner contention-marker check.
+        self._state_path_abs: Optional[Path] = None
+        self._state_owner_checked: bool = False
+
 
     @property
     def state_path(self) -> Path:
         file_name = self.config.state_file_name or f"range_inventory_ladder_{self.config.id}.json"
         return Path("data") / file_name
+
+    @property
+    def state_path_abs(self) -> Path:
+        """state_path resolved to an absolute path ONCE at first use, so post-mortems can
+        tell which file a controller actually wrote when the CWD was not the expected one."""
+        if self._state_path_abs is None:
+            try:
+                self._state_path_abs = self.state_path.resolve()
+            except OSError:
+                self._state_path_abs = self.state_path.absolute()
+        return self._state_path_abs
 
     @property
     def diagnostic_log_path(self) -> Path:
@@ -1291,8 +1308,21 @@ class RangeInventoryLadderController(ControllerBase):
     def _mark_bypass_cooldown_for_level(self, level_id: Optional[str]):
         if not level_id:
             return
+        # The bypass must outlive the SIDE's real cooldown: with a per-side cooldown
+        # configured longer than the legacy cooldown_time, a flat cooldown_time+1 bypass
+        # would expire before the side's cooldown lapsed. Derive from the level's side;
+        # an unknown prefix conservatively takes the longer of the two.
+        if level_id.startswith("buy_"):
+            side_cooldown = self.config.effective_buy_cooldown_time
+        elif level_id.startswith("sell_"):
+            side_cooldown = self.config.effective_sell_cooldown_time
+        else:
+            side_cooldown = max(
+                self.config.effective_buy_cooldown_time,
+                self.config.effective_sell_cooldown_time,
+            )
         self._cooldown_bypass_until_by_level[level_id] = (
-            self.market_data_provider.time() + max(1, self.config.cooldown_time + 1)
+            self.market_data_provider.time() + max(1, side_cooldown + 1)
         )
 
     def _should_bypass_level_cooldown(self, level_id: Optional[str]) -> bool:
@@ -1542,8 +1572,55 @@ class RangeInventoryLadderController(ControllerBase):
 
         self._state_loaded = True
 
+    def _ensure_state_owner_marker(self):
+        """First-save sidecar `<state>.owner` marker (controller id + PID + start timestamp).
+        A marker already written by a DIFFERENT controller id means two controllers are
+        pointed at ONE state file and are corrupting each other's ledger -- warn loudly and
+        emit range_ladder_state_file_contention, but do NOT block (warn-only by design).
+        Exception-safe: marker problems never block a state save."""
+        if self._state_owner_checked:
+            return
+        self._state_owner_checked = True
+        try:
+            marker = Path(f"{self.state_path}.owner")
+            if marker.exists():
+                try:
+                    existing = json.loads(marker.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = {}
+                existing_id = existing.get("controller_id")
+                if existing_id and existing_id != self.config.id:
+                    self.logger().warning(
+                        f"{self.config.id}: STATE FILE CONTENTION -- {self.state_path_abs} is marked "
+                        f"as owned by controller '{existing_id}' (pid={existing.get('pid')}, "
+                        f"started_at={existing.get('started_at')}). Two controllers sharing one "
+                        "state file corrupt each other's ledger. Continuing anyway (warn-only)."
+                    )
+                    self._emit_structured(
+                        "range_ladder_state_file_contention",
+                        state_file=str(self.state_path),
+                        state_file_abs=str(self.state_path_abs),
+                        marker_controller_id=existing_id,
+                        marker_pid=existing.get("pid"),
+                        marker_started_at=existing.get("started_at"),
+                    )
+            marker.write_text(
+                json.dumps(
+                    {
+                        "controller_id": self.config.id,
+                        "pid": os.getpid(),
+                        "started_at": self.market_data_provider.time(),
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     def _save_state(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_state_owner_marker()
         fd, tmp_path = tempfile.mkstemp(dir=str(self.state_path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -3379,6 +3456,7 @@ class RangeInventoryLadderController(ControllerBase):
                 connector=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 diagnostic_log_path=self.diagnostic_log_path,
+                state_file_abs=str(self.state_path_abs),
                 max_session_duration_hours=self.config.max_session_duration_hours,
                 max_market_data_unavailable_seconds=self.config.max_market_data_unavailable_seconds,
             )
