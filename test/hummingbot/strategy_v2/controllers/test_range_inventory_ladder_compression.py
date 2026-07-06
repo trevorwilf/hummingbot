@@ -239,6 +239,13 @@ class TestDetermineExecutorActionsDefersCreates(unittest.TestCase):
         controller._emit_structured = MagicMock()
         controller.executors_info = [mock_executor]
 
+        # Bind the REAL side-lookup helper (Phase 7) so it routes through the mocked
+        # _find_executor_by_id / _executor_side above, exactly like the old inline lookup.
+        controller._executor_side_by_id = (
+            RangeInventoryLadderController._executor_side_by_id.__get__(
+                controller, RangeInventoryLadderController
+            )
+        )
         controller.determine_executor_actions = (
             RangeInventoryLadderController.determine_executor_actions.__get__(
                 controller, RangeInventoryLadderController

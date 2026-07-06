@@ -3371,6 +3371,15 @@ class RangeInventoryLadderController(ControllerBase):
                 return executor
         return None
 
+    def _executor_side_by_id(self, executor_id: str) -> Optional[TradeType]:
+        """Side of the executor with this id, or None when the id does not resolve (a stop
+        action can race an executors_info refresh; a missing executor is neither side and
+        must not crash the cycle)."""
+        executor = self._find_executor_by_id(executor_id)
+        if executor is None:
+            return None
+        return self._executor_side(executor)
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         # v12 Issue 3: reset the side-specific defer flags every cycle so a cycle with no
         # stops never inherits a stale defer from a previous one.
@@ -3387,12 +3396,12 @@ class RangeInventoryLadderController(ControllerBase):
         # cancelled orders on the SAME side (the original compression rationale).
         if stop_actions:
             has_buy_stops = any(
-                self._executor_side(self._find_executor_by_id(a.executor_id)) == TradeType.BUY
+                self._executor_side_by_id(a.executor_id) == TradeType.BUY
                 for a in stop_actions
                 if hasattr(a, 'executor_id')
             )
             has_sell_stops = any(
-                self._executor_side(self._find_executor_by_id(a.executor_id)) == TradeType.SELL
+                self._executor_side_by_id(a.executor_id) == TradeType.SELL
                 for a in stop_actions
                 if hasattr(a, 'executor_id')
             )
