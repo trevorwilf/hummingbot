@@ -1485,7 +1485,24 @@ class RangeInventoryLadderController(ControllerBase):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self._state, f, indent=2, sort_keys=True)
+                # Flush + fsync BEFORE the atomic replace: without it, a host power loss can
+                # leave a torn/zero-length state file, and the quarantine path would then
+                # re-initialize from the current wallet -- silently resetting seed_value_quote
+                # and the ledger baseline.
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, str(self.state_path))
+            # Also fsync the parent directory so the rename itself is durable (POSIX). On
+            # platforms where directories cannot be opened/fsynced (e.g. Windows), this is a
+            # silent no-op -- the file-content fsync above is the load-bearing part.
+            try:
+                dir_fd = os.open(str(self.state_path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         except BaseException:
             try:
                 os.unlink(tmp_path)
