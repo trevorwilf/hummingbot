@@ -191,10 +191,10 @@ RATE_LIMITS = [
                              LinkedLimitWeightPair(ORDERS_24HR, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
 
+    # /getorder is a read-only status poll: it must NOT draw from the ORDERS pools, or
+    # status polling during refresh waves starves create/cancel capacity.
     RateLimit(limit_id=ORDER_INFO_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 4),
-                             LinkedLimitWeightPair(ORDERS, 1),
-                             LinkedLimitWeightPair(ORDERS_24HR, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)])
 ]
 

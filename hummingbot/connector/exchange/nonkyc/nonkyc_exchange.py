@@ -1306,6 +1306,11 @@ class NonkycExchange(ExchangePyBase):
                                 percent_token=fee_token,
                                 flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
                             )
+                            # Derive maker/taker the same way as the REST poll path
+                            # (side vs triggeredBy; default taker when either is missing)
+                            _side = str(message_params.get("side", "")).lower()
+                            _triggered_by = str(message_params.get("triggeredBy", "")).lower()
+                            _is_taker = (_side == _triggered_by) if (_side and _triggered_by) else True
                             trade_update = TradeUpdate(
                                 trade_id=str(message_params["tradeId"]),
                                 client_order_id=client_order_id,
@@ -1316,6 +1321,7 @@ class NonkycExchange(ExchangePyBase):
                                 fill_quote_amount=Decimal(message_params["tradeQuantity"]) * Decimal(message_params["tradePrice"]),
                                 fill_price=Decimal(message_params["tradePrice"]),
                                 fill_timestamp=message_params["updatedAt"] * 1e-3,
+                                is_taker=_is_taker,
                                 received_timestamp_ms=int(time.time() * 1e3),
                                 source_channel="ws",
                             )
@@ -1339,7 +1345,7 @@ class NonkycExchange(ExchangePyBase):
                                     fill_price=str(message_params["tradePrice"]),
                                     fill_amount=str(message_params["tradeQuantity"]),
                                     exchange_timestamp_ms=message_params["updatedAt"],
-                                    is_taker=True,
+                                    is_taker=_is_taker,
                                     best_bid=_best_bid, best_ask=_best_ask,
                                     balance_settling=self._balance_settling)
                             except Exception:
@@ -1494,6 +1500,10 @@ class NonkycExchange(ExchangePyBase):
 
                 if self._last_poll_timestamp > 0:
                     params["since"] = query_time
+                else:
+                    # First poll: /account/trades is GLOBAL, so omitting `since` pulls the
+                    # account's entire trade history on startup. Floor to the last 3 days.
+                    params["since"] = int((self._time_synchronizer.time() - 3 * 24 * 3600) * 1e3)
                 tasks.append(self._api_get(
                     path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
                     params=params,
