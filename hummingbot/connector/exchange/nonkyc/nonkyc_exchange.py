@@ -783,7 +783,10 @@ class NonkycExchange(ExchangePyBase):
         CANCEL_REQUEST_TIMEOUT = 15.0
         t_start = time.monotonic()
         try:
-            async with asyncio.timeout(CANCEL_REQUEST_TIMEOUT):
+            # async_timeout (not asyncio.timeout): asyncio.timeout needs Python >= 3.11 while
+            # the env pin allows resolving lower; async_timeout raises asyncio.TimeoutError so
+            # the except clause below is unchanged. Keeps parity with cancel_all.
+            async with timeout(CANCEL_REQUEST_TIMEOUT):
                 cancel_result = await self._api_post(
                     path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
                     data=api_params,

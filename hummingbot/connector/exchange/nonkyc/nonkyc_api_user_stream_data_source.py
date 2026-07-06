@@ -1,6 +1,8 @@
 import asyncio
 from typing import TYPE_CHECKING, List, Optional
 
+from async_timeout import timeout
+
 from hummingbot.connector.exchange.nonkyc import nonkyc_constants as CONSTANTS
 from hummingbot.connector.exchange.nonkyc.nonkyc_auth import NonkycAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -108,9 +110,12 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 auth_message: WSJSONRequest = WSJSONRequest(payload=auth_payload)
                 await ws.send(auth_message)
 
-                # Wait for auth response with hard timeout on silent sockets
+                # Wait for auth response with hard timeout on silent sockets.
+                # async_timeout (not asyncio.timeout): asyncio.timeout needs Python >= 3.11
+                # while the env pin allows resolving lower; async_timeout raises
+                # asyncio.TimeoutError so the except clause below is unchanged.
                 try:
-                    async with asyncio.timeout(base_timeout * attempt):
+                    async with timeout(base_timeout * attempt):
                         async for ws_response in ws.iter_messages():
                             data = ws_response.data
                             if not isinstance(data, dict):
