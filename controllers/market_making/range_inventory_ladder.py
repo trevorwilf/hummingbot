@@ -363,6 +363,29 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # Rotation for the diagnostic JSONL: without a cap, multi-week sessions on the same
+    # file grow unbounded (synchronous appends in the async loop get slower with size).
+    diagnostic_log_max_bytes: int = Field(
+        default=52_428_800,  # 50 MB
+        description=(
+            "Rotate the diagnostic JSONL when it exceeds this many bytes "
+            "(name.jsonl -> name.jsonl.1, shifting older backups up)."
+        ),
+        json_schema_extra={
+            "prompt": "Maximum diagnostic JSONL size in bytes before rotation (default 52428800 = 50 MB): ",
+            "prompt_on_new": False,
+            "is_updatable": False,
+        },
+    )
+    diagnostic_log_backup_count: int = Field(
+        default=3,
+        description="How many rotated diagnostic JSONL backups (.1, .2, ...) to keep.",
+        json_schema_extra={
+            "prompt": "How many rotated diagnostic JSONL backups to keep (default 3): ",
+            "prompt_on_new": False,
+            "is_updatable": False,
+        },
+    )
 
     # v12 Part B: fast directional recycle window. While open, the targeted side's
     # per-level cooldowns are bypassed so the offsetting order from the proceeds of a
@@ -692,6 +715,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     def validate_recycle_max_latency_seconds(cls, value: int):
         if value <= 0:
             raise ValueError("recycle_max_latency_seconds must be greater than zero")
+        return value
+
+    @field_validator("diagnostic_log_max_bytes", "diagnostic_log_backup_count")
+    @classmethod
+    def validate_diagnostic_log_rotation(cls, value: int, info: ValidationInfo):
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be greater than zero")
         return value
 
     @field_validator("ledger_overclaim_reanchor_seconds")
@@ -1038,6 +1068,10 @@ class RangeInventoryLadderController(ControllerBase):
         self._understatement_since: Optional[float] = None
         self._last_understatement_warning_time: float = 0.0
 
+        # Diagnostic JSONL rotation: last time the file size was stat()ed (throttled to
+        # once per _DIAG_SIZE_CHECK_INTERVAL_S so the stat doesn't run on every event).
+        self._diag_last_size_check_ts: float = 0.0
+
 
     @property
     def state_path(self) -> Path:
@@ -1061,11 +1095,40 @@ class RangeInventoryLadderController(ControllerBase):
             return [RangeInventoryLadderController._json_safe(v) for v in value]
         return value
 
+    _DIAG_SIZE_CHECK_INTERVAL_S = 60.0
+
+    def _maybe_rotate_diagnostic_log(self):
+        """Rotate the diagnostic JSONL when it exceeds diagnostic_log_max_bytes:
+        name.jsonl -> .1, shifting .1 -> .2 etc., deleting beyond
+        diagnostic_log_backup_count. The size stat is throttled to once per
+        _DIAG_SIZE_CHECK_INTERVAL_S. Exception-safe by contract: any failure is swallowed
+        and the append proceeds against the current file."""
+        try:
+            now = self.market_data_provider.time()
+            if (now - self._diag_last_size_check_ts) < self._DIAG_SIZE_CHECK_INTERVAL_S:
+                return
+            self._diag_last_size_check_ts = now
+            path = self.diagnostic_log_path
+            if not path.exists() or path.stat().st_size <= int(self.config.diagnostic_log_max_bytes):
+                return
+            keep = int(self.config.diagnostic_log_backup_count)
+            oldest = Path(f"{path}.{keep}")
+            if oldest.exists():
+                oldest.unlink()
+            for n in range(keep - 1, 0, -1):
+                rotated = Path(f"{path}.{n}")
+                if rotated.exists():
+                    os.replace(str(rotated), f"{path}.{n + 1}")
+            os.replace(str(path), f"{path}.1")
+        except Exception:
+            pass
+
     def _write_diagnostic_event(self, event_type: str, **payload):
         if not self.config.diagnostic_log_enabled:
             return
         try:
             self.diagnostic_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._maybe_rotate_diagnostic_log()
             record = {
                 "ts_ms": int(self.market_data_provider.time() * 1e3),
                 "event_type": event_type,
