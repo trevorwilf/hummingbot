@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from collections import OrderedDict
 from decimal import Decimal, DivisionByZero, InvalidOperation
@@ -418,12 +419,18 @@ class NonkycExchange(ExchangePyBase):
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception).lower()
-        is_time_related = any(phrase in error_description for phrase in [
-            "nonce",
-            "timestamp",
-            "time",
-            "clock",
-        ])
+        # A request TIMEOUT is a latency problem, not a clock/nonce problem. The exclusion is
+        # checked FIRST: "timeout"/"timed out" contain the substring "time" and previously
+        # triggered the 2s private-REST nonce cooldown plus a time-sync retry on every REST
+        # timeout -- compounding latency exactly during exchange slowdowns.
+        if "timeout" in error_description or "timed out" in error_description:
+            return False
+        is_time_related = (
+            "nonce" in error_description
+            or "timestamp" in error_description
+            or "clock" in error_description
+            or re.search(r"\btime\b", error_description) is not None
+        )
         if is_time_related:
             self._on_nonce_error_detected()
         return is_time_related
