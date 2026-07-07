@@ -24,6 +24,7 @@ from hummingbot.connector.exchange.gate_io.gate_io_utils import GateIOConfigMap
 from hummingbot.connector.exchange.kraken.kraken_utils import KrakenConfigMap
 from hummingbot.connector.exchange.kucoin.kucoin_utils import KuCoinConfigMap
 from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES, RateOracle
+from hummingbot.core.rate_oracle.sources.failover_rate_source import DEFAULT_FAILOVER_PRIORITY, FailoverRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.utils.kill_switch import ActiveKillSwitch, KillSwitch, PassThroughKillSwitch
 
@@ -663,6 +664,39 @@ class DeriveRateSourceMode(ExchangeRateSourceModeBase):
     model_config = ConfigDict(title="derive")
 
 
+class FailoverRateSourceMode(RateSourceModeBase):
+    """A POOL of rate sources tried in preference order with automatic failover: the
+    instance keeps trying sources until one is available; when the active one goes down
+    (3 consecutive failed fetches) it re-scans from the top of the list. At strategy start
+    the exchanges the instance actually trades on are prepended to the pool when a matching
+    rate source exists (see TradingCore / FailoverRateSource.set_preferred_exchanges)."""
+    name: str = Field(default="failover")
+    priority: List[str] = Field(
+        default=list(DEFAULT_FAILOVER_PRIORITY),
+        description=(
+            "Comma-delimited rate sources tried in order after the instance's own "
+            f"exchange, e.g. {','.join(DEFAULT_FAILOVER_PRIORITY)}"
+        ),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "List of comma-delimited rate sources in preference order "
+                f"(default: {','.join(DEFAULT_FAILOVER_PRIORITY)})"
+            ),
+        },
+    )
+    model_config = ConfigDict(title="failover")
+
+    def build_rate_source(self) -> RateSourceBase:
+        return FailoverRateSource(priority=self.priority)
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def validate_priority(cls, value: Union[str, List[str]]):
+        if isinstance(value, str):
+            value = [entry.strip() for entry in value.split(",") if entry.strip()]
+        return value
+
+
 RATE_SOURCE_MODES = {
     AscendExRateSourceMode.model_config["title"]: AscendExRateSourceMode,
     BinanceRateSourceMode.model_config["title"]: BinanceRateSourceMode,
@@ -677,6 +711,7 @@ RATE_SOURCE_MODES = {
     HyperliquidPerpetualRateSourceMode.model_config["title"]: HyperliquidPerpetualRateSourceMode,
     DeriveRateSourceMode.model_config["title"]: DeriveRateSourceMode,
     MexcRateSourceMode.model_config["title"]: MexcRateSourceMode,
+    FailoverRateSourceMode.model_config["title"]: FailoverRateSourceMode,
 }
 
 
