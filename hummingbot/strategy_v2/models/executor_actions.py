@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Optional, TypeVar
 
 from pydantic import BaseModel
@@ -19,6 +20,11 @@ class CreateExecutorAction(ExecutorAction):
     Action to create an executor.
     """
     executor_config: ExecutorConfigType
+    # Optional hint for the budget preflight: if a resize would shrink this order below
+    # min_fill_ratio * amount, DROP it instead of placing a dust-sized order (the
+    # originating controller retries at full size once balances settle). None keeps the
+    # legacy resize behavior.
+    min_fill_ratio: Optional[Decimal] = None
 
 
 class StopExecutorAction(ExecutorAction):

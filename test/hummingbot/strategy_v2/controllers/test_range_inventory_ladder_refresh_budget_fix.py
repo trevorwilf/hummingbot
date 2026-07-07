@@ -146,6 +146,9 @@ class _Harness(unittest.TestCase):
             sell_cooldown_time=120,
             ledger_overclaim_reanchor_seconds=999_999,
             fee_rate=Decimal("0"),  # budget math asserted exactly; fee headroom has its own suite
+            # These lifecycle tests assert tight cancel->recreate timing; the post-cancel
+            # balance gate has its own suite (test_range_inventory_ladder_preflight_retry).
+            post_cancel_balance_timeout_seconds=0,
         )
         defaults.update(config_overrides)
         config = RangeInventoryLadderConfig(**defaults)

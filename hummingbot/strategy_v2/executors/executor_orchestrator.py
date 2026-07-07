@@ -635,22 +635,37 @@ class ExecutorOrchestrator:
                     use_all_or_none = is_perpetual
                     adjusted = budget_checker.adjust_candidate_and_lock_available_collateral(
                         candidate, all_or_none=use_all_or_none)
-                    if adjusted.amount == Decimal("0"):
+                    # Dust-resize rule: an action may declare a minimum fill ratio; a resize
+                    # below it becomes a DROP so a dust-sized order never burns the level
+                    # (the controller retries at full size once balances settle).
+                    min_fill_ratio = getattr(action, "min_fill_ratio", None)
+                    dust_resize = (
+                        min_fill_ratio is not None
+                        and Decimal("0") < adjusted.amount < config.amount * min_fill_ratio
+                    )
+                    if adjusted.amount == Decimal("0") or dust_resize:
                         dropped_actions.append(action)
+                        reason = "resize_below_min_fill_ratio" if dust_resize else "insufficient_balance"
                         self.logger().warning(
                             f"BUDGET PREFLIGHT DROP: controller={action.controller_id} "
                             f"pair={config.trading_pair} side={config.side.name} "
                             f"amount={config.amount} price={price} on {connector_name} — "
-                            f"insufficient balance, order dropped entirely"
+                            + (f"resize to {adjusted.amount} is below min_fill_ratio "
+                               f"{min_fill_ratio}, order dropped for full-size retry"
+                               if dust_resize else "insufficient balance, order dropped entirely")
                         )
                         try:
                             get_structured_logger().emit("budget_preflight_dropped",
                                 controller_id=action.controller_id,
                                 trading_pair=config.trading_pair, side=config.side.name,
                                 proposed_amount=str(config.amount), proposed_price=str(price),
+                                adjusted_amount=str(adjusted.amount),
+                                reason=reason,
                                 connector=connector_name)
                         except Exception:
                             pass
+                        self._notify_controller_preflight(
+                            action, "dropped", config.amount, adjusted.amount, reason)
                     elif adjusted.amount != config.amount:
                         _original_amount = config.amount
                         self.logger().warning(
@@ -670,6 +685,8 @@ class ExecutorOrchestrator:
                                 connector=connector_name)
                         except Exception:
                             pass
+                        self._notify_controller_preflight(
+                            action, "resized", _original_amount, adjusted.amount, "insufficient_balance")
                     else:
                         surviving_actions.append(action)
                 except Exception as e:
@@ -677,6 +694,8 @@ class ExecutorOrchestrator:
                         f"Budget preflight failed for action on {config.trading_pair}: {e}. "
                         f"Dropping action (fail-closed).")
                     dropped_actions.append(action)
+                    self._notify_controller_preflight(
+                        action, "dropped", getattr(config, "amount", None), None, "preflight_error")
 
             budget_checker.reset_locked_collateral()
 
@@ -691,6 +710,27 @@ class ExecutorOrchestrator:
             )
 
         return surviving_actions
+
+    def _notify_controller_preflight(self, action, result: str, original_amount, adjusted_amount, reason: str):
+        """Inform the originating controller that the budget preflight dropped or resized one
+        of its create actions, so it can retry instead of inferring failure from executor
+        absence. Best-effort and opt-in: controllers expose on_budget_preflight_result();
+        anything missing or raising is swallowed so the action pipeline is never affected."""
+        try:
+            controllers = getattr(self.strategy, "controllers", None) or {}
+            controller = controllers.get(action.controller_id)
+            handler = getattr(controller, "on_budget_preflight_result", None)
+            if handler is None:
+                return
+            handler(
+                action=action,
+                result=result,
+                original_amount=original_amount,
+                adjusted_amount=adjusted_amount,
+                reason=reason,
+            )
+        except Exception as e:
+            self.logger().debug(f"Preflight controller notification failed: {e}")
 
     def _log_balance_snapshot(self, connector_name: str, trading_pair: str, context: str):
         """Log a complete balance snapshot for the given connector and trading pair."""
