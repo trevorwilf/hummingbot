@@ -485,8 +485,13 @@ class TradingCore:
             # Start the trading execution loop
             await self._start_strategy_execution()
 
-            # Start rate oracle (required for PNL calculation)
-            RateOracle.get_instance().start()
+            # Start rate oracle (required for PNL calculation). A failover-pool source is
+            # told which exchanges this instance trades on so it favors their oracles first.
+            rate_oracle = RateOracle.get_instance()
+            rate_source = rate_oracle.source
+            if self.markets and hasattr(rate_source, "set_preferred_exchanges"):
+                rate_source.set_preferred_exchanges(list(self.markets.keys()))
+            rate_oracle.start()
 
             self._strategy_running = True
 

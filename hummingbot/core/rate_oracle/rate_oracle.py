@@ -16,6 +16,7 @@ from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source imp
 from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
 from hummingbot.core.rate_oracle.sources.derive_rate_source import DeriveRateSource
 from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
+from hummingbot.core.rate_oracle.sources.failover_rate_source import FailoverRateSource
 from hummingbot.core.rate_oracle.sources.gate_io_rate_source import GateIoRateSource
 from hummingbot.core.rate_oracle.sources.hyperliquid_perpetual_rate_source import HyperliquidPerpetualRateSource
 from hummingbot.core.rate_oracle.sources.hyperliquid_rate_source import HyperliquidRateSource
@@ -45,6 +46,7 @@ RATE_ORACLE_SOURCES = {
     "mexc": MexcRateSource,
     "nonkyc": NonkycRateSource,
     "pacifica_perpetual": PacificaPerpetualRateSource,
+    "failover": FailoverRateSource,
 }
 
 
