@@ -58,6 +58,9 @@ def _make_controller(post_refresh_settle_seconds=0, now_ts=1_000.0, executors=No
     controller._active_order_executors = MagicMock(return_value=executors or [])
     controller._mark_bypass_cooldown_for_level = MagicMock()
     controller._emit_structured = MagicMock()
+    # Preflight-retry fix seams: no dust stops queued, no wave records in these tests.
+    controller._reconcile_stop_ids = set()
+    controller._refresh_wave = {"buy": None, "sell": None}
 
     # Bind real methods
     from range_inventory_ladder import RangeInventoryLadderController as _R
