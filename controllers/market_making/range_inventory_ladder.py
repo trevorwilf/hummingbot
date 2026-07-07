@@ -234,6 +234,22 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # Zero-level deadlock watchdog (event_refresh_enabled=True): if a side has NO live order
+    # executors while its effective budget could fund a rebuild (the plan is non-empty), force
+    # that side dirty after this many seconds so an empty ladder can never sit idle until the
+    # global timer. An armed per-side cooldown is respected (its lapse re-centers the side
+    # anyway); cooldowns only arm on fills, so they can never hold an empty side indefinitely.
+    empty_side_watchdog_seconds: int = Field(
+        default=60,
+        json_schema_extra={
+            "prompt": (
+                "Seconds an empty-but-fundable ladder side may sit idle before the watchdog "
+                "forces a re-place (default 60): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     cooldown_time: int = Field(
         default=30,
         json_schema_extra={
@@ -689,6 +705,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             raise ValueError(f"{validation_info.field_name} cannot be negative")
         return value
 
+    @field_validator("empty_side_watchdog_seconds")
+    @classmethod
+    def validate_empty_side_watchdog_seconds(cls, value: int):
+        if value <= 0:
+            raise ValueError("empty_side_watchdog_seconds must be greater than zero")
+        return value
+
     @field_validator("max_session_duration_hours")
     @classmethod
     def validate_max_session_duration_hours(cls, value: Decimal):
@@ -933,12 +956,41 @@ class RangeInventoryLadderController(ControllerBase):
     NOT raise the managed baseline. To change the baseline: deposit to the intended amount, then
     either set reseed_fund_from_wallet_once=True (bump reseed_generation to re-arm), or stop the
     bot, fund the wallet, quarantine/remove the state file, and restart (re-init from wallet).
+
+    REFRESH BUDGET FIX (2026-07, after the 2026-07-07 live Kraken XMR-USD deadlock):
+    - Fix 1 (deterministic refresh budget): every refresh cancel wave records the cancelled
+      executors' reservations in a per-side "refresh wave" record. While the wave is
+      unresolved, the deploy budgets credit back (a) the reservations of the cancelled
+      executors still live/shutting down (exact, from the controller's own reservation
+      ledger) and (b) up to the recorded release against the CACHED wallet hold
+      (min(released, held)) -- so the rebuild is sized from the funds the cancels return,
+      never waiting on the exchange balance poll. Both credits shrink automatically as the
+      cancels complete and the wallet cache refreshes, so nothing is ever double-counted.
+      Logged at INFO as `refresh budget: free=X + released_reservations=Y = effective=Z`.
+    - Fix 2 (`post_refresh_settle_seconds`, default 0): the already-wired settle window
+      (cancel wave first, quiet period, then re-place) is verified and covered by tests;
+      the primary fix works with this at 0.
+    - Fix 3 (zero-level watchdog, `empty_side_watchdog_seconds`, default 60): a side with
+      zero live order executors whose effective budget could fund a rebuild is forced
+      dirty after the watchdog interval (WARNING + structured event). An armed per-side
+      cooldown is respected at most once -- cooldowns only arm on fills, so they can never
+      hold an empty ladder empty indefinitely.
+    - Fix 4 (deferred creates re-proposed): issued rebuilds are tracked on the wave record;
+      if the orchestrator drops the creates (stop/create conflict deferral), the side is
+      re-marked dirty and the ladder re-proposed on the next cycle once the conflicting
+      stops have cleared -- newest refresh always supersedes older pending proposals.
+    - Fix 5 (compression guard): a refresh whose candidate set is EMPTY while live orders
+      exist and the effective budget could fund at least one level ABORTS (keeps the
+      resting orders, WARNING) instead of cancelling into nothing.
     """
 
     STATE_SCHEMA_VERSION = 10
     SUPPORTED_STATE_SCHEMA_VERSIONS = {6, 7, 8, 9, 10}
     STATE_MAX_FUTURE_SKEW_SECONDS = Decimal("86400")  # 1 day
     INITIALIZATION_UNAVAILABLE_BALANCE_TOLERANCE = Decimal("0.00000001")
+    # A refresh-wave record older than this is dropped regardless of state -- a backstop so
+    # a wave that never resolves (e.g. plan permanently empty) cannot credit budgets forever.
+    REFRESH_WAVE_TTL_SECONDS = 900.0
     # How long a wallet-over-ledger surplus must persist (not settling) before the
     # understatement diagnostic warns. Diagnostic only -- the ledger is never raised.
     LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS = 1800.0
@@ -1077,6 +1129,26 @@ class RangeInventoryLadderController(ControllerBase):
         # a once-per-process flag for the <state>.owner contention-marker check.
         self._state_path_abs: Optional[Path] = None
         self._state_owner_checked: bool = False
+
+        # Refresh-wave records (refresh budget fix 1 + deferred-create re-propose fix 4).
+        # Per side: None, or a dict with
+        #   released       Decimal -- sum of the cancelled executors' reservations at cancel
+        #                  time (quote for buys, base for sells); fixed for the wave's life.
+        #   cancelled_ids  set     -- executor ids cancelled by this wave.
+        #   started_ts     float   -- wave start (cancel emission), for the TTL backstop.
+        #   issued_ts      float|None -- when the rebuild's creates were last emitted.
+        #   issued_count   int     -- how many creates the last emission carried.
+        #   attempts       int     -- re-propose attempts after the orchestrator dropped them.
+        #   last_log       tuple|None -- latch for the INFO budget log (log on change only).
+        self._refresh_wave: Dict[str, Optional[dict]] = {"buy": None, "sell": None}
+        # Wallet/ledger credits applied by the CURRENT cycle's budget computation (read by
+        # _side_rebuild_budget_* so the planner never double-counts the wave's reservations).
+        self._wave_ledger_credit_quote: Decimal = Decimal("0")
+        self._wave_ledger_credit_base: Decimal = Decimal("0")
+
+        # Zero-level deadlock watchdog (fix 3): per side, when the side first became
+        # empty-but-fundable (None while healthy).
+        self._side_empty_since: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
 
     @property
@@ -1224,6 +1296,8 @@ class RangeInventoryLadderController(ControllerBase):
             free_sell_budget_base=p.get("free_sell_budget_base", Decimal("0")),
             buy_fee_headroom_quote=p.get("buy_fee_headroom_quote", Decimal("0")),
             ledger_surplus_quote=p.get("ledger_surplus_quote", Decimal("0")),
+            refresh_wave_release_buy_quote=p.get("refresh_wave_release_buy_quote", Decimal("0")),
+            refresh_wave_release_sell_base=p.get("refresh_wave_release_sell_base", Decimal("0")),
             ledger_funded_budgets=p.get("ledger_funded_budgets", bool(self.config.ledger_funded_budgets)),
             owned_quote_free=p.get("owned_quote_free", Decimal("0")),
             owned_base_free=p.get("owned_base_free", Decimal("0")),
@@ -2434,6 +2508,8 @@ class RangeInventoryLadderController(ControllerBase):
             "free_sell_budget_base": Decimal("0"),
             "buy_fee_headroom_quote": Decimal("0"),
             "ledger_surplus_quote": Decimal("0"),
+            "refresh_wave_release_buy_quote": Decimal("0"),
+            "refresh_wave_release_sell_base": Decimal("0"),
             "blocked_level_ids": self._recently_closed_level_ids(),
             "initial_fund_value_quote": Decimal("0"),
             "fund_growth_quote": Decimal("0"),
@@ -2660,6 +2736,210 @@ class RangeInventoryLadderController(ControllerBase):
         self._sell_reservation_sources = counts
         return total
 
+    # ------------------------------------------------------------------ refresh-wave budget fix
+    # A refresh cancel wave releases the cancelled orders' collateral, but the release is
+    # visible only asynchronously: the executors linger in SHUTTING_DOWN (still counted as
+    # reserved) and the CACHED wallet balances lag the exchange by up to a balance poll.
+    # Sizing the rebuild from the raw free budget in that window collapsed the live Kraken
+    # ladder (free_sell_budget_base=7E-8 while 1.06 XMR sat in the outgoing orders). The wave
+    # record lets the budget computation credit back exactly what the wave releases, from the
+    # controller's OWN ledger -- never waiting on exchange balance updates.
+
+    def _wave_reservation_of(self, executor: ExecutorInfo, side: TradeType) -> Decimal:
+        """The reservation a wave credits for one executor: remaining quote for buys,
+        remaining base for sells (same source as _active_reserved_*)."""
+        _, remaining_base, remaining_quote, _ = self._remaining_open_order_amounts(executor)
+        return remaining_quote if side == TradeType.BUY else remaining_base
+
+    def _record_refresh_wave_cancels(self, side: TradeType, executors: List[ExecutorInfo],
+                                     now: float, accumulate: bool = False):
+        """Start (or, for the legacy per-executor path, extend) the side's wave record with
+        the reservations of the executors being cancelled by this refresh."""
+        side_name = "buy" if side == TradeType.BUY else "sell"
+        released = Decimal("0")
+        cancelled_ids: Set[str] = set()
+        for executor in executors:
+            released += max(Decimal("0"), self._wave_reservation_of(executor, side))
+            cancelled_ids.add(executor.id)
+        existing = self._refresh_wave.get(side_name)
+        if accumulate and existing is not None:
+            existing["released"] += released
+            existing["cancelled_ids"] |= cancelled_ids
+            existing["started_ts"] = now
+            return
+        self._refresh_wave[side_name] = {
+            "released": released,
+            "cancelled_ids": cancelled_ids,
+            "started_ts": now,
+            "issued_ts": None,
+            "issued_count": 0,
+            "attempts": 0,
+            "last_log": None,
+        }
+
+    def _note_side_creates_issued(self, side_name: str, count: int, now: float):
+        """Record that a rebuild's creates were emitted for a side. Creates a released=0 wave
+        record for cancel-less rebuilds (initial placement, watchdog re-place) so a dropped
+        proposal is re-proposed there too."""
+        record = self._refresh_wave.get(side_name)
+        if record is None:
+            record = {
+                "released": Decimal("0"),
+                "cancelled_ids": set(),
+                "started_ts": now,
+                "issued_ts": None,
+                "issued_count": 0,
+                "attempts": 0,
+                "last_log": None,
+            }
+            self._refresh_wave[side_name] = record
+        record["issued_ts"] = now
+        record["issued_count"] = count
+
+    def _wave_cancels_in_flight(self, side_name: str) -> bool:
+        """True while any executor cancelled by this side's refresh wave is still
+        live/shutting down. The side's rebuild must WAIT for them: their levels are still
+        blocked, so placing early would concentrate the whole credited budget into the few
+        unblocked rungs and deform the ladder into one oversized order."""
+        record = self._refresh_wave.get(side_name)
+        if not record or not record["cancelled_ids"]:
+            return False
+        side = TradeType.BUY if side_name == "buy" else TradeType.SELL
+        return any(
+            executor.id in record["cancelled_ids"] and self._executor_side(executor) == side
+            for executor in self._order_executors_active_or_shutting_down()
+        )
+
+    def _wave_still_held(self, side_name: str) -> Decimal:
+        """EXACT ledger-side credit: the reservations of this wave's cancelled executors that
+        are STILL live/shutting down (i.e. still counted inside active_*_reserved). Shrinks to
+        zero on its own as the cancels complete."""
+        record = self._refresh_wave.get(side_name)
+        if not record or not record["cancelled_ids"]:
+            return Decimal("0")
+        side = TradeType.BUY if side_name == "buy" else TradeType.SELL
+        total = Decimal("0")
+        for executor in self._order_executors_active_or_shutting_down():
+            if executor.id in record["cancelled_ids"] and self._executor_side(executor) == side:
+                total += max(Decimal("0"), self._wave_reservation_of(executor, side))
+        return total
+
+    def _reconcile_refresh_waves(self, now: float, allow_repropose: bool):
+        """Wave lifecycle: TTL backstop, resolution once the rebuild is LIVE, and (fix 4) the
+        deferred-create re-propose. Called with allow_repropose=False from
+        update_processed_data (pure bookkeeping before budgets) and True from
+        determine_executor_actions (may re-mark a side dirty before the stop/create pass)."""
+        for side_name, side in (("buy", TradeType.BUY), ("sell", TradeType.SELL)):
+            record = self._refresh_wave.get(side_name)
+            if record is None:
+                continue
+            if (now - record["started_ts"]) > self.REFRESH_WAVE_TTL_SECONDS:
+                self.logger().warning(
+                    f"{self.config.id}: refresh wave ({side_name}) expired unresolved after "
+                    f"{self.REFRESH_WAVE_TTL_SECONDS:.0f}s (released={record['released']}, "
+                    f"attempts={record['attempts']}). Dropping the budget credit."
+                )
+                self._refresh_wave[side_name] = None
+                continue
+            if record["issued_ts"] is None:
+                continue  # cancels out, rebuild not yet issued -- the dirty flag drives it
+            side_executors = [e for e in self._order_executors_active_or_shutting_down()
+                              if self._executor_side(e) == side]
+            new_live = [e for e in side_executors if e.id not in record["cancelled_ids"]]
+            if new_live:
+                # The rebuild materialized -- the wave is resolved and budgets return to the
+                # standard computation.
+                self._refresh_wave[side_name] = None
+                continue
+            if not allow_repropose:
+                continue
+            dirty = self._buy_side_dirty if side_name == "buy" else self._sell_side_dirty
+            if dirty:
+                continue  # a newer trigger owns this side; it supersedes the pending creates
+            old_still_closing = [e for e in side_executors if e.id in record["cancelled_ids"]]
+            if old_still_closing:
+                continue  # the orchestrator would defer again while these stops are in flight
+            plan = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
+            if not plan:
+                self._refresh_wave[side_name] = None
+                continue  # nothing to place anymore (regime/budget moved on)
+            # Creates were emitted but never materialized (orchestrator deferred them on a
+            # stop/create conflict and never re-proposed) -- re-propose now.
+            record["attempts"] += 1
+            age = now - record["issued_ts"]
+            self._mark_side_dirty(side_name, "deferred_creates_repropose")
+            self.logger().info(
+                f"{self.config.id}: re-proposing {record['issued_count']} deferred create "
+                f"action(s) on the {side_name} side (deferral age {age:.1f}s, "
+                f"attempt {record['attempts']})."
+            )
+            self._emit_structured(
+                "range_ladder_deferred_creates_reproposed",
+                side=side_name,
+                deferred_count=record["issued_count"],
+                deferral_age_s=round(age, 3),
+                attempt=record["attempts"],
+                planned_levels=len(plan),
+            )
+
+    def _run_empty_side_watchdog(self, now: float):
+        """Zero-level deadlock watchdog (fix 3). A side with NO live/shutting-down order
+        executors whose effective budget can fund a rebuild (its plan is non-empty) is forced
+        dirty after empty_side_watchdog_seconds, so an empty ladder can never sit idle until
+        the 12h global timer (the 2026-07-07 deadlock). An armed per-side cooldown is
+        respected -- its lapse re-centers the side anyway, and cooldowns only arm on fills,
+        so an empty side's cooldown can never re-arm (respected at most once)."""
+        if not self.config.event_refresh_enabled:
+            return  # legacy mode re-places from the free budget every cycle by design
+        if self._market_data_hard_pause or self._session_expired:
+            self._side_empty_since = {"buy": None, "sell": None}
+            return
+        if not self.processed_data or not self.processed_data.get("initialization_ready", True) \
+                or not self.processed_data.get("market_data_ready", True):
+            return
+        if now < self._refresh_quiet_until:
+            return  # post-refresh settle window: creates are deliberately paused
+        for side_name, side, dirty, cooldown_armed in (
+            ("buy", TradeType.BUY, self._buy_side_dirty, self._buy_cooldown_armed),
+            ("sell", TradeType.SELL, self._sell_side_dirty, self._sell_cooldown_armed),
+        ):
+            side_executors = [e for e in self._order_executors_active_or_shutting_down()
+                              if self._executor_side(e) == side]
+            if side_executors or dirty:
+                self._side_empty_since[side_name] = None
+                continue
+            plan = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
+            if not plan:
+                self._side_empty_since[side_name] = None
+                continue
+            if self._side_empty_since[side_name] is None:
+                self._side_empty_since[side_name] = now
+                continue
+            empty_for = now - self._side_empty_since[side_name]
+            if empty_for < float(self.config.empty_side_watchdog_seconds):
+                continue
+            if cooldown_armed:
+                continue  # respected at most once: lapse re-centers this side by itself
+            free_buy = self.processed_data.get("free_buy_budget_quote", Decimal("0"))
+            free_sell = self.processed_data.get("free_sell_budget_base", Decimal("0"))
+            self._mark_side_dirty(side_name, "empty_side_watchdog")
+            self._side_empty_since[side_name] = now  # re-arm; no re-fire spam next cycle
+            self.logger().warning(
+                f"{self.config.id}: empty-side watchdog fired for {side_name}: the side sat "
+                f"empty for {empty_for:.1f}s with a fundable plan ({len(plan)} level(s)) and "
+                f"no pending trigger. free_buy_budget_quote={free_buy} "
+                f"free_sell_budget_base={free_sell}. Forcing a re-place."
+            )
+            self._emit_structured(
+                "range_ladder_empty_side_watchdog_fired",
+                side=side_name,
+                empty_for_s=round(empty_for, 3),
+                planned_levels=len(plan),
+                free_buy_budget_quote=str(free_buy),
+                free_sell_budget_base=str(free_sell),
+                watchdog_seconds=self.config.empty_side_watchdog_seconds,
+            )
+
     def _performance_snapshot(self) -> Dict[str, Decimal]:
         realized = Decimal("0")
         unrealized = Decimal("0")
@@ -2735,6 +3015,7 @@ class RangeInventoryLadderController(ControllerBase):
         held_quote: Decimal = Decimal("0"),
         held_base: Decimal = Decimal("0"),
         balance_settling: bool = False,
+        record_diagnostics: bool = True,
     ):
         """Size each side's deployable budget, bounded by the deploy ceiling.
 
@@ -2779,10 +3060,11 @@ class RangeInventoryLadderController(ControllerBase):
             # `held`, not as missing, so it must not trip the warning; and the warning is deferred
             # while balances are settling (a post-fill/post-reconnect race can make the cached wallet
             # transiently stale-low). The budget clamp `min(owned_free, available)` above is unchanged.
-            self._note_wallet_floor("buy", Decimal(owned_quote), avail_quote, held_quote,
-                                    buy_budget_quote, balance_settling)
-            self._note_wallet_floor("sell", Decimal(owned_base), avail_base, held_base,
-                                    sell_budget_base, balance_settling)
+            if record_diagnostics:
+                self._note_wallet_floor("buy", Decimal(owned_quote), avail_quote, held_quote,
+                                        buy_budget_quote, balance_settling)
+                self._note_wallet_floor("sell", Decimal(owned_base), avail_base, held_base,
+                                        sell_budget_base, balance_settling)
         else:
             # Legacy: raw wallet available (byte-for-byte the prior behavior).
             buy_budget_quote = avail_quote
@@ -2807,7 +3089,8 @@ class RangeInventoryLadderController(ControllerBase):
             pre_haircut_budget = buy_budget_quote
             buy_budget_quote = buy_budget_quote / (Decimal("1") + fee_rate)
             buy_fee_headroom_quote = pre_haircut_budget - buy_budget_quote
-        self._last_buy_fee_headroom_quote = buy_fee_headroom_quote
+        if record_diagnostics:
+            self._last_buy_fee_headroom_quote = buy_fee_headroom_quote
 
         active_reserved_value = (
             max(Decimal("0"), active_buy_reserved_quote)
@@ -3293,6 +3576,11 @@ class RangeInventoryLadderController(ControllerBase):
 
         self._cycles_seen += 1
 
+        # Refresh-wave bookkeeping (TTL + resolution only; re-propose runs in
+        # determine_executor_actions where it may re-mark a side dirty in time for the
+        # stop/create pass of the same tick).
+        self._reconcile_refresh_waves(now, allow_repropose=False)
+
         active_buy_reserved_quote = self._active_reserved_quote_for_buys()
         active_sell_reserved_base = self._active_reserved_base_for_sells()
 
@@ -3321,12 +3609,33 @@ class RangeInventoryLadderController(ControllerBase):
         # so the wallet-floor warning must compare owned against available + held (not available alone).
         held_quote = max(Decimal("0"), total_quote_balance - available_quote_balance)
         held_base = max(Decimal("0"), total_base_balance - available_base_balance)
+
+        # Refresh-wave budget credits (fix 1). Ledger side: the EXACT reservations of the
+        # wave's cancelled executors still live/shutting down (they inflate active_*_reserved
+        # until the cancel completes -- subtract them so owned_*_free sees the release
+        # immediately). Wallet side: the CACHED available lags the exchange by up to a balance
+        # poll after a cancel releases collateral -- credit up to the recorded release against
+        # the CACHED hold (min(released, held)); as the cache refreshes, held shrinks and the
+        # credit self-cancels, so nothing is ever double-counted in any settle ordering.
+        buy_wave = self._refresh_wave.get("buy")
+        sell_wave = self._refresh_wave.get("sell")
+        wave_ledger_credit_quote = self._wave_still_held("buy")
+        wave_ledger_credit_base = self._wave_still_held("sell")
+        wave_wallet_credit_quote = (
+            min(buy_wave["released"], held_quote) if buy_wave is not None else Decimal("0")
+        )
+        wave_wallet_credit_base = (
+            min(sell_wave["released"], held_base) if sell_wave is not None else Decimal("0")
+        )
+        self._wave_ledger_credit_quote = wave_ledger_credit_quote
+        self._wave_ledger_credit_base = wave_ledger_credit_base
+
         free_buy_budget_quote, free_sell_budget_base, throttle_scale, deploy_headroom = self._compute_deploy_budgets(
             reference_price=reference_price,
-            available_quote=available_quote_balance,
-            available_base=available_base_balance,
-            active_buy_reserved_quote=active_buy_reserved_quote,
-            active_sell_reserved_base=active_sell_reserved_base,
+            available_quote=available_quote_balance + wave_wallet_credit_quote,
+            available_base=available_base_balance + wave_wallet_credit_base,
+            active_buy_reserved_quote=max(Decimal("0"), active_buy_reserved_quote - wave_ledger_credit_quote),
+            active_sell_reserved_base=max(Decimal("0"), active_sell_reserved_base - wave_ledger_credit_base),
             deploy_ceiling=deploy_ceiling,
             owned_quote=owned_quote,
             owned_base=owned_base,
@@ -3334,6 +3643,39 @@ class RangeInventoryLadderController(ControllerBase):
             held_base=held_base,
             balance_settling=balance_settling,
         )
+
+        # INFO-log the effective refresh budget per active wave (latched on value change so a
+        # short wave logs a handful of lines, not one per tick).
+        if buy_wave is not None or sell_wave is not None:
+            raw_buy, raw_sell, _, _ = self._compute_deploy_budgets(
+                reference_price=reference_price,
+                available_quote=available_quote_balance,
+                available_base=available_base_balance,
+                active_buy_reserved_quote=active_buy_reserved_quote,
+                active_sell_reserved_base=active_sell_reserved_base,
+                deploy_ceiling=deploy_ceiling,
+                owned_quote=owned_quote,
+                owned_base=owned_base,
+                held_quote=held_quote,
+                held_base=held_base,
+                balance_settling=balance_settling,
+                record_diagnostics=False,
+            )
+            for side_name, wave, raw_free, effective, released in (
+                ("buy", buy_wave, raw_buy, free_buy_budget_quote,
+                 buy_wave["released"] if buy_wave is not None else Decimal("0")),
+                ("sell", sell_wave, raw_sell, free_sell_budget_base,
+                 sell_wave["released"] if sell_wave is not None else Decimal("0")),
+            ):
+                if wave is None:
+                    continue
+                log_signature = (str(raw_free), str(released), str(effective))
+                if wave["last_log"] != log_signature:
+                    wave["last_log"] = log_signature
+                    self.logger().info(
+                        f"{self.config.id}: refresh budget ({side_name}): free={raw_free} + "
+                        f"released_reservations={released} = effective={effective}"
+                    )
 
         # Un-reserved owned figures (the ledger-funded budget source), surfaced for diagnostics so
         # shared-account behavior is observable: owned_*_free vs the wallet available_*.
@@ -3416,6 +3758,8 @@ class RangeInventoryLadderController(ControllerBase):
             "free_sell_budget_base": free_sell_budget_base,
             "buy_fee_headroom_quote": self._last_buy_fee_headroom_quote,
             "ledger_surplus_quote": ledger_surplus_quote,
+            "refresh_wave_release_buy_quote": buy_wave["released"] if buy_wave is not None else Decimal("0"),
+            "refresh_wave_release_sell_base": sell_wave["released"] if sell_wave is not None else Decimal("0"),
             "ledger_funded_budgets": bool(self.config.ledger_funded_budgets),
             "owned_quote_free": owned_quote_free,
             "owned_base_free": owned_base_free,
@@ -3502,6 +3846,10 @@ class RangeInventoryLadderController(ControllerBase):
         self._prev_total_quote_balance = total_quote_balance
         self._prev_total_base_balance = total_base_balance
 
+        # Zero-level deadlock watchdog (fix 3): runs AFTER processed_data is assembled so the
+        # plan/budget checks see THIS cycle's effective budgets.
+        self._run_empty_side_watchdog(now)
+
         self._emit_diagnostic_heartbeat_if_due()
 
 
@@ -3526,6 +3874,13 @@ class RangeInventoryLadderController(ControllerBase):
         # stops never inherits a stale defer from a previous one.
         self._defer_buy_creates_this_cycle = False
         self._defer_sell_creates_this_cycle = False
+
+        # Fix 4: BEFORE the stop/create pass, resolve refresh waves and re-propose rebuilds
+        # whose creates the orchestrator dropped (may re-mark a side dirty for this tick).
+        self._reconcile_refresh_waves(
+            self.market_data_provider.time(),
+            allow_repropose=bool(self.config.event_refresh_enabled),
+        )
 
         actions: List[ExecutorAction] = []
         stop_actions = self.stop_actions_proposal()
@@ -3938,6 +4293,10 @@ class RangeInventoryLadderController(ControllerBase):
         p = self.processed_data or {}
         free = self._d(p.get("free_buy_budget_quote", "0"), "0")
         reserved = self._d(p.get("active_buy_reserved_quote", "0"), "0")
+        # A refresh wave's cancelled-but-still-closing reservations were already credited
+        # into `free` by the budget computation -- exclude them from the add-back so the
+        # rebuild never counts the same reservation twice.
+        reserved = max(Decimal("0"), reserved - self._wave_ledger_credit_quote)
         fee_rate = max(Decimal("0"), Decimal(self.config.fee_rate))
         return max(Decimal("0"), free + reserved / (Decimal("1") + fee_rate))
 
@@ -3946,6 +4305,8 @@ class RangeInventoryLadderController(ControllerBase):
         p = self.processed_data or {}
         free = self._d(p.get("free_sell_budget_base", "0"), "0")
         reserved = self._d(p.get("active_sell_reserved_base", "0"), "0")
+        # Exclude the wave's already-credited reservations (see _side_rebuild_budget_quote).
+        reserved = max(Decimal("0"), reserved - self._wave_ledger_credit_base)
         return max(Decimal("0"), free + reserved)
 
     def _quantize_buy_level(self, price: Decimal, order_quote: Decimal):
@@ -4101,6 +4462,11 @@ class RangeInventoryLadderController(ControllerBase):
         # bought; it waits for the BUY cooldown to lapse or the global timer (the contract).
         if self.config.event_refresh_enabled and not self._buy_side_dirty:
             return []
+        # Refresh-wave gate: while this side's cancelled orders are still closing, their
+        # levels are blocked -- placing now would concentrate the whole credited budget into
+        # the few unblocked rungs. Wait; the dirty flag keeps the rebuild owed.
+        if self._wave_cancels_in_flight("buy"):
+            return []
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
         remaining_quote_budget = self.processed_data["free_buy_budget_quote"]
@@ -4220,6 +4586,9 @@ class RangeInventoryLadderController(ControllerBase):
             return []
         # Per-side model: only (re)build the SELL side when it is dirty (see _create_buy_actions).
         if self.config.event_refresh_enabled and not self._sell_side_dirty:
+            return []
+        # Refresh-wave gate: see _create_buy_actions -- wait for this side's cancels to close.
+        if self._wave_cancels_in_flight("sell"):
             return []
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
@@ -4369,15 +4738,34 @@ class RangeInventoryLadderController(ControllerBase):
         # no eligible rung). If the planner still wants orders but none were placed this cycle
         # (e.g. the just-cancelled levels are still SHUTTING_DOWN and thus blocked), the side stays
         # dirty and retries next cycle. Sides that were deferred this cycle keep their dirty flag.
+        # Issued creates are noted on the wave record (fix 4): if the orchestrator drops them on a
+        # stop/create conflict, _reconcile_refresh_waves re-proposes them next cycle.
         if self.config.event_refresh_enabled:
             if self._buy_side_dirty and not self._defer_buy_creates_this_cycle:
-                if buy_actions or not self._plan_buy_book():
+                if buy_actions:
+                    self._note_side_creates_issued("buy", len(buy_actions), now)
                     self._buy_side_dirty = False
                     self._buy_dirty_reason = ""
+                elif not self._plan_buy_book():
+                    self._buy_side_dirty = False
+                    self._buy_dirty_reason = ""
+                    self._refresh_wave["buy"] = None  # nothing to place -> the wave is over
             if self._sell_side_dirty and not self._defer_sell_creates_this_cycle:
-                if sell_actions or not self._plan_sell_book():
+                if sell_actions:
+                    self._note_side_creates_issued("sell", len(sell_actions), now)
                     self._sell_side_dirty = False
                     self._sell_dirty_reason = ""
+                elif not self._plan_sell_book():
+                    self._sell_side_dirty = False
+                    self._sell_dirty_reason = ""
+                    self._refresh_wave["sell"] = None  # nothing to place -> the wave is over
+        else:
+            # LEGACY: creates run every cycle; note issuance so the wave record resolves once
+            # the re-placed orders are live (its budget credit then retires promptly).
+            if buy_actions and self._refresh_wave.get("buy") is not None:
+                self._note_side_creates_issued("buy", len(buy_actions), now)
+            if sell_actions and self._refresh_wave.get("sell") is not None:
+                self._note_side_creates_issued("sell", len(sell_actions), now)
 
         if not actions:
             self._emit_structured(
@@ -4437,6 +4825,55 @@ class RangeInventoryLadderController(ControllerBase):
             budget = (self._side_rebuild_budget_quote() if side == TradeType.BUY
                       else self._side_rebuild_budget_base())
             planned = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
+
+            # Compression guard (fix 5): never cancel healthy orders into an EMPTY
+            # replacement. An empty candidate set while the effective rebuild budget could
+            # fund at least one level means every rung is blocked/filtered or the sizing is
+            # off -- keep the resting book and abort this side's refresh instead of
+            # deadlocking with zero orders (the 2026-07-07 failure cancelled 8 live sells
+            # against kept_levels=[]).
+            if not planned:
+                reference_price = self._d(self.processed_data.get("reference_price", "0"), "0")
+                budget_notional = budget if side == TradeType.BUY else budget * reference_price
+                if budget_notional >= Decimal(self.config.min_order_quote):
+                    setattr(self, dirty_attr, False)
+                    setattr(self, reason_attr, "")
+                    p = self.processed_data
+                    self.logger().warning(
+                        f"{self.config.id}: aborting {side_name} refresh ({reason}): the rebuild "
+                        f"kept ZERO levels while {len(resting)} live order(s) rest and the "
+                        f"effective budget could fund at least one level -- keeping the existing "
+                        f"orders. rebuild_budget={budget} budget_notional={budget_notional} "
+                        f"free_buy_budget_quote={p.get('free_buy_budget_quote')} "
+                        f"free_sell_budget_base={p.get('free_sell_budget_base')} "
+                        f"min_order_quote={self.config.min_order_quote}"
+                    )
+                    self._emit_structured(
+                        "range_ladder_side_refresh_aborted_empty_plan",
+                        side=side_name,
+                        reason=reason,
+                        resting_levels=len(resting),
+                        rebuild_budget=str(budget),
+                        budget_notional=str(budget_notional),
+                        free_buy_budget_quote=str(p.get("free_buy_budget_quote", Decimal("0"))),
+                        free_sell_budget_base=str(p.get("free_sell_budget_base", Decimal("0"))),
+                        min_order_quote=str(self.config.min_order_quote),
+                    )
+                    continue
+
+            # Refresh-wave record (fix 1): fix the cancelled reservations BEFORE the stops go
+            # out so the rebuild's budget credits them deterministically from the controller's
+            # own ledger -- never waiting on exchange balance updates.
+            self._record_refresh_wave_cancels(side, resting, now)
+            released = self._refresh_wave[side_name]["released"]
+            free_now = (self.processed_data.get("free_buy_budget_quote", Decimal("0"))
+                        if side == TradeType.BUY
+                        else self.processed_data.get("free_sell_budget_base", Decimal("0")))
+            self.logger().info(
+                f"{self.config.id}: refresh budget ({side_name}): free={free_now} + "
+                f"released_reservations={released} = effective={budget}"
+            )
+
             for executor in resting:
                 level_id = getattr(executor.config, "level_id", "")
                 self._mark_bypass_cooldown_for_level(level_id)
@@ -4533,6 +4970,7 @@ class RangeInventoryLadderController(ControllerBase):
             # LEGACY (event_refresh_enabled=False): per-executor-age refresh -- cancel any order
             # older than executor_refresh_time.
             refresh_stopped_any = False
+            legacy_stopped: Dict[TradeType, List[ExecutorInfo]] = {TradeType.BUY: [], TradeType.SELL: []}
             for executor in active_order_executors:
                 age = now - executor.timestamp
                 if age >= self.config.executor_refresh_time:
@@ -4549,6 +4987,14 @@ class RangeInventoryLadderController(ControllerBase):
                         age_s=round(age, 3),
                     )
                     refresh_stopped_any = True
+                    executor_side = self._executor_side(executor)
+                    if executor_side in legacy_stopped:
+                        legacy_stopped[executor_side].append(executor)
+            # Refresh-wave record (fix 1) for the legacy path: the re-place next cycle sizes
+            # from the free budget, which must credit these cancels' reservations too.
+            for legacy_side, stopped_executors in legacy_stopped.items():
+                if stopped_executors:
+                    self._record_refresh_wave_cancels(legacy_side, stopped_executors, now, accumulate=True)
 
         if refresh_stopped_any and self.config.post_refresh_settle_seconds > 0:
             self._refresh_quiet_until = now + self.config.post_refresh_settle_seconds
@@ -4688,6 +5134,8 @@ class RangeInventoryLadderController(ControllerBase):
             "free_sell_budget_base": str(p["free_sell_budget_base"]),
             "buy_fee_headroom_quote": str(p.get("buy_fee_headroom_quote", Decimal("0"))),
             "ledger_surplus_quote": str(p.get("ledger_surplus_quote", Decimal("0"))),
+            "refresh_wave_release_buy_quote": str(p.get("refresh_wave_release_buy_quote", Decimal("0"))),
+            "refresh_wave_release_sell_base": str(p.get("refresh_wave_release_sell_base", Decimal("0"))),
             "ledger_funded_budgets": str(p.get("ledger_funded_budgets", self.config.ledger_funded_budgets)),
             "owned_quote_free": str(p.get("owned_quote_free", Decimal("0"))),
             "owned_base_free": str(p.get("owned_base_free", Decimal("0"))),

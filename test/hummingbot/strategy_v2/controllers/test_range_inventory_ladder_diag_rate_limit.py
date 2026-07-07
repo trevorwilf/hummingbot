@@ -48,6 +48,8 @@ def _make_buy_controller(buy_prices, blocked=None, best_bid="340"):
     # eligibility/filter-event path under test runs (these events are mode-independent).
     controller._buy_side_dirty = True
     controller._sell_side_dirty = True
+    # Refresh-wave gate: no wave in flight for these filter-event tests.
+    controller._wave_cancels_in_flight = MagicMock(return_value=False)
     controller._price_level_token = RangeInventoryLadderController._price_level_token
     for name in ("_create_buy_actions", "_buy_level_id", "_can_place_buy_level"):
         setattr(
@@ -82,6 +84,8 @@ def _make_sell_controller(sell_prices, blocked=None, best_ask="330"):
     # eligibility/filter-event path under test runs (these events are mode-independent).
     controller._buy_side_dirty = True
     controller._sell_side_dirty = True
+    # Refresh-wave gate: no wave in flight for these filter-event tests.
+    controller._wave_cancels_in_flight = MagicMock(return_value=False)
     controller._price_level_token = RangeInventoryLadderController._price_level_token
     for name in ("_create_sell_actions", "_sell_level_id", "_can_place_sell_level"):
         setattr(

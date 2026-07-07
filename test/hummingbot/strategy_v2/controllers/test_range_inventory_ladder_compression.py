@@ -238,6 +238,11 @@ class TestDetermineExecutorActionsDefersCreates(unittest.TestCase):
         controller._executor_side = MagicMock(return_value=stop_side)
         controller._emit_structured = MagicMock()
         controller.executors_info = [mock_executor]
+        controller.market_data_provider = MagicMock()
+        controller.market_data_provider.time.return_value = 1000.0
+        controller.config = MagicMock()
+        controller.config.id = "ctrl-compress"
+        controller.config.event_refresh_enabled = True
 
         # Bind the REAL side-lookup helper (Phase 7) so it routes through the mocked
         # _find_executor_by_id / _executor_side above, exactly like the old inline lookup.
