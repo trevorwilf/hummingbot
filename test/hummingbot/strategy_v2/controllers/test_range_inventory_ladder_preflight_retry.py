@@ -558,5 +558,163 @@ class TestPreflightFeedback(_Harness):
             self.assertIsNone(action.min_fill_ratio)
 
 
+# ================================ plan/budget invariant (2026-07-08 addendum)
+
+class TestPlanBudgetInvariant(_Harness):
+
+    EVENT = "range_ladder_plan_budget_invariant_violation"
+
+    def _ctrl(self):
+        balances = {"XMR": [D("1.0"), D("1.0")], "USDT": [D(100), D(100)]}
+        mdp = _make_mdp(balances=balances)
+        ctrl = self._build(mdp)
+        self._init_state(ctrl, owned_quote=100, owned_base="1.0", seed_value=435)
+        self._prime(ctrl, mdp, 1000.0)
+        return ctrl
+
+    def test_violation_warns_and_emits_once_per_window(self):
+        ctrl = self._ctrl()
+        ctrl._check_plan_budget_invariant("sell", D("1.1"), D("1.0"), "unit")
+        events = self._events(ctrl, self.EVENT)
+        self.assertEqual(1, len(events))
+        self.assertEqual("sell", events[0].kwargs["side"])
+        self.assertEqual("0.1", events[0].kwargs["excess"])
+        ctrl._check_plan_budget_invariant("sell", D("1.2"), D("1.0"), "unit")  # rate-limited
+        self.assertEqual(1, len(self._events(ctrl, self.EVENT)))
+
+    def test_within_epsilon_is_silent(self):
+        ctrl = self._ctrl()
+        ctrl._check_plan_budget_invariant("sell", D("1.0"), D("1.0"), "unit")
+        ctrl._check_plan_budget_invariant("sell", D("1.0000000001"), D("1.0"), "unit")
+        ctrl._check_plan_budget_invariant("buy", D("99.99"), D("100"), "unit")
+        self.assertEqual([], self._events(ctrl, self.EVENT))
+
+    def test_normal_refresh_and_issuance_never_violate(self):
+        # The whole 7E-8 lifecycle from the sell-wave setup: plans and issued creates are
+        # sized FROM the budget, so the invariant must stay silent end to end.
+        ctrl, mdp, balances = self._sell_wave_setup(post_cancel_balance_timeout_seconds=0)
+        self._full(ctrl, mdp, 2002.0)
+        self._full(ctrl, mdp, 2003.0)
+        self.assertEqual([], self._events(ctrl, self.EVENT))
+
+
+# ================================ 2026-07-08 session replay (quantified acceptance)
+
+class TestJuly8SessionReplay(_Harness):
+    """Replays the corrected 2026-07-08 production sequence with mocked post-cancel balance
+    staleness. Acceptance criterion from the prompt: BOTH sides must end at their FULL
+    intended ladders within the reconciliation retry window -- the buy side at all 7 rungs
+    (~$147.46 reserved, not the observed 4 rungs / $47.57), the sell side at all 8 rungs
+    (~0.92210209 XMR) -- and the plan/budget invariant must hold throughout."""
+
+    BUY_PRICES = ["333", "331.5", "330", "328.5", "327", "325.5", "324"]           # 7 rungs
+    SELL_PRICES = ["335.5", "337", "338.5", "340", "341.5", "343", "344.5", "346"]  # 8 rungs
+    OWNED_QUOTE = D("147.46")
+    OWNED_BASE = D("0.92210209")
+
+    def _session(self):
+        # Wallet at 00:56: $34.43 settled + $113.03 inside the 7 resting buys; all base
+        # inside the 7 resting sells (5E-8 settled).
+        balances = {"XMR": [self.OWNED_BASE, D("5E-8")], "USDT": [self.OWNED_QUOTE, D("34.43")]}
+        mdp = _make_mdp(balances=balances, mid=334.4, bid=334.3, ask=334.5)
+        ctrl = self._build(
+            mdp,
+            buy_prices=[Decimal(p) for p in self.BUY_PRICES],
+            buy_amounts_pct=[Decimal("1")] * 7,
+            sell_prices=[Decimal(p) for p in self.SELL_PRICES],
+            sell_amounts_pct=[Decimal("1")] * 8,
+        )
+        self._init_state(ctrl, owned_quote=str(self.OWNED_QUOTE),
+                         owned_base=str(self.OWNED_BASE), seed_value=500)
+        resting_buys = []
+        for i, price in enumerate(self.BUY_PRICES):
+            amount = (D("113.03") / 7 / D(price)).quantize(D("1e-8"))
+            resting_buys.append(_resting(f"buy_{price.rstrip('0').rstrip('.')}", TradeType.BUY,
+                                         price, str(amount), f"ob{i}"))
+        resting_sells = []
+        for i, price in enumerate(self.SELL_PRICES[:7]):   # 7 resting; the re-plan rests 8
+            amount = (self.OWNED_BASE / 7).quantize(D("1e-8"))
+            resting_sells.append(_resting(f"sell_{price.rstrip('0').rstrip('.')}", TradeType.SELL,
+                                          price, str(amount), f"os{i}"))
+        ctrl.executors_info = resting_buys + resting_sells
+        self._prime(ctrl, mdp, 1000.0)
+        return ctrl, mdp, balances, resting_buys, resting_sells
+
+    def _heal_side_to_full(self, ctrl, mdp, balances, *, side, t0, resting, released_asset,
+                           materialize_first_n):
+        """One side's 2026-07-08 shape: refresh -> cancels confirmed fast -> stale balance ->
+        gate -> issuance -> partial/zero materialization -> reconciliation heals to full."""
+        actions = self._full(ctrl, mdp, t0)
+        stops = self._stops(actions)
+        self.assertEqual({e.id for e in resting}, {a.executor_id for a in stops})
+        _terminate(resting, t0 + 1.0)                     # cancels confirmed within ~1s
+
+        actions = self._full(ctrl, mdp, t0 + 2.0)         # stale cache -> gate holds
+        self.assertEqual([], self._creates(actions))
+
+        actions = self._full(ctrl, mdp, t0 + 8.0)         # gate timeout -> full plan issued
+        issued = [a for a in self._creates(actions) if a.executor_config.side == side]
+        # ... the preflight (stale snapshot) lets only the first N through; the rest drop.
+        survivors = _materialize(issued[:materialize_first_n], prefix=f"{released_asset}m")
+        ctrl.executors_info = [e for e in ctrl.executors_info] + survivors
+
+        heal_t = t0 + 9.0
+        for _ in range(12):                               # within the retry window
+            actions = self._full(ctrl, mdp, heal_t)
+            healed = [a for a in self._creates(actions) if a.executor_config.side == side]
+            if healed:
+                survivors += _materialize(healed, prefix=f"{released_asset}h{int(heal_t)}")
+                ctrl.executors_info = [e for e in ctrl.executors_info] + survivors[-len(healed):]
+                # balances settle while the retries run
+                if released_asset == "USDT":
+                    reserved = sum((e.config.amount * e.config.price for e in survivors), D(0))
+                    balances["USDT"] = [self.OWNED_QUOTE, max(D(0), self.OWNED_QUOTE - reserved)]
+                else:
+                    reserved = sum((e.config.amount for e in survivors), D(0))
+                    balances["XMR"] = [self.OWNED_BASE, max(D(0), self.OWNED_BASE - reserved)]
+            if ctrl._refresh_wave[("buy" if side == TradeType.BUY else "sell")] is None:
+                break
+            heal_t += 16.0
+        return issued
+
+    def test_both_sides_reach_full_intended_ladders(self):
+        ctrl, mdp, balances, resting_buys, resting_sells = self._session()
+
+        # --- 00:56: sell fill -> buy-side event refresh (the side that NEVER recovered).
+        ctrl._buy_side_dirty = True
+        ctrl._buy_dirty_reason = "sell_fill"
+        self._heal_side_to_full(ctrl, mdp, balances, side=TradeType.BUY, t0=2000.0,
+                                resting=resting_buys, released_asset="USDT",
+                                materialize_first_n=4)    # observed: 4 of 7 placed
+
+        live_buys = [e for e in ctrl.executors_info
+                     if e.config.side == TradeType.BUY and e.is_active]
+        buy_reserved = sum((e.config.amount * e.config.price for e in live_buys), D(0))
+        self.assertEqual(7, len(live_buys))               # all 7 rungs, not 4
+        self.assertGreater(buy_reserved, D("146"))        # ~147.46 reserved, not 47.57
+        self.assertLessEqual(buy_reserved, self.OWNED_QUOTE)
+        self.assertIsNone(ctrl._refresh_wave["buy"])      # buy wave resolved
+
+        # --- 01:56: sell cooldown refresh; ALL 8 rungs dropped on the stale 5E-8 snapshot.
+        ctrl._sell_side_dirty = True
+        ctrl._sell_dirty_reason = "sell_cooldown_lapsed"
+        self._heal_side_to_full(ctrl, mdp, balances, side=TradeType.SELL, t0=2600.0,
+                                resting=resting_sells, released_asset="XMR",
+                                materialize_first_n=0)    # observed: dust + 7 drops
+
+        live_sells = [e for e in ctrl.executors_info
+                      if e.config.side == TradeType.SELL and e.is_active]
+        sell_reserved = sum((e.config.amount for e in live_sells), D(0))
+        self.assertEqual(8, len(live_sells))              # the full 8-rung re-plan
+        self.assertGreater(sell_reserved, D("0.9220"))    # ~0.92210209, a perfect fit
+        self.assertLessEqual(sell_reserved, self.OWNED_BASE)
+        self.assertIsNone(ctrl._refresh_wave["sell"])     # sell wave resolved
+
+        # The retracted over-planning bug: the invariant must have stayed silent throughout,
+        # and no side hit the retry cap.
+        self.assertEqual([], self._events(ctrl, "range_ladder_plan_budget_invariant_violation"))
+        self.assertEqual([], self._events(ctrl, "range_ladder_reconcile_retry_cap"))
+
+
 if __name__ == "__main__":
     unittest.main()

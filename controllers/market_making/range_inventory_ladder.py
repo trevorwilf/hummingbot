@@ -1083,6 +1083,13 @@ class RangeInventoryLadderController(ControllerBase):
       `post_cancel_balance_timeout_seconds` (default 5) elapses -- then places anyway and
       the reconciliation heals any residual preflight drops. Makes
       `post_refresh_settle_seconds` usually unnecessary (both remain available).
+    - Plan/budget invariant (2026-07-08 addendum): every refresh plan and every issued
+      create batch is checked against sum(amounts) <= effective side budget + epsilon
+      (quote notional for buys, base for sells). Expected to always hold -- the planner
+      sizes FROM the budget -- so a violation is a WARNING + structured event only
+      (rate-limited, never blocks placement): a tripwire for future sizing bugs, added
+      after the retracted "plans one rung more than owned" analysis of the 2026-07-08
+      session logs.
     """
 
     STATE_SCHEMA_VERSION = 10
@@ -1255,6 +1262,10 @@ class RangeInventoryLadderController(ControllerBase):
         # dust-sized orders (preflight-resized below preflight_min_fill_ratio of their
         # intended amount) queued for a targeted stop so their levels retry at full size.
         self._reconcile_stop_ids: Set[str] = set()
+
+        # Plan/budget invariant (2026-07-08 addendum): per-side rate-limit latch for the
+        # sum(planned) <= effective budget safety-net warning.
+        self._plan_invariant_last_warn: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
 
     @property
@@ -4643,6 +4654,36 @@ class RangeInventoryLadderController(ControllerBase):
         ratio = Decimal(self.config.preflight_min_fill_ratio)
         return ratio if ratio > Decimal("0") else None
 
+    def _check_plan_budget_invariant(self, side_name: str, planned_total: Decimal,
+                                     budget: Decimal, context: str):
+        """Safety-net invariant (2026-07-08 addendum): a side's planned/issued amounts must
+        never exceed its effective budget (quote notional for buys, base for sells). The
+        planner sizes FROM the budget, so this is expected to always hold -- a violation
+        means an upstream sizing bug. WARNING + structured event only, rate-limited; NEVER
+        blocks the refresh (placement stays bounded by the create loop and the budget
+        preflight)."""
+        epsilon = max(Decimal("1e-9"), budget * Decimal("1e-6"))
+        if planned_total <= budget + epsilon:
+            return
+        now = self.market_data_provider.time()
+        if (now - self._plan_invariant_last_warn.get(side_name, 0.0)) < self._drift_warning_interval:
+            return
+        self._plan_invariant_last_warn[side_name] = now
+        self.logger().warning(
+            f"{self.config.id}: PLAN/BUDGET INVARIANT VIOLATION ({side_name}, {context}): "
+            f"planned={planned_total} exceeds the effective budget={budget} by "
+            f"{planned_total - budget}. Placement remains bounded by the create loop and the "
+            "budget preflight -- investigate the sizing math."
+        )
+        self._emit_structured(
+            "range_ladder_plan_budget_invariant_violation",
+            side=side_name,
+            context=context,
+            planned_total=str(planned_total),
+            budget=str(budget),
+            excess=str(planned_total - budget),
+        )
+
     def _heal_scope_levels(self, side_name: str) -> Optional[Set[str]]:
         """When this side's dirty reason is a reconciliation heal, the set of level ids the
         rebuild may place (the still-unsatisfied intent); None for a normal full rebuild."""
@@ -5131,6 +5172,21 @@ class RangeInventoryLadderController(ControllerBase):
         actions.extend(buy_actions)
         actions.extend(sell_actions)
 
+        # Safety-net invariant (2026-07-08 addendum): issued creates must fit the budget.
+        if buy_actions:
+            issued_notional = sum(
+                (a.executor_config.amount * a.executor_config.price for a in buy_actions),
+                Decimal("0"),
+            )
+            self._check_plan_budget_invariant(
+                "buy", issued_notional,
+                self.processed_data.get("free_buy_budget_quote", Decimal("0")), "issued_creates")
+        if sell_actions:
+            issued_base = sum((a.executor_config.amount for a in sell_actions), Decimal("0"))
+            self._check_plan_budget_invariant(
+                "sell", issued_base,
+                self.processed_data.get("free_sell_budget_base", Decimal("0")), "issued_creates")
+
         # Per-side model: a side's refresh is complete once its rebuild has been ISSUED -- clear
         # its dirty flag so it is not rebuilt again next cycle (no self-trigger loop). We treat a
         # build as issued when it produced actions OR there is genuinely nothing to place (dust /
@@ -5230,6 +5286,18 @@ class RangeInventoryLadderController(ControllerBase):
             budget = (self._side_rebuild_budget_quote() if side == TradeType.BUY
                       else self._side_rebuild_budget_base())
             planned = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
+
+            # Safety-net invariant (2026-07-08 addendum): the plan must fit the budget.
+            if side == TradeType.BUY:
+                level_prices = {self._buy_level_id(i): p for i, p in enumerate(self.config.buy_prices)}
+                planned_total = sum(
+                    (amount * level_prices.get(level_id, Decimal("0"))
+                     for level_id, amount in planned.items()),
+                    Decimal("0"),
+                )
+            else:
+                planned_total = sum(planned.values(), Decimal("0"))
+            self._check_plan_budget_invariant(side_name, planned_total, budget, "side_refresh_plan")
 
             # Compression guard (fix 5): never cancel healthy orders into an EMPTY
             # replacement. An empty candidate set while the effective rebuild budget could
