@@ -1149,8 +1149,11 @@ class RangeInventoryLadderController(ControllerBase):
     - Pinned intent (bug 3): the intended ladder (level -> amount) is pinned ONCE at wave
       issuance. A heal re-proposes exactly the pinned missing levels at their pinned amounts
       via `_create_pinned_heal_actions` -- never re-planned or re-normalized from the shrunken
-      effective budget (the old path inflated the far rungs 0.195 -> 0.227 every attempt). A
-      genuinely newer refresh trigger supersedes and re-pins.
+      effective budget (the old path inflated the far rungs 0.195 -> 0.227 every attempt).
+      Pins adjust DOWNWARD only for confirmed fills against those levels during the heal
+      window (a dust-stopped fragment that partially filled trims its pin and the wave's
+      released credit; a fully consumed pin counts as satisfied). A genuinely newer refresh
+      trigger supersedes and re-pins.
     - Satisfaction threshold split (bug 4): the reconcile now judges a live rung against
       `reconcile_satisfied_ratio` (default 0.90), NOT preflight_min_fill_ratio (0.25) -- the
       0.25 bar let 81/40/38%-of-intent fragments pass as "satisfied" and hide forever. A rung
@@ -2985,6 +2988,7 @@ class RangeInventoryLadderController(ControllerBase):
             "last_log": None,
             # Intended-vs-live reconciliation (preflight-retry fix)
             "intended": {},          # level_id -> intended amount, pruned as levels satisfy
+            "fill_adjusted_ids": set(),  # executors whose heal-window fills already trimmed the pins
             "next_retry_ts": 0.0,    # backoff for heal retries
             "cap_warned": False,     # retry-cap WARNING latch
             "preflight_drops": 0,    # feedback events received from the budget preflight
@@ -3171,6 +3175,49 @@ class RangeInventoryLadderController(ControllerBase):
                 total += max(Decimal("0"), self._wave_reservation_of(executor, side))
         return total
 
+    def _apply_wave_fill_adjustment(self, record: dict, intended: Dict[str, Decimal],
+                                    level_id: str, executor: ExecutorInfo, side: TradeType):
+        """Bug-3 clause (reconcile-spin fix): the pinned intent adjusts DOWNWARD for base
+        confirmed filled against a level during the heal window. A dust-stopped fragment that
+        partially filled before its cancel completed must not be re-proposed at the full pin --
+        that base was already traded. Original wave cancels close BEFORE issuance, so the
+        close_ts >= issued_ts guard naturally excludes them (their remaining reservations
+        funded the pins in the first place). One-shot per executor; the wave's `released`
+        credit is trimmed by the same fill (quote for buys, base for sells) so the balance
+        gate waits for the amount that is actually coming back."""
+        status = getattr(executor, "status", None)
+        if status in (RunnableStatus.RUNNING, RunnableStatus.NOT_STARTED, RunnableStatus.SHUTTING_DOWN):
+            return  # fills are not final until the executor closes
+        issued_ts = record.get("issued_ts")
+        close_ts = getattr(executor, "close_timestamp", None)
+        if issued_ts is None or close_ts is None or close_ts < issued_ts:
+            return
+        adjusted_ids: Set[str] = record.setdefault("fill_adjusted_ids", set())
+        if executor.id in adjusted_ids or level_id not in intended:
+            return
+        adjusted_ids.add(executor.id)
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        filled_base, filled_quote, _, _ = self._sample_order_execution(executor, quote_asset, base_asset)
+        if filled_base <= Decimal("0"):
+            return
+        remaining = max(Decimal("0"), intended[level_id] - filled_base)
+        intended[level_id] = remaining
+        release_trim = filled_quote if side == TradeType.BUY else filled_base
+        record["released"] = max(Decimal("0"), record.get("released", Decimal("0")) - release_trim)
+        side_name = "buy" if side == TradeType.BUY else "sell"
+        self.logger().info(
+            f"{self.config.id}: pinned {side_name} intent at {level_id} adjusted down for a "
+            f"heal-window fill: filled_base={filled_base}, remaining intended={remaining}."
+        )
+        self._emit_structured(
+            "range_ladder_reconcile_fill_adjustment",
+            side=side_name,
+            level_id=level_id,
+            filled_base=str(filled_base),
+            remaining_intended=str(remaining),
+            released_after_trim=str(record["released"]),
+        )
+
     def _reconcile_refresh_waves(self, now: float, allow_repropose: bool):
         """Wave lifecycle + intended-vs-live reconciliation (preflight-retry fix).
 
@@ -3230,7 +3277,7 @@ class RangeInventoryLadderController(ControllerBase):
             live_statuses = (RunnableStatus.RUNNING, RunnableStatus.NOT_STARTED)
             missing: List[str] = []
             satisfied: List[str] = []
-            for level_id, intended_amount in intended.items():
+            for level_id, intended_amount in list(intended.items()):
                 live_executor = None
                 placed_elsewhere = False
                 for executor in self.executors_info:
@@ -3239,6 +3286,10 @@ class RangeInventoryLadderController(ControllerBase):
                     if self._executor_side(executor) != side:
                         continue
                     if executor.id in record["cancelled_ids"]:
+                        # Bug-3 clause: a wave-cancelled executor (e.g. a dust-stopped
+                        # fragment) that closed with a fill during the heal window trims
+                        # this level's pin -- that base was already traded.
+                        self._apply_wave_fill_adjustment(record, intended, level_id, executor, side)
                         continue
                     status = getattr(executor, "status", None)
                     if status in live_statuses:
@@ -3250,6 +3301,11 @@ class RangeInventoryLadderController(ControllerBase):
                     close_ts = getattr(executor, "close_timestamp", None)
                     if close_ts is not None and close_ts >= record["issued_ts"]:
                         placed_elsewhere = True  # placed then closed (fill/cancel) -- success
+                # Re-read the pin: a fill adjustment above may have shrunk (or consumed) it.
+                intended_amount = intended.get(level_id, intended_amount)
+                if intended_amount <= Decimal("0"):
+                    satisfied.append(level_id)  # pin fully consumed by fills -- success
+                    continue
                 if live_executor is not None:
                     live_amount = self._d(getattr(live_executor.config, "amount", "0") or "0")
                     if ratio > Decimal("0") and live_amount < intended_amount * ratio:
