@@ -251,6 +251,23 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # Reconcile-spin fix: terminal backstop for an UNDER-deployed side -- one that still holds
+    # some (e.g. fragment) orders, so the empty-side watchdog above never fires, yet has free
+    # budget that could fund at least one more full level. After this many seconds of a
+    # continuously fundable idle surplus (no pending wave, no cancels in flight, no armed
+    # cooldown) the side is forced dirty for a full re-center. Longer than the empty-side
+    # default because under-deployment is less urgent than a fully empty side.
+    underdeployed_watchdog_seconds: int = Field(
+        default=300,
+        json_schema_extra={
+            "prompt": (
+                "Seconds an under-deployed ladder side (idle free budget >= one level) may sit "
+                "before the watchdog forces a full re-center (default 300): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     # Preflight-retry fix: if the orchestrator's budget preflight would RESIZE an order below
     # this fraction of its intended amount, the order is DROPPED instead and retried at full
     # size once balances settle (a dust-sized order burns its level and defeats the
@@ -278,6 +295,23 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # Reconcile-spin fix: a LIVE level whose amount is below this fraction of its PINNED
+    # intended amount is size-mismatched (a preflight-resized fragment) -- it is stopped and
+    # re-placed at full size once the balance gate is open. Distinct from
+    # preflight_min_fill_ratio (0.25, the orchestrator's placement-time dust guard): the
+    # reconcile satisfaction bar is deliberately high (0.90) so fragments cannot masquerade
+    # as satisfied rungs. 1.0 requires exact size; values in (0, 1].
+    reconcile_satisfied_ratio: Decimal = Field(
+        default=Decimal("0.90"),
+        json_schema_extra={
+            "prompt": (
+                "Minimum fraction of the pinned intended amount a live rung must hold to count "
+                "as satisfied by the ladder reconciliation (default 0.90): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     reconcile_max_attempts: int = Field(
         default=10,
         json_schema_extra={
@@ -293,11 +327,11 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     # Makes post_refresh_settle_seconds usually unnecessary. 0 disables the gate (the forced
     # refresh still fires).
     post_cancel_balance_timeout_seconds: int = Field(
-        default=5,
+        default=15,
         json_schema_extra={
             "prompt": (
                 "Seconds to hold post-cancel placement waiting for the freed balance to appear "
-                "in the connector cache (default 5, 0=no gate): "
+                "in the connector cache (default 15, 0=no gate): "
             ),
             "prompt_on_new": False,
             "is_updatable": True,
@@ -758,11 +792,18 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             raise ValueError(f"{validation_info.field_name} cannot be negative")
         return value
 
-    @field_validator("empty_side_watchdog_seconds")
+    @field_validator("empty_side_watchdog_seconds", "underdeployed_watchdog_seconds")
     @classmethod
-    def validate_empty_side_watchdog_seconds(cls, value: int):
+    def validate_empty_side_watchdog_seconds(cls, value: int, info: ValidationInfo):
         if value <= 0:
-            raise ValueError("empty_side_watchdog_seconds must be greater than zero")
+            raise ValueError(f"{info.field_name} must be greater than zero")
+        return value
+
+    @field_validator("reconcile_satisfied_ratio")
+    @classmethod
+    def validate_reconcile_satisfied_ratio(cls, value: Decimal):
+        if not value.is_finite() or value <= Decimal("0") or value > Decimal("1"):
+            raise ValueError("reconcile_satisfied_ratio must be a finite fraction in (0, 1]")
         return value
 
     @field_validator("preflight_min_fill_ratio")
@@ -1080,7 +1121,7 @@ class RangeInventoryLadderController(ControllerBase):
     - Post-cancel balance refresh: once a wave's cancels finish closing, the controller
       fires one connector._update_balances() (connector-agnostic, best-effort) and holds
       that side's creates until the cached available balance shows the freed collateral or
-      `post_cancel_balance_timeout_seconds` (default 5) elapses -- then places anyway and
+      `post_cancel_balance_timeout_seconds` (default 15) elapses -- then places anyway and
       the reconciliation heals any residual preflight drops. Makes
       `post_refresh_settle_seconds` usually unnecessary (both remain available).
     - Plan/budget invariant (2026-07-08 addendum): every refresh plan and every issued
@@ -1090,6 +1131,43 @@ class RangeInventoryLadderController(ControllerBase):
       (rate-limited, never blocks placement): a tripwire for future sizing bugs, added
       after the retracted "plans one rung more than owned" analysis of the 2026-07-08
       session logs.
+
+    RECONCILE-SPIN FIX (2026-07-08, after the 12:58 UTC Kraken XMR/USD spin loop -- the
+    round-2 gate timed out against a still-stale balance, then the reconciliation retried
+    ~every second, placing one preflight-resized SELL fragment per pass and inflating the
+    remaining rungs each re-plan until 88% of sell inventory sat idle for 1.5h+):
+    - Backoff integrity (bug 1): on_budget_preflight_result records the drop (counter +
+      structured event) but NEVER resets next_retry_ts. The old `next_retry_ts = 0.0` reset
+      turned reconcile_retry_seconds into a tick-rate (1s) spin; heal retries now honor the
+      full flat 15s backoff unconditionally, so the cap-10 window spans >=150s.
+    - Re-arming balance gate/refresh (bug 2): the post-cancel gate and forced
+      _update_balances() were one-shot per wave. They now RE-ARM per heal attempt -- each
+      attempt requests a fresh balance snapshot and holds placement until the freed
+      collateral is actually visible (or that attempt's gate window elapses). Default
+      `post_cancel_balance_timeout_seconds` raised 5 -> 15 (REST-poll connectors like kraken
+      routinely need >5s; NonKYC's WS push is unaffected).
+    - Pinned intent (bug 3): the intended ladder (level -> amount) is pinned ONCE at wave
+      issuance. A heal re-proposes exactly the pinned missing levels at their pinned amounts
+      via `_create_pinned_heal_actions` -- never re-planned or re-normalized from the shrunken
+      effective budget (the old path inflated the far rungs 0.195 -> 0.227 every attempt). A
+      genuinely newer refresh trigger supersedes and re-pins.
+    - Satisfaction threshold split (bug 4): the reconcile now judges a live rung against
+      `reconcile_satisfied_ratio` (default 0.90), NOT preflight_min_fill_ratio (0.25) -- the
+      0.25 bar let 81/40/38%-of-intent fragments pass as "satisfied" and hide forever. A rung
+      below 0.90 of its pinned amount is stopped and re-placed at full size. During the stale
+      window (freed collateral not yet confirmed visible) wave creates go ALL-OR-NONE
+      (min_fill_ratio=1) so a preflight resize DROPS instead of leaving a fragment; normal
+      resize behavior resumes once the balance is confirmed.
+    - Under-deployment watchdog (bug 5, `underdeployed_watchdog_seconds`, default 300): the
+      empty-side watchdog required ZERO executors, which the fragments defeated. It now also
+      forces a full re-center on a NON-empty side whose free budget could fund another full
+      level continuously for the window (no pending wave, no cancels in flight, no armed
+      cooldown) -- the terminal backstop that guarantees stranded budget recovers once
+      balances settle.
+    - Log-volume bounds (bug 6): the orchestrator collapses per-level preflight WARNINGs into
+      one summary WARNING per pass (dropped + resized inline); the controller's per-level
+      feedback drops to DEBUG with a single INFO summary per heal attempt. Per-level
+      structured JSONL events keep full granularity.
     """
 
     STATE_SCHEMA_VERSION = 10
@@ -1257,6 +1335,11 @@ class RangeInventoryLadderController(ControllerBase):
         # Zero-level deadlock watchdog (fix 3): per side, when the side first became
         # empty-but-fundable (None while healthy).
         self._side_empty_since: Dict[str, Optional[float]] = {"buy": None, "sell": None}
+
+        # Reconcile-spin fix (bug 5): terminal under-deployment backstop. Per side, when the
+        # side first became under-deployed-but-fundable (non-empty, yet idle free budget can
+        # fund another full level). None while fully deployed or empty.
+        self._side_underdeployed_since: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
         # Intended-vs-live reconciliation (preflight-retry fix): executor ids of live
         # dust-sized orders (preflight-resized below preflight_min_fill_ratio of their
@@ -2886,6 +2969,7 @@ class RangeInventoryLadderController(ControllerBase):
             # More collateral is coming back: re-open the post-cancel balance gate.
             existing["balance_refresh_ts"] = None
             existing["balance_gate_done"] = False
+            existing["balance_confirmed"] = False
             return
         self._refresh_wave[side_name] = self._new_wave_record(now, released, cancelled_ids)
 
@@ -2904,9 +2988,15 @@ class RangeInventoryLadderController(ControllerBase):
             "next_retry_ts": 0.0,    # backoff for heal retries
             "cap_warned": False,     # retry-cap WARNING latch
             "preflight_drops": 0,    # feedback events received from the budget preflight
-            # Post-cancel balance refresh/gate (preflight-retry fix)
+            # Post-cancel balance refresh/gate (preflight-retry fix). balance_confirmed flips
+            # True the moment the connector's CACHED available balance actually shows the freed
+            # collateral; it stays False if the gate only opened by TIMEOUT (balance still
+            # stale) -- that is the "stale suspected" window in which wave creates go all-or-
+            # none (min_fill_ratio=1) so a preflight resize DROPS instead of leaving a fragment.
+            # Re-armed per heal attempt (reconcile-spin fix).
             "balance_refresh_ts": None,
             "balance_gate_done": False,
+            "balance_confirmed": False,
         }
 
     def _note_side_creates_issued(self, side_name: str, actions: List[CreateExecutorAction], now: float):
@@ -2915,9 +3005,13 @@ class RangeInventoryLadderController(ControllerBase):
         Creates a released=0 wave record for cancel-less rebuilds (initial placement,
         watchdog re-place) so a dropped proposal is retried there too.
 
-        A heal issuance (dirty reason "ladder_reconcile") MERGES its levels into the existing
-        intent, keeping the retry counters; any other issuance is a NEW refresh generation --
-        intent replaced, retry state reset (a newer refresh supersedes older proposals)."""
+        A heal issuance (dirty reason "ladder_reconcile") keeps the retry counters and the
+        ALREADY-PINNED per-level amounts (reconcile-spin fix): a heal re-proposes the pinned
+        ladder, so its issued amounts equal the pins and must NOT overwrite them (the
+        2026-07-08 moving-target bug re-normalized every attempt over a shrinking budget,
+        inflating the far rungs). setdefault only records a level not seen before (defensive;
+        a heal never introduces a brand-new level). Any other issuance is a NEW refresh
+        generation -- intent re-pinned, retry state reset (a newer refresh supersedes)."""
         record = self._refresh_wave.get(side_name)
         if record is None:
             record = self._new_wave_record(now, Decimal("0"), set())
@@ -2929,7 +3023,8 @@ class RangeInventoryLadderController(ControllerBase):
             if getattr(a.executor_config, "level_id", None)
         }
         if reason == "ladder_reconcile" and record["intended"]:
-            record["intended"].update(issued_intent)
+            for level_id, amount in issued_intent.items():
+                record["intended"].setdefault(level_id, amount)  # pin once; never re-normalize
         else:
             record["intended"] = issued_intent
             record["attempts"] = 0
@@ -2972,7 +3067,11 @@ class RangeInventoryLadderController(ControllerBase):
             if callable(updater):
                 result = updater()
                 if asyncio.iscoroutine(result):
-                    asyncio.ensure_future(result)
+                    try:
+                        asyncio.get_running_loop()
+                        asyncio.ensure_future(result)
+                    except RuntimeError:
+                        result.close()  # no running loop (unit test): don't leak the coroutine
             self.logger().info(
                 f"{self.config.id}: post-cancel balance refresh requested for the "
                 f"{side_name} side (released={record['released']})."
@@ -3010,7 +3109,10 @@ class RangeInventoryLadderController(ControllerBase):
         base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
         asset = quote_asset if side_name == "buy" else base_asset
         if self._safe_get_available_balance(asset) >= record["released"]:
-            record["balance_gate_done"] = True  # the freed collateral is visible -- place now
+            # The freed collateral is actually visible: open the gate AND clear the stale
+            # suspicion so normal preflight resize behavior resumes for this side.
+            record["balance_gate_done"] = True
+            record["balance_confirmed"] = True
             return False
         return True
 
@@ -3018,18 +3120,23 @@ class RangeInventoryLadderController(ControllerBase):
                                    adjusted_amount=None, reason: str = "", **_kwargs):
         """Called (best-effort) by the executor orchestrator when its budget preflight drops
         or resizes one of THIS controller's create actions. Records the failure on the side's
-        refresh wave so the intended-vs-live reconciliation retries on the next pass instead
-        of waiting out the backoff. Never raises."""
+        refresh wave (a counter + a structured event) so the intended-vs-live reconciliation
+        SEES it -- but never accelerates the retry. Resetting next_retry_ts here was the
+        2026-07-08 spin loop: a drop right after placement means the balance is still stale, so
+        retrying sooner than reconcile_retry_seconds is guaranteed to fail and only fragments
+        the ladder + floods the log. The heal backoff is honored unconditionally; the per-level
+        detail lands in the structured event and a DEBUG line, with a single INFO summary
+        emitted once per heal attempt from _reconcile_refresh_waves. Never raises."""
         try:
             config = getattr(action, "executor_config", None)
             level_id = getattr(config, "level_id", None) or ""
             side = getattr(config, "side", None)
             side_name = ("buy" if side == TradeType.BUY
                          else "sell" if side == TradeType.SELL else None)
-            self.logger().info(
+            self.logger().debug(
                 f"{self.config.id}: budget preflight {result} for {side_name or '?'} level "
                 f"{level_id or '?'} (amount {original_amount} -> {adjusted_amount}, "
-                f"reason={reason}); the ladder reconciliation will retry."
+                f"reason={reason}); the ladder reconciliation will retry on backoff."
             )
             self._emit_structured(
                 "range_ladder_preflight_feedback",
@@ -3044,8 +3151,9 @@ class RangeInventoryLadderController(ControllerBase):
                 return
             record = self._refresh_wave.get(side_name)
             if record is not None:
+                # Record the drop for visibility only; DO NOT touch next_retry_ts -- the full
+                # reconcile_retry_seconds backoff must be honored (fixes the tick-rate spin).
                 record["preflight_drops"] = record.get("preflight_drops", 0) + 1
-                record["next_retry_ts"] = 0.0  # retry on the next reconcile pass
         except Exception:
             pass
 
@@ -3071,8 +3179,8 @@ class RangeInventoryLadderController(ControllerBase):
         closed again -- a fill is success, never re-placed here). Levels never observed live
         were dropped somewhere (budget preflight against a stale balance snapshot, orchestrator
         deferral, ...) and are re-proposed with backoff up to reconcile_max_attempts per
-        refresh generation; levels observed at dust size (below preflight_min_fill_ratio of
-        intended) are stopped and re-proposed at full size. This generalizes the previous
+        refresh generation; levels observed under-sized (below reconcile_satisfied_ratio of
+        intended) are stopped and re-proposed at pinned full size. This generalizes the previous
         round's deferred-create re-propose: "1 dust order out of 9" heals exactly like
         "0 orders out of 9".
 
@@ -3112,8 +3220,13 @@ class RangeInventoryLadderController(ControllerBase):
                     self._refresh_wave[side_name] = None
                 continue
 
-            # ---- classify every intended level against the executors we can observe
-            ratio = max(Decimal("0"), Decimal(self.config.preflight_min_fill_ratio))
+            # ---- classify every intended level against the executors we can observe.
+            # Reconcile-spin fix (bug 4): satisfaction uses reconcile_satisfied_ratio (0.90),
+            # NOT preflight_min_fill_ratio (0.25). The 0.25 bar let the 2026-07-08 preflight
+            # fragments (81%/40%/38% of intent) pass as "satisfied", so the undersized rungs
+            # were invisible to healing forever. A live rung below the (high) satisfied bar is
+            # a size mismatch -- stopped and re-placed at the pinned full size.
+            ratio = max(Decimal("0"), Decimal(self.config.reconcile_satisfied_ratio))
             live_statuses = (RunnableStatus.RUNNING, RunnableStatus.NOT_STARTED)
             missing: List[str] = []
             satisfied: List[str] = []
@@ -3140,13 +3253,13 @@ class RangeInventoryLadderController(ControllerBase):
                 if live_executor is not None:
                     live_amount = self._d(getattr(live_executor.config, "amount", "0") or "0")
                     if ratio > Decimal("0") and live_amount < intended_amount * ratio:
-                        # Dust survivor (preflight resize slipped through): stop it and keep
-                        # the level in the intent so it retries at full size once closed.
+                        # Size mismatch (a preflight-resized fragment slipped through): stop it
+                        # and keep the level in the intent so it retries at pinned full size.
                         if allow_repropose and live_executor.id not in self._reconcile_stop_ids:
                             self._reconcile_stop_ids.add(live_executor.id)
                             self._record_refresh_wave_cancels(side, [live_executor], now, accumulate=True)
                             self.logger().warning(
-                                f"{self.config.id}: stopping dust-sized {side_name} order at "
+                                f"{self.config.id}: stopping under-sized {side_name} order at "
                                 f"{level_id}: live amount {live_amount} < "
                                 f"{ratio} * intended {intended_amount}. The level retries at "
                                 "full size once the cancel settles."
@@ -3158,6 +3271,7 @@ class RangeInventoryLadderController(ControllerBase):
                                 live_amount=str(live_amount),
                                 intended_amount=str(intended_amount),
                                 min_fill_ratio=str(ratio),
+                                satisfied_ratio=str(ratio),
                             )
                     else:
                         satisfied.append(level_id)
@@ -3208,6 +3322,19 @@ class RangeInventoryLadderController(ControllerBase):
 
             record["attempts"] += 1
             record["next_retry_ts"] = now + float(self.config.reconcile_retry_seconds)
+            # Reconcile-spin fix (bug 2): re-arm the post-cancel balance gate for THIS attempt.
+            # The gate + forced _update_balances() were one-shot per wave, so once the first
+            # refresh raced ahead of the exchange reflecting the freed funds, every later
+            # attempt placed ungated against the same stale snapshot. Re-opening here makes the
+            # next tick request a fresh balance snapshot and hold placement until the freed
+            # collateral is actually visible (or this attempt's own gate window elapses).
+            if record.get("cancelled_ids") and record.get("released", Decimal("0")) > Decimal("0"):
+                record["balance_refresh_ts"] = None
+                record["balance_gate_done"] = False
+                record["balance_confirmed"] = False
+                # Fire a FRESH balance refresh now (sets balance_refresh_ts) so this tick's
+                # create pass gates on the new snapshot instead of placing against the stale one.
+                self._maybe_request_post_cancel_balance_refresh(side_name, record, now)
             age = now - record["issued_ts"]
             self._mark_side_dirty(side_name, "ladder_reconcile")
             self.logger().info(
@@ -3241,17 +3368,46 @@ class RangeInventoryLadderController(ControllerBase):
                     planned_levels=len(plan),
                 )
 
+    def _side_free_budget_funds_a_level(self, side_name: str) -> bool:
+        """True when the side's FREE budget alone could fund at least one full level at/above
+        min_order_quote (buy: free quote; sell: free base x reference price). Used by the
+        under-deployment backstop to tell 'idle collateral stranded' from 'fully deployed'."""
+        p = self.processed_data or {}
+        min_quote = Decimal(self.config.min_order_quote)
+        if side_name == "buy":
+            free_quote = self._d(p.get("free_buy_budget_quote", "0"), "0")
+            return free_quote >= min_quote
+        free_base = self._d(p.get("free_sell_budget_base", "0"), "0")
+        ref_price = self._d(p.get("best_bid", "0"), "0")
+        if ref_price <= Decimal("0"):
+            ref_price = self._d(p.get("best_ask", "0"), "0")
+        if ref_price <= Decimal("0"):
+            return False
+        return free_base * ref_price >= min_quote
+
     def _run_empty_side_watchdog(self, now: float):
-        """Zero-level deadlock watchdog (fix 3). A side with NO live/shutting-down order
-        executors whose effective budget can fund a rebuild (its plan is non-empty) is forced
-        dirty after empty_side_watchdog_seconds, so an empty ladder can never sit idle until
-        the 12h global timer (the 2026-07-07 deadlock). An armed per-side cooldown is
-        respected -- its lapse re-centers the side anyway, and cooldowns only arm on fills,
-        so an empty side's cooldown can never re-arm (respected at most once)."""
+        """Deadlock / under-deployment watchdog (fix 3 + reconcile-spin fix bug 5).
+
+        EMPTY-SIDE (original): a side with NO live/shutting-down order executors whose effective
+        budget can fund a rebuild (plan non-empty) is forced dirty after
+        empty_side_watchdog_seconds, so an empty ladder can never sit idle until the 12h global
+        timer (the 2026-07-07 deadlock).
+
+        UNDER-DEPLOYED (new terminal backstop): a side that is NOT empty -- it still holds some
+        orders, so the empty-side check never fires -- but whose FREE budget could fund at least
+        one more full level is forced dirty for a FULL re-center after
+        underdeployed_watchdog_seconds. This is the guaranteed recovery path after the
+        reconcile retry cap + wave TTL both expire with a few preflight fragments stranding most
+        of a side's inventory (2026-07-08: 88% of sell inventory idle 1.5h+).
+
+        Both branches respect an armed per-side cooldown (its lapse re-centers the side anyway;
+        cooldowns only arm on fills) and yield while an unresolved refresh wave owns the side
+        (so the retry cap stays meaningful -- no order spam after it)."""
         if not self.config.event_refresh_enabled:
             return  # legacy mode re-places from the free budget every cycle by design
         if self._market_data_hard_pause or self._session_expired:
             self._side_empty_since = {"buy": None, "sell": None}
+            self._side_underdeployed_since = {"buy": None, "sell": None}
             return
         if not self.processed_data or not self.processed_data.get("initialization_ready", True) \
                 or not self.processed_data.get("market_data_ready", True):
@@ -3264,45 +3420,85 @@ class RangeInventoryLadderController(ControllerBase):
         ):
             side_executors = [e for e in self._order_executors_active_or_shutting_down()
                               if self._executor_side(e) == side]
-            if side_executors or dirty:
-                self._side_empty_since[side_name] = None
+            wave_present = self._refresh_wave.get(side_name) is not None
+
+            # -------------------------------------------------- EMPTY-SIDE branch (original)
+            if not side_executors and not dirty and not wave_present:
+                self._side_underdeployed_since[side_name] = None  # not applicable to empty side
+                plan = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
+                if not plan:
+                    self._side_empty_since[side_name] = None
+                    continue
+                if self._side_empty_since[side_name] is None:
+                    self._side_empty_since[side_name] = now
+                    continue
+                empty_for = now - self._side_empty_since[side_name]
+                if empty_for < float(self.config.empty_side_watchdog_seconds):
+                    continue
+                if cooldown_armed:
+                    continue  # respected at most once: lapse re-centers this side by itself
+                free_buy = self.processed_data.get("free_buy_budget_quote", Decimal("0"))
+                free_sell = self.processed_data.get("free_sell_budget_base", Decimal("0"))
+                self._mark_side_dirty(side_name, "empty_side_watchdog")
+                self._side_empty_since[side_name] = now  # re-arm; no re-fire spam next cycle
+                self.logger().warning(
+                    f"{self.config.id}: empty-side watchdog fired for {side_name}: the side sat "
+                    f"empty for {empty_for:.1f}s with a fundable plan ({len(plan)} level(s)) and "
+                    f"no pending trigger. free_buy_budget_quote={free_buy} "
+                    f"free_sell_budget_base={free_sell}. Forcing a re-place."
+                )
+                self._emit_structured(
+                    "range_ladder_empty_side_watchdog_fired",
+                    side=side_name,
+                    empty_for_s=round(empty_for, 3),
+                    planned_levels=len(plan),
+                    free_buy_budget_quote=str(free_buy),
+                    free_sell_budget_base=str(free_sell),
+                    watchdog_seconds=self.config.empty_side_watchdog_seconds,
+                )
                 continue
-            if self._refresh_wave.get(side_name) is not None:
-                # An unresolved refresh wave owns this side: the intended-vs-live
-                # reconciliation is retrying (or has capped out and warned). The watchdog
-                # yielding here keeps the retry cap meaningful -- no order spam after it.
-                self._side_empty_since[side_name] = None
+
+            # The side is non-empty (or busy): the empty timer never applies here.
+            self._side_empty_since[side_name] = None
+
+            # -------------------------------------------- UNDER-DEPLOYED backstop (bug 5)
+            if dirty or wave_present or cooldown_armed \
+                    or self._wave_cancels_in_flight(side_name) or not side_executors:
+                self._side_underdeployed_since[side_name] = None
+                continue
+            if not self._side_free_budget_funds_a_level(side_name):
+                self._side_underdeployed_since[side_name] = None
                 continue
             plan = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
             if not plan:
-                self._side_empty_since[side_name] = None
+                self._side_underdeployed_since[side_name] = None
                 continue
-            if self._side_empty_since[side_name] is None:
-                self._side_empty_since[side_name] = now
+            if self._side_underdeployed_since[side_name] is None:
+                self._side_underdeployed_since[side_name] = now
                 continue
-            empty_for = now - self._side_empty_since[side_name]
-            if empty_for < float(self.config.empty_side_watchdog_seconds):
+            under_for = now - self._side_underdeployed_since[side_name]
+            if under_for < float(self.config.underdeployed_watchdog_seconds):
                 continue
-            if cooldown_armed:
-                continue  # respected at most once: lapse re-centers this side by itself
             free_buy = self.processed_data.get("free_buy_budget_quote", Decimal("0"))
             free_sell = self.processed_data.get("free_sell_budget_base", Decimal("0"))
-            self._mark_side_dirty(side_name, "empty_side_watchdog")
-            self._side_empty_since[side_name] = now  # re-arm; no re-fire spam next cycle
+            self._mark_side_dirty(side_name, "underdeployed_watchdog")
+            self._side_underdeployed_since[side_name] = now  # re-arm; no re-fire spam
             self.logger().warning(
-                f"{self.config.id}: empty-side watchdog fired for {side_name}: the side sat "
-                f"empty for {empty_for:.1f}s with a fundable plan ({len(plan)} level(s)) and "
-                f"no pending trigger. free_buy_budget_quote={free_buy} "
-                f"free_sell_budget_base={free_sell}. Forcing a re-place."
+                f"{self.config.id}: under-deployment watchdog fired for {side_name}: the side "
+                f"held orders but its free budget could fund another full level for "
+                f"{under_for:.1f}s with no pending wave/cooldown. "
+                f"free_buy_budget_quote={free_buy} free_sell_budget_base={free_sell}. Forcing a "
+                "full re-center."
             )
             self._emit_structured(
-                "range_ladder_empty_side_watchdog_fired",
+                "range_ladder_underdeployed_watchdog_fired",
                 side=side_name,
-                empty_for_s=round(empty_for, 3),
+                under_for_s=round(under_for, 3),
+                live_executors=len(side_executors),
                 planned_levels=len(plan),
                 free_buy_budget_quote=str(free_buy),
                 free_sell_budget_base=str(free_sell),
-                watchdog_seconds=self.config.empty_side_watchdog_seconds,
+                watchdog_seconds=self.config.underdeployed_watchdog_seconds,
             )
 
     def _performance_snapshot(self) -> Dict[str, Decimal]:
@@ -4535,11 +4731,14 @@ class RangeInventoryLadderController(ControllerBase):
         remaining_quote_before: Decimal,
         kept_buy_indexes: List[int],
         passive_execution_strategy: ExecutionStrategy,
+        pinned_base: Optional[Decimal] = None,
     ):
         quantized_price = Decimal(
             self.market_data_provider.quantize_order_price(self.config.connector_name, self.config.trading_pair, price)
         )
-        amount = order_quote / quantized_price
+        # Reconcile-spin fix: a heal re-proposes the PINNED base amount exactly (no re-sizing
+        # from a shrunken budget). Otherwise size from the allocated quote as usual.
+        amount = pinned_base if pinned_base is not None else order_quote / quantized_price
         quantized_amount = Decimal(
             self.market_data_provider.quantize_order_amount(
                 self.config.connector_name, self.config.trading_pair, amount
@@ -4584,7 +4783,7 @@ class RangeInventoryLadderController(ControllerBase):
         return CreateExecutorAction(
             controller_id=self.config.id,
             executor_config=executor_config,
-            min_fill_ratio=self._action_min_fill_ratio(),
+            min_fill_ratio=self._action_min_fill_ratio("buy"),
         ), notional
 
     def _build_sell_executor_action(
@@ -4597,13 +4796,16 @@ class RangeInventoryLadderController(ControllerBase):
         remaining_base_before: Decimal,
         kept_sell_indexes: List[int],
         passive_execution_strategy: ExecutionStrategy,
+        pinned_base: Optional[Decimal] = None,
     ):
         quantized_price = Decimal(
             self.market_data_provider.quantize_order_price(self.config.connector_name, self.config.trading_pair, price)
         )
+        # Reconcile-spin fix: a heal re-proposes the PINNED base amount exactly.
+        base_to_place = pinned_base if pinned_base is not None else order_base
         quantized_amount = Decimal(
             self.market_data_provider.quantize_order_amount(
-                self.config.connector_name, self.config.trading_pair, order_base
+                self.config.connector_name, self.config.trading_pair, base_to_place
             )
         )
         notional = quantized_amount * quantized_price
@@ -4645,14 +4847,39 @@ class RangeInventoryLadderController(ControllerBase):
         return CreateExecutorAction(
             controller_id=self.config.id,
             executor_config=executor_config,
-            min_fill_ratio=self._action_min_fill_ratio(),
+            min_fill_ratio=self._action_min_fill_ratio("sell"),
         ), quantized_amount
 
-    def _action_min_fill_ratio(self) -> Optional[Decimal]:
+    def _action_min_fill_ratio(self, side_name: str) -> Optional[Decimal]:
         """min_fill_ratio carried on create actions so the budget preflight DROPS (for
-        full-size retry) instead of resizing an order to dust. None when disabled."""
+        full-size retry) instead of resizing an order to dust.
+
+        Reconcile-spin fix: while a cancel wave's freed collateral is NOT yet confirmed in the
+        connector's cached balance (gate active, or the gate opened only by TIMEOUT against a
+        still-stale snapshot), wave creates go ALL-OR-NONE (ratio 1) so a preflight resize
+        DROPS instead of leaving a fragment -- resize-to-fragment during that stale window is
+        exactly what stranded 88% of inventory on 2026-07-08. Once the freed funds are visible
+        (balance_confirmed), normal resize behavior at preflight_min_fill_ratio resumes.
+        Returns None only when the dust guard is disabled and no stale window is active."""
+        if self._wave_stale_suspected(side_name):
+            return Decimal("1")
         ratio = Decimal(self.config.preflight_min_fill_ratio)
         return ratio if ratio > Decimal("0") else None
+
+    def _wave_stale_suspected(self, side_name: str) -> bool:
+        """True while this side has a cancel wave whose freed collateral has not yet been
+        confirmed visible in the connector's cached available balance. Covers both the gate-
+        active window and a gate that opened by timeout with the balance still stale.
+
+        Tied to the post-cancel gate: with the gate disabled (timeout <= 0) the operator has
+        opted out of the wait-for-balance protection, so the all-or-none resize suppression is
+        off too and the normal preflight_min_fill_ratio applies."""
+        if int(self.config.post_cancel_balance_timeout_seconds) <= 0:
+            return False
+        record = self._refresh_wave.get(side_name)
+        return bool(record and record.get("cancelled_ids")
+                    and record.get("released", Decimal("0")) > Decimal("0")
+                    and not record.get("balance_confirmed"))
 
     def _check_plan_budget_invariant(self, side_name: str, planned_total: Decimal,
                                      budget: Decimal, context: str):
@@ -4694,6 +4921,68 @@ class RangeInventoryLadderController(ControllerBase):
         if not record or not record.get("intended"):
             return None
         return set(record["intended"].keys())
+
+    def _create_pinned_heal_actions(self, side_name: str, heal_scope: Set[str]) -> List[CreateExecutorAction]:
+        """Reconcile-spin fix (bug 3): a heal rebuild re-proposes ONLY the still-missing
+        intended levels, each at its PINNED base amount -- never re-planned or re-normalized
+        from the (shrunken) current budget, which was the 2026-07-08 moving-target bug that
+        inflated the far rungs every attempt. Eligibility (blocked / passivity / quantization)
+        is still enforced; a level that is temporarily ineligible stays in the intent and is
+        retried later. No budget clamp here: an unaffordable pinned order is DROPPED whole by
+        the budget preflight (min_fill_ratio=1 during the stale window) and retried at full
+        size, so a fragment can never be created."""
+        side = TradeType.BUY if side_name == "buy" else TradeType.SELL
+        record = self._refresh_wave.get(side_name)
+        intended: Dict[str, Decimal] = (record or {}).get("intended") or {}
+        blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
+        passive_execution_strategy = self._passive_execution_strategy()
+        prices = self.config.buy_prices if side == TradeType.BUY else self.config.sell_prices
+        actions: List[CreateExecutorAction] = []
+        placed_levels: List[str] = []
+        for idx, price in enumerate(prices):
+            level_id = self._buy_level_id(idx) if side == TradeType.BUY else self._sell_level_id(idx)
+            if level_id not in heal_scope:
+                continue
+            pinned = intended.get(level_id)
+            if pinned is None or pinned <= Decimal("0"):
+                continue
+            if level_id in blocked_levels:
+                continue
+            can_place = (self._can_place_buy_level(price) if side == TradeType.BUY
+                         else self._can_place_sell_level(price))
+            if not can_place:
+                continue
+            if side == TradeType.BUY:
+                action, _ = self._build_buy_executor_action(
+                    idx=idx, level_id=level_id, price=price,
+                    order_quote=pinned * price, remaining_quote_before=Decimal("0"),
+                    kept_buy_indexes=sorted(
+                        i for i in range(len(self.config.buy_prices))
+                        if self._buy_level_id(i) in heal_scope),
+                    passive_execution_strategy=passive_execution_strategy,
+                    pinned_base=pinned,
+                )
+            else:
+                action, _ = self._build_sell_executor_action(
+                    idx=idx, level_id=level_id, price=price,
+                    order_base=pinned, remaining_base_before=Decimal("0"),
+                    kept_sell_indexes=sorted(
+                        i for i in range(len(self.config.sell_prices))
+                        if self._sell_level_id(i) in heal_scope),
+                    passive_execution_strategy=passive_execution_strategy,
+                    pinned_base=pinned,
+                )
+            if action is not None:
+                actions.append(action)
+                placed_levels.append(level_id)
+        if actions:
+            self._emit_structured(
+                "range_ladder_pinned_heal_placement",
+                side=side_name,
+                levels=placed_levels,
+                pinned_amounts={lvl: str(intended[lvl]) for lvl in placed_levels},
+            )
+        return actions
 
     # ---------------------------------------------------------------- per-side refresh planner
     # The planner mirrors the create path's eligibility (passive filter) + compression + weight
@@ -4894,8 +5183,12 @@ class RangeInventoryLadderController(ControllerBase):
             return []
         # Heal scope (intended-vs-live reconciliation): a heal rebuild places ONLY the
         # still-unsatisfied intended levels -- a level that filled during the retry window is
-        # success, and re-placing it here would bypass the per-side cooldown contract.
+        # success, and re-placing it here would bypass the per-side cooldown contract. A heal
+        # takes the PINNED-amount path (bug 3): re-propose each missing level at its wave-
+        # issuance amount, never re-normalized from the current budget.
         heal_scope = self._heal_scope_levels("buy")
+        if heal_scope is not None:
+            return self._create_pinned_heal_actions("buy", heal_scope)
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
         remaining_quote_budget = self.processed_data["free_buy_budget_quote"]
@@ -5025,8 +5318,11 @@ class RangeInventoryLadderController(ControllerBase):
         # Post-cancel balance gate: see _create_buy_actions.
         if self._wave_balance_gate_active("sell"):
             return []
-        # Heal scope: see _create_buy_actions -- heal rebuilds fill only the missing rungs.
+        # Heal scope: see _create_buy_actions -- heal rebuilds fill only the missing rungs at
+        # their pinned amounts (bug 3).
         heal_scope = self._heal_scope_levels("sell")
+        if heal_scope is not None:
+            return self._create_pinned_heal_actions("sell", heal_scope)
         actions: List[CreateExecutorAction] = []
         blocked_levels: Set[str] = self.processed_data["blocked_level_ids"]
         remaining_base_budget = self.processed_data["free_sell_budget_base"]

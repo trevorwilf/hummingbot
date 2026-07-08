@@ -202,6 +202,9 @@ class _Harness(unittest.TestCase):
 
     def _sell_wave_setup(self, connector_style="kraken", **config_overrides):
         """The 19:18 shape: all base inside two resting sells, stale wallet cache."""
+        # The post_cancel gate default changed 5 -> 15 in the reconcile-spin fix; pin 5 here so
+        # these legacy timelines (gate-timeout at t+6..8) keep their meaning unless overridden.
+        config_overrides.setdefault("post_cancel_balance_timeout_seconds", 5)
         balances = {"XMR": [D(OWNED), D("7E-8")], "USDT": [D(0), D(0)]}
         mdp = _make_mdp(balances=balances, connector_style=connector_style)
         ctrl = self._build(mdp, **config_overrides)
@@ -236,40 +239,44 @@ class TestStaleBalanceRegression(_Harness):
         actions = self._full(ctrl, mdp, 2005.0)          # still stale, still inside 5s gate
         self.assertEqual([], self._creates(actions))
 
-        actions = self._full(ctrl, mdp, 2008.0)          # gate timeout -> place anyway
+        actions = self._full(ctrl, mdp, 2008.0)          # gate timeout -> place the full plan
         self.assertEqual(1, len(self._events(ctrl, "range_ladder_post_cancel_balance_gate_timeout")))
         issued = self._creates(actions)
         self.assertEqual(3, len(issued))
         intended_levels = {a.executor_config.level_id for a in issued}
+        issued_amt = {a.executor_config.level_id: a.executor_config.amount for a in issued}
         # ... and the budget preflight drops ALL of them on the stale snapshot
         # (simulated: no executor ever materializes).
 
-        actions = self._full(ctrl, mdp, 2009.0)          # heal attempt 1 (immediate)
+        # Reconcile-spin fix: heal attempt 1 RE-ARMS the balance gate (re-requesting balances)
+        # and HOLDS placement instead of spinning a fragment against the still-stale cache.
+        actions = self._full(ctrl, mdp, 2009.0)
         heals = self._events(ctrl, "range_ladder_intended_vs_live_heal")
         self.assertEqual(1, len(heals))
         self.assertEqual(sorted(intended_levels), heals[0].kwargs["missing_levels"])
-        retry_1 = self._creates(actions)
-        self.assertEqual(intended_levels, {a.executor_config.level_id for a in retry_1})
+        self.assertEqual([], self._creates(actions))                 # gated, NOT a fragment
+        self.assertGreaterEqual(connector._update_balances.call_count, 2)  # re-requested per attempt
 
-        actions = self._full(ctrl, mdp, 2012.0)          # inside the 15s backoff
-        self.assertEqual([], self._creates(actions))
-
-        # The mock balance finally catches up; the next retry is placed and materializes.
+        # The cache catches up; the gate opens and the FULL pinned ladder places at once, at
+        # the PINNED (issuance) amounts -- never re-normalized from the shrunken budget.
         balances["XMR"] = [D(OWNED), D(OWNED)]
-        actions = self._full(ctrl, mdp, 2025.0)          # heal attempt 2
-        retry_2 = self._creates(actions)
-        self.assertEqual(intended_levels, {a.executor_config.level_id for a in retry_2})
-        ctrl.executors_info = _materialize(retry_2)
+        actions = self._full(ctrl, mdp, 2010.0)
+        placed = self._creates(actions)
+        self.assertEqual(intended_levels, {a.executor_config.level_id for a in placed})
+        placed_amt = {a.executor_config.level_id: a.executor_config.amount for a in placed}
+        self.assertEqual(issued_amt, placed_amt)         # pinned intent immutability
+        self.assertLessEqual(ctrl._refresh_wave["sell"]["attempts"], 3)  # attempt count <= 3
+        ctrl.executors_info = _materialize(placed)
 
-        actions = self._full(ctrl, mdp, 2026.0)
+        actions = self._full(ctrl, mdp, 2011.0)
         self.assertEqual([], self._creates(actions))     # nothing left to heal
         self.assertIsNone(ctrl._refresh_wave["sell"])    # wave resolved
         # The final live ladder equals the intended ladder.
         live = {e.config.level_id: e.config.amount for e in ctrl.executors_info}
-        self.assertEqual({a.executor_config.level_id: a.executor_config.amount for a in retry_2}, live)
+        self.assertEqual(placed_amt, live)
         total = sum(live.values(), D(0))
         self.assertGreaterEqual(total, D(OWNED) - D("0.000003"))
-        return retry_2
+        return placed
 
     def test_kraken_style_rest_poll_balances(self):
         self._run_regression("kraken")
@@ -319,9 +326,10 @@ class TestDustResizeBackstop(_Harness):
         ctrl, mdp, balances = self._sell_wave_setup(post_cancel_balance_timeout_seconds=0)
         issued = self._creates(self._full(ctrl, mdp, 2002.0))
         keep = next(a for a in issued if a.executor_config.level_id == "sell_350")
-        # 30% of intended >= the 25% ratio -> satisfied, never stopped.
+        # Reconcile-spin fix (bug 4): the satisfaction bar is now reconcile_satisfied_ratio
+        # (0.90). A 95%-of-intended order clears it -> satisfied, never stopped.
         ok_order = _resting("sell_350", TradeType.SELL, "350",
-                            str(keep.executor_config.amount * D("0.3")), "ok0")
+                            str(keep.executor_config.amount * D("0.95")), "ok0")
         ctrl.executors_info = [ok_order]
 
         actions = self._full(ctrl, mdp, 2003.0)
@@ -523,26 +531,30 @@ class TestPartialFillDuringRetry(_Harness):
 
 class TestPreflightFeedback(_Harness):
 
-    def test_feedback_resets_backoff_for_immediate_retry(self):
+    def test_feedback_records_drop_but_never_shortens_backoff(self):
+        # Reconcile-spin fix (bug 1): a preflight drop right after placement means the balance
+        # is still stale, so retrying sooner is guaranteed to fail and only fragments the
+        # ladder + floods the log. Feedback must record the drop but NEVER reset next_retry_ts.
         ctrl, mdp, balances = self._sell_wave_setup(post_cancel_balance_timeout_seconds=0)
         issued = self._creates(self._full(ctrl, mdp, 2002.0))
         self._full(ctrl, mdp, 2003.0)                    # heal attempt 1 -> backoff to 2018
         record = ctrl._refresh_wave["sell"]
-        self.assertGreater(record["next_retry_ts"], 2003.0)
+        backoff_before = record["next_retry_ts"]
+        self.assertGreater(backoff_before, 2003.0)
 
         ctrl.on_budget_preflight_result(
             action=issued[0], result="dropped",
             original_amount=issued[0].executor_config.amount,
             adjusted_amount=Decimal("0"), reason="insufficient_balance")
 
-        self.assertEqual(0.0, record["next_retry_ts"])
+        self.assertEqual(backoff_before, record["next_retry_ts"])   # backoff UNCHANGED
         self.assertEqual(1, record["preflight_drops"])
         feedback = self._events(ctrl, "range_ladder_preflight_feedback")
         self.assertEqual(1, len(feedback))
         self.assertEqual("sell", feedback[0].kwargs["side"])
 
-        actions = self._full(ctrl, mdp, 2004.0)          # retried despite the 15s backoff
-        self.assertEqual(3, len(self._creates(actions)))
+        actions = self._full(ctrl, mdp, 2004.0)          # still inside the backoff -> no retry
+        self.assertEqual([], self._creates(actions))
 
     def test_actions_carry_min_fill_ratio(self):
         ctrl, mdp, balances = self._sell_wave_setup(post_cancel_balance_timeout_seconds=0)
@@ -623,6 +635,7 @@ class TestJuly8SessionReplay(_Harness):
             buy_amounts_pct=[Decimal("1")] * 7,
             sell_prices=[Decimal(p) for p in self.SELL_PRICES],
             sell_amounts_pct=[Decimal("1")] * 8,
+            post_cancel_balance_timeout_seconds=5,  # legacy timeline (default is now 15)
         )
         self._init_state(ctrl, owned_quote=str(self.OWNED_QUOTE),
                          owned_base=str(self.OWNED_BASE), seed_value=500)

@@ -574,6 +574,7 @@ class ExecutorOrchestrator:
 
         surviving_actions = list(ungrouped_actions)
         dropped_actions = []
+        resized_actions = []  # (action, original_amount, adjusted_amount) for the summary line
 
         for connector_name, group_actions in connector_groups.items():
             connector = self.strategy.connectors.get(connector_name)
@@ -646,7 +647,10 @@ class ExecutorOrchestrator:
                     if adjusted.amount == Decimal("0") or dust_resize:
                         dropped_actions.append(action)
                         reason = "resize_below_min_fill_ratio" if dust_resize else "insufficient_balance"
-                        self.logger().warning(
+                        # Per-level detail at DEBUG only; a single summary WARNING per preflight
+                        # pass is emitted below (the 2026-07-08 tick-rate retries otherwise
+                        # flooded hundreds of WARNING lines and truncated the main log).
+                        self.logger().debug(
                             f"BUDGET PREFLIGHT DROP: controller={action.controller_id} "
                             f"pair={config.trading_pair} side={config.side.name} "
                             f"amount={config.amount} price={price} on {connector_name} — "
@@ -668,12 +672,14 @@ class ExecutorOrchestrator:
                             action, "dropped", config.amount, adjusted.amount, reason)
                     elif adjusted.amount != config.amount:
                         _original_amount = config.amount
-                        self.logger().warning(
+                        # Per-level detail at DEBUG; folded into the summary WARNING below.
+                        self.logger().debug(
                             f"BUDGET PREFLIGHT RESIZE: controller={action.controller_id} "
                             f"pair={config.trading_pair} side={config.side.name} "
                             f"amount {config.amount} -> {adjusted.amount} on {connector_name} — "
                             f"resized due to insufficient balance"
                         )
+                        resized_actions.append((action, _original_amount, adjusted.amount))
                         config.amount = adjusted.amount
                         surviving_actions.append(action)
                         try:
@@ -699,15 +705,26 @@ class ExecutorOrchestrator:
 
             budget_checker.reset_locked_collateral()
 
-        if dropped_actions:
-            dropped_summary = ", ".join(
-                f"{a.controller_id}:{a.executor_config.trading_pair} {a.executor_config.side.name} {a.executor_config.amount}"
-                for a in dropped_actions
-            )
-            self.logger().warning(
-                f"Budget preflight: dropped {len(dropped_actions)} action(s) due to insufficient balance: "
-                f"[{dropped_summary}]"
-            )
+        # One summary WARNING per preflight pass (bug 6): the per-level lines above are DEBUG,
+        # so a spinning controller no longer floods the log. Dropped and resized levels are
+        # listed inline with their amounts; per-level structured events keep full granularity.
+        if dropped_actions or resized_actions:
+            parts = []
+            if dropped_actions:
+                dropped_summary = ", ".join(
+                    f"{a.controller_id}:{a.executor_config.trading_pair} "
+                    f"{a.executor_config.side.name} {a.executor_config.amount}"
+                    for a in dropped_actions
+                )
+                parts.append(f"dropped {len(dropped_actions)} action(s): [{dropped_summary}]")
+            if resized_actions:
+                resized_summary = ", ".join(
+                    f"{a.controller_id}:{a.executor_config.trading_pair} "
+                    f"{a.executor_config.side.name} {orig}->{adj}"
+                    for (a, orig, adj) in resized_actions
+                )
+                parts.append(f"resized {len(resized_actions)}: [{resized_summary}]")
+            self.logger().warning(f"Budget preflight adjustments — {'; '.join(parts)}")
 
         return surviving_actions
 
