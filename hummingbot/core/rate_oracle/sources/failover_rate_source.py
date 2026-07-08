@@ -7,7 +7,7 @@ from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 
 # The pool tried in order until a source delivers prices. The exchanges an instance
 # actually trades on are prepended at runtime via set_preferred_exchanges().
-DEFAULT_FAILOVER_PRIORITY = ["binance", "gate_io", "coin_gecko", "kucoin", "coin_cap", "mexc"]
+DEFAULT_FAILOVER_PRIORITY = ["gate_io", "coin_gecko", "kucoin", "coin_cap", "mexc"]
 
 # CoinCap needs a symbol->asset-id map; mirror of CoinCapRateSourceMode's default.
 DEFAULT_COIN_CAP_ASSETS_MAP = {

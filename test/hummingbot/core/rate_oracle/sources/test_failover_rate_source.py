@@ -173,7 +173,7 @@ class TestFailoverRateSource(unittest.TestCase):
         pool = FailoverRateSource()
         self.assertEqual(DEFAULT_FAILOVER_PRIORITY, pool.pool_names)
         self.assertEqual(
-            ["binance", "gate_io", "coin_gecko", "kucoin", "coin_cap", "mexc"],
+            ["gate_io", "coin_gecko", "kucoin", "coin_cap", "mexc"],
             pool.pool_names,
         )
 
