@@ -31,12 +31,25 @@ set -euo pipefail
 #     ENV CONDA_PLUGINS_USE_SHARDED_REPODATA=0
 # after every FROM, forcing the solver back to monolithic repodata.json.
 #
+# ---------------------------------------------------------------------------
+# CONTROLLER-STRATEGY SYNC
+# ---------------------------------------------------------------------------
+# After a SUCCESSFUL build, the bot fork's controllers/ tree (custom V2
+# controller strategies) is synced to the host directory hummingbot-api mounts
+# into bot containers (default: /mnt/sharedrive/apps/hummingbot/api/data/bots/
+# controllers). Bot containers never read controllers from the image -- the
+# mount shadows them -- so without this sync a rebuilt image runs with STALE
+# strategy scripts. Update/add only (never deletes), checksum-based, with
+# timestamped backups of every overwritten file.
+#
 # Usage:
 #   chmod +x Build_hummingbot_api_nonkyc.sh
 #   ./Build_hummingbot_api_nonkyc.sh              # build with defaults
 #   ./Build_hummingbot_api_nonkyc.sh --tag v2     # custom tag suffix
 #   ./Build_hummingbot_api_nonkyc.sh --no-cache   # force full Docker rebuild
 #   ./Build_hummingbot_api_nonkyc.sh --dir /tmp/x # custom working directory
+#   ./Build_hummingbot_api_nonkyc.sh --controllers-dest /path  # custom bots dir
+#   ./Build_hummingbot_api_nonkyc.sh --no-controllers-sync     # skip the sync
 # =============================================================================
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -71,6 +84,17 @@ DOCKER_BUILD_FLAGS=""
 # Name of the patched Dockerfile we generate inside the build context.
 PATCHED_DOCKERFILE="Dockerfile.nonkyc-base"
 
+# Controller-strategy sync: bot containers do NOT read controllers from the
+# image -- hummingbot-api mounts this host directory over them -- so a rebuilt
+# image alone never updates strategies. After a successful build, the bot
+# fork's controllers/ tree is synced here (update/add only, checksum-based;
+# replaced files are backed up to .backup-<timestamp>/ inside the destination;
+# nothing at the destination is ever deleted). Note: this script never clones
+# the bot fork for the image (pip installs it INSIDE Docker), so the sync does
+# its own light sparse checkout of controllers/.
+CONTROLLERS_DEST="${CONTROLLERS_DEST:-/mnt/sharedrive/apps/hummingbot/api/data/bots/controllers}"
+SYNC_CONTROLLERS=1
+
 # ── Parse CLI args ─────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
@@ -80,12 +104,18 @@ while [[ $# -gt 0 ]]; do
     --no-cache) DOCKER_BUILD_FLAGS="--no-cache"; shift ;;
     --dir)      BUILD_DIR="$2"; shift 2 ;;
     --dir=*)    BUILD_DIR="${1#*=}"; shift ;;
+    --controllers-dest)   CONTROLLERS_DEST="$2"; shift 2 ;;
+    --controllers-dest=*) CONTROLLERS_DEST="${1#*=}"; shift ;;
+    --no-controllers-sync) SYNC_CONTROLLERS=0; shift ;;
     --help|-h)
-      echo "Usage: $0 [--tag TAG] [--no-cache] [--dir BUILD_DIR]"
+      echo "Usage: $0 [--tag TAG] [--no-cache] [--dir BUILD_DIR] [--controllers-dest DIR] [--no-controllers-sync]"
       echo ""
-      echo "  --tag TAG     Docker image tag (default: latest)"
-      echo "  --no-cache    Force full Docker rebuild"
-      echo "  --dir DIR     Working directory (default: /tmp/hummingbot-api-nonkyc-build)"
+      echo "  --tag TAG               Docker image tag (default: latest)"
+      echo "  --no-cache              Force full Docker rebuild"
+      echo "  --dir DIR               Working directory (default: /tmp/hummingbot-api-nonkyc-build)"
+      echo "  --controllers-dest DIR  Where hummingbot-api keeps bot controllers"
+      echo "                          (default: $CONTROLLERS_DEST)"
+      echo "  --no-controllers-sync   Skip the post-build controller-strategy sync"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -125,6 +155,97 @@ patch_dockerfile_conda_fix() {
   ' "$src" > "$dst"
   if ! grep -q "CONDA_PLUGINS_USE_SHARDED_REPODATA" "$dst"; then
     die "Patch failed — no FROM line found in $src (unexpected Dockerfile shape)."
+  fi
+}
+
+# Fetch the bot fork's controllers/ tree so the sync has a source. This script
+# never clones the bot fork for the image itself (pip installs it INSIDE
+# Docker), so a light sparse checkout is done here; falls back to a full
+# shallow clone on older git without sparse-checkout support. Sets
+# HBOT_CONTROLLERS_SRC on success.
+fetch_controllers_source() {
+  local dir="$BUILD_DIR/hbot-controllers-src"
+  rm -rf "$dir"
+  if git clone --quiet --depth=1 --branch "$HB_BRANCH" --filter=blob:none --sparse "$HB_REPO" "$dir" 2>/dev/null \
+     && git -C "$dir" sparse-checkout set controllers 2>/dev/null; then
+    :
+  else
+    warn "Sparse clone unsupported by this git — falling back to a full shallow clone."
+    rm -rf "$dir"
+    git clone --quiet --depth=1 --branch "$HB_BRANCH" "$HB_REPO" "$dir"
+  fi
+  HBOT_CONTROLLERS_SRC="$dir/controllers"
+  ok "Controllers source at $(git -C "$dir" rev-parse --short HEAD) ($HB_BRANCH)"
+}
+
+# Sync the bot fork's controller strategy scripts into the directory
+# hummingbot-api mounts into bot containers (CONTROLLERS_DEST). Bot containers
+# never read controllers from the image -- the mount shadows them -- so this
+# keeps the live strategy scripts in lockstep with the image that was just built.
+#   - update/add ONLY: nothing at the destination is ever deleted
+#   - content comparison (cmp), not mtimes: fresh clones don't force copies
+#   - every file being overwritten is first backed up to
+#     $CONTROLLERS_DEST/.backup-<timestamp>/<same relative path>
+#   - new files inherit the destination directory's owner (containers must
+#     be able to read them) and 644 permissions
+# Never fatal: a missing source or destination logs a warning and skips.
+sync_controllers() {
+  local src="$1"
+  local dest="$CONTROLLERS_DEST"
+
+  if [ "$SYNC_CONTROLLERS" != "1" ]; then
+    log "Controller sync disabled (--no-controllers-sync)."
+    return 0
+  fi
+  if [ ! -d "$src" ]; then
+    warn "Controllers source not found: $src — skipping controller sync."
+    return 0
+  fi
+  if [ ! -d "$dest" ]; then
+    warn "Controllers destination not found: $dest — skipping controller sync."
+    warn "Set CONTROLLERS_DEST or --controllers-dest if your API data dir differs."
+    return 0
+  fi
+
+  log "Syncing controller strategies: $src -> $dest"
+  local stamp backup_dir dest_owner
+  local changed=0 added=0
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  backup_dir="$dest/.backup-$stamp"
+  dest_owner="$(stat -c '%u:%g' "$dest" 2>/dev/null || echo "")"
+
+  local srcf rel dstf
+  while IFS= read -r -d '' srcf; do
+    rel="${srcf#"$src"/}"
+    dstf="$dest/$rel"
+    if [ -f "$dstf" ] && cmp -s "$srcf" "$dstf"; then
+      continue                                    # unchanged — leave untouched
+    fi
+    if [ -f "$dstf" ]; then
+      mkdir -p "$backup_dir/$(dirname "$rel")"    # keep the replaced original
+      cp -p "$dstf" "$backup_dir/$rel"
+      changed=$((changed + 1))
+      log "    updated: $rel"
+    else
+      added=$((added + 1))
+      log "    added:   $rel"
+    fi
+    mkdir -p "$(dirname "$dstf")"
+    cp "$srcf" "$dstf"
+    chmod 644 "$dstf" 2>/dev/null || true
+    if [ -n "$dest_owner" ]; then
+      chown "$dest_owner" "$dstf" 2>/dev/null || true
+    fi
+  done < <(find "$src" -type f -name '*.py' -not -path '*/__pycache__/*' -print0)
+
+  if [ "$((changed + added))" -eq 0 ]; then
+    ok "Controllers already up to date: $dest"
+  else
+    ok "Controller sync: $changed updated, $added added -> $dest"
+    if [ "$changed" -gt 0 ]; then
+      log "  Replaced originals backed up to: $backup_dir"
+    fi
+    log "  NOTE: bots already running keep the old code until they are restarted."
   fi
 }
 
@@ -327,6 +448,18 @@ print('nonkyc present: YES')
 docker tag "$FULL_TAG" hummingbot/hummingbot-api:latest
 ok "Tagged hummingbot/hummingbot-api:latest -> $FULL_TAG"
 
+# ── Post-build: sync controller strategies to the API bots directory ───────
+# Runs only when the build fully succeeded (any die above skips this), so the
+# mounted controller scripts and the image stay in version lockstep.
+
+log "Post-build: syncing controller strategies"
+if [ "$SYNC_CONTROLLERS" = "1" ]; then
+  fetch_controllers_source
+  sync_controllers "$HBOT_CONTROLLERS_SRC"
+else
+  log "Controller sync disabled (--no-controllers-sync)."
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
@@ -338,6 +471,7 @@ echo "  API Repo:   $HB_API_REPO"
 echo "  API Branch: $HB_API_BRANCH ($HB_API_SHA)"
 echo "  HBot Fork:  $HB_REPO ($HB_BRANCH)"
 echo "  Conda Env:  $CONDA_ENV"
+echo "  Ctrl dir:   $CONTROLLERS_DEST (sync $( [ "$SYNC_CONTROLLERS" = "1" ] && echo enabled || echo disabled ))"
 echo ""
 echo "  Compose can use:"
 echo "    image: $FULL_TAG"
