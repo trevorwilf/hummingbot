@@ -529,6 +529,14 @@ from hummingbot.connector.exchange.nonkyc import nonkyc_utils; \\
 print('NonKYC connector verified:', hasattr(nonkyc_utils, 'KEYS')); \\
 "
 
+# The API code must import cleanly against the FORK's hummingbot. Upstream API
+# merges can grow imports that only newer upstream hummingbot provides (2026-07-12:
+# hummingbot.connector.gateway.gateway crash-looped every container start).
+# 'import deps' pulls every service module, so fork/API drift fails the BUILD
+# here instead of at deploy. All module-level code is side-effect-free (config
+# Settings have defaults; docker/db clients connect lazily in __init__).
+RUN cd /hummingbot-api && ${CONDA_PYTHON} -c "import deps; print('API service imports OK against fork hummingbot')"
+
 EOF
 
 # Detect the correct runtime user from the base image
@@ -579,6 +587,13 @@ if docker run --rm --entrypoint "$CONDA_PIP" "$FULL_TAG" show commlib-py > /dev/
 else
   ok "commlib-py absent"
 fi
+
+log "  Verifying API service imports against the fork's hummingbot..."
+docker run --rm --entrypoint "$CONDA_PYTHON" -w /hummingbot-api "$FULL_TAG" -c "
+import deps
+print('API service imports OK')
+" 2>&1 && ok "API import check passed" \
+  || die "API code cannot import against the fork's hummingbot — fork/API drift (see the ModuleNotFoundError above)!"
 
 log "  Verifying connector appears in exchange list..."
 docker run --rm --entrypoint "$CONDA_PYTHON" "$FULL_TAG" -c "
