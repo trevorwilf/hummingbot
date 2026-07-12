@@ -17,6 +17,17 @@ set -euo pipefail
 # Update/add only (never deletes), checksum-based, with timestamped backups of
 # every overwritten file. Control with --controllers-dest / --no-controllers-sync.
 #
+# PRE-BUILD PURGE (default ON, disable with --no-purge): before the first
+# docker build, every container -- running OR stopped -- that uses one of the
+# images this script produces (hummingbot-nonkyc:TAG, hummingbot/hummingbot:latest,
+# hummingbot-nonkyc-base:TAG) is stopped and REMOVED, and the old images are
+# deleted. A container pins its original image ID forever, so without this a
+# stopped bot could later `docker start` on a STALE build and old images pile
+# up as dangling layers. The purge runs AFTER the cheap clone/verify steps, so
+# an early failure never takes the stack down -- but once it runs, the stack
+# stays down until the build succeeds and you bring it back up (compose up /
+# redeploy bots), which then provably runs the image built here.
+#
 # IMPORTANT: psycopg2-binary is installed into the CONDA ENVIRONMENT
 # (/opt/conda/envs/hummingbot), not the base conda python. Hummingbot runs
 # inside `conda activate hummingbot`, so packages must be installed there.
@@ -81,6 +92,11 @@ PATCHED_DOCKERFILE="Dockerfile.nonkyc-base"
 CONTROLLERS_DEST="${CONTROLLERS_DEST:-/mnt/sharedrive/apps/hummingbot/api/data/bots/controllers}"
 SYNC_CONTROLLERS=1
 
+# Pre-build purge: stop + remove containers using the images this script
+# rebuilds, then delete those images, so nothing can keep running (or later
+# restart on) a stale build. See the header note. Disable with --no-purge.
+PURGE_OLD=1
+
 # ── Parse CLI args ─────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
@@ -93,8 +109,9 @@ while [[ $# -gt 0 ]]; do
     --controllers-dest)   CONTROLLERS_DEST="$2"; shift 2 ;;
     --controllers-dest=*) CONTROLLERS_DEST="${1#*=}"; shift ;;
     --no-controllers-sync) SYNC_CONTROLLERS=0; shift ;;
+    --no-purge) PURGE_OLD=0; shift ;;
     --help|-h)
-      echo "Usage: $0 [--tag TAG] [--no-cache] [--dir BUILD_DIR] [--controllers-dest DIR] [--no-controllers-sync]"
+      echo "Usage: $0 [--tag TAG] [--no-cache] [--dir BUILD_DIR] [--controllers-dest DIR] [--no-controllers-sync] [--no-purge]"
       echo ""
       echo "  --tag TAG               Docker image tag (default: latest)"
       echo "  --no-cache              Force full Docker rebuild"
@@ -102,6 +119,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --controllers-dest DIR  Where hummingbot-api keeps bot controllers"
       echo "                          (default: $CONTROLLERS_DEST)"
       echo "  --no-controllers-sync   Skip the post-build controller-strategy sync"
+      echo "  --no-purge              Do NOT stop/remove containers or delete the old"
+      echo "                          images before building (legacy behavior)"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -142,6 +161,101 @@ patch_dockerfile_conda_fix() {
   ' "$src" > "$dst"
   if ! grep -q "CONDA_PLUGINS_USE_SHARDED_REPODATA" "$dst"; then
     die "Patch failed — no FROM line found in $src (unexpected Dockerfile shape)."
+  fi
+}
+
+# Pre-build purge: stop and REMOVE every container (running or stopped) that
+# uses one of the images this script is about to rebuild, then delete the
+# images themselves. A container pins its original image ID forever, so a
+# merely-stopped container would (a) block `docker rmi` of the old image and
+# (b) silently resurrect ON THE STALE BUILD if anything ever `docker start`s
+# it. Removing the containers + images guarantees that everything brought back
+# up after this build runs the image built here.
+#
+# Containers are matched BOTH by the image name recorded at create time
+# (normalized for a docker.io/ prefix; catches containers created from this
+# tag before a rebuild reassigned it to a new ID) and by the tags' CURRENT
+# image IDs (catches containers started from a different tag on the same
+# image). Everything matched is logged before it is touched. Never fatal:
+# on a first build there is simply nothing to purge.
+purge_old_image_and_containers() {
+  local tags=("$@")
+  local tag id ids=""
+
+  log "Pre-build purge: retiring containers and images for: ${tags[*]}"
+
+  # Current image IDs behind the tags (a tag may not exist yet on a first build).
+  for tag in "${tags[@]}"; do
+    id="$(docker image inspect --format '{{.Id}}' "$tag" 2>/dev/null || true)"
+    if [ -n "$id" ]; then
+      case " $ids " in
+        *" $id "*) ;;
+        *) ids="$ids $id" ;;
+      esac
+    fi
+  done
+
+  # Find every container -- running OR stopped -- that uses these images.
+  local all_cids matched="" count=0
+  local cid cname cimgid cimgname cstate hit
+  all_cids="$(docker ps -aq 2>/dev/null || true)"
+  if [ -n "$all_cids" ]; then
+    while IFS='|' read -r cid cname cimgid cimgname cstate; do
+      [ -n "$cid" ] || continue
+      cname="${cname#/}"
+      cimgname="${cimgname#docker.io/}"
+      hit=0
+      for tag in "${tags[@]}"; do
+        if [ "$cimgname" = "$tag" ]; then hit=1; break; fi
+        # A bare image name (no tag) at create time means :latest.
+        if [ "${tag##*:}" = "latest" ] && [ "$cimgname" = "${tag%%:*}" ]; then hit=1; break; fi
+      done
+      if [ "$hit" -eq 0 ] && [ -n "$ids" ]; then
+        for id in $ids; do
+          if [ "$cimgid" = "$id" ]; then hit=1; break; fi
+        done
+      fi
+      if [ "$hit" -eq 1 ]; then
+        log "    matched container: $cname ($cstate, image: $cimgname)"
+        matched="$matched $cid"
+        count=$((count + 1))
+      fi
+    done < <(docker inspect --format '{{.Id}}|{{.Name}}|{{.Image}}|{{.Config.Image}}|{{.State.Status}}' $all_cids 2>/dev/null || true)
+  fi
+
+  if [ "$count" -eq 0 ]; then
+    ok "No containers reference the image(s) being rebuilt."
+  else
+    log "  Stopping $count container(s) (30s grace for clean bot shutdown)..."
+    docker stop -t 30 $matched >/dev/null 2>&1 || true
+    log "  Removing them (a kept container would restart on the STALE image)..."
+    docker rm $matched >/dev/null 2>&1 || true
+    ok "Stopped and removed $count container(s) — recreate them after the build."
+  fi
+
+  # Delete the images themselves so the rebuild starts from a clean name.
+  for tag in "${tags[@]}"; do
+    if docker image inspect "$tag" >/dev/null 2>&1; then
+      if docker rmi "$tag" >/dev/null 2>&1; then
+        ok "Removed old image: $tag"
+      else
+        # Still referenced by something unmatched (e.g. another tag on the same
+        # ID): force-untag so the rebuild owns the name regardless.
+        docker rmi -f "$tag" >/dev/null 2>&1 || true
+        warn "Force-untagged $tag (its layers were still referenced elsewhere)."
+      fi
+    else
+      log "  Image not present (first build?): $tag"
+    fi
+  done
+
+  # Sweep now-dangling leftovers from PREVIOUS builds of this script (matched
+  # by its own build label) so superseded layers don't accumulate on disk.
+  local dangling
+  dangling="$(docker images -q --filter dangling=true --filter "label=hummingbot.source.repo=$HB_REPO" 2>/dev/null | sort -u | tr '\n' ' ' || true)"
+  if [ -n "${dangling// /}" ]; then
+    docker rmi $dangling >/dev/null 2>&1 || true
+    ok "Pruned dangling image(s) from previous builds of this script."
   fi
 }
 
@@ -259,6 +373,19 @@ if [ "${PY_COUNT:-0}" -lt 3 ]; then
   die "Only $PY_COUNT Python files found in $CONNECTOR_REL_PATH — connector seems incomplete."
 fi
 ok "Connector present ($PY_COUNT Python files)"
+
+# ── Pre-build: retire containers + images from previous builds ─────────────
+# Placed AFTER the cheap clone/verify steps so an early failure never takes
+# the stack down; from here on this build owns the image tags.
+
+if [ "$PURGE_OLD" = "1" ]; then
+  purge_old_image_and_containers \
+    "${IMAGE_NAME}:${IMAGE_TAG}" \
+    "hummingbot/hummingbot:latest" \
+    "${IMAGE_NAME}-base:${IMAGE_TAG}"
+else
+  log "Pre-build purge disabled (--no-purge): existing containers/images are left alone."
+fi
 
 # ── Step 3: Build base image from repo Dockerfile ──────────────────────────
 
@@ -443,6 +570,12 @@ echo "  Compose can use:"
 echo "    image: $FULL_TAG"
 echo "    image: hummingbot/hummingbot:latest"
 echo ""
+if [ "$PURGE_OLD" = "1" ]; then
+  echo "  NOTE: containers that used the previous image were stopped and REMOVED"
+  echo "        before this build. Bring the stack back up (docker compose up -d /"
+  echo "        redeploy bots) — everything recreated now runs the image above."
+  echo ""
+fi
 
 docker image inspect "$FULL_TAG" --format='{{.Size}}' 2>/dev/null | \
   awk '{printf "Image size: %.0f MB\n", $1/1024/1024}' || true
