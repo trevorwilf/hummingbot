@@ -141,21 +141,31 @@ class TestUnderstatementDiagnostic(_Harness):
         self.assertEqual([], self._events(ctrl, self.EVENT))
         self.assertEqual(1000.0, ctrl._understatement_since)
 
-    def test_persistent_surplus_one_event_per_rate_limit_window(self):
+    def test_persistent_surplus_single_baseline_warning_then_reduced_diag_cadence(self):
+        # Growth-gate fix (2026-07-12): a STABLE surplus warns exactly once (the baseline);
+        # the previous behavior re-warned every _drift_warning_interval and produced 85%+ of
+        # total warning volume in production. The jsonl event keeps flowing at a reduced
+        # cadence (once per 30 minutes) for offline analysis.
         ctrl, mdp = self._surplus_ctrl()
         self._cycle(ctrl, mdp, 1000.0)                     # timer starts
-        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S)         # persistence met -> first warning
+        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S)         # persistence met -> baseline warning
         events = self._events(ctrl, self.EVENT)
         self.assertEqual(1, len(events))
         self.assertEqual("100", events[0].kwargs["surplus_quote"])
         self.assertEqual("100", events[0].kwargs["owned_quote"])
         self.assertEqual("200", events[0].kwargs["wallet_derived_quote"])
+        self.assertEqual("baseline", events[0].kwargs["warn_kind"])
 
-        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 100)   # inside 300s window -> silent
+        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 100)   # flat -> silent
         self.assertEqual(1, len(self._events(ctrl, self.EVENT)))
 
-        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 301)   # window elapsed -> warns again
-        self.assertEqual(2, len(self._events(ctrl, self.EVENT)))
+        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 301)   # still flat -> STILL silent
+        self.assertEqual(1, len(self._events(ctrl, self.EVENT)))
+
+        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 1801)  # reduced-cadence jsonl visibility
+        events = self._events(ctrl, self.EVENT)
+        self.assertEqual(2, len(events))
+        self.assertEqual("flat_no_warning", events[1].kwargs["warn_kind"])
 
     def test_surplus_clearing_resets_the_persistence_timer(self):
         balances = {"XMR": (D(0), D(0)), "USDT": (D(200), D(200))}

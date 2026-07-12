@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import inspect
 import logging
@@ -45,6 +46,22 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 lsb_logger = None
 s_decimal_nan = Decimal("NaN")
+
+# Per-file fault isolation for controller config (hot-)loading: full config path -> content
+# key (sha256 of the content that failed, or an mtime fallback when unreadable). A broken
+# YAML is warned about ONCE per distinct content -- not on every tick -- and a subsequent
+# successful load of the same file logs recovery at INFO and clears the entry.
+_controller_config_load_failures: Dict[str, str] = {}
+
+
+def _controller_config_content_key(raw_content: Optional[str], full_path: str) -> str:
+    if raw_content is not None:
+        return hashlib.sha256(raw_content.encode("utf-8", errors="replace")).hexdigest()
+    try:
+        return f"mtime:{os.path.getmtime(full_path)}"
+    except OSError:
+        return "unreadable"
+
 
 # Lazy-loaded to avoid circular import (strategy_v2_base -> executor_orchestrator -> executors -> strategy_v2_base)
 ExecutorOrchestrator = None
@@ -96,30 +113,58 @@ class StrategyV2ConfigBase(BaseClientModel):
         return v
 
     def load_controller_configs(self):
+        """Load all controller configs with PER-FILE fault isolation.
+
+        A file that fails to read/parse/validate is skipped so the remaining configs still
+        load: the error can never raise out of update_controllers_configs() -> on_tick() and
+        freeze every controller (2026-07-11: one out-of-order sell_prices hot-edit stopped
+        ALL controllers for 2m23s). The affected controller keeps its last-known-good config
+        (update_controllers_configs simply receives no update for it); at startup it is
+        skipped with a warning. The warning is de-duplicated by content hash -- it re-fires
+        only when the broken file actually changes -- and a subsequent successful load logs
+        the recovery at INFO.
+        """
         loaded_configs = []
         for config_path in self.controllers_config:
             full_path = os.path.join(settings.CONTROLLERS_CONF_DIR_PATH, config_path)
-            with open(full_path, 'r') as file:
-                config_data = yaml.safe_load(file)
+            raw_content: Optional[str] = None
+            try:
+                with open(full_path, 'r') as file:
+                    raw_content = file.read()
+                config_data = yaml.safe_load(raw_content)
 
-            controller_type = config_data.get('controller_type')
-            controller_name = config_data.get('controller_name')
+                controller_type = config_data.get('controller_type')
+                controller_name = config_data.get('controller_name')
 
-            if not controller_type or not controller_name:
-                raise ValueError(f"Missing controller_type or controller_name in {config_path}")
+                if not controller_type or not controller_name:
+                    raise ValueError(f"Missing controller_type or controller_name in {config_path}")
 
-            module_path = f"{settings.CONTROLLERS_MODULE}.{controller_type}.{controller_name}"
-            module = importlib.import_module(module_path)
+                module_path = f"{settings.CONTROLLERS_MODULE}.{controller_type}.{controller_name}"
+                module = importlib.import_module(module_path)
 
-            config_class = next((member for member_name, member in inspect.getmembers(module)
-                                 if inspect.isclass(member) and member not in [ControllerConfigBase,
-                                                                               MarketMakingControllerConfigBase,
-                                                                               DirectionalTradingControllerConfigBase]
-                                 and (issubclass(member, ControllerConfigBase))), None)
-            if not config_class:
-                raise InvalidController(f"No configuration class found in the module {controller_name}.")
+                config_class = next((member for member_name, member in inspect.getmembers(module)
+                                     if inspect.isclass(member) and member not in [ControllerConfigBase,
+                                                                                   MarketMakingControllerConfigBase,
+                                                                                   DirectionalTradingControllerConfigBase]
+                                     and (issubclass(member, ControllerConfigBase))), None)
+                if not config_class:
+                    raise InvalidController(f"No configuration class found in the module {controller_name}.")
 
-            loaded_configs.append(config_class(**config_data))
+                loaded_configs.append(config_class(**config_data))
+            except Exception as e:
+                content_key = _controller_config_content_key(raw_content, full_path)
+                if _controller_config_load_failures.get(full_path) != content_key:
+                    _controller_config_load_failures[full_path] = content_key
+                    logging.getLogger(__name__).warning(
+                        f"Skipping controller config {config_path}: {e}. The controller keeps its "
+                        f"last-known-good config (or is skipped at startup) until the file is fixed."
+                    )
+                continue
+            if full_path in _controller_config_load_failures:
+                del _controller_config_load_failures[full_path]
+                logging.getLogger(__name__).info(
+                    f"Controller config {config_path} reloaded successfully after a previous failure."
+                )
 
         return loaded_configs
 

@@ -242,7 +242,14 @@ class TestUnderdeployedWatchdog(_Harness):
         self._tick(ctrl, mdp, 1200.0)                          # 200s < 300s -> not yet
         self.assertEqual([], self._events(ctrl, "range_ladder_underdeployed_watchdog_fired"))
 
-        self._tick(ctrl, mdp, 1301.0)                          # 301s >= 300s -> fire
+        # Fire/skip loop fix rule 4 (2026-07-12): the FIRST fire of an episode forces a
+        # fresh balance snapshot and defers the re-center by the grace window.
+        self._tick(ctrl, mdp, 1301.0)                          # 301s >= 300s -> refresh gate
+        self.assertEqual([], self._events(ctrl, "range_ladder_underdeployed_watchdog_fired"))
+        self.assertEqual(1, len(self._events(
+            ctrl, "range_ladder_underdeployed_balance_refresh_requested")))
+
+        self._tick(ctrl, mdp, 1307.0)                          # persists on fresh data -> fire
         fired = self._events(ctrl, "range_ladder_underdeployed_watchdog_fired")
         self.assertEqual(1, len(fired))
         self.assertEqual("sell", fired[0].kwargs["side"])
@@ -371,22 +378,28 @@ class TestBackstopChain(_Harness):
         self.assertEqual(1005.0, ctrl._side_underdeployed_since["sell"])
 
         mdp.time.return_value = 1306.0
-        asyncio.run(ctrl.update_processed_data())               # 301s >= 300s -> fires
+        asyncio.run(ctrl.update_processed_data())               # 301s >= 300s -> refresh gate
+        # Fire/skip loop fix rule 4 (2026-07-12): the first fire of an episode forces a
+        # fresh balance snapshot; the re-center only follows once the condition persists.
+        self.assertEqual([], self._events(ctrl, "range_ladder_underdeployed_watchdog_fired"))
+
+        mdp.time.return_value = 1312.0
+        asyncio.run(ctrl.update_processed_data())               # persists on fresh data -> fires
         self.assertEqual(1, len(self._events(ctrl, "range_ladder_underdeployed_watchdog_fired")))
         self.assertTrue(ctrl._sell_side_dirty)
 
         actions = ctrl.determine_executor_actions()             # re-center: the fragment cancels
         self.assertEqual({"frag0"}, {a.executor_id for a in self._stops(actions)})
-        _terminate([frag], 1307.0)
+        _terminate([frag], 1313.0)
         balances["XMR"] = [D("1.06"), D("1.06")]                # cancel frees the held base
 
-        rebuilt = self._creates(self._full(ctrl, mdp, 1308.0))  # full ladder from the freed budget
+        rebuilt = self._creates(self._full(ctrl, mdp, 1314.0))  # full ladder from the freed budget
         self.assertEqual(3, len(rebuilt))
         total = sum((a.executor_config.amount for a in rebuilt), D(0))
         self.assertGreaterEqual(total, D("1.05"))               # ~all inventory redeployed
         self.assertLessEqual(total, D("1.06"))
         ctrl.executors_info = _materialize(rebuilt)
-        self._full(ctrl, mdp, 1309.0)
+        self._full(ctrl, mdp, 1315.0)
         self.assertIsNone(ctrl._refresh_wave["sell"])           # full deployment, wave resolved
 
 

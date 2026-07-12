@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -545,6 +546,24 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
 
+    # Understatement growth gate (2026-07-12): once a sustained wallet-over-ledger surplus has
+    # been warned about ONCE (the baseline), re-warn only when the surplus GROWS beyond the
+    # baseline by more than this many quote units AND a fill has been booked since -- a stable
+    # surplus (reserve/deposit) stays silent at WARNING level. Blank/None falls back to
+    # ledger_reconcile_threshold_quote.
+    understatement_growth_threshold_quote: Optional[Decimal] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": (
+                "Re-warn about a suspected ledger understatement only when the surplus grows "
+                "past the baseline by more than this many quote units (blank = use "
+                "ledger_reconcile_threshold_quote): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
     # v13 Part A: fallback per-fill fee rate (fraction of filled quote) used ONLY when the
     # connector does not report an actual fee for an order. NonKYC's order object carries no
     # fee field; a silent 0 would slowly overstate the fund. Ledger-accuracy only -- this
@@ -667,6 +686,18 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             if value == "":
                 return None
         return _safe_decimal(value, "reseed_fund_target_quote")
+
+    @field_validator("understatement_growth_threshold_quote", mode="before")
+    @classmethod
+    def parse_optional_understatement_growth_threshold(cls, value):
+        # Blank / unset -> None (falls back to ledger_reconcile_threshold_quote).
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+        return _safe_decimal(value, "understatement_growth_threshold_quote")
 
     @field_validator("buy_cooldown_time", "sell_cooldown_time", mode="before")
     @classmethod
@@ -1183,6 +1214,14 @@ class RangeInventoryLadderController(ControllerBase):
     # How long a wallet-over-ledger surplus must persist (not settling) before the
     # understatement diagnostic warns. Diagnostic only -- the ledger is never raised.
     LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS = 1800.0
+    # Reduced cadence for the understatement jsonl diagnostic event once the one-shot
+    # baseline WARNING has fired (growth-gate fix, 2026-07-12): offline analysis keeps
+    # visibility without the 5-minute warning spam that trained operators to ignore it.
+    LEDGER_UNDERSTATEMENT_DIAG_INTERVAL_SECONDS = 1800.0
+    # Watchdog fire/skip loop fix rule 4 (2026-07-12): how long after the forced balance
+    # refresh request the under-deployment condition must STILL hold before the re-center
+    # actually fires (gives the async REST refresh a moment to land in the cached balances).
+    _UNDERDEPLOYED_FRESH_BALANCE_GRACE_S = 5.0
 
 
     def __init__(self, config: RangeInventoryLadderConfig, *args, **kwargs):
@@ -1308,10 +1347,25 @@ class RangeInventoryLadderController(ControllerBase):
         # rate-limit timestamp. Deliberately NOT shared with the over-claim warning state.
         self._understatement_since: Optional[float] = None
         self._last_understatement_warning_time: float = 0.0
+        # Growth gate (2026-07-12): surplus value at the last WARNING (the baseline) and when
+        # it was set. A stable surplus warns ONCE per episode/session; re-warns require growth
+        # past understatement_growth_threshold_quote PLUS a booked fill since the baseline.
+        # The jsonl diagnostic event keeps flowing at a reduced cadence for offline analysis.
+        self._understatement_baseline: Optional[Decimal] = None
+        self._understatement_baseline_ts: float = 0.0
+        self._understatement_last_diag_ts: float = 0.0
 
         # Diagnostic JSONL rotation: last time the file size was stat()ed (throttled to
         # once per _DIAG_SIZE_CHECK_INTERVAL_S so the stat doesn't run on every event).
         self._diag_last_size_check_ts: float = 0.0
+
+        # Diagnostic filename session stamp (2026-07-12): generated ONCE per controller
+        # session from local container wall-clock time, so every restart opens a NEW
+        # diagnostic jsonl and files from multiple runs can be harvested into one analysis
+        # directory without colliding. ONLY the diagnostic file is stamped -- the state
+        # .json and its .owner marker keep their fixed names (resume/ownership relies on
+        # finding them at the same path across restarts).
+        self._diagnostic_session_stamp: str = time.strftime("%Y%m%d-%H%M%S", time.localtime())
 
         # State-path anchoring: the relative Path("data") default resolved to an absolute
         # path once at first use (logged so an unexpected CWD is visible post-mortem), and
@@ -1344,6 +1398,20 @@ class RangeInventoryLadderController(ControllerBase):
         # fund another full level). None while fully deployed or empty.
         self._side_underdeployed_since: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
+        # Watchdog fire/skip loop fix (2026-07-12, the 234-fires-in-20h loop):
+        # - noop streak/budget: consecutive watchdog-forced refreshes the planner skipped as
+        #   noop_or_dust; each one doubles the next fire's threshold (capped at 8x) for the
+        #   SAME free-budget value -- any budget change resets the backoff.
+        # - suppressed latch: once-per-episode emission of the fully-deployed suppression
+        #   diagnostic (rule 1), so the condition stays observable without log spam.
+        # - fresh-balance ts: rule 4 -- the FIRST fire of an episode requests a connector
+        #   balance refresh and the re-center is deferred until the condition persists on
+        #   fresh data (stale cached budgets were implicated in production).
+        self._underdeployed_noop_streak: Dict[str, int] = {"buy": 0, "sell": 0}
+        self._underdeployed_noop_budget: Dict[str, Optional[Decimal]] = {"buy": None, "sell": None}
+        self._underdeployed_suppressed_logged: Dict[str, bool] = {"buy": False, "sell": False}
+        self._underdeployed_fresh_balance_ts: Dict[str, Optional[float]] = {"buy": None, "sell": None}
+
         # Intended-vs-live reconciliation (preflight-retry fix): executor ids of live
         # dust-sized orders (preflight-resized below preflight_min_fill_ratio of their
         # intended amount) queued for a targeted stop so their levels retry at full size.
@@ -1352,6 +1420,9 @@ class RangeInventoryLadderController(ControllerBase):
         # Plan/budget invariant (2026-07-08 addendum): per-side rate-limit latch for the
         # sum(planned) <= effective budget safety-net warning.
         self._plan_invariant_last_warn: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
+        # Plan/budget invariant fix (2026-07-12): per-side rate-limit latch for the
+        # range_ladder_plan_budget_shaved diagnostic (the planner runs several times per tick).
+        self._plan_shave_last_emit: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
 
     @property
@@ -1372,8 +1443,18 @@ class RangeInventoryLadderController(ControllerBase):
 
     @property
     def diagnostic_log_path(self) -> Path:
+        """The diagnostic jsonl path, stamped with the session-start datetime (2026-07-12):
+        `<name>.jsonl` -> `<name>_{YYYYMMDD-HHMMSS}.jsonl`. The stamp is fixed for the
+        session, so every restart opens a fresh file and harvested files never collide.
+        Derived INDEPENDENTLY of state_path -- the state .json / .json.owner names must
+        stay byte-identical across restarts."""
         file_name = self.config.diagnostic_log_file_name or f"range_inventory_ladder_{self.config.id}.diagnostic.jsonl"
-        return Path("data") / file_name
+        stem, dot, ext = file_name.rpartition(".")
+        if dot:
+            stamped = f"{stem}_{self._diagnostic_session_stamp}.{ext}"
+        else:
+            stamped = f"{file_name}_{self._diagnostic_session_stamp}"
+        return Path("data") / stamped
 
     @staticmethod
     def _json_safe(value: Any):
@@ -3441,6 +3522,58 @@ class RangeInventoryLadderController(ControllerBase):
             return False
         return free_base * ref_price >= min_quote
 
+    def _side_free_budget_value(self, side_name: str) -> Decimal:
+        """The side-relevant FREE budget (buy: quote, sell: base) -- the value whose change
+        resets the underdeployed-watchdog noop backoff (fire/skip loop fix rule 2)."""
+        p = self.processed_data or {}
+        if side_name == "buy":
+            return self._d(p.get("free_buy_budget_quote", "0"), "0")
+        return self._d(p.get("free_sell_budget_base", "0"), "0")
+
+    def _reset_underdeployed_episode(self, side_name: str):
+        """End the side's under-deployment episode: clear the timer, the once-per-episode
+        suppression latch and the pending fresh-balance check. The noop backoff streak is
+        deliberately NOT cleared here -- it resets on a free-budget change or when a forced
+        refresh actually does work (both handled at their own sites)."""
+        self._side_underdeployed_since[side_name] = None
+        self._underdeployed_suppressed_logged[side_name] = False
+        self._underdeployed_fresh_balance_ts[side_name] = None
+
+    def _note_underdeployed_forced_refresh_noop(self, side_name: str):
+        """Fire/skip loop fix rule 2 (2026-07-12): the watchdog forced a re-center and the
+        planner skipped it as noop_or_dust -> the residual is ACCEPTED dust. Reset the
+        under-deployment timer and double the next fire's threshold (2x per consecutive
+        noop, capped at 8x) for this unchanged free budget; any budget change resets the
+        backoff at evaluation time in _run_empty_side_watchdog."""
+        self._underdeployed_noop_streak[side_name] += 1
+        self._underdeployed_noop_budget[side_name] = self._side_free_budget_value(side_name)
+        self._reset_underdeployed_episode(side_name)
+
+    def _request_underdeployed_balance_refresh(self, side_name: str):
+        """Fire/skip loop fix rule 4: on the FIRST fire of an under-deployment episode,
+        request a fresh connector balance snapshot before forcing the re-center. Same
+        best-effort contract as _maybe_request_post_cancel_balance_refresh: a connector
+        without _update_balances (or no running loop) is skipped silently."""
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            updater = getattr(connector, "_update_balances", None)
+            if callable(updater):
+                result = updater()
+                if asyncio.iscoroutine(result):
+                    try:
+                        asyncio.get_running_loop()
+                        asyncio.ensure_future(result)
+                    except RuntimeError:
+                        result.close()  # no running loop (unit test): don't leak the coroutine
+            self._emit_structured(
+                "range_ladder_underdeployed_balance_refresh_requested",
+                side=side_name,
+            )
+        except Exception as e:
+            self.logger().debug(
+                f"{self.config.id}: underdeployed-watchdog balance refresh failed: {e}"
+            )
+
     def _run_empty_side_watchdog(self, now: float):
         """Deadlock / under-deployment watchdog (fix 3 + reconcile-spin fix bug 5).
 
@@ -3463,7 +3596,8 @@ class RangeInventoryLadderController(ControllerBase):
             return  # legacy mode re-places from the free budget every cycle by design
         if self._market_data_hard_pause or self._session_expired:
             self._side_empty_since = {"buy": None, "sell": None}
-            self._side_underdeployed_since = {"buy": None, "sell": None}
+            self._reset_underdeployed_episode("buy")
+            self._reset_underdeployed_episode("sell")
             return
         if not self.processed_data or not self.processed_data.get("initialization_ready", True) \
                 or not self.processed_data.get("market_data_ready", True):
@@ -3520,25 +3654,71 @@ class RangeInventoryLadderController(ControllerBase):
             # -------------------------------------------- UNDER-DEPLOYED backstop (bug 5)
             if dirty or wave_present or cooldown_armed \
                     or self._wave_cancels_in_flight(side_name) or not side_executors:
-                self._side_underdeployed_since[side_name] = None
+                self._reset_underdeployed_episode(side_name)
                 continue
             if not self._side_free_budget_funds_a_level(side_name):
-                self._side_underdeployed_since[side_name] = None
+                self._reset_underdeployed_episode(side_name)
                 continue
             plan = self._plan_buy_book() if side == TradeType.BUY else self._plan_sell_book()
             if not plan:
-                self._side_underdeployed_since[side_name] = None
+                self._reset_underdeployed_episode(side_name)
                 continue
+            # Fire/skip loop fix rule 1+3 (2026-07-12): the watchdog defers to the PLANNER'S
+            # OWN noop test. When a forced refresh would reproduce the resting book (same
+            # rungs, total within min_order_quote), the side is fully deployed and the
+            # residual free budget is accepted dust -- never fire. Production showed 140/140
+            # forced re-centers skipped as noop_or_dust because the watchdog's raw
+            # free-budget threshold disagreed with this placement test.
+            if self._side_refresh_converged(side):
+                if not self._underdeployed_suppressed_logged[side_name]:
+                    self._underdeployed_suppressed_logged[side_name] = True
+                    self.logger().debug(
+                        f"{self.config.id}: under-deployment watchdog suppressed for "
+                        f"{side_name}: {len(side_executors)} live executor(s) already match "
+                        f"the {len(plan)}-level plan (residual free budget is dust)."
+                    )
+                    self._emit_structured(
+                        "range_ladder_watchdog_suppressed_fully_deployed",
+                        side=side_name,
+                        live_executors=len(side_executors),
+                        planned_levels=len(plan),
+                        free_buy_budget_quote=str(self.processed_data.get("free_buy_budget_quote", Decimal("0"))),
+                        free_sell_budget_base=str(self.processed_data.get("free_sell_budget_base", Decimal("0"))),
+                    )
+                self._side_underdeployed_since[side_name] = None
+                self._underdeployed_fresh_balance_ts[side_name] = None
+                continue
+            self._underdeployed_suppressed_logged[side_name] = False
             if self._side_underdeployed_since[side_name] is None:
                 self._side_underdeployed_since[side_name] = now
                 continue
             under_for = now - self._side_underdeployed_since[side_name]
-            if under_for < float(self.config.underdeployed_watchdog_seconds):
+            # Rule 2 backoff: consecutive noop-skipped fires double the threshold (capped at
+            # 8x) while the free budget is unchanged; any budget change resets the backoff.
+            if self._underdeployed_noop_streak[side_name]:
+                snapshot = self._underdeployed_noop_budget[side_name]
+                if snapshot is None or self._side_free_budget_value(side_name) != snapshot:
+                    self._underdeployed_noop_streak[side_name] = 0
+                    self._underdeployed_noop_budget[side_name] = None
+            backoff_multiplier = min(2 ** self._underdeployed_noop_streak[side_name], 8)
+            if under_for < float(self.config.underdeployed_watchdog_seconds) * backoff_multiplier:
+                continue
+            # Rule 4: the FIRST fire of an episode first forces a fresh balance snapshot
+            # (stale cached budgets were implicated in production -- the loop cleared after
+            # a WS reconnect forced a REST refresh) and re-centers only if the condition
+            # persists on the refreshed data.
+            fresh_ts = self._underdeployed_fresh_balance_ts[side_name]
+            if fresh_ts is None:
+                self._underdeployed_fresh_balance_ts[side_name] = now
+                self._request_underdeployed_balance_refresh(side_name)
+                continue
+            if (now - fresh_ts) < self._UNDERDEPLOYED_FRESH_BALANCE_GRACE_S:
                 continue
             free_buy = self.processed_data.get("free_buy_budget_quote", Decimal("0"))
             free_sell = self.processed_data.get("free_sell_budget_base", Decimal("0"))
             self._mark_side_dirty(side_name, "underdeployed_watchdog")
             self._side_underdeployed_since[side_name] = now  # re-arm; no re-fire spam
+            self._underdeployed_fresh_balance_ts[side_name] = None
             self.logger().warning(
                 f"{self.config.id}: under-deployment watchdog fired for {side_name}: the side "
                 f"held orders but its free budget could fund another full level for "
@@ -3555,6 +3735,7 @@ class RangeInventoryLadderController(ControllerBase):
                 free_buy_budget_quote=str(free_buy),
                 free_sell_budget_base=str(free_sell),
                 watchdog_seconds=self.config.underdeployed_watchdog_seconds,
+                backoff_multiplier=backoff_multiplier,
             )
 
     def _performance_snapshot(self) -> Dict[str, Decimal]:
@@ -4164,32 +4345,82 @@ class RangeInventoryLadderController(ControllerBase):
         elif ledger_surplus_quote > RECONCILIATION_ALERT_THRESHOLD_QUOTE:
             if self._understatement_since is None:
                 self._understatement_since = now_ts
-            elif (
-                (now_ts - self._understatement_since) >= self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS
-                and (now_ts - self._last_understatement_warning_time) >= self._drift_warning_interval
-            ):
-                self._last_understatement_warning_time = now_ts
-                self.logger().warning(
-                    f"{self.config.id}: possible ledger understatement — the wallet has held "
-                    f"{ledger_surplus_quote} quote more than the fills-only ledger owns for over "
-                    f"{self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS:.0f}s. "
-                    f"owned_quote={owned_quote} wallet_derived_quote={wallet_derived_quote} "
-                    f"owned_base={owned_base} wallet_derived_base={wallet_derived_base}. "
-                    "This is expected if you hold reserve/deposits; investigate only if this "
-                    "grew after fills (a missed fill leaves proceeds stranded outside the fund)."
-                )
-                self._emit_structured(
-                    "range_ladder_ledger_understatement_suspected",
-                    owned_quote=str(owned_quote),
-                    owned_base=str(owned_base),
-                    wallet_derived_quote=str(wallet_derived_quote),
-                    wallet_derived_base=str(wallet_derived_base),
-                    surplus_quote=str(ledger_surplus_quote),
-                    threshold_quote=str(RECONCILIATION_ALERT_THRESHOLD_QUOTE),
-                    persistence_seconds=self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS,
-                )
+            elif (now_ts - self._understatement_since) >= self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS:
+                # Growth gate (2026-07-12): a STABLE surplus (reserve/deposit) warns exactly
+                # once, when first detected -- production re-warned every 5 minutes on a flat
+                # surplus (272+ per pair, 85% of warning volume). Re-warn only when the
+                # surplus GROWS past the baseline by more than the growth threshold AND a
+                # fill has been booked since the baseline was set (the message's own advice:
+                # "investigate only if this grew after fills"). A growth warning moves the
+                # baseline to the new value.
+                growth_threshold = self.config.understatement_growth_threshold_quote
+                if growth_threshold is None:
+                    growth_threshold = RECONCILIATION_ALERT_THRESHOLD_QUOTE
+                if self._understatement_baseline is None:
+                    should_warn = True
+                    warn_kind = "baseline"
+                else:
+                    fill_since_baseline = (
+                        self._last_fill_booked_ts is not None
+                        and self._last_fill_booked_ts > self._understatement_baseline_ts
+                    )
+                    grew = ledger_surplus_quote > (self._understatement_baseline + growth_threshold)
+                    should_warn = grew and fill_since_baseline
+                    warn_kind = "growth_after_fill"
+                if should_warn:
+                    previous_baseline = self._understatement_baseline
+                    self._understatement_baseline = ledger_surplus_quote
+                    self._understatement_baseline_ts = now_ts
+                    self._last_understatement_warning_time = now_ts
+                    self._understatement_last_diag_ts = now_ts
+                    grew_note = (
+                        "" if previous_baseline is None
+                        else f" The surplus GREW from the {previous_baseline} baseline after a fill —"
+                             " this is the pattern that indicates a missed fill."
+                    )
+                    self.logger().warning(
+                        f"{self.config.id}: possible ledger understatement — the wallet has held "
+                        f"{ledger_surplus_quote} quote more than the fills-only ledger owns for over "
+                        f"{self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS:.0f}s. "
+                        f"owned_quote={owned_quote} wallet_derived_quote={wallet_derived_quote} "
+                        f"owned_base={owned_base} wallet_derived_base={wallet_derived_base}."
+                        f"{grew_note} "
+                        "This is expected if you hold reserve/deposits; investigate only if this "
+                        "grew after fills (a missed fill leaves proceeds stranded outside the fund). "
+                        "This warning will not repeat unless the surplus grows after a fill."
+                    )
+                    self._emit_structured(
+                        "range_ladder_ledger_understatement_suspected",
+                        owned_quote=str(owned_quote),
+                        owned_base=str(owned_base),
+                        wallet_derived_quote=str(wallet_derived_quote),
+                        wallet_derived_base=str(wallet_derived_base),
+                        surplus_quote=str(ledger_surplus_quote),
+                        threshold_quote=str(RECONCILIATION_ALERT_THRESHOLD_QUOTE),
+                        persistence_seconds=self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS,
+                        warn_kind=warn_kind,
+                        baseline_quote=str(previous_baseline) if previous_baseline is not None else "",
+                    )
+                elif (now_ts - self._understatement_last_diag_ts) >= self.LEDGER_UNDERSTATEMENT_DIAG_INTERVAL_SECONDS:
+                    # Silent at WARNING level; keep the jsonl trail alive at a reduced
+                    # cadence so offline analysis retains visibility of the flat surplus.
+                    self._understatement_last_diag_ts = now_ts
+                    self._emit_structured(
+                        "range_ladder_ledger_understatement_suspected",
+                        owned_quote=str(owned_quote),
+                        owned_base=str(owned_base),
+                        wallet_derived_quote=str(wallet_derived_quote),
+                        wallet_derived_base=str(wallet_derived_base),
+                        surplus_quote=str(ledger_surplus_quote),
+                        threshold_quote=str(RECONCILIATION_ALERT_THRESHOLD_QUOTE),
+                        persistence_seconds=self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS,
+                        warn_kind="flat_no_warning",
+                        baseline_quote=str(self._understatement_baseline),
+                    )
         else:
             self._understatement_since = None
+            self._understatement_baseline = None
+            self._understatement_baseline_ts = 0.0
 
         self._cycles_seen += 1
 
@@ -4795,11 +5026,7 @@ class RangeInventoryLadderController(ControllerBase):
         # Reconcile-spin fix: a heal re-proposes the PINNED base amount exactly (no re-sizing
         # from a shrunken budget). Otherwise size from the allocated quote as usual.
         amount = pinned_base if pinned_base is not None else order_quote / quantized_price
-        quantized_amount = Decimal(
-            self.market_data_provider.quantize_order_amount(
-                self.config.connector_name, self.config.trading_pair, amount
-            )
-        )
+        quantized_amount = self._quantize_amount_down(amount)
         notional = quantized_amount * quantized_price
         failure_reason = self._level_quantization_failure(quantized_amount, quantized_price)
         if failure_reason is not None:
@@ -4859,11 +5086,7 @@ class RangeInventoryLadderController(ControllerBase):
         )
         # Reconcile-spin fix: a heal re-proposes the PINNED base amount exactly.
         base_to_place = pinned_base if pinned_base is not None else order_base
-        quantized_amount = Decimal(
-            self.market_data_provider.quantize_order_amount(
-                self.config.connector_name, self.config.trading_pair, base_to_place
-            )
-        )
+        quantized_amount = self._quantize_amount_down(base_to_place)
         notional = quantized_amount * quantized_price
         failure_reason = self._level_quantization_failure(quantized_amount, quantized_price)
         if failure_reason is not None:
@@ -5074,6 +5297,31 @@ class RangeInventoryLadderController(ControllerBase):
         reserved = max(Decimal("0"), reserved - self._wave_ledger_credit_base)
         return max(Decimal("0"), free + reserved)
 
+    def _quantize_amount_down(self, amount: Decimal) -> Decimal:
+        """Plan/budget invariant fix rule 1 (2026-07-12): exchange amount quantization must
+        never round a planned amount UP -- a sum of rounded-up levels can exceed the budget
+        (DASH-USDT: +0.008%). Core connectors floor already; this guards a provider that
+        rounds-to-nearest by stepping the probe down until the result is <= the target.
+        Returns 0 when no on-grid amount <= the target can be found."""
+        if amount <= Decimal("0"):
+            return Decimal("0")
+        q = self._d(self.market_data_provider.quantize_order_amount(
+            self.config.connector_name, self.config.trading_pair, amount), "0")
+        if q <= amount:
+            return q
+        step_guess = q - amount
+        probe = amount
+        for _ in range(8):
+            probe = probe - step_guess
+            if probe <= Decimal("0"):
+                return Decimal("0")
+            q = self._d(self.market_data_provider.quantize_order_amount(
+                self.config.connector_name, self.config.trading_pair, probe), "0")
+            if q <= amount:
+                return q
+            step_guess *= 2
+        return Decimal("0")
+
     def _quantize_buy_level(self, price: Decimal, order_quote: Decimal):
         """Pure quantization mirror of _build_buy_executor_action; returns (qamount, notional,
         qprice) or None when the level is infeasible (zero amount / sub-min-notional)."""
@@ -5081,8 +5329,7 @@ class RangeInventoryLadderController(ControllerBase):
             self.config.connector_name, self.config.trading_pair, price), "0")
         if qprice <= Decimal("0"):
             return None
-        qamount = self._d(self.market_data_provider.quantize_order_amount(
-            self.config.connector_name, self.config.trading_pair, order_quote / qprice), "0")
+        qamount = self._quantize_amount_down(order_quote / qprice)
         notional = qamount * qprice
         if self._level_quantization_failure(qamount, qprice) is not None:
             return None
@@ -5092,8 +5339,7 @@ class RangeInventoryLadderController(ControllerBase):
         """Pure quantization mirror of _build_sell_executor_action."""
         qprice = self._d(self.market_data_provider.quantize_order_price(
             self.config.connector_name, self.config.trading_pair, price), "0")
-        qamount = self._d(self.market_data_provider.quantize_order_amount(
-            self.config.connector_name, self.config.trading_pair, order_base), "0")
+        qamount = self._quantize_amount_down(order_base)
         notional = qamount * qprice
         if self._level_quantization_failure(qamount, qprice) is not None:
             return None
@@ -5116,6 +5362,12 @@ class RangeInventoryLadderController(ControllerBase):
         if kept_weight_total <= Decimal("0"):
             return {}
         book: Dict[str, Decimal] = {}
+        # Plan/budget invariant fix (2026-07-12): account every level at the CONSERVATIVE
+        # price basis max(config price, quantized price). Accounting at the quantized price
+        # while the invariant measures at the config price let the sum land a hair above
+        # the budget when price quantization rounded down (DASH-USDT: +0.0141 on 167.79).
+        # basis: level_id -> (quantized price for min-notional checks, accounting price).
+        basis: Dict[str, tuple] = {}
         remaining = budget
         pending = list(kept)
         while pending and remaining >= self.config.min_order_quote:
@@ -5132,10 +5384,12 @@ class RangeInventoryLadderController(ControllerBase):
                 quantized = self._quantize_buy_level(price, remaining)
             if quantized is None:
                 continue
-            qamount, notional, _ = quantized
-            book[self._buy_level_id(idx)] = qamount
-            remaining = max(Decimal("0"), remaining - notional)
-        return book
+            qamount, _, qprice = quantized
+            level_id = self._buy_level_id(idx)
+            book[level_id] = qamount
+            basis[level_id] = (qprice, max(price, qprice))
+            remaining = max(Decimal("0"), remaining - qamount * basis[level_id][1])
+        return self._enforce_plan_budget_postcondition("buy", book, budget, basis)
 
     def _plan_sell_book(self) -> Dict[str, Decimal]:
         """The SELL book a fresh rebuild would rest, as {level_id: quantized_base_amount}."""
@@ -5154,6 +5408,7 @@ class RangeInventoryLadderController(ControllerBase):
         if kept_weight_total <= Decimal("0"):
             return {}
         book: Dict[str, Decimal] = {}
+        basis: Dict[str, tuple] = {}
         remaining = budget
         pending = list(kept)
         while pending and remaining > Decimal("0"):
@@ -5170,9 +5425,82 @@ class RangeInventoryLadderController(ControllerBase):
                 quantized = self._quantize_sell_level(price, remaining)
             if quantized is None:
                 continue
-            qamount, _, _ = quantized
-            book[self._sell_level_id(idx)] = qamount
+            qamount, _, qprice = quantized
+            level_id = self._sell_level_id(idx)
+            book[level_id] = qamount
+            basis[level_id] = (qprice, price)
             remaining = max(Decimal("0"), remaining - qamount)
+        return self._enforce_plan_budget_postcondition("sell", book, budget, basis)
+
+    def _enforce_plan_budget_postcondition(
+        self,
+        side_name: str,
+        book: Dict[str, Decimal],
+        budget: Decimal,
+        price_basis: Dict[str, tuple],
+    ) -> Dict[str, Decimal]:
+        """Plan/budget invariant fix (2026-07-12): HARD planner post-condition -- the plan's
+        total budget draw (quote notional at the conservative accounting price for buys;
+        base amount for sells) must never exceed the effective budget. Per-level
+        quantization can round the raw sum a hair above it (DASH-USDT 2026-07-10/11:
+        planned 167.8029 vs budget 167.7888, +0.008%); when that happens the SMALLEST
+        level is shaved down by the excess (re-quantized down), or dropped entirely when
+        the shave lands below min_order_quote. price_basis maps level_id ->
+        (quantized price for the min-notional test, accounting price). Returns the
+        (possibly shaved) book, guaranteed <= budget."""
+        def _acct_price(lid: str) -> Decimal:
+            entry = price_basis.get(lid)
+            return entry[1] if entry else Decimal("0")
+
+        def _floor_price(lid: str) -> Decimal:
+            entry = price_basis.get(lid)
+            return entry[0] if entry else Decimal("0")
+
+        def _total(b: Dict[str, Decimal]) -> Decimal:
+            if side_name == "buy":
+                return sum((amt * _acct_price(lid) for lid, amt in b.items()), Decimal("0"))
+            return sum(b.values(), Decimal("0"))
+
+        if not book or _total(book) <= budget:
+            return book
+        adjusted: List[tuple] = []
+        guard = 2 * len(book) + 4
+        while book and _total(book) > budget and guard > 0:
+            guard -= 1
+            excess = _total(book) - budget
+            if side_name == "buy":
+                level_id = min(book, key=lambda k: book[k] * _acct_price(k))
+                unit = _acct_price(level_id)
+                if unit <= Decimal("0"):
+                    book.pop(level_id)
+                    adjusted.append((level_id, "dropped"))
+                    continue
+                target_amount = book[level_id] - (excess / unit)
+            else:
+                level_id = min(book, key=lambda k: book[k])
+                target_amount = book[level_id] - excess
+            shaved = self._quantize_amount_down(target_amount) if target_amount > Decimal("0") else Decimal("0")
+            floor_price = _floor_price(level_id)
+            below_min_notional = floor_price > Decimal("0") and (shaved * floor_price) < self.config.min_order_quote
+            if shaved <= Decimal("0") or shaved >= book[level_id] or below_min_notional:
+                book.pop(level_id)
+                adjusted.append((level_id, "dropped"))
+            else:
+                book[level_id] = shaved
+                adjusted.append((level_id, "shaved"))
+        if adjusted:
+            # Rate-limited observability: shaving is expected to be rare (a rounding hair),
+            # but the planner runs several times per tick -- don't flood the jsonl.
+            now = self.market_data_provider.time()
+            if (now - self._plan_shave_last_emit.get(side_name, 0.0)) >= self._drift_warning_interval:
+                self._plan_shave_last_emit[side_name] = now
+                self._emit_structured(
+                    "range_ladder_plan_budget_shaved",
+                    side=side_name,
+                    budget=str(budget),
+                    planned_total=str(_total(book)),
+                    adjustments=[f"{lid}:{what}" for lid, what in adjusted],
+                )
         return book
 
     def _resting_side_book(self, side: TradeType) -> Dict[str, Decimal]:
@@ -5627,6 +5955,10 @@ class RangeInventoryLadderController(ControllerBase):
                     "range_ladder_side_refresh_skipped",
                     side=side_name, reason=reason, guard="noop_or_dust",
                 )
+                if reason == "underdeployed_watchdog":
+                    # Fire/skip loop fix rule 2: a watchdog-forced refresh that no-ops means
+                    # the residual is accepted dust -> reset the timer and back off.
+                    self._note_underdeployed_forced_refresh_noop(side_name)
                 continue
 
             resting = [e for e in active_order_executors if self._executor_side(e) == side]
@@ -5704,6 +6036,11 @@ class RangeInventoryLadderController(ControllerBase):
                 self._mark_bypass_cooldown_for_level(level_id)
                 actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
                 stopped = True
+            if reason == "underdeployed_watchdog":
+                # Fire/skip loop fix rule 2: this forced refresh did REAL work (cancels
+                # emitted) -> the noop backoff no longer applies.
+                self._underdeployed_noop_streak[side_name] = 0
+                self._underdeployed_noop_budget[side_name] = None
             # Dirty flag stays set: the rebuild lands next cycle (creates are deferred on a side
             # that has stops this cycle), and create_actions_proposal clears it once issued.
             self._emit_structured(

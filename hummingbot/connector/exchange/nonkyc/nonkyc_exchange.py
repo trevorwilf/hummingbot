@@ -539,10 +539,12 @@ class NonkycExchange(ExchangePyBase):
                 f"REST latency: createorder {trading_pair} {trade_type.name} -> "
                 f"{t_elapsed:.0f}ms (id={o_id})"
             )
-            if t_elapsed > 2000:
+            # 2500ms: NonKYC createorder averages 771-1329ms with normal peaks to ~2549ms;
+            # the previous 2000ms threshold flagged routine traffic.
+            if t_elapsed > 2500:
                 self.logger().warning(
                     f"REST SLOW: createorder {trading_pair} took {t_elapsed:.0f}ms "
-                    f"(threshold: 2000ms)"
+                    f"(threshold: 2500ms)"
                 )
             self._log_order_lifecycle(order_id, "PLACED",
                 f"{trade_type.name} {amount} {trading_pair} @ {price} -> exch_id={o_id}")
