@@ -331,6 +331,14 @@ RUN ${CONDA_PIP} install --no-cache-dir --upgrade pip \\
 # Verify psycopg2 imports from the conda env python (not base python)
 RUN ${CONDA_PYTHON} -c "import psycopg2; print('psycopg2 OK in conda env: ${CONDA_ENV}')"
 
+# Verify the MQTT bridge dependency swap: aiomqtt (paho-mqtt 2.x) must import and
+# the retired commlib-py must be absent. aiomqtt and commlib-py are mutually
+# exclusive (paho-mqtt 2.x vs <2), so a broken swap must fail the BUILD, not runtime.
+RUN ${CONDA_PYTHON} -c "import aiomqtt; from paho.mqtt.enums import CallbackAPIVersion; print('aiomqtt + paho-mqtt v2 OK')"
+RUN if ${CONDA_PIP} show commlib-py > /dev/null 2>&1; then \\
+      echo 'ERROR: commlib-py is still installed — the aiomqtt swap is incomplete'; exit 1; \\
+    else echo 'commlib-py absent OK'; fi
+
 # Verify NonKYC connector loads
 RUN ${CONDA_PYTHON} -c "\\
 from hummingbot.connector.exchange.nonkyc import nonkyc_utils; \\
@@ -384,7 +392,7 @@ print('nonkyc present: YES')
   || warn "NonKYC not in exchange list"
 
 # 4. Confirm psycopg2 is NOT only in base env (catch the old bug)
-log "  [4/4] Confirming install location..."
+log "  [4/5] Confirming install location..."
 INSTALL_LOC=$(run_in_image "$FULL_TAG" "$CONDA_PYTHON" -c "
 import psycopg2, os
 print(os.path.dirname(psycopg2.__file__))
@@ -393,6 +401,17 @@ if echo "$INSTALL_LOC" | grep -q "envs/${CONDA_ENV}"; then
   ok "psycopg2 installed in correct conda env: $INSTALL_LOC"
 else
   warn "psycopg2 location unexpected: $INSTALL_LOC (expected envs/${CONDA_ENV})"
+fi
+
+# 5. MQTT bridge dependency swap: aiomqtt present, commlib-py gone.
+log "  [5/5] MQTT bridge dependency (aiomqtt in, commlib-py out)..."
+run_in_image "$FULL_TAG" "$CONDA_PYTHON" -c "import aiomqtt; from paho.mqtt.enums import CallbackAPIVersion; print('aiomqtt + paho-mqtt v2 OK')" \
+  && ok "aiomqtt imports in conda env" \
+  || die "aiomqtt NOT importable — the MQTT bridge will fail at runtime!"
+if run_in_image "$FULL_TAG" "$CONDA_PIP" show commlib-py > /dev/null 2>&1; then
+  die "commlib-py is still installed in the image — the aiomqtt swap is incomplete!"
+else
+  ok "commlib-py absent (mutually exclusive with aiomqtt/paho-mqtt 2.x)"
 fi
 
 # Tag as hummingbot/hummingbot:latest for compose compatibility

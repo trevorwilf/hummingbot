@@ -26,7 +26,6 @@ dependencies:
   - bidict>=0.22.1
   - bip-utils
   - cachetools>=5.3.1
-  - commlib-py==0.11.5
   - cryptography>=41.0.2
   - eth-account>=0.13.0
 #  - injective-py==1.12.*
@@ -66,3 +65,7 @@ dependencies:
   - zlib>=1.2.13
   - pip:
     - injective-py==1.13.*
+    # aiomqtt (with paho-mqtt 2.x) drives the remote_iface MQTT bridge; kept in
+    # the pip section so paho-mqtt 2.x is sourced consistently with setup.py's
+    # install_requires.
+    - aiomqtt>=2.0.0

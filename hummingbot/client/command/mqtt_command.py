@@ -74,8 +74,11 @@ class MQTTCommand:
                         self.logger().error(
                             f'Failed to connect MQTT Bridge: {str(e)}')
                         self.notify('MQTT Bridge failed to connect to the broker.')
-                    self._mqtt.stop()
-                    self._mqtt = None
+                    # Guard against a failed construct/connect leaving _mqtt as None
+                    # (the aiomqtt gateway can raise before it is assigned).
+                    if self._mqtt is not None:
+                        self._mqtt.stop()
+                        self._mqtt = None
 
                     if self.client_config_map.mqtt_bridge.mqtt_autostart:
                         await asyncio.sleep(self._mqtt_sleep_rate_autostart_retry)

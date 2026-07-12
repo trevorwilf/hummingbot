@@ -384,6 +384,14 @@ RUN ${CONDA_PIP} install --no-cache-dir --upgrade pip && \\
 # Verify paho-mqtt v2 is intact (aiomqtt requires paho.mqtt.enums from v2+)
 RUN ${CONDA_PYTHON} -c "from paho.mqtt.enums import CallbackAPIVersion; print('paho-mqtt v2 OK')"
 
+# Verify the MQTT bridge dependency swap: aiomqtt imports and the retired
+# commlib-py is absent. They are mutually exclusive (paho-mqtt 2.x vs <2), so a
+# broken swap must fail the BUILD, not surface at runtime.
+RUN ${CONDA_PYTHON} -c "import aiomqtt; print('aiomqtt OK')"
+RUN if ${CONDA_PIP} show commlib-py > /dev/null 2>&1; then \\
+      echo 'ERROR: commlib-py is still installed — the aiomqtt swap is incomplete'; exit 1; \\
+    else echo 'commlib-py absent OK'; fi
+
 # Verify the NonKYC connector is present
 RUN ${CONDA_PYTHON} -c "\\
 from hummingbot.connector.exchange.nonkyc import nonkyc_utils; \\
@@ -433,6 +441,13 @@ import aiomqtt
 print('aiomqtt + paho-mqtt v2 OK')
 " 2>&1 && ok "paho-mqtt/aiomqtt check passed" \
   || die "paho-mqtt/aiomqtt compatibility BROKEN — aiomqtt will fail at runtime!"
+
+log "  Verifying commlib-py is absent (mutually exclusive with aiomqtt)..."
+if docker run --rm --entrypoint "$CONDA_PIP" "$FULL_TAG" show commlib-py > /dev/null 2>&1; then
+  die "commlib-py is still installed in the image — the aiomqtt swap is incomplete!"
+else
+  ok "commlib-py absent"
+fi
 
 log "  Verifying connector appears in exchange list..."
 docker run --rm --entrypoint "$CONDA_PYTHON" "$FULL_TAG" -c "
