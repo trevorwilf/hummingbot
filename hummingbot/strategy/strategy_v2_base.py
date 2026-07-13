@@ -356,11 +356,40 @@ class StrategyV2Base(StrategyPyBase):
         else:
             self.on_tick()
 
+    def _ensure_performance_publisher(self):
+        """(Re)arm the MQTT performance publisher whenever the bridge is available.
+
+        The bridge autostart retries in the background with _mqtt set to None between
+        attempts (mqtt_command.start_mqtt_async), and `mqtt restart` replaces the gateway
+        object entirely. The old one-shot check at strategy start silently lost the race
+        (2026-07-13: a bot whose bridge was mid-retry at startup published logs/heartbeats
+        but never a performance report, showing as permanently 'stopped' in the dashboard
+        while trading normally). Called from start() and every on_tick: once armed against
+        the current gateway this is two attribute reads."""
+        from hummingbot.client.hummingbot_application import HummingbotApplication
+        app = HummingbotApplication._main_app  # never main_application(): that would CREATE one
+        mqtt = getattr(app, "_mqtt", None) if app is not None else None
+        if mqtt is None:
+            return
+        if self._pub is not None and getattr(self._pub, "_gateway", None) is mqtt:
+            return  # already armed against the CURRENT bridge
+        try:
+            self._pub = ETopicPublisher("performance", use_bot_prefix=True)
+        except Exception:
+            return  # bridge went away between the check and the construct: retry next tick
+        self.logger().info(
+            "MQTT performance publisher armed"
+            + ("" if not self.mqtt_enabled else " (re-armed onto a restarted bridge)")
+            + "."
+        )
+        self.mqtt_enabled = True
+
     def on_tick(self):
         """
         An event which is called on every tick. When controllers are configured, runs executor orchestration.
         Simple scripts override this method for custom logic.
         """
+        self._ensure_performance_publisher()
         if self.controllers:
             import time as _tick_time
             self._current_cycle_id = str(int(_tick_time.time() * 1000))
@@ -682,11 +711,9 @@ class StrategyV2Base(StrategyPyBase):
         """
         self._last_timestamp = timestamp
         self.apply_initial_setting()
-        # Check if MQTT is enabled at runtime
-        from hummingbot.client.hummingbot_application import HummingbotApplication
-        if HummingbotApplication.main_application()._mqtt is not None:
-            self.mqtt_enabled = True
-            self._pub = ETopicPublisher("performance", use_bot_prefix=True)
+        # Arm the MQTT performance publisher if the bridge is already up; if not, every
+        # tick retries via the same helper (see _ensure_performance_publisher).
+        self._ensure_performance_publisher()
 
         # Start controllers
         for controller in self.controllers.values():
