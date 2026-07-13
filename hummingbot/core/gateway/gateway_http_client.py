@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import ssl
 from decimal import Decimal
@@ -93,6 +94,10 @@ class GatewayHttpClient:
             self._base_url = f"{protocol}://{api_host}:{api_port}"
             self._use_ssl = use_ssl
             self._gateway_ready_event = asyncio.Event()
+            # Episode latch for ping-failure logging: the status monitor pings every
+            # POLL_INTERVAL (2s) forever; a stack WITHOUT a Gateway (no client certs)
+            # otherwise logs an ERROR + full traceback thirty times a minute.
+            self._ping_failure_logged = False
         self._gateway_config = gateway_config
         GatewayHttpClient.__instance = self
 
@@ -117,6 +122,16 @@ class GatewayHttpClient:
                 ca_file = str(cert_path / "ca_cert.pem")
                 cert_file = str(cert_path / "client_cert.pem")
                 key_file = str(cert_path / "client_key.pem")
+
+                # The certs only exist once a Gateway has started in this stack and its
+                # cert set was mirrored here. Raise a DESCRIPTIVE error instead of the
+                # bare "[Errno 2] No such file or directory" ssl otherwise produces.
+                missing = [p for p in (ca_file, cert_file, key_file) if not os.path.exists(p)]
+                if missing:
+                    raise FileNotFoundError(
+                        f"Gateway client certificate file(s) missing: {', '.join(missing)}. "
+                        "They are generated when a Gateway first starts in this stack."
+                    )
 
                 password = Security.secrets_manager.password.get_secret_value()
 
@@ -490,9 +505,31 @@ class GatewayHttpClient:
         try:
             response: Dict[str, Any] = await self.api_request("get", "", fail_silently=True)
             success = response.get("status") == "ok"
+            if success and getattr(self, "_ping_failure_logged", False):
+                self._ping_failure_logged = False
+                self.logger().info("Gateway ping recovered — gateway is reachable again.")
             return success
         except Exception as e:
-            self.logger().error(f"✗ Failed to ping gateway: {type(e).__name__}: {e}", exc_info=True)
+            # The status monitor retries every POLL_INTERVAL (2s) forever: log the FIRST
+            # failure of an episode loudly, then go quiet (DEBUG) until it recovers.
+            if not getattr(self, "_ping_failure_logged", False):
+                self._ping_failure_logged = True
+                if isinstance(e, FileNotFoundError):
+                    # No client certs = no Gateway has ever started in this stack. That is
+                    # a valid deployment (CEX-only stack), not an error worth a traceback.
+                    self.logger().warning(
+                        f"Gateway client certificates not found ({e}) — is a Gateway part of "
+                        "this stack? Gateway status stays OFFLINE; the ping keeps retrying "
+                        "quietly and further failures are logged at DEBUG."
+                    )
+                else:
+                    self.logger().error(
+                        f"✗ Failed to ping gateway: {type(e).__name__}: {e}. Further failures "
+                        "are logged at DEBUG until the ping recovers.",
+                        exc_info=True,
+                    )
+            else:
+                self.logger().debug(f"Gateway ping still failing: {type(e).__name__}: {e}")
             return False
 
     async def get_gateway_status(self, fail_silently: bool = False) -> List[Dict[str, Any]]:
