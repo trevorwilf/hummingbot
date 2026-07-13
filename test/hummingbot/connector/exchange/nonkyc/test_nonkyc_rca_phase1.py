@@ -412,6 +412,9 @@ class TestNonkycLastPriceFallbackLogging(IsolatedAsyncioWrapperTestCase):
 
         exchange._api_request = AsyncMock(side_effect=mock_api_request)
         exchange.exchange_symbol_associated_to_pair = AsyncMock(return_value="ARRR/USDT")
+        # Bulk-tickers fix (2026-07-13): the fallback now goes through the shared
+        # cached /tickers snapshot instead of a raw per-call fetch.
+        exchange._tickers_snapshot = AsyncMock(return_value={"ARRR_USDT": 0.22})
 
         # Bind real method
         result = await NonkycExchange._get_last_traded_price(exchange, "ARRR-USDT")

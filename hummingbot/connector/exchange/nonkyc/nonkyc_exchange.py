@@ -69,6 +69,13 @@ class NonkycExchange(ExchangePyBase):
         self._trading_fees: Dict[str, Decimal] = {}
         self._trading_fees_last_computed: float = 0.0
         self._trading_fees_ttl: float = 3600.0  # 1 hour cache TTL
+        # Bulk /tickers snapshot cache (2026-07-13): hummingbot-api's ticker pool asks for
+        # the last price of EVERY listed pair every 30s; served per-pair that was ~400
+        # concurrent GET /ticker/{symbol} calls and an instant, total 429 storm. One
+        # short-TTL snapshot serves any number of pairs; the lock makes it single-flight.
+        self._tickers_snapshot_cache: Optional[Dict[str, float]] = None
+        self._tickers_snapshot_ts: float = 0.0
+        self._tickers_snapshot_lock: asyncio.Lock = asyncio.Lock()
         self._pre_adjusted_assets: Dict[str, float] = {}  # asset -> timestamp of last pre-adjust
         self._ws_reconnect_count: int = 0
         self._ws_reconnect_count_since_log: int = 0
@@ -1847,6 +1854,62 @@ class NonkycExchange(ExchangePyBase):
             mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
         self._set_trading_pair_symbol_map(mapping)
 
+    # How long one bulk /tickers snapshot serves price lookups. Half the hummingbot-api
+    # ticker-pool interval (30s): every pool cycle gets fresh data, and everything else
+    # that asks in between shares the same snapshot instead of hitting the exchange.
+    _TICKERS_SNAPSHOT_TTL_S = 15.0
+
+    async def get_last_traded_prices(self, trading_pairs: List[str] = None) -> Dict[str, float]:
+        """Bulk last-traded prices from ONE /tickers snapshot.
+
+        The base implementation fans out one GET /ticker/{symbol} per pair. The
+        hummingbot-api ticker pool requests EVERY listed pair (~400) every 30s, which
+        turned that into a full 429 storm on 2026-07-13. Any multi-pair request is now
+        served from a single cached /tickers call; a single-pair request keeps the
+        fresher per-symbol endpoint (with the shared snapshot as its fallback)."""
+        trading_pairs = trading_pairs or []
+        if len(trading_pairs) <= 1:
+            return await super().get_last_traded_prices(trading_pairs=trading_pairs)
+        snapshot = await self._tickers_snapshot()
+        result: Dict[str, float] = {}
+        for trading_pair in trading_pairs:
+            try:
+                symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            except Exception:
+                continue  # unknown/delisted pair: skip rather than fail the whole batch
+            price = snapshot.get(symbol.replace("/", "_"))
+            if price is not None:
+                result[trading_pair] = price
+        return result
+
+    async def _tickers_snapshot(self) -> Dict[str, float]:
+        """{ticker_id ("BASE_QUOTE"): last_price} from GET /tickers, cached for
+        _TICKERS_SNAPSHOT_TTL_S. Single-flight: concurrent callers (ticker-pool warmup +
+        collection loop + per-pair fallbacks) share one request instead of stampeding."""
+        async with self._tickers_snapshot_lock:
+            now = self._time()
+            if (self._tickers_snapshot_cache is not None
+                    and (now - self._tickers_snapshot_ts) < self._TICKERS_SNAPSHOT_TTL_S):
+                return self._tickers_snapshot_cache
+            all_tickers = await self._api_request(
+                method=RESTMethod.GET,
+                path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
+                limit_id=CONSTANTS.TICKER_BOOK_PATH_URL,
+            )
+            snapshot: Dict[str, float] = {}
+            for ticker in all_tickers:
+                ticker_id = ticker.get("ticker_id")
+                last_price = ticker.get("last_price")
+                if ticker_id is None or last_price is None:
+                    continue
+                try:
+                    snapshot[ticker_id] = float(last_price)
+                except (TypeError, ValueError):
+                    continue
+            self._tickers_snapshot_cache = snapshot
+            self._tickers_snapshot_ts = now
+            return snapshot
+
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         try:
@@ -1863,16 +1926,13 @@ class NonkycExchange(ExchangePyBase):
                 f"Falling back to full tickers list."
             )
             try:
-                all_tickers = await self._api_request(
-                    method=RESTMethod.GET,
-                    path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
-                    limit_id=CONSTANTS.TICKER_BOOK_PATH_URL
-                )
-                ticker_id = symbol.replace("/", "_")
-                for ticker in all_tickers:
-                    if ticker.get("ticker_id") == ticker_id:
-                        return float(ticker["last_price"])
-                raise ValueError(f"Ticker not found for {trading_pair} in tickers list")
+                # Shared short-TTL snapshot (single-flight): when MANY pairs fail over at
+                # once (exchange blip), they share one /tickers call instead of N.
+                snapshot = await self._tickers_snapshot()
+                price = snapshot.get(symbol.replace("/", "_"))
+                if price is None:
+                    raise ValueError(f"Ticker not found for {trading_pair} in tickers list")
+                return price
             except Exception as fallback_err:
                 self.logger().warning(
                     f"Both ticker endpoints failed for {trading_pair}: "
