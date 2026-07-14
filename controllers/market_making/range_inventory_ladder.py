@@ -6,7 +6,7 @@ import tempfile
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
@@ -564,6 +564,23 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
 
+    # LOG-6 (CSF-V1 Phase 5): hysteresis on price-regime transitions. Production showed 133
+    # regime flaps in 38h (median 12s apart) with the price parked exactly on a band edge --
+    # every sub-tick oscillation announced a regime change. A new regime must now HOLD for
+    # this many seconds before the switch is confirmed (logged / emitted / reported in
+    # processed_data). Diagnostic-path only: fills and safety paths never consult the regime.
+    regime_dwell_seconds: int = Field(
+        default=30,
+        json_schema_extra={
+            "prompt": (
+                "Seconds a new price regime must hold before the transition is confirmed "
+                "(hysteresis against band-edge flapping, default 30; 0 = immediate): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
     # v13 Part A: fallback per-fill fee rate (fraction of filled quote) used ONLY when the
     # connector does not report an actual fee for an order. NonKYC's order object carries no
     # fee field; a silent 0 would slowly overstate the fund. Ledger-accuracy only -- this
@@ -720,6 +737,7 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         "recycle_max_latency_seconds",
         "ledger_overclaim_reanchor_seconds",
         "fill_settle_grace_seconds",
+        "regime_dwell_seconds",
         "reseed_generation",
         mode="before",
     )
@@ -905,6 +923,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     def validate_fill_settle_grace_seconds(cls, value: int):
         if value < 0:
             raise ValueError("fill_settle_grace_seconds cannot be negative")
+        return value
+
+    @field_validator("regime_dwell_seconds")
+    @classmethod
+    def validate_regime_dwell_seconds(cls, value: int):
+        if value < 0:
+            raise ValueError("regime_dwell_seconds cannot be negative")
         return value
 
     @field_validator("ledger_reconcile_threshold_quote")
@@ -1218,6 +1243,12 @@ class RangeInventoryLadderController(ControllerBase):
     # baseline WARNING has fired (growth-gate fix, 2026-07-12): offline analysis keeps
     # visibility without the 5-minute warning spam that trained operators to ignore it.
     LEDGER_UNDERSTATEMENT_DIAG_INTERVAL_SECONDS = 1800.0
+    # LOG-8 (CSF-V1 Phase 5): settle-grace on the over-claim WARNING (not the re-anchor).
+    # Production 2026-07-14 13:35: a WS balance delta landed ~1s before the fill event
+    # reached the ledger, reading as a momentary over-claim that self-healed in 1s -- but
+    # the warning had already fired. Warn only when the over-claim persists longer than
+    # this OR across two consecutive evaluations.
+    OVERCLAIM_WARNING_GRACE_SECONDS = 10.0
     # Watchdog fire/skip loop fix rule 4 (2026-07-12): how long after the forced balance
     # refresh request the under-deployment condition must STILL hold before the re-center
     # actually fires (gives the async REST refresh a moment to land in the cached balances).
@@ -1234,6 +1265,11 @@ class RangeInventoryLadderController(ControllerBase):
         self._last_drift_warning_time: float = 0.0
         self._drift_warning_interval: float = 300.0  # warn at most every 5 minutes
         self._last_drift_above_threshold: bool = False
+        # LOG-8: persistence tracking for the over-claim warning settle-grace. Timestamp of
+        # the first non-settling evaluation that observed the over-claim, and the count of
+        # consecutive such evaluations. Reset whenever the over-claim clears.
+        self._overclaim_warn_since: Optional[float] = None
+        self._overclaim_warn_streak: int = 0
         self._positions_empty_warning_emitted = False
         self._state_recovery_reason: Optional[str] = None
         self._state_recovery_backup_path: Optional[Path] = None
@@ -1247,6 +1283,11 @@ class RangeInventoryLadderController(ControllerBase):
         self._last_buy_compression_signature: Optional[tuple] = None
         self._last_sell_compression_signature: Optional[tuple] = None
         self._last_price_regime: Optional[str] = None
+        # LOG-6: regime-hysteresis state. The candidate regime observed while a change is
+        # dwelling, and when it was first observed. Cleared on confirmation or when the
+        # price returns to the confirmed regime.
+        self._pending_price_regime: Optional[str] = None
+        self._pending_regime_since: Optional[float] = None
         self._cooldown_bypass_until_by_level: Dict[str, float] = {}
 
         # Per-level last filter reason (None = eligible, "blocked", "not_passive").
@@ -3915,6 +3956,33 @@ class RangeInventoryLadderController(ControllerBase):
         except Exception:
             return False
 
+    def _external_order_holds(self) -> Tuple[Decimal, Decimal]:
+        """LOG-2' (CSF-V1 Phase 5): (quote_hold, base_hold) locked in untracked (manual /
+        external) active exchange orders for this pair, as reported by the connector's
+        ``external_order_holds(trading_pair)`` accounting (NonKYC-only for now). Those holds
+        sit in the wallet but are legitimately outside the fills-only ledger, so the
+        understatement check subtracts them before comparing wallet-held vs ledger-owned.
+        Degrades to zeros when the connector does not expose the API (e.g. Kraken) or
+        returns anything that is not a finite non-negative Decimal (also keeps MagicMock
+        connectors in unit tests from injecting auto-generated values)."""
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            getter = getattr(connector, "external_order_holds", None)
+            if not callable(getter):
+                return Decimal("0"), Decimal("0")
+            holds = getter(self.config.trading_pair)
+            if not isinstance(holds, dict):
+                return Decimal("0"), Decimal("0")
+
+            def _clean(value) -> Decimal:
+                if isinstance(value, Decimal) and value.is_finite() and value >= Decimal("0"):
+                    return value
+                return Decimal("0")
+
+            return _clean(holds.get("quote")), _clean(holds.get("base"))
+        except Exception:
+            return Decimal("0"), Decimal("0")
+
     def _within_fill_settle_grace(self, now: float) -> bool:
         """True within fill_settle_grace_seconds of the last BOOKED fill. Connectors without a
         settling flag (e.g. Kraken, poll-only balances) leave the wallet snapshot one balance
@@ -4297,14 +4365,30 @@ class RangeInventoryLadderController(ControllerBase):
         now_ts = self.market_data_provider.time()
         should_warn = False
         # Defer the over-claim warning while balances settle (a post-fill/reconnect race can read as a
-        # false over-claim). The latch is not set during settling, so a GENUINE persistent over-claim
-        # still warns on the first post-settle cycle (test 6 -> defer, test 7 -> fires after RESOLVED).
+        # false over-claim). LOG-8 (Phase 5): additionally, a short persistence grace -- a WS balance
+        # delta can land ~1s before the fill event reaches the ledger, producing a one-evaluation
+        # over-claim that the ledger self-heals; warn only when the over-claim persists longer than
+        # OVERCLAIM_WARNING_GRACE_SECONDS or across two consecutive (non-settling) evaluations.
+        # During settling the persistence state is frozen (neither advanced nor reset), so a genuine
+        # over-claim first seen while settling resumes counting on the first post-settle cycle.
         if overclaim_above_threshold and not balance_settling:
-            if not self._last_drift_above_threshold:
-                should_warn = True
-            elif (now_ts - self._last_drift_warning_time) >= self._drift_warning_interval:
-                should_warn = True
-        self._last_drift_above_threshold = overclaim_above_threshold and not balance_settling
+            if self._overclaim_warn_since is None:
+                self._overclaim_warn_since = now_ts
+            self._overclaim_warn_streak += 1
+            overclaim_persisted = (
+                (now_ts - self._overclaim_warn_since) >= self.OVERCLAIM_WARNING_GRACE_SECONDS
+                or self._overclaim_warn_streak >= 2
+            )
+            if overclaim_persisted:
+                if not self._last_drift_above_threshold:
+                    should_warn = True
+                elif (now_ts - self._last_drift_warning_time) >= self._drift_warning_interval:
+                    should_warn = True
+            self._last_drift_above_threshold = overclaim_persisted
+        elif not balance_settling:
+            self._overclaim_warn_since = None
+            self._overclaim_warn_streak = 0
+            self._last_drift_above_threshold = False
         if should_warn:
             self._last_drift_warning_time = now_ts
             self.logger().warning(
@@ -4333,9 +4417,17 @@ class RangeInventoryLadderController(ControllerBase):
         # SUSTAINED wallet-over-ledger surplus for visibility. DIAGNOSTIC ONLY -- the ledger
         # is never auto-corrected upward: a legitimate idle reserve or deposit also produces
         # surplus, so this is a visibility aid, not an error.
+        # LOG-2' (Phase 5): wallet balance locked in the operator's MANUAL (untracked) open
+        # orders is real and visible to the connector's external-holds accounting, but it is
+        # legitimately outside the fills-only ledger -- production showed the identical 20.5
+        # USDT of orphan holds reported as a chronic "understatement" by every controller on
+        # the account. Subtract those holds from the wallet side before comparing; the
+        # warning stays intact for residual drift above the existing threshold. Connectors
+        # without the API (e.g. Kraken) degrade to zeros == current behavior.
+        external_quote_hold, external_base_hold = self._external_order_holds()
         ledger_surplus_quote = (
-            max(Decimal("0"), wallet_derived_quote - owned_quote)
-            + max(Decimal("0"), wallet_derived_base - owned_base) * reference_price
+            max(Decimal("0"), wallet_derived_quote - external_quote_hold - owned_quote)
+            + max(Decimal("0"), wallet_derived_base - external_base_hold - owned_base) * reference_price
         )
         if balance_settling:
             # Defer while balances settle -- the persistence timer is neither advanced nor
@@ -4400,6 +4492,8 @@ class RangeInventoryLadderController(ControllerBase):
                         persistence_seconds=self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS,
                         warn_kind=warn_kind,
                         baseline_quote=str(previous_baseline) if previous_baseline is not None else "",
+                        external_holds_quote=str(external_quote_hold),
+                        external_holds_base=str(external_base_hold),
                     )
                 elif (now_ts - self._understatement_last_diag_ts) >= self.LEDGER_UNDERSTATEMENT_DIAG_INTERVAL_SECONDS:
                     # Silent at WARNING level; keep the jsonl trail alive at a reduced
@@ -4416,6 +4510,8 @@ class RangeInventoryLadderController(ControllerBase):
                         persistence_seconds=self.LEDGER_UNDERSTATEMENT_PERSISTENCE_SECONDS,
                         warn_kind="flat_no_warning",
                         baseline_quote=str(self._understatement_baseline),
+                        external_holds_quote=str(external_quote_hold),
+                        external_holds_base=str(external_base_hold),
                     )
         else:
             self._understatement_since = None
@@ -4562,11 +4658,30 @@ class RangeInventoryLadderController(ControllerBase):
                 trading_pair=self.config.trading_pair,
             )
 
-        price_regime = self._current_price_regime(reference_price)
-        if price_regime != self._last_price_regime:
-            if price_regime in {"below_buy_range", "above_sell_range"}:
+        # LOG-6: regime hysteresis. A raw regime that differs from the confirmed one must
+        # HOLD for regime_dwell_seconds before the switch is confirmed (announced, emitted
+        # and reported in processed_data). The first-ever observation confirms immediately.
+        # Fill booking and all safety paths above never consult the regime, so a fill that
+        # lands during the dwell books normally.
+        raw_regime = self._current_price_regime(reference_price)
+        confirmed_change = False
+        if self._last_price_regime is None:
+            confirmed_change = True
+        elif raw_regime == self._last_price_regime:
+            self._pending_price_regime = None
+            self._pending_regime_since = None
+        else:
+            if raw_regime != self._pending_price_regime:
+                self._pending_price_regime = raw_regime
+                self._pending_regime_since = now
+            if (now - self._pending_regime_since) >= float(self.config.regime_dwell_seconds):
+                confirmed_change = True
+        if confirmed_change:
+            self._pending_price_regime = None
+            self._pending_regime_since = None
+            if raw_regime in {"below_buy_range", "above_sell_range"}:
                 self.logger().warning(
-                    f"{self.config.id}: price regime changed to {price_regime} at {reference_price}. "
+                    f"{self.config.id}: price regime changed to {raw_regime} at {reference_price}. "
                     "The market is currently outside the configured ladder range."
                 )
             self._emit_structured(
@@ -4574,10 +4689,11 @@ class RangeInventoryLadderController(ControllerBase):
                 connector=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 previous_regime=self._last_price_regime or "",
-                new_regime=price_regime,
+                new_regime=raw_regime,
                 reference_price=str(reference_price),
             )
-            self._last_price_regime = price_regime
+            self._last_price_regime = raw_regime
+        price_regime = self._last_price_regime
 
         self.processed_data = {
             "reference_price": reference_price,
