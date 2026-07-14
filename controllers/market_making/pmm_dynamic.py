@@ -1,3 +1,4 @@
+import math
 from decimal import Decimal
 from typing import List
 
@@ -80,6 +81,16 @@ class PMMDynamicController(MarketMakingControllerBase):
         self.config = config
         self.max_records = max(config.macd_slow, config.macd_fast, config.macd_signal, config.natr_length) + 100
         super().__init__(config, *args, **kwargs)
+        self._degenerate_indicator_warning_ts: float = 0.0
+
+    def _warn_degenerate_indicators(self, reasons: List[str]):
+        now = self.market_data_provider.time()
+        if now - self._degenerate_indicator_warning_ts >= 30.0:
+            self._degenerate_indicator_warning_ts = now
+            self.logger().warning(
+                f"Degenerate indicators for {self.config.candles_trading_pair} "
+                f"({', '.join(reasons)}) — falling back to plain mid quoting. "
+                f"Rate-limited to one warning per 30s.")
 
     async def update_processed_data(self):
         candles = self.market_data_provider.get_candles_df(connector_name=self.config.candles_connector,
@@ -90,16 +101,48 @@ class PMMDynamicController(MarketMakingControllerBase):
         macd_output = ta.macd(candles["close"], fast=self.config.macd_fast,
                               slow=self.config.macd_slow, signal=self.config.macd_signal)
         macd = macd_output[f"MACD_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
-        macd_signal = - (macd - macd.mean()) / macd.std()
-        macdh = macd_output[f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
-        macdh_signal = macdh.apply(lambda x: 1 if x > 0 else -1)
-        max_price_shift = natr / 2
-        price_multiplier = ((0.5 * macd_signal + 0.5 * macdh_signal) * max_price_shift).iloc[-1]
+
+        # Flat closes on an illiquid pair make macd.std() zero (or NaN on degenerate
+        # data) — the original math then poisons reference_price/spread_multiplier with
+        # NaN/inf. Fall back per component: price_multiplier -> 0 (quote around mid),
+        # spread_multiplier -> 1.
+        degenerate_reasons = []
+        macd_std = float(macd.std())
+        if not math.isfinite(macd_std) or macd_std == 0:
+            degenerate_reasons.append(f"macd_std={macd_std}")
+            price_multiplier = 0.0
+        else:
+            macd_signal = - (macd - macd.mean()) / macd_std
+            macdh = macd_output[f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"]
+            macdh_signal = macdh.apply(lambda x: 1 if x > 0 else -1)
+            max_price_shift = natr / 2
+            price_multiplier = float(((0.5 * macd_signal + 0.5 * macdh_signal) * max_price_shift).iloc[-1])
+            if not math.isfinite(price_multiplier):
+                degenerate_reasons.append(f"price_multiplier={price_multiplier}")
+                price_multiplier = 0.0
+
+        latest_natr = float(natr.iloc[-1])
+        if not math.isfinite(latest_natr) or latest_natr <= 0:
+            degenerate_reasons.append(f"natr={latest_natr}")
+            spread_multiplier = Decimal("1")
+        else:
+            spread_multiplier = Decimal(str(latest_natr))
+
+        reference_price = float(candles["close"].iloc[-1]) * (1 + price_multiplier)
+        if not math.isfinite(reference_price) or reference_price <= 0:
+            # No usable close: keep the previous processed_data (proposal paths no-op
+            # without a reference price) rather than publishing garbage.
+            degenerate_reasons.append(f"reference_price={reference_price}")
+            self._warn_degenerate_indicators(degenerate_reasons)
+            return
+        if degenerate_reasons:
+            self._warn_degenerate_indicators(degenerate_reasons)
+
         candles["spread_multiplier"] = natr
         candles["reference_price"] = candles["close"] * (1 + price_multiplier)
         self.processed_data = {
-            "reference_price": Decimal(candles["reference_price"].iloc[-1]),
-            "spread_multiplier": Decimal(candles["spread_multiplier"].iloc[-1]),
+            "reference_price": Decimal(str(reference_price)),
+            "spread_multiplier": spread_multiplier,
             "features": candles
         }
 

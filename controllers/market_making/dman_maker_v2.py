@@ -20,12 +20,16 @@ class DManMakerV2Config(MarketMakingControllerConfigBase):
     controller_name: str = "dman_maker_v2"
 
     # DCA configuration
+    # NOTE: dca_spreads/dca_amounts are consumed once in the controller's __init__ and
+    # are NOT hot-reloadable — YAML edits to them require a controller restart.
     dca_spreads: List[Decimal] = Field(
         default="0.01,0.02,0.04,0.08",
-        json_schema_extra={"prompt": "Enter a comma-separated list of spreads for each DCA level: ", "prompt_on_new": True})
+        json_schema_extra={"prompt": "Enter a comma-separated list of spreads for each DCA level "
+                                     "(not hot-reloadable, requires restart): ", "prompt_on_new": True})
     dca_amounts: List[Decimal] = Field(
         default="0.1,0.2,0.4,0.8",
-        json_schema_extra={"prompt": "Enter a comma-separated list of amounts for each DCA level: ", "prompt_on_new": True})
+        json_schema_extra={"prompt": "Enter a comma-separated list of amounts for each DCA level "
+                                     "(not hot-reloadable, requires restart): ", "prompt_on_new": True})
     top_executor_refresh_time: Optional[float] = Field(default=None, json_schema_extra={"is_updatable": True})
     executor_activation_bounds: Optional[List[Decimal]] = Field(default=None, json_schema_extra={"is_updatable": True})
 
@@ -57,10 +61,17 @@ class DManMakerV2Config(MarketMakingControllerConfigBase):
         if v is None or v == "":
             return [1 for _ in validation_info.data['dca_spreads']]
         if isinstance(v, str):
-            return [float(x.strip()) for x in v.split(',')]
+            v = [float(x.strip()) for x in v.split(',')]
         elif isinstance(v, list) and len(v) != len(validation_info.data['dca_spreads']):
             raise ValueError(
                 f"The number of dca amounts must match the number of {validation_info.data['dca_spreads']}.")
+        if isinstance(v, list) and len(v) > 0:
+            try:
+                total = sum(float(x) for x in v)
+            except (TypeError, ValueError):
+                return v  # non-numeric entries are reported by pydantic's own coercion
+            if total <= 0:
+                raise ValueError("The sum of dca_amounts must be positive.")
         return v
 
 
@@ -68,7 +79,16 @@ class DManMakerV2(MarketMakingControllerBase):
     def __init__(self, config: DManMakerV2Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
-        self.dca_amounts_pct = [Decimal(amount) / sum(self.config.dca_amounts) for amount in self.config.dca_amounts]
+        # The validator forbids a zero sum from YAML; guard the division anyway for
+        # programmatic construction — fall back to equal weights instead of raising.
+        total_dca_amount = sum(self.config.dca_amounts)
+        if total_dca_amount > 0:
+            self.dca_amounts_pct = [Decimal(amount) / total_dca_amount for amount in self.config.dca_amounts]
+        else:
+            level_count = len(self.config.dca_amounts)
+            if level_count > 0:
+                self.logger().warning("dca_amounts sum to zero — falling back to equal DCA weights.")
+            self.dca_amounts_pct = [Decimal("1") / level_count for _ in range(level_count)]
         self.spreads = self.config.dca_spreads
 
     def first_level_refresh_condition(self, executor):

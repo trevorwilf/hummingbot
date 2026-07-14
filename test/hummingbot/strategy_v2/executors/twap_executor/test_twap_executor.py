@@ -125,7 +125,13 @@ class TestTWAPExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         await executor.control_task()
         executor._order_plan[1].order = self.in_flight_order_maker
         await executor.control_task()
-        self.assertEqual(executor._order_plan[1].order_id, "OID-BUY-3")
+        # The second slot's computed slice is negative while the first order is still
+        # resting (100 quote total - 120 open): it is SKIPPED with a warning instead of
+        # submitted as a negative-amount order (the old behavior consumed OID-BUY-2 on
+        # that bogus order, so the refresh used to land on OID-BUY-3).
+        self.assertEqual(executor._order_plan[1].order_id, "OID-BUY-2")
+        self.assertEqual(2, self.strategy.buy.call_count)
+        self.assertTrue(self.is_partially_logged("WARNING", "is not placeable"))
 
     @patch.object(TWAPExecutor, 'get_trading_rules')
     @patch.object(TWAPExecutor, 'adjust_order_candidates')

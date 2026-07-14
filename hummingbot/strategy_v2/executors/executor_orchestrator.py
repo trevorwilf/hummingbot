@@ -180,6 +180,9 @@ class ExecutorOrchestrator:
         # Track (connector, pair, side) keys with executors currently shutting down.
         # Used to defer creates across cycles, not just within one batch.
         self._shutdown_in_flight_keys: Dict[tuple, float] = {}
+        # Rate limit for the preflight price-unavailable warning: an empty book during a
+        # WS reconnect drops actions every tick, which must not flood the log.
+        self._price_unavailable_warning_ts: float = 0.0
         self._initialize_cached_performance()
 
     def _initialize_cached_performance(self):
@@ -359,15 +362,39 @@ class ExecutorOrchestrator:
                 if not executor.is_closed:
                     executor.early_stop()
         for i in range(max_executors_close_attempts):
-            if all([executor.executor_info.is_done for executors_list in self.active_executors.values()
-                    for executor in executors_list]):
-                continue
+            if self._all_executors_done():
+                break
             await asyncio.sleep(2.0)
-        # Store all positions and executors
-        self.store_all_positions()
-        self.store_all_executors()
+        # Store all positions and executors. Each store is independently guarded so one
+        # failure cannot skip the other — held inventory must survive the restart.
+        try:
+            self.store_all_positions()
+        except Exception:
+            self.logger().error("Failed to store positions during shutdown.", exc_info=True)
+        try:
+            self.store_all_executors()
+        except Exception:
+            self.logger().error("Failed to store executors during shutdown.", exc_info=True)
         # Clear executors and trigger garbage collection
         self.active_executors.clear()
+
+    def _all_executors_done(self) -> bool:
+        """
+        True when every active executor reports itself done. An executor whose
+        executor_info raises counts as done: it cannot report status, and the shutdown
+        wait (and the persistence that follows) must not be held hostage by it.
+        """
+        all_done = True
+        for executors_list in self.active_executors.values():
+            for executor in executors_list:
+                try:
+                    if not executor.executor_info.is_done:
+                        all_done = False
+                except Exception:
+                    self.logger().error(
+                        f"Error reading executor_info for executor "
+                        f"{getattr(executor.config, 'id', 'unknown')} during stop().", exc_info=True)
+        return all_done
 
     def store_all_positions(self):
         """
@@ -385,27 +412,32 @@ class ExecutorOrchestrator:
                     self.logger().warning(f"Skipping position storage for {position.connector_name}.{position.trading_pair} - "
                                           f"not available in current strategy markets")
                     continue
-                mid_price = self.strategy.market_data_provider.get_price_by_type(
-                    position.connector_name, position.trading_pair, PriceType.MidPrice)
-                position_summary = position.get_position_summary(mid_price)
+                try:
+                    mid_price = self.strategy.market_data_provider.get_price_by_type(
+                        position.connector_name, position.trading_pair, PriceType.MidPrice)
+                    position_summary = position.get_position_summary(mid_price)
 
-                # Create a Position record (id will only be used for new positions)
-                position_record = Position(
-                    id=str(uuid.uuid4()),
-                    controller_id=controller_id,
-                    connector_name=position_summary.connector_name,
-                    trading_pair=position_summary.trading_pair,
-                    side=position_summary.side.name,
-                    timestamp=int(self.strategy.current_timestamp * 1e3),
-                    volume_traded_quote=position_summary.volume_traded_quote,
-                    amount=position_summary.amount,
-                    breakeven_price=position_summary.breakeven_price,
-                    unrealized_pnl_quote=position_summary.unrealized_pnl_quote,
-                    realized_pnl_quote=position_summary.realized_pnl_quote,
-                    cum_fees_quote=position_summary.cum_fees_quote,
-                )
-                # Store or update the position in the database
-                markets_recorder.update_or_store_position(position_record)
+                    # Create a Position record (id will only be used for new positions)
+                    position_record = Position(
+                        id=str(uuid.uuid4()),
+                        controller_id=controller_id,
+                        connector_name=position_summary.connector_name,
+                        trading_pair=position_summary.trading_pair,
+                        side=position_summary.side.name,
+                        timestamp=int(self.strategy.current_timestamp * 1e3),
+                        volume_traded_quote=position_summary.volume_traded_quote,
+                        amount=position_summary.amount,
+                        breakeven_price=position_summary.breakeven_price,
+                        unrealized_pnl_quote=position_summary.unrealized_pnl_quote,
+                        realized_pnl_quote=position_summary.realized_pnl_quote,
+                        cum_fees_quote=position_summary.cum_fees_quote,
+                    )
+                    # Store or update the position in the database
+                    markets_recorder.update_or_store_position(position_record)
+                except Exception:
+                    self.logger().error(
+                        f"Failed to store position {position.connector_name}.{position.trading_pair} "
+                        f"for controller {controller_id}.", exc_info=True)
 
         # Clear all positions after storing (avoid modifying list while iterating)
         self.positions_held.clear()
@@ -413,9 +445,14 @@ class ExecutorOrchestrator:
     def store_all_executors(self):
         for controller_id, executors_list in self.active_executors.items():
             for executor in executors_list:
-                # Store the executor in the database
-                MarketsRecorder.get_instance().store_or_update_executor(executor)
-                self._update_cached_performance(controller_id, executor.executor_info)
+                try:
+                    # Store the executor in the database
+                    MarketsRecorder.get_instance().store_or_update_executor(executor)
+                    self._update_cached_performance(controller_id, executor.executor_info)
+                except Exception:
+                    self.logger().error(
+                        f"Failed to store executor {getattr(executor.config, 'id', 'unknown')} "
+                        f"for controller {controller_id}.", exc_info=True)
         # Remove the executors from the list
         self.active_executors = {}
 
@@ -598,10 +635,33 @@ class ExecutorOrchestrator:
                     # Determine price for validation
                     price = getattr(config, 'entry_price', None) or getattr(config, 'price', None)
                     if price is None or (hasattr(price, 'is_nan') and price.is_nan()):
-                        # For market orders, use current market price
-                        price = self.strategy.market_data_provider.get_price_by_type(
-                            connector_name, config.trading_pair,
-                            PriceType.BestAsk if config.side == TradeType.BUY else PriceType.BestBid)
+                        # For market orders, use current market price. An empty book during
+                        # a WS reconnect raises (spot connectors) or yields NaN — that is a
+                        # transient price outage, not a budget shortfall: drop fail-closed
+                        # with its own reason so controllers can tell the two apart.
+                        try:
+                            price = self.strategy.market_data_provider.get_price_by_type(
+                                connector_name, config.trading_pair,
+                                PriceType.BestAsk if config.side == TradeType.BUY else PriceType.BestBid)
+                        except Exception:
+                            price = None
+                    if price is None or (hasattr(price, 'is_nan') and price.is_nan()):
+                        dropped_actions.append(action)
+                        self._warn_price_unavailable(connector_name, config)
+                        try:
+                            get_structured_logger().emit(
+                                "budget_preflight_dropped",
+                                controller_id=action.controller_id,
+                                trading_pair=config.trading_pair, side=config.side.name,
+                                proposed_amount=str(config.amount), proposed_price=str(price),
+                                adjusted_amount=None,
+                                reason="price_unavailable",
+                                connector=connector_name)
+                        except Exception:
+                            pass
+                        self._notify_controller_preflight(
+                            action, "dropped", config.amount, None, "price_unavailable")
+                        continue
 
                     is_maker = True  # Conservative default
                     if hasattr(config, 'execution_strategy'):
@@ -680,7 +740,10 @@ class ExecutorOrchestrator:
                             f"resized due to insufficient balance"
                         )
                         resized_actions.append((action, _original_amount, adjusted.amount))
-                        config.amount = adjusted.amount
+                        # Resize on a copy: mutating the controller's own config object in
+                        # place would make any deferred/re-proposed action carry the
+                        # shrunken amount instead of the controller's original intent.
+                        action.executor_config = config.model_copy(update={"amount": adjusted.amount})
                         surviving_actions.append(action)
                         try:
                             get_structured_logger().emit("budget_preflight_resized",
@@ -727,6 +790,22 @@ class ExecutorOrchestrator:
             self.logger().warning(f"Budget preflight adjustments — {'; '.join(parts)}")
 
         return surviving_actions
+
+    def _warn_price_unavailable(self, connector_name: str, config):
+        """Warn (rate-limited, not per-action) that preflight validation prices are
+        unavailable — typically an empty order book during a WS reconnect."""
+        now = self.strategy.current_timestamp
+        if now - self._price_unavailable_warning_ts >= 30.0:
+            self._price_unavailable_warning_ts = now
+            self.logger().warning(
+                f"Budget preflight: validation price unavailable for "
+                f"{connector_name}:{config.trading_pair} (empty order book?) — dropping "
+                f"market-order create action(s) until prices return. Rate-limited to one "
+                f"warning per 30s; per-action detail in structured events.")
+        else:
+            self.logger().debug(
+                f"Budget preflight: price unavailable, dropped action on "
+                f"{connector_name}:{config.trading_pair}")
 
     def _notify_controller_preflight(self, action, result: str, original_amount, adjusted_amount, reason: str):
         """Inform the originating controller that the budget preflight dropped or resized one
@@ -972,7 +1051,8 @@ class ExecutorOrchestrator:
             for position in positions_list:
                 mid_price = self.strategy.market_data_provider.get_price_by_type(
                     position.connector_name, position.trading_pair, PriceType.MidPrice)
-                positions_summary.append(position.get_position_summary(mid_price))
+                positions_summary.append(position.get_position_summary(
+                    mid_price if not mid_price.is_nan() else Decimal("0")))
             report[controller_id] = positions_summary
         return report
 

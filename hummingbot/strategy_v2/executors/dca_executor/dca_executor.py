@@ -40,19 +40,13 @@ class DCAExecutor(ExecutorBase):
         super().__init__(strategy=strategy, connectors=[config.connector_name], config=config, update_interval=update_interval)
         self.config: DCAExecutorConfig = config
 
-        # validate amounts with exchange trading rules
-        if self.is_any_amount_lower_than_min_order_size():
-            self.close_execution_by(CloseType.FAILED)
-            trading_rules = self.get_trading_rules(connector_name=config.connector_name, trading_pair=config.trading_pair)
-            self.logger().error("Please increase the amount of the order:"
-                                f"- Current amounts quote: {config.amounts_quote} | Min notional size: {trading_rules.min_notional_size}"
-                                f"- Current amounts base: {[amount / price for amount, price in zip(config.amounts_quote, config.prices)]} | Min order size: {trading_rules.min_order_size}")
         # set default bounds
         self.n_levels = len(config.amounts_quote)
         if self.config.mode == DCAMode.TAKER and not self.config.activation_bounds:
             self.config.activation_bounds = [Decimal("0.0001"), Decimal("0.005")]  # 0.01% and 0.5%
 
-        # executors tracking
+        # executors tracking — initialized BEFORE any early-fail path so a FAILED-at-
+        # construction executor still answers status/get_custom_info queries.
         self._open_orders: List[TrackedOrder] = []
         self._close_orders: List[TrackedOrder] = []  # for now will be just one order but we can have multiple
         self._failed_orders: List[TrackedOrder] = []
@@ -65,6 +59,23 @@ class DCAExecutor(ExecutorBase):
         # add retries
         self._current_retries = 0
         self._max_retries = max_retries
+        self._barriers_suspended_warning_ts: float = 0.0
+
+        # validate amounts with exchange trading rules
+        if self.is_any_amount_lower_than_min_order_size():
+            self.close_execution_by(CloseType.FAILED)
+            trading_rules = self.get_trading_rules(connector_name=config.connector_name, trading_pair=config.trading_pair)
+            self.logger().error("Please increase the amount of the order:"
+                                f"- Current amounts quote: {config.amounts_quote} | Min notional size: {trading_rules.min_notional_size}"
+                                f"- Current amounts base: {[amount / price for amount, price in zip(config.amounts_quote, config.prices)]} | Min order size: {trading_rules.min_order_size}")
+
+    def _warn_barriers_suspended(self, detail: str):
+        now = self._strategy.current_timestamp
+        if now - self._barriers_suspended_warning_ts >= 30.0:
+            self._barriers_suspended_warning_ts = now
+            self.logger().warning(
+                f"Executor {self.config.id} ({self.config.trading_pair}): barriers suspended — "
+                f"price unavailable ({detail}). Rate-limited to one warning per 30s.")
 
     @property
     def active_open_orders(self) -> List[TrackedOrder]:
@@ -322,12 +333,23 @@ class DCAExecutor(ExecutorBase):
         will be triggered if the net pnl is lower than the stop loss.
         """
         if self.config.stop_loss:
+            # NaN <= x is always False: without the finite checks a price outage would
+            # silently disarm the stop-loss instead of suspending it observably.
             if self.config.mode == DCAMode.MAKER:
-                if self.all_open_orders_executed and self.net_pnl_pct <= -self.config.stop_loss:
-                    self.close_type = CloseType.STOP_LOSS
-                    self.place_close_order_and_cancel_open_orders()
+                if self.all_open_orders_executed:
+                    net_pnl_pct = self.net_pnl_pct
+                    if not net_pnl_pct.is_finite():
+                        self._warn_barriers_suspended(f"net_pnl_pct={net_pnl_pct}")
+                        return
+                    if net_pnl_pct <= -self.config.stop_loss:
+                        self.close_type = CloseType.STOP_LOSS
+                        self.place_close_order_and_cancel_open_orders()
             else:
-                if self.net_pnl_quote <= -self.max_loss_quote:
+                net_pnl_quote = self.net_pnl_quote
+                if not net_pnl_quote.is_finite():
+                    self._warn_barriers_suspended(f"net_pnl_quote={net_pnl_quote}")
+                    return
+                if net_pnl_quote <= -self.max_loss_quote:
                     self.close_type = CloseType.STOP_LOSS
                     self.place_close_order_and_cancel_open_orders()
 
@@ -341,6 +363,9 @@ class DCAExecutor(ExecutorBase):
         """
         if self.config.trailing_stop:
             net_pnl_pct = self.get_net_pnl_pct()
+            if not net_pnl_pct.is_finite():
+                self._warn_barriers_suspended(f"net_pnl_pct={net_pnl_pct}")
+                return
             if not self._trailing_stop_trigger_pct:
                 if net_pnl_pct > self.config.trailing_stop.activation_price:
                     self._trailing_stop_trigger_pct = net_pnl_pct - self.config.trailing_stop.trailing_delta
@@ -358,7 +383,11 @@ class DCAExecutor(ExecutorBase):
         want to use market order, you can use trailing stop instead.
         """
         if self.config.take_profit:
-            if self.net_pnl_pct > self.config.take_profit:
+            net_pnl_pct = self.net_pnl_pct
+            if not net_pnl_pct.is_finite():
+                self._warn_barriers_suspended(f"net_pnl_pct={net_pnl_pct}")
+                return
+            if net_pnl_pct > self.config.take_profit:
                 self.close_type = CloseType.TAKE_PROFIT
                 self.place_close_order_and_cancel_open_orders()
 

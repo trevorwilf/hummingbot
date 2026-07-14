@@ -70,6 +70,7 @@ class ControllerConfigBase(BaseClientModel):
     controller_type: str = "generic"
     total_amount_quote: Decimal = Field(
         default=Decimal("100"),
+        gt=0,
         json_schema_extra={
             "prompt": "Enter the total amount in quote asset to use for trading (e.g., 1000): ",
             "prompt_on_new": True,
@@ -227,7 +228,15 @@ class ControllerBase(RunnableBase):
         """
         candles_configs = self.get_candles_config()
         for candles_config in candles_configs:
-            self.market_data_provider.initialize_candles_feed(candles_config)
+            try:
+                self.market_data_provider.initialize_candles_feed(candles_config)
+            except Exception:
+                # A bad feed (typo'd connector, UnsupportedConnectorException, ...) must
+                # not prevent the controller — or the other controllers — from starting.
+                self.logger().error(
+                    f"Failed to initialize candles feed "
+                    f"{candles_config.connector}/{candles_config.trading_pair}/{candles_config.interval} "
+                    f"for controller {self.config.id} — feed skipped.", exc_info=True)
 
     def get_candles_config(self) -> List[CandlesConfig]:
         """

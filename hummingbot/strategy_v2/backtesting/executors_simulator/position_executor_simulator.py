@@ -42,14 +42,19 @@ class PositionExecutorSimulator(ExecutorSimulatorBase):
 
         returns_df = df_filtered[start_timestamp:]
         returns = returns_df['close'].pct_change().fillna(0)
-        cumulative_returns = (((1 + returns).cumprod() - 1) * side_multiplier) - trade_cost
+        # A closed position pays fees on BOTH legs (entry and exit) — consistent with
+        # the round-trip volume doubling at the close row below.
+        cumulative_returns = (((1 + returns).cumprod() - 1) * side_multiplier) - 2 * trade_cost
         df_filtered.loc[start_timestamp:, 'net_pnl_pct'] = cumulative_returns
         df_filtered.loc[start_timestamp:, 'filled_amount_quote'] = float(config.amount) * entry_price
         df_filtered['net_pnl_quote'] = df_filtered['net_pnl_pct'] * df_filtered['filled_amount_quote']
-        df_filtered['cum_fees_quote'] = trade_cost * df_filtered['filled_amount_quote']
+        df_filtered['cum_fees_quote'] = 2 * trade_cost * df_filtered['filled_amount_quote']
 
         # Make sure the trailing stop pct rises linearly to the net p/l pct when above the trailing stop trigger pct (if any)
         if trailing_sl_trigger_pct is not None and trailing_sl_delta_pct is not None:
+            # Pre-create the column: with an all-False mask some pandas versions never
+            # create 'ts' and the read below KeyErrors (trigger never reached).
+            df_filtered['ts'] = float("nan")
             df_filtered.loc[(df_filtered['net_pnl_pct'] > trailing_sl_trigger_pct).cummax(), 'ts'] = (
                 df_filtered['net_pnl_pct'] - float(trailing_sl_delta_pct)
             ).cummax()
