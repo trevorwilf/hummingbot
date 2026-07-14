@@ -194,6 +194,9 @@ class ArbitrageExecutor(ExecutorBase):
         self.place_sell_arbitrage_order()
 
     def place_buy_arbitrage_order(self):
+        # NOTE: _last_buy_price is the PRE-TRADE quote captured by update_trade_pnl_pct
+        # when profitability was evaluated — the MARKET order fills at whatever the book
+        # offers now, so on a re-place after a failure this price is only informational.
         self.buy_order.order_id = self.place_order(
             connector_name=self.buying_market.connector_name,
             trading_pair=self.buying_market.trading_pair,
@@ -204,6 +207,7 @@ class ArbitrageExecutor(ExecutorBase):
         )
 
     def place_sell_arbitrage_order(self):
+        # NOTE: _last_sell_price is the PRE-TRADE quote (see place_buy_arbitrage_order).
         self.sell_order.order_id = self.place_order(
             connector_name=self.selling_market.connector_name,
             trading_pair=self.selling_market.trading_pair,
@@ -311,12 +315,17 @@ class ArbitrageExecutor(ExecutorBase):
             self.sell_order.order = self.get_in_flight_order(self.selling_market.connector_name, event.order_id)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        # Increment BEFORE the gate: the event handler used to re-place unconditionally
+        # and only the control loop (later) checked the ceiling, so a burst of failure
+        # events could re-fire past max_retries at stale prices.
         if self.buy_order.order_id == event.order_id:
-            self.place_buy_arbitrage_order()
             self._cumulative_failures += 1
+            if self._cumulative_failures <= self.max_retries:
+                self.place_buy_arbitrage_order()
         elif self.sell_order.order_id == event.order_id:
-            self.place_sell_arbitrage_order()
             self._cumulative_failures += 1
+            if self._cumulative_failures <= self.max_retries:
+                self.place_sell_arbitrage_order()
 
     def get_custom_info(self) -> Dict:
         return {
