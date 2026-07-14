@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -510,3 +511,194 @@ class KrakenAPIOrderBookDataSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(
             self._is_logged("ERROR", f"Error unsubscribing from {self.trading_pair}")
         )
+
+    # ------------------------------------------------------------------
+    # CSF-V1 Phase 2: KRK-1 dual-dict diffs + KRK-12 checksum validation
+    # ------------------------------------------------------------------
+
+    # 10x10 book fixture using the feed's own string formats. The expected CRC32 values below were
+    # computed offline with zlib over the live-verified transformation (decimal point removed,
+    # leading zeros stripped, top-10 asks ascending then top-10 bids descending).
+    CHECKSUM_ASKS_10 = [
+        ["100.00000", "1.00000000", "1534614200.000000"],
+        ["100.10000", "2.00000000", "1534614200.000000"],
+        ["100.20000", "3.00000000", "1534614200.000000"],
+        ["100.30000", "4.00000000", "1534614200.000000"],
+        ["100.40000", "5.00000000", "1534614200.000000"],
+        ["100.50000", "6.00000000", "1534614200.000000"],
+        ["100.60000", "7.00000000", "1534614200.000000"],
+        ["100.70000", "8.00000000", "1534614200.000000"],
+        ["100.80000", "9.00000000", "1534614200.000000"],
+        ["100.90000", "10.00000000", "1534614200.000000"],
+    ]
+    CHECKSUM_BIDS_10 = [
+        ["99.90000", "2.00000000", "1534614200.000000"],
+        ["99.80000", "3.00000000", "1534614200.000000"],
+        ["99.70000", "4.00000000", "1534614200.000000"],
+        ["99.60000", "5.00000000", "1534614200.000000"],
+        ["99.50000", "6.00000000", "1534614200.000000"],
+        ["99.40000", "7.00000000", "1534614200.000000"],
+        ["99.30000", "8.00000000", "1534614200.000000"],
+        ["99.20000", "9.00000000", "1534614200.000000"],
+        ["99.10000", "10.00000000", "1534614200.000000"],
+        ["99.00000", "11.00000000", "1534614200.000000"],
+    ]
+    # Checksum of the untouched 10x10 snapshot book above.
+    CHECKSUM_SNAPSHOT_EXPECTED = 945700655
+    # Checksum after the consistent diff below (best-ask volume replaced, new best bid inserted,
+    # which pushes the 99.00000 bid out of the hashed top 10).
+    CHECKSUM_AFTER_DIFF_EXPECTED = 2977597905
+
+    def _ws_snapshot_event_10x10(self):
+        return [
+            1234,
+            {"as": [list(level) for level in self.CHECKSUM_ASKS_10],
+             "bs": [list(level) for level in self.CHECKSUM_BIDS_10]},
+            "book-1000",
+            f"{self.base_asset}/{self.quote_asset}",
+        ]
+
+    def _consistent_diff_event(self, checksum: str = None):
+        return [
+            1234,
+            {"a": [["100.00000", "5.00000000", "1534614250.000000"]]},
+            {"b": [["99.95000", "0.50000000", "1534614250.100000"]],
+             "c": checksum if checksum is not None else str(self.CHECKSUM_AFTER_DIFF_EXPECTED)},
+            "book-1000",
+            f"{self.base_asset}/{self.quote_asset}",
+        ]
+
+    async def test_parse_order_book_diff_message_merges_dual_dict_payload(self):
+        # KRK-1 (would-have-caught): live-observed dual-dict diffs [ch, {"a": ...}, {"b": ..., "c":
+        # ...}, "book-10", pair] carry asks and bids in SEPARATE payload dicts; reading only
+        # raw_message[1] silently dropped the bid side.
+        queue: asyncio.Queue = asyncio.Queue()
+        raw = [
+            1234,
+            {"a": [["5541.30000", "2.50700000", "1534614248.456738"]]},
+            {"b": [["5541.20000", "1.00000000", "1534614248.456739"]], "c": "974942666"},
+            "book-10",
+            f"{self.base_asset}/{self.quote_asset}",
+        ]
+
+        await self.data_source._parse_order_book_diff_message(raw, queue)
+
+        msg: OrderBookMessage = await queue.get()
+        self.assertEqual(1, len(msg.asks))
+        self.assertEqual(1, len(msg.bids))
+        self.assertEqual(5541.3, msg.asks[0].price)
+        self.assertEqual(5541.2, msg.bids[0].price)
+        # update_id must derive from the MERGED level set (the bid carries the newest timestamp).
+        self.assertEqual(1534614248.456739, msg.update_id)
+
+    def test_checksum_field_matches_live_examples(self):
+        # Live-verified 2026-07-14 examples of the checksum string transformation.
+        self.assertEqual("6448790000", self.data_source._checksum_field("64487.90000"))
+        self.assertEqual("420000", self.data_source._checksum_field("0.00420000"))
+
+    async def test_checksum_match_keeps_connection_and_resets_counter(self):
+        queue: asyncio.Queue = asyncio.Queue()
+        ws_mock = AsyncMock()
+        self.data_source._ws_assistant = ws_mock
+
+        await self.data_source._parse_order_book_diff_message(self._ws_snapshot_event_10x10(), queue)
+        book = self.data_source._checksum_books[self.trading_pair]
+        self.assertEqual(self.CHECKSUM_SNAPSHOT_EXPECTED, self.data_source._compute_book_checksum(book))
+
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(), queue)
+
+        ws_mock.disconnect.assert_not_awaited()
+        self.assertEqual(0, self.data_source._checksum_mismatch_counts.get(self.trading_pair, 0))
+
+    async def test_single_checksum_mismatch_does_not_disconnect(self):
+        # KRK-12 false-positive guard: a single mismatch (warm-up/edge transient in the live
+        # capture) must NOT tear the connection down.
+        queue: asyncio.Queue = asyncio.Queue()
+        ws_mock = AsyncMock()
+        self.data_source._ws_assistant = ws_mock
+
+        await self.data_source._parse_order_book_diff_message(self._ws_snapshot_event_10x10(), queue)
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(checksum="1"), queue)
+
+        ws_mock.disconnect.assert_not_awaited()
+        self.assertEqual(1, self.data_source._checksum_mismatch_counts[self.trading_pair])
+
+    async def test_two_consecutive_checksum_mismatches_disconnect(self):
+        # KRK-12: confirmed drift (2 consecutive mismatches) forces a clean WS reconnect and resets
+        # the local replica (mirrors the NonKYC gap-disconnect pattern; NOT a REST resync).
+        queue: asyncio.Queue = asyncio.Queue()
+        ws_mock = AsyncMock()
+        self.data_source._ws_assistant = ws_mock
+
+        await self.data_source._parse_order_book_diff_message(self._ws_snapshot_event_10x10(), queue)
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(checksum="1"), queue)
+        ws_mock.disconnect.assert_not_awaited()
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(checksum="1"), queue)
+
+        ws_mock.disconnect.assert_awaited_once()
+        self.assertNotIn(self.trading_pair, self.data_source._checksum_books)
+        self.assertEqual(0, self.data_source._checksum_mismatch_counts.get(self.trading_pair, 0))
+
+    async def test_checksum_match_between_mismatches_resets_counter(self):
+        # Non-consecutive mismatches must never accumulate into a disconnect.
+        queue: asyncio.Queue = asyncio.Queue()
+        ws_mock = AsyncMock()
+        self.data_source._ws_assistant = ws_mock
+
+        await self.data_source._parse_order_book_diff_message(self._ws_snapshot_event_10x10(), queue)
+        # Mismatch, then a matching diff, then another mismatch: counter never reaches 2.
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(checksum="1"), queue)
+        self.assertEqual(1, self.data_source._checksum_mismatch_counts[self.trading_pair])
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(), queue)
+        self.assertEqual(0, self.data_source._checksum_mismatch_counts.get(self.trading_pair, 0))
+        await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(checksum="1"), queue)
+
+        ws_mock.disconnect.assert_not_awaited()
+
+    async def test_checksum_validation_skipped_during_warmup(self):
+        # KRK-12 warm-up guard: no validation (and no disconnect) until the local book holds a full
+        # 10x10 — the live capture's false mismatches all occurred on partially built books.
+        queue: asyncio.Queue = asyncio.Queue()
+        ws_mock = AsyncMock()
+        self.data_source._ws_assistant = ws_mock
+
+        shallow_snapshot = [
+            1234,
+            {"as": [list(level) for level in self.CHECKSUM_ASKS_10[:5]],
+             "bs": [list(level) for level in self.CHECKSUM_BIDS_10[:5]]},
+            "book-1000",
+            f"{self.base_asset}/{self.quote_asset}",
+        ]
+        await self.data_source._parse_order_book_diff_message(shallow_snapshot, queue)
+        for _ in range(3):
+            await self.data_source._parse_order_book_diff_message(self._consistent_diff_event(checksum="1"), queue)
+
+        ws_mock.disconnect.assert_not_awaited()
+        self.assertEqual(0, self.data_source._checksum_mismatch_counts.get(self.trading_pair, 0))
+
+    async def test_checksum_book_applies_deletions(self):
+        # Volume 0 deletes the level from the checksum replica.
+        queue: asyncio.Queue = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._ws_snapshot_event_10x10(), queue)
+
+        delete_diff = [
+            1234,
+            {"a": [["100.00000", "0.00000000", "1534614251.000000"]]},
+            "book-1000",
+            f"{self.base_asset}/{self.quote_asset}",
+        ]
+        await self.data_source._parse_order_book_diff_message(delete_diff, queue)
+
+        book = self.data_source._checksum_books[self.trading_pair]
+        self.assertNotIn(Decimal("100.00000"), book["asks"])
+        self.assertEqual(9, len(book["asks"]))
+
+    async def test_checksum_state_cleared_on_stream_interruption(self):
+        queue: asyncio.Queue = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._ws_snapshot_event_10x10(), queue)
+        self.data_source._checksum_mismatch_counts[self.trading_pair] = 1
+
+        await self.data_source._on_order_stream_interruption(websocket_assistant=None)
+
+        self.assertEqual({}, self.data_source._checksum_books)
+        self.assertEqual(0, len(self.data_source._checksum_mismatch_counts))
