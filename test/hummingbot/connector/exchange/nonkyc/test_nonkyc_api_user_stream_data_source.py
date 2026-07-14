@@ -64,14 +64,32 @@ class NonkycAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
             for record in self.log_records
         )
 
-    async def test_subscribe_channels(self):
+    def _ack_capable_ws(self, sent_messages: list, snapshot: Optional[list] = None) -> AsyncMock:
+        """Mock WS whose iter_messages yields a subscribeReports success ack correlated to
+        the id of the last sent request (NKC-2: _subscribe_channels now awaits the ack)."""
         mock_ws = AsyncMock(spec=WSAssistant)
-        sent_messages = []
 
         async def capture_send(request):
             sent_messages.append(request.payload)
 
         mock_ws.send.side_effect = capture_send
+
+        async def ack_iter():
+            ack = MagicMock()
+            ack.data = {
+                "id": sent_messages[-1]["id"],
+                "jsonrpc": "2.0",
+                "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_ORDERS,
+                "result": snapshot if snapshot is not None else [],
+            }
+            yield ack
+
+        mock_ws.iter_messages.return_value = ack_iter()
+        return mock_ws
+
+    async def test_subscribe_channels(self):
+        sent_messages = []
+        mock_ws = self._ack_capable_ws(sent_messages)
 
         await self.data_source._subscribe_channels(mock_ws)
 
@@ -218,13 +236,8 @@ class NonkycAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
     async def test_balance_ws_disabled_skips_subscription(self):
         """Fix 5: ENABLE_BALANCE_WS=False should skip balance WS subscription."""
         self.connector.ENABLE_BALANCE_WS = False
-        mock_ws = AsyncMock(spec=WSAssistant)
         sent_messages = []
-
-        async def capture_send(request):
-            sent_messages.append(request.payload)
-
-        mock_ws.send.side_effect = capture_send
+        mock_ws = self._ack_capable_ws(sent_messages)
 
         await self.data_source._subscribe_channels(mock_ws)
 
@@ -236,13 +249,8 @@ class NonkycAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
     async def test_balance_ws_enabled_sends_subscription(self):
         """Fix 5: ENABLE_BALANCE_WS=True (default) should send balance WS subscription."""
         self.connector.ENABLE_BALANCE_WS = True
-        mock_ws = AsyncMock(spec=WSAssistant)
         sent_messages = []
-
-        async def capture_send(request):
-            sent_messages.append(request.payload)
-
-        mock_ws.send.side_effect = capture_send
+        mock_ws = self._ack_capable_ws(sent_messages)
 
         await self.data_source._subscribe_channels(mock_ws)
 

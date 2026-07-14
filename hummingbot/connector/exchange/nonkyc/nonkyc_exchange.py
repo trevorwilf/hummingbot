@@ -7,7 +7,7 @@ from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from async_timeout import timeout
-from bidict import bidict
+from bidict import ValueDuplicationError, bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.exchange.nonkyc import (
@@ -116,6 +116,14 @@ class NonkycExchange(ExchangePyBase):
         # unknown REST status counts (repeated unknowns trigger a reconciliation log).
         self._unknown_status_last_warn: Dict[str, float] = {}
         self._unknown_status_counts: Dict[str, int] = {}
+        # NKC-2: rate-limit state for the catch-all WS error-frame warning.
+        self._ws_error_frame_last_warn: float = 0.0
+        # Read-only accounting of balance held by untracked ("orphan" = the operator's manual)
+        # active exchange orders, per trading pair: {pair: {"quote": Decimal, "base": Decimal}}.
+        # Refreshed by the post-reconnect reconciliation snapshot and by the subscribeReports
+        # ack snapshot. Feeds the ladder understatement check (LOG-2'); never used to adopt,
+        # track or cancel those orders.
+        self._external_order_holds: Dict[str, Dict[str, Decimal]] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.logger().info(
             "NonKYC connector supports LIMIT and MARKET order types. "
@@ -263,6 +271,8 @@ class NonkycExchange(ExchangePyBase):
                     )
             # Replace (not update) so an orphan that resolves and later reappears warns again.
             self._warned_orphan_ids = set(orphans)
+            # Refresh the read-only external-holds accounting from this reconciliation snapshot.
+            await self._update_external_holds_from_order_snapshot(exchange_orders)
             if missing:
                 self.logger().warning(
                     f"Post-reconnect reconciliation: {len(missing)} tracked orders "
@@ -287,6 +297,66 @@ class NonkycExchange(ExchangePyBase):
             self._orders_reconciled_after_reconnect = True
             # Now try to exit balance settling (balances may already be refreshed)
             self._exit_balance_settling()
+
+    def external_order_holds(self, trading_pair: str) -> Dict[str, Decimal]:
+        """Balance held by untracked (manual/external) active exchange orders for the pair.
+        Returns {"quote": Decimal, "base": Decimal}; zeros when no snapshot has run or no
+        external orders exist. Read-only accounting — feeds the ladder understatement check."""
+        holds = self._external_order_holds.get(trading_pair)
+        if holds is None:
+            return {"quote": Decimal("0"), "base": Decimal("0")}
+        return dict(holds)
+
+    async def _update_external_holds_from_order_snapshot(self, orders: List[Dict[str, Any]]):
+        """Recompute `_external_order_holds` from a full open-orders snapshot (the REST
+        post-reconnect reconciliation response, or the subscribeReports ack `result`).
+
+        For each ACTIVE order not tracked locally (matched by neither exchange id nor
+        client/userProvidedId — the latter covers UNKNOWN-sentinel orders):
+          BUY:  quote hold = price × (quantity − executedQuantity)
+          SELL: base hold  = remaining quantity
+        The dict is REPLACED wholesale so holds of orders that resolved since the last
+        snapshot are cleared. NO cancellation, NO tracking-adoption."""
+        if not isinstance(orders, list):
+            return
+        tracked = self._order_tracker.active_orders
+        tracked_exchange_ids = {o.exchange_order_id for o in tracked.values() if o.exchange_order_id}
+        tracked_client_ids = set(tracked.keys())
+        holds: Dict[str, Dict[str, Decimal]] = {}
+        for eo in orders:
+            if not isinstance(eo, dict):
+                continue
+            try:
+                if eo.get("isActive") is False:
+                    continue
+                eo_id = str(eo.get("id") or "")
+                client_id = str(eo.get("userProvidedId") or "")
+                if (eo_id and eo_id in tracked_exchange_ids) or (client_id and client_id in tracked_client_ids):
+                    continue
+                symbol = eo.get("symbol")
+                if not symbol and isinstance(eo.get("market"), dict):
+                    symbol = eo["market"].get("symbol")
+                if not symbol:
+                    continue
+                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=str(symbol))
+                quantity = Decimal(str(eo.get("quantity", "0")))
+                executed = Decimal(str(eo.get("executedQuantity") or "0"))
+                remaining = quantity - executed
+                if remaining <= 0:
+                    continue
+                pair_holds = holds.setdefault(
+                    trading_pair, {"quote": Decimal("0"), "base": Decimal("0")})
+                side = str(eo.get("side", "")).lower()
+                if side == "buy":
+                    price = Decimal(str(eo.get("price", "0")))
+                    pair_holds["quote"] += price * remaining
+                elif side == "sell":
+                    pair_holds["base"] += remaining
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                self.logger().debug(
+                    f"Skipping malformed order in external-holds snapshot: {eo}", exc_info=True)
+                continue
+        self._external_order_holds = holds
 
     def _on_nonce_error_detected(self):
         """Set a short cooldown on private REST requests after nonce error."""
@@ -1502,6 +1572,20 @@ class NonkycExchange(ExchangePyBase):
                             )
                             self._order_tracker.process_order_update(order_update)
 
+                # NKC-2: server error frames ({"id": N, "error": {...}}) used to fall through
+                # every branch unlogged — a rejected subscription or failed request was
+                # invisible. Catch-all WARNING, rate-limited to one per 30s window.
+                elif "error" in event_message:
+                    now = time.time()
+                    if now - self._ws_error_frame_last_warn >= self._UNKNOWN_STATUS_WARN_INTERVAL_S:
+                        self._ws_error_frame_last_warn = now
+                        error = event_message.get("error") or {}
+                        self.logger().warning(
+                            f"NonKYC WS error frame (unhandled): id={event_message.get('id')} "
+                            f"code={error.get('code') if isinstance(error, dict) else None} "
+                            f"message={error.get('message') if isinstance(error, dict) else error}"
+                        )
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1998,7 +2082,26 @@ class NonkycExchange(ExchangePyBase):
                 base = base or parts[0]
                 quote = quote or parts[1]
 
-            mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
+            # NKC-5: a base/quote containing a HB or exchange separator would corrupt the
+            # derived trading pair (and any later split of it). 0 occurrences in the 347
+            # live markets — cheap insurance against a future listing.
+            if any(sep in str(base) or sep in str(quote) for sep in ("-", "_", "/")):
+                self.logger().warning(
+                    f"Skipping market {symbol}: base '{base}' or quote '{quote}' "
+                    f"contains a separator character"
+                )
+                continue
+
+            try:
+                mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
+            except ValueDuplicationError:
+                # NKC-5: a second market resolving to the same HB pair used to crash the
+                # whole symbol-map build (connector dead). Keep the first mapping.
+                self.logger().warning(
+                    f"Duplicate trading pair for market {symbol} "
+                    f"({combine_to_hb_trading_pair(base=base, quote=quote)}): "
+                    f"keeping the first mapping"
+                )
         self._set_trading_pair_symbol_map(mapping)
 
     # How long one bulk /tickers snapshot serves price lookups. Half the hummingbot-api
