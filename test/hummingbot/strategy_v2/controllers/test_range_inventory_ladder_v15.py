@@ -397,11 +397,17 @@ class TestFillSettleGrace(_Harness):
         self.assertEqual([], self._events(ctrl, "range_ladder_wallet_floor_binding"))
 
     def test_persistent_overclaim_still_warns_after_grace(self):
-        """A GENUINE over-claim (wallet never catches up) must still warn once the grace expires."""
+        """A GENUINE over-claim (wallet never catches up) must still warn once the grace expires.
+        LOG-8 (Phase 5): the warning additionally requires the over-claim to persist across two
+        consecutive evaluations (or >10s), so a single cycle no longer fires it."""
         mdp = self._incident_mdp()
         ctrl = self._incident_controller(mdp)
         ctrl._last_fill_booked_ts = 905.0  # 95s ago -> grace (90s) expired
         asyncio.run(ctrl.update_processed_data())
+        # first evaluation: over-claim observed but not yet persistent -> no warning
+        self.assertEqual(0, len(self._events(ctrl, "range_ladder_reconciliation_overclaim")))
+        asyncio.run(ctrl.update_processed_data())
+        # second consecutive evaluation: persistence confirmed -> warns
         self.assertEqual(1, len(self._events(ctrl, "range_ladder_reconciliation_overclaim")))
         self.assertEqual(1, len(self._events(ctrl, "range_ladder_wallet_floor_binding")))
 
