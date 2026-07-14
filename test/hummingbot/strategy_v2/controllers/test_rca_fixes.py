@@ -368,9 +368,11 @@ class TestExecutorRefreshIncludesPartiallyFilled(IsolatedAsyncioWrapperTestCase)
         mock.id = executor_id
         return mock
 
-    def test_refresh_includes_partially_filled_executor(self):
-        """Partially filled executor older than refresh time should be included."""
-        ctrl = _make_controller(executor_refresh_time=300)
+    def test_refresh_includes_partially_filled_executor_when_opted_in(self):
+        """Partially filled executor older than refresh time is included only when the
+        controller opts in via refresh_trading_executors=True (the original fork
+        behavior, now gated behind a config flag)."""
+        ctrl = _make_controller(executor_refresh_time=300, refresh_trading_executors=True)
         ctrl.market_data_provider.time.return_value = 1000.0
         executor = self._make_executor_mock(is_trading=True, is_active=True, age=600)
         ctrl.executors_info = [executor]
@@ -379,6 +381,17 @@ class TestExecutorRefreshIncludesPartiallyFilled(IsolatedAsyncioWrapperTestCase)
         self.assertEqual(1, len(actions))
         self.assertIsInstance(actions[0], StopExecutorAction)
         self.assertEqual("exec_1", actions[0].executor_id)
+
+    def test_refresh_excludes_trading_executor_by_default(self):
+        """Stock behavior (default): a trading executor is never force-cycled on age —
+        that would cancel resting TPs and burn fees/queue position."""
+        ctrl = _make_controller(executor_refresh_time=300)
+        ctrl.market_data_provider.time.return_value = 1000.0
+        executor = self._make_executor_mock(is_trading=True, is_active=True, age=600)
+        ctrl.executors_info = [executor]
+
+        actions = ctrl.executors_to_refresh()
+        self.assertEqual(0, len(actions))
 
     def test_refresh_excludes_young_trading_executor(self):
         """Partially filled executor younger than refresh time should NOT be included."""

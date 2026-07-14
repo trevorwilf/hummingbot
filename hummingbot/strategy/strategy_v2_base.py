@@ -279,9 +279,15 @@ class StrategyV2Base(StrategyPyBase):
         Initialize candles for the strategy. This method collects candles configurations
         from controllers only.
         """
-        # From controllers (after they are initialized)
-        for controller in self.controllers.values():
-            controller.initialize_candles()
+        # From controllers (after they are initialized). One controller's bad candles
+        # feed must not prevent the other controllers — or the process — from starting.
+        for controller_id, controller in self.controllers.items():
+            try:
+                controller.initialize_candles()
+            except Exception:
+                self.logger().error(
+                    f"Failed to initialize candles for controller {controller_id} — "
+                    f"its feeds are skipped.", exc_info=True)
 
     def get_candles_df(self, connector_name: str, trading_pair: str, interval: str) -> pd.DataFrame:
         """
