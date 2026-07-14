@@ -47,6 +47,7 @@ class MarketDataProvider:
         self._rates = {}
         self._non_trading_connectors = LazyDict[str, ConnectorBase](self._create_non_trading_connector)
         self._non_trading_connectors_started: Dict[str, bool] = {}  # Track which connectors have been started
+        self._non_trading_connector_start_locks: Dict[str, asyncio.Lock] = {}  # One start at a time per connector
         self._rates_required = GroupedSetDict[str, ConnectorPair]()
         self.conn_settings = AllConnectorSettings.get_connector_settings()
 
@@ -326,33 +327,41 @@ class MarketDataProvider:
         if self._non_trading_connectors_started.get(connector_name, False):
             return True
 
-        try:
-            # Add the trading pair to the connector BEFORE starting the network
-            # This ensures the WebSocket has something to subscribe to
-            if trading_pair not in connector._trading_pairs:
-                connector._trading_pairs.append(trading_pair)
+        # Per-connector lock closes the check-then-act race: two controllers sharing the
+        # provider could both see started=False across the awaits below and double-start
+        # the connector (double order book tracker / WS, leaked task).
+        lock = self._non_trading_connector_start_locks.setdefault(connector_name, asyncio.Lock())
+        async with lock:
+            if self._non_trading_connectors_started.get(connector_name, False):
+                return True
 
-            # Start the network - this will initialize order book tracker with the trading pair
-            await connector.start_network()
-            self._non_trading_connectors_started[connector_name] = True
-            self.logger().info(f"Started non-trading connector: {connector_name} with initial pair {trading_pair}")
+            try:
+                # Add the trading pair to the connector BEFORE starting the network
+                # This ensures the WebSocket has something to subscribe to
+                if trading_pair not in connector._trading_pairs:
+                    connector._trading_pairs.append(trading_pair)
 
-            # Wait for order book tracker to be ready
-            max_wait = 30
-            waited = 0
-            tracker = connector.order_book_tracker
-            while waited < max_wait:
-                if tracker._order_book_stream_listener_task is not None:
-                    # Give WebSocket time to establish connection
-                    await asyncio.sleep(2.0)
-                    break
-                await asyncio.sleep(0.5)
-                waited += 0.5
+                # Start the network - this will initialize order book tracker with the trading pair
+                await connector.start_network()
+                self._non_trading_connectors_started[connector_name] = True
+                self.logger().info(f"Started non-trading connector: {connector_name} with initial pair {trading_pair}")
 
-            return True
-        except Exception as e:
-            self.logger().error(f"Error starting non-trading connector {connector_name}: {e}")
-            return False
+                # Wait for order book tracker to be ready
+                max_wait = 30
+                waited = 0
+                tracker = connector.order_book_tracker
+                while waited < max_wait:
+                    if tracker._order_book_stream_listener_task is not None:
+                        # Give WebSocket time to establish connection
+                        await asyncio.sleep(2.0)
+                        break
+                    await asyncio.sleep(0.5)
+                    waited += 0.5
+
+                return True
+            except Exception as e:
+                self.logger().error(f"Error starting non-trading connector {connector_name}: {e}")
+                return False
 
     @staticmethod
     def get_connector_config_map(connector_name: str):

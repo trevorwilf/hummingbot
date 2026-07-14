@@ -1,3 +1,4 @@
+import logging
 import time as _time
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple, Union
@@ -63,6 +64,13 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
         json_schema_extra={
             "prompt": "Enter the refresh time in seconds for executors (e.g., 300 for 5 minutes): ",
             "prompt_on_new": True, "is_updatable": True}
+    )
+    refresh_trading_executors: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": "Refresh executors that are already trading once past executor_refresh_time? "
+                      "(True force-cycles live positions — cancels resting TPs; False = stock behavior): ",
+            "is_updatable": True}
     )
     cooldown_time: int = Field(
         default=15,
@@ -194,19 +202,39 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
     @field_validator('buy_spreads', 'sell_spreads', mode="before")
     @classmethod
     def parse_spreads(cls, v):
-        return parse_comma_separated_list(v)
+        parsed = parse_comma_separated_list(v)
+        if isinstance(parsed, list):
+            for spread in parsed:
+                try:
+                    numeric = float(spread)
+                except (TypeError, ValueError):
+                    continue  # non-numeric entries are reported by pydantic's own coercion
+                if numeric < 0:
+                    raise ValueError(
+                        "Spreads must be non-negative (zero is allowed for top-of-book quoting).")
+        return parsed
 
     @field_validator('buy_amounts_pct', 'sell_amounts_pct', mode="before")
     @classmethod
     def parse_and_validate_amounts(cls, v, validation_info: ValidationInfo):
         field_name = validation_info.field_name
+        # When the spreads field failed its own validation it is absent from
+        # validation_info.data — use .get() so pydantic reports the spread error instead
+        # of this validator escaping with a KeyError.
+        spreads = validation_info.data.get(field_name.replace('amounts_pct', 'spreads'))
         if v is None or v == "":
-            spread_field = field_name.replace('amounts_pct', 'spreads')
-            return [1 for _ in validation_info.data[spread_field]]
+            return [1 for _ in (spreads or [])]
         parsed = parse_comma_separated_list(v)
-        if isinstance(parsed, list) and len(parsed) != len(validation_info.data[field_name.replace('amounts_pct', 'spreads')]):
+        if isinstance(parsed, list) and spreads is not None and len(parsed) != len(spreads):
             raise ValueError(
                 f"The number of {field_name} must match the number of {field_name.replace('amounts_pct', 'spreads')}.")
+        if isinstance(parsed, list) and len(parsed) > 0:
+            try:
+                total = sum(float(amount) for amount in parsed)
+            except (TypeError, ValueError):
+                return parsed  # non-numeric entries are reported by pydantic's own coercion
+            if total <= 0:
+                raise ValueError(f"{field_name} must sum to a positive value when provided.")
         return parsed
 
     @property
@@ -228,6 +256,16 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
 
         # Calculate total percentages across buys and sells
         total_pct = sum(buy_amounts_pct) + sum(sell_amounts_pct)
+
+        # The validators forbid this from YAML; guard the division anyway (e.g. values
+        # mutated programmatically) — an empty allocation quotes nothing, a raise here
+        # would abort every cycle.
+        if total_pct <= 0:
+            logging.getLogger(__name__).warning(
+                f"buy_amounts_pct + sell_amounts_pct sum to {total_pct} for {self.id} — "
+                f"returning an empty allocation (no orders will be quoted).")
+            spreads = getattr(self, f'{trade_type.name.lower()}_spreads')
+            return spreads, [Decimal("0") for _ in spreads]
 
         # Normalize amounts_pct based on total percentages
         if trade_type == TradeType.BUY:
@@ -268,6 +306,8 @@ class MarketMakingControllerBase(ControllerBase):
         self._last_stale_log_time: float = 0.0             # Rate-limit logging
         self._stale_transition_time: Optional[float] = None  # When stale state began
         self._stale_suppression_logged: bool = False
+        self._empty_book_warning_ts: float = 0.0           # Rate-limit empty-book cycle skips
+        self._degenerate_level_warning_ts: float = 0.0     # Rate-limit non-positive price skips
         self.market_data_provider.initialize_rate_sources([ConnectorPair(
             connector_name=config.connector_name, trading_pair=config.trading_pair)])
         self.logger().info(
@@ -681,6 +721,11 @@ class MarketMakingControllerBase(ControllerBase):
         except Exception:
             pass  # Logging must never break proposal flow
 
+        # No reference price yet (e.g. the book has been empty since startup):
+        # update_processed_data kept processed_data unset and warned — nothing to quote.
+        if "reference_price" not in self.processed_data:
+            return create_actions
+
         # Check if we need to rebalance position first
         position_rebalance_action = self.check_position_rebalance()
         if position_rebalance_action is not None:
@@ -697,6 +742,11 @@ class MarketMakingControllerBase(ControllerBase):
         for level_id in levels_to_execute:
             price, amount = self.get_price_and_amount(level_id)
             trade_type = self.get_trade_type_from_level_id(level_id)
+
+            # Degenerate level (non-positive price or empty allocation) — already warned
+            # rate-limited by get_price_and_amount / get_spreads_and_amounts_in_quote.
+            if price <= 0 or amount <= 0:
+                continue
 
             # Cross-order prevention (deduplicated — warn once per level)
             if trade_type == TradeType.SELL and highest_buy is not None and price <= highest_buy:
@@ -940,11 +990,11 @@ class MarketMakingControllerBase(ControllerBase):
             # Original behavior: unfilled executors are always refresh-eligible
             if not x.is_trading:
                 return True
-            # Partially filled / trading executors are refresh-eligible
-            # if they've exceeded the refresh time. The position executor's
-            # shutdown logic will handle canceling open orders and closing
-            # the position appropriately.
-            return True
+            # Partially filled / trading executors are refresh-eligible past the refresh
+            # time only when the controller opts in: force-cycling a live position
+            # cancels resting TPs, burns fees and queue position. Default False keeps
+            # the stock behavior (leave trading executors alone).
+            return self.config.refresh_trading_executors
 
         executors_to_refresh = self.filter_executors(
             executors=self.executors_info,
@@ -1000,10 +1050,27 @@ class MarketMakingControllerBase(ControllerBase):
         Update the processed data for the controller. This method should be reimplemented to modify the reference price
         and spread multiplier based on the market data. By default, it will update the reference price as mid price and
         the spread multiplier as 1.
+
+        An empty order book during a WS reconnect raises (spot connectors) or yields NaN.
+        That must not abort the whole cycle: keep the previous processed_data (or leave it
+        unset on the first tick — the proposal paths no-op without a reference_price) and
+        warn (rate-limited).
         """
-        reference_price = self.market_data_provider.get_price_by_type(self.config.connector_name,
-                                                                      self.config.trading_pair, PriceType.MidPrice)
-        self.processed_data = {"reference_price": Decimal(reference_price), "spread_multiplier": Decimal("1")}
+        try:
+            reference_price = Decimal(self.market_data_provider.get_price_by_type(
+                self.config.connector_name, self.config.trading_pair, PriceType.MidPrice))
+        except Exception:
+            reference_price = None
+        if reference_price is None or not reference_price.is_finite() or reference_price <= 0:
+            now = self.market_data_provider.time()
+            if now - self._empty_book_warning_ts >= 30.0:
+                self._empty_book_warning_ts = now
+                self.logger().warning(
+                    f"Reference price unavailable for {self.config.connector_name}:"
+                    f"{self.config.trading_pair} (empty order book?) — skipping cycle, keeping "
+                    f"previous processed data. Rate-limited to one warning per 30s.")
+            return
+        self.processed_data = {"reference_price": reference_price, "spread_multiplier": Decimal("1")}
 
     def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
         """
@@ -1022,6 +1089,17 @@ class MarketMakingControllerBase(ControllerBase):
         spread_in_pct = Decimal(spreads[int(level)]) * Decimal(self.processed_data["spread_multiplier"])
         side_multiplier = Decimal("-1") if trade_type == TradeType.BUY else Decimal("1")
         order_price = reference_price * (1 + side_multiplier * spread_in_pct)
+        if order_price <= 0:
+            # Runtime backstop: a spread >= 1 (possibly via spread_multiplier) pushes a
+            # buy price to zero/negative. Zero amount makes the caller skip the level.
+            now = self.market_data_provider.time()
+            if now - self._degenerate_level_warning_ts >= 30.0:
+                self._degenerate_level_warning_ts = now
+                self.logger().warning(
+                    f"Skipping {level_id}: computed order price {order_price} <= 0 "
+                    f"(reference {reference_price}, spread {spread_in_pct}). "
+                    f"Rate-limited to one warning per 30s.")
+            return order_price, Decimal("0")
         return order_price, Decimal(amounts_quote[int(level)]) / order_price
 
     def get_level_id_from_side(self, trade_type: TradeType, level: int) -> str:
