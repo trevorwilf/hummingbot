@@ -332,6 +332,33 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(report), 1)
         self.assertEqual(report["main"][0].amount, Decimal(10))
 
+    def test_get_positions_report_with_nan_mid_price_returns_finite_summary(self):
+        position_held = PositionHold("binance", "SOL-USDT", side=TradeType.BUY)
+        executor_info = ExecutorInfo(
+            id="123", timestamp=1234, type="position_executor",
+            status=RunnableStatus.TERMINATED, config=PositionExecutorConfig(
+                timestamp=1234, trading_pair="SOL-USDT", connector_name="binance",
+                side=TradeType.BUY, amount=Decimal(10), entry_price=Decimal(100),
+            ), net_pnl_pct=Decimal(0), net_pnl_quote=Decimal(0), cum_fees_quote=Decimal(0),
+            filled_amount_quote=Decimal(100), is_active=False, is_trading=False,
+            custom_info={"held_position_orders": [
+                {"order_id": "123", "amount": Decimal(10), "trade_type": "BUY",
+                 "executed_amount_base": Decimal("10"), "executed_amount_quote": Decimal("2300"),
+                 "cumulative_fee_paid_quote": Decimal(0)}]},
+            controller_id="main"
+        )
+        position_held.add_orders_from_executor(executor_info)
+        self.orchestrator.positions_held = {
+            "main": [position_held]
+        }
+        # Empty book during a WS reconnect: the mid-price read yields NaN
+        self.mock_strategy.market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("NaN"))
+        report = self.orchestrator.get_positions_report()
+        summary = report["main"][0]
+        self.assertTrue(summary.unrealized_pnl_quote.is_finite())
+        self.assertTrue(summary.breakeven_price.is_finite())
+        self.assertEqual(Decimal(10), summary.amount)
+
     @patch.object(MarketsRecorder, "get_instance")
     def test_store_all_executors(self, markets_recorder_mock):
         markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
