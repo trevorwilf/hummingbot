@@ -101,6 +101,7 @@ class XEMMExecutor(ExecutorBase):
         self.failed_orders = []
         self._current_retries = 0
         self._max_retries = max_retries
+        self._degenerate_target_warning_ts: float = 0.0
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval)
@@ -131,7 +132,9 @@ class XEMMExecutor(ExecutorBase):
 
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
-            await self.update_prices_and_tx_costs()
+            prices_ok = await self.update_prices_and_tx_costs()
+            if not prices_ok:
+                return
             await self.control_maker_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
@@ -142,7 +145,13 @@ class XEMMExecutor(ExecutorBase):
         else:
             await self.control_update_maker_order()
 
-    async def update_prices_and_tx_costs(self):
+    async def update_prices_and_tx_costs(self) -> bool:
+        """
+        Refresh the taker quote and the maker target price. Returns False (and skips
+        maker placement this tick) when the target-price denominator is degenerate:
+        with target_profitability + tx_cost_pct >= 1 the maker price would explode to
+        infinity or flip sign.
+        """
         self._taker_result_price = await self.get_resulting_price_for_amount(
             connector=self.taker_connector,
             trading_pair=self.taker_trading_pair,
@@ -152,11 +161,23 @@ class XEMMExecutor(ExecutorBase):
         if self.taker_order_side == TradeType.BUY:
             # Maker is SELL: profitability = (maker_price - taker_price) / maker_price
             # To achieve target: maker_price = taker_price / (1 - target_profitability - tx_cost_pct)
-            self._maker_target_price = self._taker_result_price / (Decimal("1") - self.config.target_profitability - self._tx_cost_pct)
+            denominator = Decimal("1") - self.config.target_profitability - self._tx_cost_pct
         else:
             # Maker is BUY: profitability = (taker_price - maker_price) / maker_price
             # To achieve target: maker_price = taker_price / (1 + target_profitability + tx_cost_pct)
-            self._maker_target_price = self._taker_result_price / (Decimal("1") + self.config.target_profitability + self._tx_cost_pct)
+            denominator = Decimal("1") + self.config.target_profitability + self._tx_cost_pct
+        if denominator <= 0:
+            now = self._strategy.current_timestamp
+            if now - self._degenerate_target_warning_ts >= 30.0:
+                self._degenerate_target_warning_ts = now
+                self.logger().warning(
+                    f"Executor {self.config.id}: degenerate maker target price denominator "
+                    f"({denominator}; target_profitability={self.config.target_profitability}, "
+                    f"tx_cost_pct={self._tx_cost_pct}) — skipping maker placement. "
+                    f"Rate-limited to one warning per 30s.")
+            return False
+        self._maker_target_price = self._taker_result_price / denominator
+        return True
 
     async def update_tx_costs(self):
         base, quote = split_hb_trading_pair(trading_pair=self.config.buying_market.trading_pair)
@@ -226,7 +247,11 @@ class XEMMExecutor(ExecutorBase):
         self.logger().info(f"Created maker order {order_id} at price {self._maker_target_price}.")
 
     async def control_shutdown_process(self):
-        if self.maker_order.is_done and self.taker_order.is_done:
+        # Either leg can be None here (a maker failure clears maker_order; a taker
+        # re-place can fail before a TrackedOrder exists) — a None leg counts as done.
+        maker_done = self.maker_order is None or self.maker_order.is_done
+        taker_done = self.taker_order is None or self.taker_order.is_done
+        if maker_done and taker_done:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
 
