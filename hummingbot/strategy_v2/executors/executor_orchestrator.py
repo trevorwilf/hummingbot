@@ -180,6 +180,9 @@ class ExecutorOrchestrator:
         # Track (connector, pair, side) keys with executors currently shutting down.
         # Used to defer creates across cycles, not just within one batch.
         self._shutdown_in_flight_keys: Dict[tuple, float] = {}
+        # Rate limit for the preflight price-unavailable warning: an empty book during a
+        # WS reconnect drops actions every tick, which must not flood the log.
+        self._price_unavailable_warning_ts: float = 0.0
         self._initialize_cached_performance()
 
     def _initialize_cached_performance(self):
@@ -632,10 +635,33 @@ class ExecutorOrchestrator:
                     # Determine price for validation
                     price = getattr(config, 'entry_price', None) or getattr(config, 'price', None)
                     if price is None or (hasattr(price, 'is_nan') and price.is_nan()):
-                        # For market orders, use current market price
-                        price = self.strategy.market_data_provider.get_price_by_type(
-                            connector_name, config.trading_pair,
-                            PriceType.BestAsk if config.side == TradeType.BUY else PriceType.BestBid)
+                        # For market orders, use current market price. An empty book during
+                        # a WS reconnect raises (spot connectors) or yields NaN — that is a
+                        # transient price outage, not a budget shortfall: drop fail-closed
+                        # with its own reason so controllers can tell the two apart.
+                        try:
+                            price = self.strategy.market_data_provider.get_price_by_type(
+                                connector_name, config.trading_pair,
+                                PriceType.BestAsk if config.side == TradeType.BUY else PriceType.BestBid)
+                        except Exception:
+                            price = None
+                    if price is None or (hasattr(price, 'is_nan') and price.is_nan()):
+                        dropped_actions.append(action)
+                        self._warn_price_unavailable(connector_name, config)
+                        try:
+                            get_structured_logger().emit(
+                                "budget_preflight_dropped",
+                                controller_id=action.controller_id,
+                                trading_pair=config.trading_pair, side=config.side.name,
+                                proposed_amount=str(config.amount), proposed_price=str(price),
+                                adjusted_amount=None,
+                                reason="price_unavailable",
+                                connector=connector_name)
+                        except Exception:
+                            pass
+                        self._notify_controller_preflight(
+                            action, "dropped", config.amount, None, "price_unavailable")
+                        continue
 
                     is_maker = True  # Conservative default
                     if hasattr(config, 'execution_strategy'):
@@ -714,7 +740,10 @@ class ExecutorOrchestrator:
                             f"resized due to insufficient balance"
                         )
                         resized_actions.append((action, _original_amount, adjusted.amount))
-                        config.amount = adjusted.amount
+                        # Resize on a copy: mutating the controller's own config object in
+                        # place would make any deferred/re-proposed action carry the
+                        # shrunken amount instead of the controller's original intent.
+                        action.executor_config = config.model_copy(update={"amount": adjusted.amount})
                         surviving_actions.append(action)
                         try:
                             get_structured_logger().emit("budget_preflight_resized",
@@ -761,6 +790,22 @@ class ExecutorOrchestrator:
             self.logger().warning(f"Budget preflight adjustments — {'; '.join(parts)}")
 
         return surviving_actions
+
+    def _warn_price_unavailable(self, connector_name: str, config):
+        """Warn (rate-limited, not per-action) that preflight validation prices are
+        unavailable — typically an empty order book during a WS reconnect."""
+        now = self.strategy.current_timestamp
+        if now - self._price_unavailable_warning_ts >= 30.0:
+            self._price_unavailable_warning_ts = now
+            self.logger().warning(
+                f"Budget preflight: validation price unavailable for "
+                f"{connector_name}:{config.trading_pair} (empty order book?) — dropping "
+                f"market-order create action(s) until prices return. Rate-limited to one "
+                f"warning per 30s; per-action detail in structured events.")
+        else:
+            self.logger().debug(
+                f"Budget preflight: price unavailable, dropped action on "
+                f"{connector_name}:{config.trading_pair}")
 
     def _notify_controller_preflight(self, action, result: str, original_amount, adjusted_amount, reason: str):
         """Inform the originating controller that the budget preflight dropped or resized one
