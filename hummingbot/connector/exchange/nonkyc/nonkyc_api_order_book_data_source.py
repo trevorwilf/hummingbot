@@ -196,12 +196,12 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             sequence = int(params.get("sequence", 0))
             last_seq = self._last_sequence.get(trading_pair, 0)
 
-            # Late arrival or duplicate
+            # Late arrival or duplicate — drop unconditionally (NKC-3). A message with
+            # sequence <= last_seq can never fill a forward gap (gaps start at last_seq + 1);
+            # inserting it into an active reorder buffer jams the buffer non-empty forever
+            # and keeps the timeout timer armed, turning the next out-of-order message into
+            # an instant spurious resync.
             if sequence <= last_seq:
-                # Check if it fills a gap in the reorder buffer
-                if trading_pair in self._reorder_buffer and sequence not in self._reorder_buffer[trading_pair]:
-                    self._reorder_buffer[trading_pair][sequence] = (raw_message, time.time())
-                    await self._flush_reorder_buffer(trading_pair, message_queue)
                 return
 
             # Contiguous — apply immediately
@@ -255,6 +255,12 @@ class NonkycAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return
 
         last_seq = self._last_sequence.get(trading_pair, 0)
+        # NKC-3: purge stale entries (<= last_seq, e.g. left behind by a snapshot that advanced
+        # the sequence) BEFORE the emptiness check, so a buffer holding only stale entries is
+        # cleared and its timeout timer disarmed instead of jamming forever.
+        stale_seqs = [seq for seq in buffer if seq <= last_seq]
+        for seq in stale_seqs:
+            buffer.pop(seq, None)
         applied = 0
         while last_seq + 1 in buffer:
             next_seq = last_seq + 1

@@ -137,6 +137,15 @@ class TestPhase7BUserStreamWsId(IsolatedAsyncioWrapperTestCase):
             sent_payloads.append(request.payload)
         mock_ws.send = capture_send
 
+        # NKC-2: _subscribe_channels awaits the subscribeReports ack — feed a success frame
+        # correlated on the id of the sent request.
+        async def ack_iter():
+            ack = MagicMock()
+            ack.data = {"id": sent_payloads[-1]["id"], "jsonrpc": "2.0",
+                        "method": "subscribeReports", "result": []}
+            yield ack
+        mock_ws.iter_messages = MagicMock(return_value=ack_iter())
+
         await self.uds._subscribe_channels(mock_ws)
 
         self.assertEqual(2, len(sent_payloads), "Should send subscribeReports + subscribeBalances")
