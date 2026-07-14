@@ -34,11 +34,6 @@ class TWAPExecutor(ExecutorBase):
                  max_retries: int = 15):
         super().__init__(strategy=strategy, connectors=[config.connector_name], config=config, update_interval=update_interval)
         self.config = config
-        trading_rules = self.get_trading_rules(config.connector_name, config.trading_pair)
-        if self.config.order_amount_quote < trading_rules.min_order_size:
-            self.close_execution_by(CloseType.FAILED)
-            self.logger().error("Please increase the total amount or the interval between orders. The current"
-                                f"amount {self.config.order_amount_quote} is less than the minimum order {trading_rules.min_order_size}")
         if self.config.is_maker:
             self.logger().warning("Maker mode is in beta. Please use with caution.")
         self._max_retries = max_retries
@@ -47,6 +42,28 @@ class TWAPExecutor(ExecutorBase):
         self._order_plan: Dict[float, Optional[TrackedOrder]] = self.create_order_plan()
         self._failed_orders = []
         self._refreshed_orders = []
+        # order_amount_quote is in QUOTE units: compare against min_notional_size
+        # directly, and against min_order_size (BASE units) through a price — mirroring
+        # DCAExecutor.is_any_amount_lower_than_min_order_size.
+        trading_rules = self.get_trading_rules(config.connector_name, config.trading_pair)
+        below_min_notional = (trading_rules.min_notional_size > 0
+                              and self.config.order_amount_quote < trading_rules.min_notional_size)
+        below_min_order_size = False
+        try:
+            price = self.get_price(config.connector_name, config.trading_pair, PriceType.MidPrice)
+            if price.is_finite() and price > 0:
+                below_min_order_size = self.config.order_amount_quote / price < trading_rules.min_order_size
+        except Exception:
+            # No price at construction: the base-size check happens again per slice in
+            # create_order via the amount gate.
+            pass
+        if below_min_notional or below_min_order_size:
+            self.close_execution_by(CloseType.FAILED)
+            self.logger().error(
+                "Please increase the total amount or the interval between orders. The slice amount "
+                f"{self.config.order_amount_quote} (quote) violates the exchange minimums "
+                f"(min_notional_size={trading_rules.min_notional_size}, "
+                f"min_order_size={trading_rules.min_order_size} base).")
 
     def create_order_plan(self):
         order_plan = {}
@@ -108,6 +125,10 @@ class TWAPExecutor(ExecutorBase):
                 if self.refresh_order_condition(tracked_order):
                     self._strategy.cancel(self.config.connector_name, self.config.trading_pair, tracked_order.order_id)
                     self._refreshed_orders.append(tracked_order)
+                    # Free the slot before re-placing so the replacement is not sized
+                    # against the order being cancelled, and so a skipped re-place is
+                    # retried by evaluate_create_order instead of pinning the old order.
+                    self._order_plan[timestamp] = None
                     self.create_order(timestamp)
 
     def refresh_order_condition(self, tracked_order: TrackedOrder):
@@ -124,11 +145,21 @@ class TWAPExecutor(ExecutorBase):
 
     def create_order(self, timestamp):
         price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        if not price.is_finite() or price <= 0:
+            self.logger().warning(
+                f"Executor {self.config.id} ({self.config.trading_pair}): mid price unavailable "
+                f"({price}) — skipping this TWAP slice, will retry next tick.")
+            return
         total_executed_amount = self.get_total_executed_amount_quote()
         open_orders_open_amount = sum([order.order.amount * order.order.price for order in self._order_plan.values() if order and order.order and not order.is_done])
         orders_amount_quote_left = self.config.total_amount_quote - total_executed_amount - open_orders_open_amount
         number_or_orders_left = self.config.number_of_orders - len([order for order in self._order_plan.values() if order])
         amount = (orders_amount_quote_left / number_or_orders_left) / price
+        if not amount.is_finite() or amount <= 0:
+            self.logger().warning(
+                f"Executor {self.config.id} ({self.config.trading_pair}): computed slice amount "
+                f"{amount} is not placeable — skipping this TWAP slice.")
+            return
         if self.config.is_maker:
             order_price = price * (1 + self.config.limit_order_buffer) if self.config.side == TradeType.SELL else price * (1 - self.config.limit_order_buffer)
         else:
@@ -163,15 +194,18 @@ class TWAPExecutor(ExecutorBase):
         the order plan and if it is we will move the order to the failed collection and retry with a new order.
         """
         all_orders = self._order_plan.values()
-        active_order = next((order for order in all_orders if order.order_id == event.order_id), None)
+        active_order = next((order for order in all_orders if order and order.order_id == event.order_id), None)
         if active_order:
             self._failed_orders.append(active_order)
-            self._order_plan = {timestamp: None for timestamp, order in self._order_plan.items() if order == active_order}
+            # Reset ONLY the failed slot for a retry — every other scheduled/placed/
+            # filled slot (and its fill accounting) must be preserved.
+            self._order_plan = {timestamp: (None if order is active_order else order)
+                                for timestamp, order in self._order_plan.items()}
             self._current_retries += 1
 
     def update_tracked_orders_with_order_id(self, order_id: str):
         all_orders = self._order_plan.values()
-        active_order = next((order for order in all_orders if order.order_id == order_id), None)
+        active_order = next((order for order in all_orders if order and order.order_id == order_id), None)
         if active_order:
             in_flight_order = self.get_in_flight_order(self.config.connector_name, order_id)
             if in_flight_order:
@@ -186,7 +220,8 @@ class TWAPExecutor(ExecutorBase):
         of the order plan and if it is we will check if the rest of the orders are completed and if they are we will
         pass the executor to SHUTTING_DOWN state.
         """
-        active_order = next((order for order in self._order_plan.values() if order.order_id == event.order_id), None)
+        active_order = next((order for order in self._order_plan.values()
+                             if order and order.order_id == event.order_id), None)
         if active_order:
             self.evaluate_all_orders_completed()
 
