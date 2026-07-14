@@ -2039,3 +2039,158 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.assertEqual("0.00000035", captured["price"])
         self.assertNotIn("E", captured["volume"].upper())
         self.assertNotIn("E", captured["price"].upper())
+
+    # ------------------------------------------------------------------
+    # CSF-V1 Phase 2: KRK-2 flex-fold stability, KRK-7 canonical Ticker
+    # keys, KRK-8 retryable errors
+    # ------------------------------------------------------------------
+
+    @aioresponses()
+    def test_update_balances_flex_only_stable_across_two_polls(self, mocked_api):
+        # KRK-2 (would-have-caught): a flex-only asset (XBT.F held without a co-held spot XXBT) must
+        # be stable and correct across two consecutive polls. The old in-place fold double-counted
+        # against stale prior-poll state on poll 2, then the stale-key cleanup deleted the folded
+        # entry entirely (balance oscillated present -> absent per poll).
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.BALANCE_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps(
+            {"error": [], "result": {"XBT.F": "5", "USDT": "100"}}), repeat=True)
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.OPEN_ORDERS_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {"open": {}}}), repeat=True)
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+        self.assertEqual(Decimal("5"), self.exchange.available_balances["BTC"])
+        self.assertEqual(Decimal("5"), self.exchange.get_balance("BTC"))
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+        self.assertEqual(Decimal("5"), self.exchange.available_balances["BTC"])
+        self.assertEqual(Decimal("5"), self.exchange.get_balance("BTC"))
+        self.assertNotIn("XBT.F", self.exchange.available_balances)
+        self.assertEqual(Decimal("100"), self.exchange.available_balances["USDT"])
+
+    @aioresponses()
+    def test_update_balances_flex_with_coheld_spot_stable_across_two_polls(self, mocked_api):
+        # KRK-2 companion: the co-held case (XXBT spot + XBT.F flex) folds to the sum and must not
+        # grow or shrink across polls.
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.BALANCE_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps(
+            {"error": [], "result": {"XXBT": "1", "XBT.F": "2"}}), repeat=True)
+
+        url = f"{CONSTANTS.BASE_URL}{CONSTANTS.OPEN_ORDERS_PATH_URL}"
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mocked_api.post(regex_url, body=json.dumps({"error": [], "result": {"open": {}}}), repeat=True)
+
+        for _ in range(2):
+            self.async_run_with_timeout(self.exchange._update_balances())
+            self.assertEqual(Decimal("3"), self.exchange.get_balance("BTC"))
+            self.assertEqual(Decimal("3"), self.exchange.available_balances["BTC"])
+
+    @aioresponses()
+    async def test_get_last_traded_prices_translates_canonical_ticker_keys(self, mock_api):
+        # KRK-7 (would-have-caught, live-confirmed): the all-pairs Ticker response keys by CANONICAL
+        # pair name (XXBTZUSD) while the symbol map holds altnames (XBTUSD); without translation the
+        # >=2-pair path silently omits legacy pairs.
+        self.exchange._set_trading_pair_symbol_map(bidict({
+            "XBTUSD": "BTC-USD",
+            self.ex_trading_pair: self.trading_pair,
+        }))
+
+        asset_pairs_url = f"{CONSTANTS.BASE_URL}{CONSTANTS.ASSET_PAIRS_PATH_URL}"
+        asset_pairs_resp = {
+            "error": [],
+            "result": {
+                "XXBTZUSD": {"altname": "XBTUSD", "wsname": "XBT/USD", "base": "XXBT", "quote": "ZUSD"},
+                self.ex_trading_pair: {
+                    "altname": self.ex_trading_pair,
+                    "wsname": f"{self.base_asset}/{self.quote_asset}",
+                    "base": self.base_asset,
+                    "quote": self.quote_asset,
+                },
+            },
+        }
+        mock_api.get(asset_pairs_url, body=json.dumps(asset_pairs_resp))
+
+        ticker_url = web_utils.public_rest_url(CONSTANTS.TICKER_PATH_URL)
+        regex_ticker_url = re.compile(f"^{ticker_url}".replace(".", r"\.").replace("?", r"\?"))
+        mock_api.get(regex_ticker_url, body=json.dumps({
+            "error": [],
+            "result": {
+                "XXBTZUSD": {"c": ["64487.90000", "0.00420000"]},
+                self.ex_trading_pair: {"c": ["1234.50000", "0.10000000"]},
+            },
+        }))
+
+        prices = await self.exchange.get_last_traded_prices(["BTC-USD", self.trading_pair])
+
+        self.assertEqual(64487.9, prices["BTC-USD"])
+        self.assertEqual(1234.5, prices[self.trading_pair])
+        self.assertEqual(2, len(prices))
+
+    async def test_api_request_with_retry_retries_rate_limit_and_eservice_errors(self):
+        # KRK-8: rate-limit and busy/unavailable-service errors on non-AddOrder endpoints retry
+        # with backoff instead of failing hard on the first hit.
+        api_request_mock = AsyncMock(side_effect=[
+            {"error": ["EAPI:Rate limit exceeded"], "result": None},
+            {"error": ["EService:Busy"], "result": None},
+            {"error": [], "result": {"ok": 1}},
+        ])
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
+        self.assertEqual({"ok": 1}, result)
+        self.assertEqual(3, api_request_mock.call_count)
+
+    async def test_api_request_with_retry_still_raises_non_retryable_errors(self):
+        # KRK-8 guard: unrelated Kraken errors keep failing fast (no behavior change).
+        api_request_mock = AsyncMock(return_value={"error": ["EGeneral:Invalid arguments"], "result": None})
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(IOError):
+                await self.exchange._api_request_with_retry(
+                    method=RESTMethod.POST, path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
+        self.assertEqual(1, api_request_mock.call_count)
+
+    async def test_add_order_rate_limit_reconciles_instead_of_retrying(self):
+        # KRK-8 + KRK-4: a rate-limited AddOrder routes through userref reconciliation; a reconciled
+        # match is adopted and the request is never resubmitted.
+        client_order_id = "12345"
+        recovered = {
+            "open": {
+                "OABC-123-XYZ": {
+                    "userref": int(client_order_id),
+                    "status": "open",
+                    "descr": {"order": "buy 1 ETH/USDT @ limit 100"},
+                },
+            }
+        }
+        api_request_mock = AsyncMock(return_value={"error": ["EOrder:Rate limit exceeded"], "result": None})
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value=recovered)), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                data={"userref": client_order_id, "ordertype": "limit"}, is_auth_required=True)
+        self.assertEqual(["OABC-123-XYZ"], result["txid"])
+        self.assertEqual(1, api_request_mock.call_count)  # no resubmission
+
+    async def test_add_order_rate_limit_without_match_fails_without_retry(self):
+        # KRK-8 + KRK-4 fail-closed: a rate-limited AddOrder with no reconciled match must fail
+        # WITHOUT blind resubmission (the old code failed on first hit; retrying could double-place).
+        api_request_mock = AsyncMock(return_value={"error": ["EAPI:Rate limit exceeded"], "result": None})
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value={"open": {}})), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value={"closed": {}})), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(IOError) as context:
+                await self.exchange._api_request_with_retry(
+                    method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                    data={"userref": "444", "ordertype": "limit"}, is_auth_required=True)
+        self.assertIn("EAPI:Rate limit exceeded", str(context.exception))
+        self.assertEqual(1, api_request_mock.call_count)

@@ -162,11 +162,16 @@ def _build_private_rate_limits(tier: KrakenAPITier = KrakenAPITier.STARTER) -> L
             time_interval=CONSTANTS.MATCHING_ENGINE_LIMIT_INTERVAL,
             linked_limits=[LinkedLimitWeightPair(CONSTANTS.MATCHING_ENGINE_LIMIT_ID)],
         ),
+        # KRK-8: CancelOrder carries an age-based matching-engine penalty (up to 8 on starter tier for
+        # young orders — exactly the ladder refresh-wave pattern); weight it at the documented worst
+        # case instead of 1 so bursts of cancels cannot trip Kraken's counter.
         RateLimit(
             limit_id=CONSTANTS.CANCEL_ORDER_PATH_URL,
             limit=MATCHING_ENGINE_LIMIT,
             time_interval=CONSTANTS.MATCHING_ENGINE_LIMIT_INTERVAL,
-            linked_limits=[LinkedLimitWeightPair(CONSTANTS.MATCHING_ENGINE_LIMIT_ID)],
+            weight=CONSTANTS.CANCEL_ORDER_RATE_LIMIT_WEIGHT,
+            linked_limits=[LinkedLimitWeightPair(CONSTANTS.MATCHING_ENGINE_LIMIT_ID,
+                                                 CONSTANTS.CANCEL_ORDER_RATE_LIMIT_WEIGHT)],
         ),
     ])
 
