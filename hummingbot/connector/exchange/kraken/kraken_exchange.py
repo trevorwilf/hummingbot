@@ -144,7 +144,15 @@ class KrakenExchange(ExchangePyBase):
         return False
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return False
+        # KRK-6: QueryOrders with an unknown txid returns `error: [], result: {}` (live-verified
+        # 2026-07-14), which _request_order_status surfaces as IOError(ORDER_NOT_EXIST_ERROR_CODE ...).
+        # The EOrder strings cover the explicit error-shaped variants. Without this classification,
+        # process_order_not_found is never invoked from the status poll and unknown orders stay in
+        # in_flight_orders forever, occupying strategy budget/level slots.
+        error_text = str(status_update_exception)
+        return (CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE in error_text
+                or "EOrder:Invalid order" in error_text
+                or "EOrder:Unknown order" in error_text)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
@@ -218,7 +226,73 @@ class KrakenExchange(ExchangePyBase):
                                                   is_auth_required=True,
                                                   data=data)
 
+    async def get_closed_orders_with_userref(self, userref: int):
+        data = {'userref': userref}
+        return await self._api_request_with_retry(RESTMethod.POST,
+                                                  CONSTANTS.CLOSED_ORDERS_PATH_URL,
+                                                  is_auth_required=True,
+                                                  data=data)
+
+    @staticmethod
+    def _orders_matching_userref(orders: Dict[str, Any], userref) -> Dict[str, Any]:
+        # Kraken returns userref as an int; only adopt orders that actually carry our userref.
+        return {txid: order for txid, order in orders.items()
+                if str(order.get("userref", "")) == str(userref)}
+
+    async def _reconcile_ambiguous_add_order(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        KRK-4/KRK-9: after an ambiguous AddOrder outcome (Cloudflare 5xx/10xx, EService:*, request
+        timeout) the order may be live — or already executed — on the exchange. Reconcile by userref
+        against OpenOrders AND ClosedOrders (userref is live-verified present and reliable in both).
+        Returns an AddOrder-shaped result ({"descr": ..., "txid": [...]}) when the order reached the
+        exchange, or None when reconciliation positively found nothing. Errors raised by the
+        reconciliation queries propagate (fail closed): the caller must not resubmit blindly when
+        the order's existence could not be determined.
+        """
+        userref = (data or {}).get("userref")
+        if userref is None:
+            return None
+        response = await self.get_open_orders_with_userref(userref)
+        matched = self._orders_matching_userref(response.get("open", {}) or {}, userref)
+        if not matched:
+            response = await self.get_closed_orders_with_userref(userref)
+            matched = self._orders_matching_userref(response.get("closed", {}) or {}, userref)
+        if matched:
+            matched_txids = list(matched.keys())
+            self.logger().info(
+                f"Reconciled ambiguous AddOrder via userref {userref}: found {matched_txids}.")
+            # Return an AddOrder-shaped result so _place_order can read result["txid"][0],
+            # marking the order OPEN rather than crashing with KeyError('txid') and FAILED.
+            return {
+                "descr": matched[matched_txids[0]].get("descr", {}),
+                "txid": matched_txids,
+            }
+        return None
+
     # === Orders placing ===
+
+    def _next_client_order_id(self) -> str:
+        """
+        Generates a new numeric client order id (Kraken userref). The 31-bit userref space allows
+        birthday collisions with orders still in flight; a collision would silently overwrite the
+        tracked order (plain dict assignment) and orphan the live one, so regenerate while the id
+        is already tracked (bounded, in case the nonce source is degenerate).
+        """
+        order_id = str(get_new_numeric_client_order_id(
+            nonce_creator=self._client_order_id_nonce_provider,
+            max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
+        ))
+        for _ in range(10):
+            if order_id not in self._order_tracker.all_fillable_orders:
+                break
+            order_id = str(get_new_numeric_client_order_id(
+                nonce_creator=self._client_order_id_nonce_provider,
+                max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
+            ))
+        else:
+            self.logger().warning(
+                f"Could not generate a collision-free client order id after 10 attempts; using {order_id}.")
+        return order_id
 
     def buy(self,
             trading_pair: str,
@@ -236,10 +310,7 @@ class KrakenExchange(ExchangePyBase):
 
         :return: the id assigned by the connector to the order (the client id)
         """
-        order_id = str(get_new_numeric_client_order_id(
-            nonce_creator=self._client_order_id_nonce_provider,
-            max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
-        ))
+        order_id = self._next_client_order_id()
         safe_ensure_future(self._create_order(
             trade_type=TradeType.BUY,
             order_id=order_id,
@@ -263,10 +334,7 @@ class KrakenExchange(ExchangePyBase):
         :param price: the order price
         :return: the id assigned by the connector to the order (the client id)
         """
-        order_id = str(get_new_numeric_client_order_id(
-            nonce_creator=self._client_order_id_nonce_provider,
-            max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
-        ))
+        order_id = self._next_client_order_id()
         safe_ensure_future(self._create_order(
             trade_type=TradeType.SELL,
             order_id=order_id,
@@ -295,13 +363,15 @@ class KrakenExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        # KRK-13: str(Decimal) emits scientific notation for sub-1e-6 values (e.g. "1.2E-7");
+        # serialize fixed-point, which Kraken unconditionally accepts.
         data = {
             "pair": trading_pair,
             "type": "buy" if trade_type is TradeType.BUY else "sell",
             "ordertype": "market" if order_type is OrderType.MARKET else "limit",
-            "volume": str(amount),
+            "volume": f"{amount:f}",
             "userref": order_id,
-            "price": str(price)
+            "price": f"{price:f}"
         }
 
         if order_type is OrderType.MARKET:
@@ -351,26 +421,51 @@ class KrakenExchange(ExchangePyBase):
                 if result is None or error:
                     raise IOError({"error": response_json})
                 break
+            except asyncio.TimeoutError:
+                if path_url == CONSTANTS.ADD_ORDER_PATH_URL:
+                    # KRK-9: a timed-out AddOrder may still have been accepted. Reconcile before
+                    # declaring the order failed; never blind-resubmit on an ambiguous outcome.
+                    recovered = await self._reconcile_ambiguous_add_order(data=data)
+                    if recovered is not None:
+                        return recovered
+                    raise IOError(
+                        f"AddOrder request for userref {(data or {}).get('userref')} timed out and "
+                        "reconciliation found no matching order; failing without retry.")
+                raise
             except IOError as e:
+                error_text = str(e)
+                is_ambiguous_add_order = (
+                    path_url == CONSTANTS.ADD_ORDER_PATH_URL
+                    and (self.is_cloudflare_exception(e) or "EService:" in error_text)
+                )
+                if is_ambiguous_add_order:
+                    # KRK-4/KRK-9: order placement could have been successful despite the error.
+                    # Reconcile by userref (OpenOrders + ClosedOrders) before any resubmission.
+                    self.logger().info(f"Ambiguous AddOrder outcome ({error_text}); reconciling by userref.")
+                    recovered = await self._reconcile_ambiguous_add_order(data=data)
+                    if recovered is not None:
+                        return recovered
+                    if data.get("ordertype") == "market":
+                        # A MARKET order never rests; if the first request was accepted it executed
+                        # immediately. Resubmitting could double-execute, so a market AddOrder with
+                        # no reconciled match fails WITHOUT retry.
+                        raise IOError(
+                            f"Ambiguous market AddOrder outcome for userref {data.get('userref')} "
+                            f"({error_text}); reconciliation found no matching order. "
+                            "Failing without retry.")
+                    if not self.is_cloudflare_exception(e):
+                        # EService:* on a limit AddOrder with no reconciled match: fail closed rather
+                        # than blind-retrying against a busy matching engine.
+                        raise e
+                    # Cloudflare error on a limit AddOrder: reconciliation positively found no order,
+                    # so a resubmission cannot duplicate — retry.
+                    self.logger().warning(
+                        f"Cloudflare error on AddOrder; no order with userref {data.get('userref')} found."
+                        f" Resubmitting. Attempt {retry_attempt + 1}/{self.REQUEST_ATTEMPTS}"
+                    )
+                    await asyncio.sleep(retry_interval ** retry_attempt)
+                    continue
                 if self.is_cloudflare_exception(e):
-                    if path_url == CONSTANTS.ADD_ORDER_PATH_URL:
-                        self.logger().info(f"Retrying {path_url}")
-                        # Order placement could have been successful despite the IOError, so check for the open order.
-                        userref = data.get('userref')
-                        response = await self.get_open_orders_with_userref(userref)
-                        open_orders = response.get("open", {}) or {}
-                        # Only adopt orders that actually carry our userref (Kraken returns userref as an int).
-                        matched_txids = [
-                            txid for txid, order in open_orders.items()
-                            if str(order.get("userref", "")) == str(userref)
-                        ]
-                        if matched_txids:
-                            # Return an AddOrder-shaped result so _place_order can read result["txid"][0],
-                            # marking the order OPEN rather than crashing with KeyError('txid') and FAILED.
-                            return {
-                                "descr": open_orders[matched_txids[0]].get("descr", {}),
-                                "txid": matched_txids,
-                            }
                     self.logger().warning(
                         f"Cloudflare error. Attempt {retry_attempt + 1}/{self.REQUEST_ATTEMPTS}"
                         f" API command {method}: {path_url}"
@@ -612,34 +707,52 @@ class KrakenExchange(ExchangePyBase):
                     self._order_tracker.process_order_update(order_update=order_update)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        # KRK-3: QueryTrades only accepts T-prefixed TRADE txids; querying it with the ORDER txid
+        # returns EOrder:Invalid order (live-verified 2026-07-14), which the whitelist below used to
+        # swallow as "no fills" — REST fill recovery was structurally dead. Fetch the order's
+        # trade-id list via QueryOrders (trades=true) first, then fetch the fills themselves via
+        # QueryTrades in batches of at most 20 ids.
         trade_updates = []
 
         try:
             exchange_order_id = await order.get_exchange_order_id()
+        except asyncio.TimeoutError:
+            raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
+                          "- waiting for exchange order id.")
+
+        try:
+            orders_response = await self._api_request_with_retry(
+                method=RESTMethod.POST,
+                path_url=CONSTANTS.QUERY_ORDERS_PATH_URL,
+                data={"txid": exchange_order_id, "trades": "true"},
+                is_auth_required=True)
+            order_data = orders_response.get(exchange_order_id) or {}
+            trade_ids: List[str] = list(order_data.get("trades") or [])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # An unknown/invalid order id genuinely has no fills. This whitelist applies ONLY to the
+            # QueryOrders step: any error from the QueryTrades fetch below must propagate so the base
+            # class logs it and retries next cycle — swallowing it would understate executed amounts.
+            if "EOrder:Unknown order" in str(e) or "EOrder:Invalid order" in str(e):
+                return trade_updates
+            raise
+
+        for start in range(0, len(trade_ids), CONSTANTS.QUERY_TRADES_MAX_IDS_PER_REQUEST):
+            batch = trade_ids[start:start + CONSTANTS.QUERY_TRADES_MAX_IDS_PER_REQUEST]
             all_fills_response = await self._api_request_with_retry(
                 method=RESTMethod.POST,
                 path_url=CONSTANTS.QUERY_TRADES_PATH_URL,
-                data={"txid": exchange_order_id},
+                data={"txid": ",".join(batch)},
                 is_auth_required=True)
 
             for trade_id, trade_fill in all_fills_response.items():
-                trade: Dict[str, str] = all_fills_response[trade_id]
+                trade: Dict[str, Any] = dict(trade_fill)
                 trade["trade_id"] = trade_id
                 trade_update = self._create_trade_update_with_order_fill_data(
                     order_fill=trade,
                     order=order)
                 trade_updates.append(trade_update)
-
-        except asyncio.TimeoutError:
-            raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
-                          "- waiting for exchange order id.")
-        except Exception as e:
-            # An unknown/invalid order id genuinely has no fills (mirrors REST QueryTrades semantics).
-            # Any OTHER error (network failure, Cloudflare 5xx, IOError) must propagate so the base class
-            # logs it and retries next cycle — swallowing it would silently understate executed amounts.
-            if "EOrder:Unknown order" in str(e) or "EOrder:Invalid order" in str(e):
-                return trade_updates
-            raise
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:

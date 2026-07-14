@@ -552,15 +552,21 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.assertEqual(order.exchange_order_id, request_params["txid"])
 
     def validate_trades_request(self, order: InFlightOrder, request_call: RequestCall):
+        # KRK-3: QueryTrades is now called with the TRADE txids reported by QueryOrders
+        # (trades=true), never with the order txid (which QueryTrades rejects).
         request_params = request_call.kwargs["data"]
-        self.assertEqual(order.exchange_order_id, str(request_params["txid"]))
+        self.assertEqual(self.expected_fill_trade_id, str(request_params["txid"]))
 
     def configure_order_not_found_error_cancelation_response(
             self, order: InFlightOrder, mock_api: aioresponses,
             callback: Optional[Callable] = lambda *args, **kwargs: None
     ) -> str:
-        # Implement the expected not found response when enabling test_cancel_order_not_found_in_the_exchange
-        raise NotImplementedError
+        # Kraken reports an unknown order on cancel as an EOrder error in a 200 response.
+        url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        response = {"error": ["EOrder:Unknown order"]}
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
 
     def configure_successful_cancelation_response(
             self,
@@ -606,7 +612,9 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?") + ".*")
         response = self._order_status_request_completely_filled_mock_response(order=order)
-        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        # repeat=True because the fills path (QueryOrders trades=true) and the status poll both
+        # hit QueryOrders in the same update cycle.
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback, repeat=True)
         return url
 
     def configure_canceled_order_status_response(
@@ -617,7 +625,7 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?") + ".*")
         response = self._order_status_request_canceled_mock_response(order=order)
-        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback, repeat=True)
         return url
 
     def configure_erroneous_http_fill_trade_response(
@@ -641,7 +649,7 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_status_request_open_mock_response(order=order)
-        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback, repeat=True)
         return url
 
     def configure_http_error_order_status_response(
@@ -651,7 +659,7 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
             callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
         url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
-        mock_api.post(regex_url, status=401, callback=callback)
+        mock_api.post(regex_url, status=401, callback=callback, repeat=True)
         return url
 
     def configure_partially_filled_order_status_response(
@@ -662,7 +670,7 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_status_request_partially_filled_mock_response(order=order)
-        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback, repeat=True)
         return url
 
     def configure_order_not_found_error_order_status_response(
@@ -671,8 +679,11 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
     ) -> List[str]:
         url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
-        response = {"code": -2013, "msg": "Order does not exist."}
-        mock_api.post(regex_url, body=json.dumps(response), status=400, callback=callback)
+        # Live-verified 2026-07-14: QueryOrders with an unknown txid returns error: [], result: {}
+        # (an EMPTY result, not an error); _request_order_status turns that into
+        # IOError(ORDER_NOT_EXIST_ERROR_CODE ...), which is the not-found signature.
+        response = {"error": [], "result": {}}
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback, repeat=True)
         return [url]
 
     def configure_partial_fill_trade_response(
@@ -840,21 +851,14 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
             }
         ]
 
-    @aioresponses()
-    def test_lost_order_removed_if_not_found_during_order_status_update(self, mock_api):
-        # Disabling this test because the connector has not been updated yet to validate
-        # order not found during status update (check _is_order_not_found_during_status_update_error)
-        pass
+    # test_lost_order_removed_if_not_found_during_order_status_update and
+    # test_cancel_order_not_found_in_the_exchange are re-enabled (base-class versions run):
+    # KRK-6 classifies not-found during status updates and the cancel path already classified
+    # "Unknown order" errors.
 
     @aioresponses()
     @patch("hummingbot.connector.time_synchronizer.TimeSynchronizer._current_seconds_counter")
     def test_update_time_synchronizer_successfully(self, mock_api, seconds_counter_mock):
-        pass
-
-    @aioresponses()
-    def test_cancel_order_not_found_in_the_exchange(self, mock_api):
-        # Disabling this test because the connector has not been updated yet to validate
-        # order not found during cancellation (check _is_order_not_found_during_cancelation_error)
         pass
 
     def test_user_stream_balance_update(self):
@@ -927,7 +931,9 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
             "error": [],
             "result": order_status
         }
-        mock_api.post(regex_url, body=json.dumps(mock_response))
+        # repeat=True: the fills path (QueryOrders trades=true) and the status poll both hit
+        # QueryOrders in the same update cycle.
+        mock_api.post(regex_url, body=json.dumps(mock_response), repeat=True)
 
         self.async_run_with_timeout(self.exchange._update_order_status())
 
@@ -1719,3 +1725,317 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         rules = await self.exchange._format_trading_rules(exchange_info)
         self.assertEqual(Decimal("1e-2"), rules[0].min_price_increment)
         self.assertEqual(Decimal("0"), rules[0].min_notional_size)
+
+    # === Phase 1 (CSF-V1): Kraken order lifecycle & fills (KRK-3/4/6/9/13/14) ===
+
+    @aioresponses()
+    async def test_lost_order_included_in_order_fills_update_and_not_in_order_status_update(self, mock_api):
+        # Overrides the base test for the KRK-3 dual-path flow: fills for a LOST order are
+        # recovered via QueryOrders (trades=true) -> QueryTrades, and the lost order stays failed.
+        self.exchange._set_current_timestamp(1640780000)
+        request_sent_event = asyncio.Event()
+
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + "1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("10000"),
+            amount=Decimal("1"),
+        )
+        order: InFlightOrder = self.exchange.in_flight_orders[self.client_order_id_prefix + "1"]
+
+        for _ in range(self.exchange._order_tracker._lost_order_count_limit + 1):
+            await self.exchange._order_tracker.process_order_not_found(client_order_id=order.client_order_id)
+
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+
+        # QueryOrders (fills discovery + lost-order status poll) reports the order closed with one trade id.
+        status_response = self._order_status_request_completely_filled_mock_response(order=order)
+        status_response["result"][str(order.exchange_order_id)]["trades"] = [self.expected_fill_trade_id]
+        url = web_utils.private_rest_url(CONSTANTS.QUERY_ORDERS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mock_api.post(regex_url, body=json.dumps(status_response), repeat=True)
+
+        trade_url = self.configure_full_fill_trade_response(
+            order=order,
+            mock_api=mock_api,
+            callback=lambda *args, **kwargs: request_sent_event.set())
+
+        await self.exchange._update_lost_orders_status()
+        await request_sent_event.wait()
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(order.is_done)
+        self.assertTrue(order.is_failure)
+
+        trades_request = self._all_executed_requests(mock_api, trade_url)[0]
+        self.validate_auth_credentials_present(trades_request)
+        self.validate_trades_request(order=order, request_call=trades_request)
+
+        self.assertEqual(1, len(self.order_filled_logger.event_log))
+        fill_event = self.order_filled_logger.event_log[0]
+        self.assertEqual(order.client_order_id, fill_event.order_id)
+        self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
+        self.assertNotIn(order.client_order_id, self.exchange._order_tracker.all_fillable_orders)
+
+    async def test_all_trade_updates_dual_path_fetches_fills_via_query_trades(self):
+        # KRK-3 would-have-caught: the fills poll must NOT send the ORDER txid to QueryTrades
+        # (QueryTrades rejects it with EOrder:Invalid order -> the old whitelist swallowed every
+        # fill). Fills are discovered via QueryOrders (trades=true) and fetched with the TRADE ids.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-P1", "OTXID-P1", price=Decimal("100"), amount=Decimal("2"))
+        calls = []
+
+        async def _fake_api(method, path_url, params=None, data=None, is_auth_required=False, retry_interval=2.0):
+            calls.append((path_url, dict(data or {})))
+            if path_url == CONSTANTS.QUERY_ORDERS_PATH_URL:
+                return {"OTXID-P1": {"status": "closed", "trades": ["TAAAA-1", "TBBBB-2"]}}
+            if path_url == CONSTANTS.QUERY_TRADES_PATH_URL:
+                return {
+                    "TAAAA-1": {"ordertxid": "OTXID-P1", "pair": "ETHUSDT", "type": "buy", "maker": True,
+                                "price": "100", "cost": "150", "vol": "1.5", "fee": "0.1",
+                                "time": 1499865549.59},
+                    "TBBBB-2": {"ordertxid": "OTXID-P1", "pair": "ETHUSDT", "type": "buy", "maker": True,
+                                "price": "101", "cost": "50.5", "vol": "0.5", "fee": "0.05",
+                                "time": 1499865550.59},
+                }
+            raise AssertionError(f"unexpected path {path_url}")
+
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(side_effect=_fake_api)):
+            updates = await self.exchange._all_trade_updates_for_order(order)
+
+        self.assertEqual(2, len(updates))
+        self.assertEqual({"TAAAA-1", "TBBBB-2"}, {u.trade_id for u in updates})
+        self.assertEqual(Decimal("1.5"), updates[0].fill_base_amount)
+        # Step 1: QueryOrders with the ORDER txid and trades=true.
+        self.assertEqual(CONSTANTS.QUERY_ORDERS_PATH_URL, calls[0][0])
+        self.assertEqual({"txid": "OTXID-P1", "trades": "true"}, calls[0][1])
+        # Step 2: QueryTrades with the TRADE ids (comma separated), never the order txid.
+        self.assertEqual(CONSTANTS.QUERY_TRADES_PATH_URL, calls[1][0])
+        self.assertEqual("TAAAA-1,TBBBB-2", calls[1][1]["txid"])
+
+    async def test_all_trade_updates_batches_query_trades_in_chunks_of_twenty(self):
+        # KRK-3: QueryTrades accepts at most 20 txids per request -> 45 ids need 3 batches.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-P2", "OTXID-P2")
+        trade_ids = [f"T{i:05d}" for i in range(45)]
+        batches = []
+
+        async def _fake_api(method, path_url, params=None, data=None, is_auth_required=False, retry_interval=2.0):
+            if path_url == CONSTANTS.QUERY_ORDERS_PATH_URL:
+                return {"OTXID-P2": {"status": "closed", "trades": trade_ids}}
+            batch = data["txid"].split(",")
+            batches.append(batch)
+            return {tid: {"ordertxid": "OTXID-P2", "price": "100", "cost": "1", "vol": "0.01",
+                          "fee": "0.001", "time": 1499865549.59} for tid in batch}
+
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(side_effect=_fake_api)):
+            updates = await self.exchange._all_trade_updates_for_order(order)
+
+        self.assertEqual(45, len(updates))
+        self.assertEqual([20, 20, 5], [len(b) for b in batches])
+        self.assertEqual(trade_ids, [tid for batch in batches for tid in batch])
+
+    async def test_all_trade_updates_whitelist_applies_only_to_query_orders_step(self):
+        # KRK-3: the unknown/invalid-order whitelist may only swallow errors from the QueryOrders
+        # discovery step. Any QueryTrades error (even an EOrder one) must propagate so the base
+        # class retries next cycle instead of silently understating executed amounts.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-P3", "OTXID-P3")
+
+        async def _fake_api(method, path_url, params=None, data=None, is_auth_required=False, retry_interval=2.0):
+            if path_url == CONSTANTS.QUERY_ORDERS_PATH_URL:
+                return {"OTXID-P3": {"status": "closed", "trades": ["TAAAA-1"]}}
+            raise IOError("EOrder:Invalid order")
+
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(side_effect=_fake_api)):
+            with self.assertRaises(IOError):
+                await self.exchange._all_trade_updates_for_order(order)
+
+    async def test_all_trade_updates_empty_result_returns_no_fills_without_query_trades(self):
+        # KRK-3/KRK-6 signature: QueryOrders returning an empty result (unknown txid) means no
+        # fills; QueryTrades must not be called at all.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._track_simple_order("OID-P4", "OTXID-P4")
+        api_mock = AsyncMock(return_value={})
+
+        with patch.object(self.exchange, "_api_request_with_retry", new=api_mock):
+            updates = await self.exchange._all_trade_updates_for_order(order)
+
+        self.assertEqual([], updates)
+        self.assertEqual(1, api_mock.call_count)
+        self.assertEqual(CONSTANTS.QUERY_ORDERS_PATH_URL, api_mock.call_args.kwargs["path_url"])
+
+    def test_is_order_not_found_during_status_update_error_classification(self):
+        # KRK-6: the empty-result signature (ORDER_NOT_EXIST_ERROR_CODE raised by
+        # _request_order_status) and the explicit EOrder strings classify as not-found;
+        # transport errors must not.
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(
+            IOError(f"{CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE} OTXID-1")))
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(
+            IOError("EOrder:Invalid order")))
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(
+            IOError("EOrder:Unknown order")))
+        self.assertFalse(self.exchange._is_order_not_found_during_status_update_error(
+            IOError("Error, HTTP status is 503.")))
+        self.assertFalse(self.exchange._is_order_not_found_during_status_update_error(
+            IOError("EService:Unavailable")))
+
+    async def test_ambiguous_market_add_order_fails_without_resubmission(self):
+        # KRK-4 would-have-caught: a MARKET AddOrder with an ambiguous (Cloudflare) outcome and no
+        # reconciled match must fail WITHOUT a second AddOrder submission (a resubmit could
+        # double-execute).
+        api_request_mock = AsyncMock(side_effect=IOError("Error, HTTP status is 520."))
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value={"open": {}})), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value={"closed": {}})), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(IOError) as context:
+                await self.exchange._api_request_with_retry(
+                    method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                    data={"userref": "111", "ordertype": "market"}, is_auth_required=True)
+        self.assertIn("Failing without retry", str(context.exception))
+        self.assertEqual(1, api_request_mock.call_count)
+
+    async def test_place_order_recovers_from_cloudflare_via_closed_orders(self):
+        # KRK-4: an AddOrder accepted just before the Cloudflare error may already have executed
+        # (aggressive limit / market) -> it appears in ClosedOrders, not OpenOrders. The
+        # reconciliation must find it there and adopt it instead of resubmitting.
+        client_order_id = "777"
+        recovered_closed = {
+            "closed": {
+                "OXYZ-999-CLOSED": {
+                    "userref": int(client_order_id),
+                    "status": "closed",
+                    "descr": {"order": "buy 1 ETH/USDT @ limit 100"},
+                },
+            }
+        }
+        api_request_mock = AsyncMock(side_effect=IOError("Error, HTTP status is 520."))
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value={"open": {}})), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value=recovered_closed)), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                data={"userref": client_order_id, "ordertype": "limit"}, is_auth_required=True)
+        self.assertEqual(["OXYZ-999-CLOSED"], result["txid"])
+        self.assertEqual(1, api_request_mock.call_count)
+
+    async def test_add_order_timeout_reconciles_and_adopts_found_order(self):
+        # KRK-9: a timed-out AddOrder may still have been accepted; reconciliation by userref must
+        # run before the order is declared failed, and a found order is adopted.
+        client_order_id = "555"
+        recovered_open = {
+            "open": {
+                "OABC-555-OPEN": {
+                    "userref": int(client_order_id),
+                    "status": "open",
+                    "descr": {"order": "buy 1 ETH/USDT @ limit 100"},
+                },
+            }
+        }
+        api_request_mock = AsyncMock(side_effect=asyncio.TimeoutError())
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value=recovered_open)), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value={"closed": {}})):
+            result = await self.exchange._api_request_with_retry(
+                method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                data={"userref": client_order_id, "ordertype": "limit"}, is_auth_required=True)
+        self.assertEqual(["OABC-555-OPEN"], result["txid"])
+        self.assertEqual(1, api_request_mock.call_count)
+
+    async def test_add_order_timeout_fails_without_retry_when_not_found(self):
+        # KRK-9: timeout + reconciliation finding nothing -> the order fails without any resubmit.
+        api_request_mock = AsyncMock(side_effect=asyncio.TimeoutError())
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref",
+                             new=AsyncMock(return_value={"open": {}})), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value={"closed": {}})):
+            with self.assertRaises(IOError) as context:
+                await self.exchange._api_request_with_retry(
+                    method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                    data={"userref": "444", "ordertype": "limit"}, is_auth_required=True)
+        self.assertIn("timed out", str(context.exception))
+        self.assertEqual(1, api_request_mock.call_count)
+
+    async def test_add_order_eservice_error_reconciles_and_fails_closed_when_not_found(self):
+        # KRK-9: EService:* on AddOrder is ambiguous -> reconcile; with no match, a limit order
+        # fails closed (no blind retry against a busy matching engine).
+        api_request_mock = AsyncMock(return_value={"error": ["EService:Unavailable"]})
+        open_orders_mock = AsyncMock(return_value={"open": {}})
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref", new=open_orders_mock), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value={"closed": {}})):
+            with self.assertRaises(IOError) as context:
+                await self.exchange._api_request_with_retry(
+                    method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                    data={"userref": "333", "ordertype": "limit"}, is_auth_required=True)
+        self.assertIn("EService:Unavailable", str(context.exception))
+        self.assertEqual(1, api_request_mock.call_count)
+        self.assertEqual(1, open_orders_mock.call_count)
+
+    async def test_cloudflare_limit_add_order_resubmits_only_after_clean_reconciliation(self):
+        # KRK-4: a LIMIT AddOrder under Cloudflare errors may be resubmitted, but only after
+        # reconciliation positively found no existing order (every attempt re-reconciles).
+        api_request_mock = AsyncMock(side_effect=IOError("Error, HTTP status is 520."))
+        open_orders_mock = AsyncMock(return_value={"open": {}})
+        with patch.object(self.exchange, "_api_request", new=api_request_mock), \
+                patch.object(self.exchange, "get_open_orders_with_userref", new=open_orders_mock), \
+                patch.object(self.exchange, "get_closed_orders_with_userref",
+                             new=AsyncMock(return_value={"closed": {}})), \
+                patch("hummingbot.connector.exchange.kraken.kraken_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(IOError):
+                await self.exchange._api_request_with_retry(
+                    method=RESTMethod.POST, path_url=CONSTANTS.ADD_ORDER_PATH_URL,
+                    data={"userref": "222", "ordertype": "limit"}, is_auth_required=True)
+        self.assertEqual(KrakenExchange.REQUEST_ATTEMPTS, api_request_mock.call_count)
+        self.assertEqual(KrakenExchange.REQUEST_ATTEMPTS, open_orders_mock.call_count)
+
+    @patch("hummingbot.connector.exchange.kraken.kraken_exchange.get_new_numeric_client_order_id")
+    def test_client_order_id_regenerated_on_collision(self, id_mock):
+        # KRK-14 would-have-caught: a userref collision with an in-flight order must regenerate
+        # instead of silently overwriting the tracked order (orphaning the live one).
+        id_mock.side_effect = [7, 7, 8]
+        self._track_simple_order("7", "EX-7")
+        result = self.exchange.buy(
+            trading_pair=self.trading_pair,
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT,
+            price=Decimal("2"),
+        )
+        self.assertEqual("8", result)
+        self.assertEqual(3, id_mock.call_count)
+
+    async def test_place_order_serializes_small_decimals_fixed_point(self):
+        # KRK-13 would-have-caught: str(Decimal("1.2E-7")) is "1.2E-7" (scientific notation);
+        # the AddOrder payload must carry fixed-point strings.
+        captured = {}
+
+        async def _fake_api(method, path_url, params=None, data=None, is_auth_required=False, retry_interval=2.0):
+            captured.update(data)
+            return {"txid": ["ONEW-1"], "descr": {}}
+
+        with patch.object(self.exchange, "_api_request_with_retry", new=AsyncMock(side_effect=_fake_api)):
+            await self.exchange._place_order(
+                order_id="123",
+                trading_pair=self.trading_pair,
+                amount=Decimal("1.2E-7"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("3.5E-7"))
+
+        self.assertEqual("0.00000012", captured["volume"])
+        self.assertEqual("0.00000035", captured["price"])
+        self.assertNotIn("E", captured["volume"].upper())
+        self.assertNotIn("E", captured["price"].upper())

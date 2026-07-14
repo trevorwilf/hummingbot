@@ -66,8 +66,12 @@ ADD_ORDER_PATH_URL = "/0/private/AddOrder"
 CANCEL_ORDER_PATH_URL = "/0/private/CancelOrder"
 BALANCE_PATH_URL = "/0/private/Balance"
 OPEN_ORDERS_PATH_URL = "/0/private/OpenOrders"
+CLOSED_ORDERS_PATH_URL = "/0/private/ClosedOrders"
 QUERY_ORDERS_PATH_URL = "/0/private/QueryOrders"
 QUERY_TRADES_PATH_URL = "/0/private/QueryTrades"
+
+# QueryTrades accepts a comma-delimited list of trade txids, capped at 20 per request.
+QUERY_TRADES_MAX_IDS_PER_REQUEST = 20
 
 
 UNKNOWN_ORDER_MESSAGE = "Unknown order"
