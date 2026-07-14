@@ -2,7 +2,6 @@ from sys import float_info as sflt
 from typing import List
 
 import pandas as pd
-import pandas_ta as ta  # noqa: F401
 import talib
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
@@ -28,7 +27,7 @@ class BollingerV2ControllerConfig(DirectionalTradingControllerConfigBase):
             "prompt": "Enter the trading pair for the candles data, leave empty to use the same trading pair as the connector: ",
             "prompt_on_new": True})
     interval: str = Field(
-        default="3m",
+        default="5m",
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True})
@@ -92,7 +91,6 @@ class BollingerV2Controller(DirectionalTradingControllerBase):
                                                       interval=self.config.interval,
                                                       max_records=self.max_records)
         # Add indicators
-        df.ta.bbands(length=self.config.bb_length, lower_std=self.config.bb_std, upper_std=self.config.bb_std, append=True)
         df["upperband"], df["middleband"], df["lowerband"] = talib.BBANDS(real=df["close"], timeperiod=self.config.bb_length, nbdevup=self.config.bb_std, nbdevdn=self.config.bb_std, matype=MA_Type.SMA)
 
         ulr = self.non_zero_range(df["upperband"], df["lowerband"])
@@ -107,11 +105,6 @@ class BollingerV2Controller(DirectionalTradingControllerBase):
         df["signal"] = 0
         df.loc[long_condition, "signal"] = 1
         df.loc[short_condition, "signal"] = -1
-
-        # Debug
-        # We skip the last row which is live candle
-        with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', None):
-            self.logger().info(df.head(-1).tail(15))
 
         # Update processed data
         self.processed_data["signal"] = df["signal"].iloc[-1]
