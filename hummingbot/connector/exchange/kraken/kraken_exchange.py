@@ -597,6 +597,16 @@ class KrakenExchange(ExchangePyBase):
                 self.logger().error(f"Error parsing the trading pair rule {rule}. Skipping.", exc_info=True)
         return retval
 
+    async def _update_trading_rules(self):
+        # Refresh the symbol map BEFORE formatting trading rules so that a new
+        # listing (e.g. SN75USD class) is resolvable on the same refresh cycle.
+        exchange_info = await self._make_trading_rules_request()
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+        trading_rules_list = await self._format_trading_rules(exchange_info)
+        self._trading_rules.clear()
+        for trading_rule in trading_rules_list:
+            self._trading_rules[trading_rule.trading_pair] = trading_rule
+
     async def _update_trading_fees(self):
         """
         Update fees information from the exchange

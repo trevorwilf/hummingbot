@@ -2194,3 +2194,72 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
                     data={"userref": "444", "ordertype": "limit"}, is_auth_required=True)
         self.assertIn("EAPI:Rate limit exceeded", str(context.exception))
         self.assertEqual(1, api_request_mock.call_count)
+
+    # === Phase 6 (CSF-V1): Logging plumbing & trading-rules ordering ===
+
+    async def test_update_trading_rules_new_listing_no_keyerror(self):
+        # SN75USD-class regression: _update_trading_rules must initialise the symbol map BEFORE
+        # calling _format_trading_rules so a brand-new listing resolves on the same refresh cycle
+        # instead of being silently skipped with a KeyError.
+        altname = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        new_altname = "SN75USD"
+        new_wsname = "SN75/USD"
+        exchange_info = {
+            altname: {
+                "altname": altname,
+                "wsname": f"{self.base_asset}/{self.quote_asset}",
+                "base": self.base_asset,
+                "quote": self.quote_asset,
+                "pair_decimals": 1,
+                "lot_decimals": 8,
+                "ordermin": "1",
+                "status": "online",
+            },
+            new_altname: {
+                "altname": new_altname,
+                "wsname": new_wsname,
+                "base": "SN75",
+                "quote": "USD",
+                "pair_decimals": 4,
+                "lot_decimals": 8,
+                "ordermin": "10",
+                "status": "online",
+            },
+        }
+        # Start with an EMPTY symbol map (simulates the state before _initialize runs)
+        self.exchange._set_trading_pair_symbol_map(bidict())
+
+        with patch.object(self.exchange, "_make_trading_rules_request", new=AsyncMock(return_value=exchange_info)):
+            await self.exchange._update_trading_rules()
+
+        # Both pairs must have been resolved and added to trading_rules
+        self.assertIn(self.trading_pair, self.exchange._trading_rules)
+        self.assertIn("SN75-USD", self.exchange._trading_rules)
+        self.assertEqual(Decimal("10"), self.exchange._trading_rules["SN75-USD"].min_order_size)
+
+    async def test_update_trading_rules_symbol_map_refreshed_before_format(self):
+        # White-box: after _update_trading_rules the symbol map must contain the new pair
+        # — i.e. _initialize was definitely called and not skipped.
+        new_altname = "NEWTOKEN123USD"
+        new_wsname = "NEWTOKEN123/USD"
+        exchange_info = {
+            new_altname: {
+                "altname": new_altname,
+                "wsname": new_wsname,
+                "base": "NEWTOKEN123",
+                "quote": "USD",
+                "pair_decimals": 2,
+                "lot_decimals": 8,
+                "ordermin": "5",
+                "status": "online",
+            },
+        }
+        self.exchange._set_trading_pair_symbol_map(bidict())
+
+        with patch.object(self.exchange, "_make_trading_rules_request", new=AsyncMock(return_value=exchange_info)):
+            await self.exchange._update_trading_rules()
+
+        # Symbol map must now map altname → hb pair
+        hb_pair = await self.exchange.trading_pair_associated_to_exchange_symbol(new_altname)
+        self.assertEqual("NEWTOKEN123-USD", hb_pair)
+        self.assertIn("NEWTOKEN123-USD", self.exchange._trading_rules)
