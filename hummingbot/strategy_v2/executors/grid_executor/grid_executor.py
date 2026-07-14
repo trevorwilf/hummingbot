@@ -56,8 +56,9 @@ class GridExecutor(ExecutorBase):
         self.close_order_price_type = PriceType.BestAsk if config.side == TradeType.BUY else PriceType.BestBid
         self.close_order_side = TradeType.BUY if config.side == TradeType.SELL else TradeType.SELL
         self.trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
-        # Grid levels
-        self.grid_levels = self._generate_grid_levels()
+        # All state is initialized BEFORE grid generation so a failed construction still
+        # leaves a fully-initialized, queryable executor (no half-init AttributeErrors).
+        self.grid_levels = []
         self.levels_by_state = {state: [] for state in GridLevelStates}
         self._close_order: Optional[TrackedOrder] = None
         self._filled_orders = []
@@ -86,6 +87,34 @@ class GridExecutor(ExecutorBase):
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
         self._current_retries = 0
         self._max_retries = max_retries
+        self._barriers_suspended_warning_ts: float = 0.0
+
+        # Grid levels are generated last: an empty/NaN order book during construction
+        # (WS reconnect) must not raise out of __init__ into the orchestrator.
+        try:
+            self.grid_levels = self._generate_grid_levels()
+        except Exception:
+            self.logger().error(
+                f"Executor {self.config.id} ({self.config.trading_pair}): failed to generate "
+                f"grid levels (mid price unavailable?) — terminating as FAILED.", exc_info=True)
+            self.close_type = CloseType.FAILED
+            self.stop()
+
+    def start(self):
+        """
+        A FAILED-at-construction executor must never register events or start its loop.
+        """
+        if self.is_closed:
+            return
+        super().start()
+
+    def _warn_barriers_suspended(self, detail: str):
+        now = self._strategy.current_timestamp
+        if now - self._barriers_suspended_warning_ts >= 30.0:
+            self._barriers_suspended_warning_ts = now
+            self.logger().warning(
+                f"Executor {self.config.id} ({self.config.trading_pair}): barriers suspended — "
+                f"price unavailable ({detail}). Rate-limited to one warning per 30s.")
 
     @property
     def is_perpetual(self) -> bool:
@@ -97,7 +126,19 @@ class GridExecutor(ExecutorBase):
         return self.is_perpetual_connector(self.config.connector_name)
 
     async def validate_sufficient_balance(self):
-        mid_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        try:
+            mid_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        except Exception:
+            mid_price = Decimal("NaN")
+        if not mid_price.is_finite() or mid_price <= 0:
+            # A raise here would escape on_start and kill the control loop, leaving the
+            # executor RUNNING forever. Fail closed instead; the controller re-creates.
+            self.close_type = CloseType.FAILED
+            self.logger().error(
+                f"Executor {self.config.id} ({self.config.trading_pair}): mid price unavailable "
+                f"at startup — cannot validate balance, terminating as FAILED.")
+            self.stop()
+            return
         total_amount_base = self.config.total_amount_quote / mid_price
         if self.is_perpetual:
             order_candidate = PerpetualOrderCandidate(
@@ -127,6 +168,8 @@ class GridExecutor(ExecutorBase):
     def _generate_grid_levels(self):
         grid_levels = []
         price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        if not price.is_finite() or price <= 0:
+            raise ValueError(f"Mid price unavailable for grid generation: {price}")
         # Get minimum notional and base amount increment from trading rules
         min_notional = max(
             self.config.min_order_amount_quote,
@@ -134,7 +177,7 @@ class GridExecutor(ExecutorBase):
         )
         min_base_increment = self.trading_rules.min_base_amount_increment
         # Add safety margin to minimum notional to account for price movements and quantization
-        min_notional_with_margin = min_notional * Decimal("1.05")  # 20% margin for safety
+        min_notional_with_margin = min_notional * Decimal("1.05")  # 5% margin for safety
         # Calculate minimum base amount that satisfies both min_notional and quantization
         min_base_amount = max(
             min_notional_with_margin / price,  # Minimum from notional requirement
@@ -246,8 +289,12 @@ class GridExecutor(ExecutorBase):
         :return: None
         """
         self.update_grid_levels()
-        self.update_metrics()
+        metrics_ok = self.update_metrics()
         if self.status == RunnableStatus.RUNNING:
+            if not metrics_ok:
+                # No trustworthy prices this tick: do not evaluate barriers (a NaN
+                # comparison would silently disarm them) and do not place orders.
+                return
             if self.control_triple_barrier():
                 self.cancel_open_orders()
                 self._status = RunnableStatus.SHUTTING_DOWN
@@ -462,14 +509,33 @@ class GridExecutor(ExecutorBase):
             price=take_profit_price
         )
 
-    def update_metrics(self):
-        self.mid_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-        self.current_open_quote = self.get_price(self.config.connector_name, self.config.trading_pair,
-                                                 price_type=self.open_order_price_type)
-        self.current_close_quote = self.get_price(self.config.connector_name, self.config.trading_pair,
-                                                  price_type=self.close_order_price_type)
+    def update_metrics(self) -> bool:
+        """
+        Refresh price-derived metrics. Returns False when any fetched price is
+        non-finite/non-positive (empty book during a reconnect) — the previous metric
+        values are kept and the caller must skip barrier evaluation for this tick
+        instead of letting NaN comparisons silently disarm the stop-loss.
+        """
+        try:
+            mid_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+            current_open_quote = self.get_price(self.config.connector_name, self.config.trading_pair,
+                                                price_type=self.open_order_price_type)
+            current_close_quote = self.get_price(self.config.connector_name, self.config.trading_pair,
+                                                 price_type=self.close_order_price_type)
+        except Exception as e:
+            self._warn_barriers_suspended(f"price fetch failed: {e}")
+            return False
+        if any(not price.is_finite() or price <= 0
+               for price in (mid_price, current_open_quote, current_close_quote)):
+            self._warn_barriers_suspended(
+                f"mid={mid_price} open_quote={current_open_quote} close_quote={current_close_quote}")
+            return False
+        self.mid_price = mid_price
+        self.current_open_quote = current_open_quote
+        self.current_close_quote = current_close_quote
         self.update_position_metrics()
         self.update_realized_pnl_metrics()
+        return True
 
     def get_open_orders_to_create(self):
         """
@@ -593,6 +659,9 @@ class GridExecutor(ExecutorBase):
         :return: None
         """
         if self.config.triple_barrier_config.stop_loss:
+            if not self.position_pnl_pct.is_finite():
+                self._warn_barriers_suspended(f"position_pnl_pct={self.position_pnl_pct}")
+                return False
             return self.position_pnl_pct <= -self.config.triple_barrier_config.stop_loss
         return False
 
