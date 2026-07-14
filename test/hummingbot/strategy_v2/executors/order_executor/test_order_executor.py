@@ -512,6 +512,9 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor._order = TrackedOrder("OID-OPEN")
         executor._order.order = order
 
+        # The shutdown watchdog compares real timestamps
+        self.strategy.current_timestamp = 1640001112.223
+
         await executor.control_shutdown_process()
         mock_sleep.assert_called_once_with(5.0)
         self.strategy.cancel.assert_called_once_with(
@@ -519,6 +522,8 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             trading_pair=config.trading_pair,
             order_id="OID-OPEN"
         )
+        # Within the timeout window the executor keeps waiting for the cancel confirmation
+        self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
 
     @patch.object(OrderExecutor, '_sleep')
     async def test_control_shutdown_process_with_filled_order(self, mock_sleep):
