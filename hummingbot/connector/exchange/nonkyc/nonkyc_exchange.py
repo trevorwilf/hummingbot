@@ -375,13 +375,16 @@ class NonkycExchange(ExchangePyBase):
             pass
         try:
             import json
+            import logging as _logging
             event = {
                 "event_type": event_type,
                 "connector": "nonkyc",
                 "timestamp_ms": int(time.time() * 1e3),
                 **payload
             }
-            self.logger().info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+            json_str = json.dumps(event)
+            self.logger().info(f"[STRUCTURED_EVENT] {json_str}")
+            _logging.getLogger("hummingbot.structured_events").info(json_str)
         except Exception:
             pass
 
