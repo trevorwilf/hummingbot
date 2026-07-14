@@ -1006,7 +1006,8 @@ class ExecutorOrchestrator:
             for position in positions_list:
                 mid_price = self.strategy.market_data_provider.get_price_by_type(
                     position.connector_name, position.trading_pair, PriceType.MidPrice)
-                positions_summary.append(position.get_position_summary(mid_price))
+                positions_summary.append(position.get_position_summary(
+                    mid_price if not mid_price.is_nan() else Decimal("0")))
             report[controller_id] = positions_summary
         return report
 

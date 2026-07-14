@@ -3,12 +3,14 @@
 import asyncio
 import functools
 import logging
+import math
 import threading
 import time
 from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import aiomqtt
@@ -55,14 +57,20 @@ def _make_primitive(val: Any) -> Any:
 
     Faithful port of the previous MQTT serializer's ``make_primitive_value`` so
     the wire format is byte-compatible after dropping the external MQTT-RPC
-    library (Decimals/floats -> float, non-digit/unknown values -> str, etc.).
+    library (Decimals/floats -> float, non-digit/unknown values -> str, etc.),
+    with two strict-JSON guarantees on top:
+    - non-finite floats/Decimals (NaN/Infinity) become None — ujson would emit a
+      bare ``NaN`` token that strict JSON parsers reject
+    - Enum dict keys become their stable ``.name`` (e.g. close_type_counts keyed
+      by CloseType) instead of ujson's ``"CloseType.X"`` str() coercion
     """
     if isinstance(val, dict):
-        return {k: _make_primitive(v) for k, v in val.items()}
+        return {(k.name if isinstance(k, Enum) else k): _make_primitive(v) for k, v in val.items()}
     elif isinstance(val, (list, tuple)):
         return [_make_primitive(v) for v in val]
     elif isinstance(val, (Decimal, float)):
-        return float(val)
+        as_float = float(val)
+        return as_float if math.isfinite(as_float) else None
     elif isinstance(val, int) and str(val).isdigit():
         return int(val)
     elif isinstance(val, bool):
