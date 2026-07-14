@@ -108,3 +108,5 @@ CLAUDE.md
 
 # Test runner log output
 test_logs/
+
+/instances/*
