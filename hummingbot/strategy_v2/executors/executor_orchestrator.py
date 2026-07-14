@@ -359,15 +359,39 @@ class ExecutorOrchestrator:
                 if not executor.is_closed:
                     executor.early_stop()
         for i in range(max_executors_close_attempts):
-            if all([executor.executor_info.is_done for executors_list in self.active_executors.values()
-                    for executor in executors_list]):
-                continue
+            if self._all_executors_done():
+                break
             await asyncio.sleep(2.0)
-        # Store all positions and executors
-        self.store_all_positions()
-        self.store_all_executors()
+        # Store all positions and executors. Each store is independently guarded so one
+        # failure cannot skip the other — held inventory must survive the restart.
+        try:
+            self.store_all_positions()
+        except Exception:
+            self.logger().error("Failed to store positions during shutdown.", exc_info=True)
+        try:
+            self.store_all_executors()
+        except Exception:
+            self.logger().error("Failed to store executors during shutdown.", exc_info=True)
         # Clear executors and trigger garbage collection
         self.active_executors.clear()
+
+    def _all_executors_done(self) -> bool:
+        """
+        True when every active executor reports itself done. An executor whose
+        executor_info raises counts as done: it cannot report status, and the shutdown
+        wait (and the persistence that follows) must not be held hostage by it.
+        """
+        all_done = True
+        for executors_list in self.active_executors.values():
+            for executor in executors_list:
+                try:
+                    if not executor.executor_info.is_done:
+                        all_done = False
+                except Exception:
+                    self.logger().error(
+                        f"Error reading executor_info for executor "
+                        f"{getattr(executor.config, 'id', 'unknown')} during stop().", exc_info=True)
+        return all_done
 
     def store_all_positions(self):
         """
@@ -385,27 +409,32 @@ class ExecutorOrchestrator:
                     self.logger().warning(f"Skipping position storage for {position.connector_name}.{position.trading_pair} - "
                                           f"not available in current strategy markets")
                     continue
-                mid_price = self.strategy.market_data_provider.get_price_by_type(
-                    position.connector_name, position.trading_pair, PriceType.MidPrice)
-                position_summary = position.get_position_summary(mid_price)
+                try:
+                    mid_price = self.strategy.market_data_provider.get_price_by_type(
+                        position.connector_name, position.trading_pair, PriceType.MidPrice)
+                    position_summary = position.get_position_summary(mid_price)
 
-                # Create a Position record (id will only be used for new positions)
-                position_record = Position(
-                    id=str(uuid.uuid4()),
-                    controller_id=controller_id,
-                    connector_name=position_summary.connector_name,
-                    trading_pair=position_summary.trading_pair,
-                    side=position_summary.side.name,
-                    timestamp=int(self.strategy.current_timestamp * 1e3),
-                    volume_traded_quote=position_summary.volume_traded_quote,
-                    amount=position_summary.amount,
-                    breakeven_price=position_summary.breakeven_price,
-                    unrealized_pnl_quote=position_summary.unrealized_pnl_quote,
-                    realized_pnl_quote=position_summary.realized_pnl_quote,
-                    cum_fees_quote=position_summary.cum_fees_quote,
-                )
-                # Store or update the position in the database
-                markets_recorder.update_or_store_position(position_record)
+                    # Create a Position record (id will only be used for new positions)
+                    position_record = Position(
+                        id=str(uuid.uuid4()),
+                        controller_id=controller_id,
+                        connector_name=position_summary.connector_name,
+                        trading_pair=position_summary.trading_pair,
+                        side=position_summary.side.name,
+                        timestamp=int(self.strategy.current_timestamp * 1e3),
+                        volume_traded_quote=position_summary.volume_traded_quote,
+                        amount=position_summary.amount,
+                        breakeven_price=position_summary.breakeven_price,
+                        unrealized_pnl_quote=position_summary.unrealized_pnl_quote,
+                        realized_pnl_quote=position_summary.realized_pnl_quote,
+                        cum_fees_quote=position_summary.cum_fees_quote,
+                    )
+                    # Store or update the position in the database
+                    markets_recorder.update_or_store_position(position_record)
+                except Exception:
+                    self.logger().error(
+                        f"Failed to store position {position.connector_name}.{position.trading_pair} "
+                        f"for controller {controller_id}.", exc_info=True)
 
         # Clear all positions after storing (avoid modifying list while iterating)
         self.positions_held.clear()
@@ -413,9 +442,14 @@ class ExecutorOrchestrator:
     def store_all_executors(self):
         for controller_id, executors_list in self.active_executors.items():
             for executor in executors_list:
-                # Store the executor in the database
-                MarketsRecorder.get_instance().store_or_update_executor(executor)
-                self._update_cached_performance(controller_id, executor.executor_info)
+                try:
+                    # Store the executor in the database
+                    MarketsRecorder.get_instance().store_or_update_executor(executor)
+                    self._update_cached_performance(controller_id, executor.executor_info)
+                except Exception:
+                    self.logger().error(
+                        f"Failed to store executor {getattr(executor.config, 'id', 'unknown')} "
+                        f"for controller {controller_id}.", exc_info=True)
         # Remove the executors from the list
         self.active_executors = {}
 

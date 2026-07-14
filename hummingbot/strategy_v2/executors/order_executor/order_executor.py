@@ -26,6 +26,10 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 class OrderExecutor(ExecutorBase):
     _logger = None
 
+    # Watchdog for a shutdown that never completes (lost cancel confirmation, or an
+    # order stuck in a pending state that matches no shutdown branch).
+    _SHUTDOWN_TIMEOUT_S = 30.0
+
     @classmethod
     def logger(cls) -> HummingbotLogger:
         if cls._logger is None:
@@ -53,6 +57,7 @@ class OrderExecutor(ExecutorBase):
         self._partial_filled_orders: list[TrackedOrder] = []
         self._current_retries = 0
         self._max_retries = max_retries
+        self._shutdown_start_timestamp: Optional[float] = None
 
     @property
     def current_market_price(self) -> Decimal:
@@ -113,22 +118,72 @@ class OrderExecutor(ExecutorBase):
         """
         Control the shutdown process of the executor.
         """
+        if self._shutdown_start_timestamp is None:
+            self._shutdown_start_timestamp = self._strategy.current_timestamp
         if self._order:
             if self._order.is_open:
                 self.cancel_order()
             elif self._order.is_filled:
                 self.close_type = CloseType.POSITION_HOLD
-                self._held_position_orders.append(self._order.order.to_json())
-                self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders])
+                self._held_position_orders.append(self._order_json_safe(self._order))
+                self._held_position_orders.extend([self._order_json_safe(order) for order in self._partial_filled_orders])
                 self.stop()
         else:
             if self._partial_filled_orders:
-                self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders])
+                self._held_position_orders.extend([self._order_json_safe(order) for order in self._partial_filled_orders])
                 self.close_type = CloseType.POSITION_HOLD
             else:
                 self.close_type = CloseType.EARLY_STOP
             self.stop()
+        if self.status == RunnableStatus.SHUTTING_DOWN and \
+                self._strategy.current_timestamp - self._shutdown_start_timestamp > self._SHUTDOWN_TIMEOUT_S:
+            self._force_terminate_shutdown()
         await self._sleep(5.0)
+
+    def _force_terminate_shutdown(self):
+        """
+        Terminate a shutdown that did not complete within _SHUTDOWN_TIMEOUT_S: the cancel
+        confirmation was lost, or the order is wedged in a pending state. Filled inventory
+        is recorded as POSITION_HOLD; otherwise the executor terminates FAILED. The order
+        may still be live on the exchange either way.
+        """
+        order_id = self._order.order_id if self._order else None
+        order_has_fills = self._order is not None and \
+            (self._order.is_filled or self._order.executed_amount_base > Decimal("0"))
+        if order_has_fills or self._partial_filled_orders:
+            self.close_type = CloseType.POSITION_HOLD
+            if order_has_fills:
+                self._held_position_orders.append(self._order_json_safe(self._order))
+            self._held_position_orders.extend([self._order_json_safe(order) for order in self._partial_filled_orders])
+        else:
+            self.close_type = CloseType.FAILED
+        self.logger().warning(
+            f"Executor {self.config.id} ({self.config.trading_pair} on {self.config.connector_name}): shutdown did "
+            f"not complete within {self._SHUTDOWN_TIMEOUT_S:.0f}s — order {order_id} may still be live on the "
+            f"exchange. Force-terminating as {self.close_type.name}."
+        )
+        self.stop()
+
+    def _order_json_safe(self, tracked: TrackedOrder) -> Dict:
+        """
+        A TrackedOrder whose InFlightOrder was evicted by the connector has order=None;
+        fall back to a minimal record instead of raising inside event handlers / shutdown.
+        """
+        try:
+            if tracked.order is not None:
+                return tracked.order.to_json()
+        except Exception:
+            pass
+        return {
+            "client_order_id": tracked.order_id,
+            "exchange_order_id": None,
+            "trading_pair": self.config.trading_pair,
+            "trade_type": self.config.side.name,
+            "price": str(self.config.price),
+            "amount": str(self.config.amount),
+            "executed_amount_base": str(tracked.executed_amount_base),
+            "executed_amount_quote": str(tracked.executed_amount_quote),
+        }
 
     def evaluate_max_retries(self):
         """
@@ -248,7 +303,7 @@ class OrderExecutor(ExecutorBase):
         """
         self.update_tracked_order_with_order_id(event.order_id)
         if self._order and self._order.order_id == event.order_id:
-            self._held_position_orders.append(self._order.order.to_json())
+            self._held_position_orders.append(self._order_json_safe(self._order))
             self.close_type = CloseType.POSITION_HOLD
             self.stop()
 

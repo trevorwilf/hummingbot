@@ -409,6 +409,23 @@ class PositionExecutor(ExecutorBase):
                 self.stop()
             elif self.open_and_close_volume_match():
                 self.stop()
+            elif self._current_retries >= self._max_retries:
+                self.close_type = CloseType.FAILED
+                self.logger().error(
+                    f"Executor {self.config.id} ({self.config.trading_pair}): max retries ({self._max_retries}) "
+                    f"exceeded while closing during shutdown — terminating as FAILED. The position may remain "
+                    f"open on the exchange."
+                )
+                try:
+                    get_structured_logger().emit(
+                        "executor_terminal_failure",
+                        controller_id=self.config.controller_id, executor_id=self.config.id,
+                        level_id=getattr(self.config, 'level_id', None),
+                        reason="max_retries_exceeded_in_shutdown",
+                        retries=self._current_retries, max_retries=self._max_retries)
+                except Exception:
+                    pass
+                self.stop()
             else:
                 await self.control_close_order()
                 self._current_retries += 1
