@@ -182,16 +182,39 @@ class DirectionalTradingControllerBase(ControllerBase):
 
         return create_actions
 
+    def _last_same_side_reference_ts(self, signal: int) -> float:
+        """
+        Timestamp of the most recent same-side executor event, preferring
+        close_timestamp for closed executors and falling back to timestamp
+        (creation) for still-active ones. Returns 0.0 if no same-side history
+        exists in executors_info.
+
+        executors_info is a rolling buffer bounded by closed_executors_buffer
+        (default 30 in v2_with_controllers.py); it must retain enough history
+        to cover the configured cooldown_time.
+        """
+        target_side = TradeType.BUY if signal > 0 else TradeType.SELL
+        relevant = [e for e in self.executors_info if e.side == target_side]
+        if not relevant:
+            return 0.0
+        return max(
+            (e.close_timestamp if e.close_timestamp is not None else e.timestamp)
+            for e in relevant
+        )
+
     def can_create_executor(self, signal: int) -> bool:
         """
         Check if an executor can be created based on the signal, the quantity of active executors and the cooldown time.
+        The cooldown is measured against ALL same-side executors (closed ones by close_timestamp),
+        so it survives executor close instead of collapsing to zero.
         """
+        target_side = TradeType.BUY if signal > 0 else TradeType.SELL
         active_executors_by_signal_side = self.filter_executors(
             executors=self.executors_info,
-            filter_func=lambda x: x.is_active and (x.side == TradeType.BUY if signal > 0 else TradeType.SELL))
-        max_timestamp = max([executor.timestamp for executor in active_executors_by_signal_side], default=0)
+            filter_func=lambda x: x.is_active and x.side == target_side)
         active_executors_condition = len(active_executors_by_signal_side) < self.config.max_executors_per_side
-        cooldown_condition = self.market_data_provider.time() - max_timestamp > self.config.cooldown_time
+        last_ts = self._last_same_side_reference_ts(signal)
+        cooldown_condition = last_ts == 0.0 or self.market_data_provider.time() - last_ts > self.config.cooldown_time
         return active_executors_condition and cooldown_condition
 
     def stop_actions_proposal(self) -> List[ExecutorAction]:

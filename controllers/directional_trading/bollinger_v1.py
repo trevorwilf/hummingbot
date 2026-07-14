@@ -24,7 +24,7 @@ class BollingerV1ControllerConfig(DirectionalTradingControllerConfigBase):
             "prompt": "Enter the trading pair for the candles data, leave empty to use the same trading pair as the connector: ",
             "prompt_on_new": True})
     interval: str = Field(
-        default="3m",
+        default="5m",
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True})
@@ -53,7 +53,7 @@ class BollingerV1ControllerConfig(DirectionalTradingControllerConfigBase):
 class BollingerV1Controller(DirectionalTradingControllerBase):
     def __init__(self, config: BollingerV1ControllerConfig, *args, **kwargs):
         self.config = config
-        self.max_records = self.config.bb_length
+        self.max_records = self.config.bb_length + 20
         super().__init__(config, *args, **kwargs)
 
     def get_candles_config(self) -> List[CandlesConfig]:
