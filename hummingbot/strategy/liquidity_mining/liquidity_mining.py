@@ -88,6 +88,7 @@ class LiquidityMiningStrategy(StrategyPyBase):
         self._mid_prices = {market: [] for market in market_infos}
         self._volatility = {market: s_decimal_nan for market in self._market_infos}
         self._last_vol_reported = 0.
+        self._last_nan_mid_report_ts = 0.
         self._hb_app_notification = hb_app_notification
 
         self.add_markets([exchange])
@@ -114,18 +115,25 @@ class LiquidityMiningStrategy(StrategyPyBase):
         :param timestamp: current tick timestamp
         """
         if not self._ready_to_trade:
-            # Check if there are restored orders, they should be canceled before strategy starts.
-            self._ready_to_trade = self._exchange.ready and len(self._exchange.limit_orders) == 0
+            # ARB-12: never trade (nor re-run the budget allocation) until the strategy is ready.
+            # Falling through here every tick used to wipe the fill-adjusted budgets each second.
             if not self._exchange.ready:
                 self.logger().warning(f"{self._exchange.name} is not ready. Please wait...")
                 return
-            else:
-                self.logger().info(f"{self._exchange.name} is ready. Trading started.")
-                if self._validate_order_book_for_markets() >= 1:
-                    self.create_budget_allocation()
-                else:
-                    self.logger().warning(f"{self._exchange.name} has no pairs with order book. Consider redefining your strategy.")
-                    return
+            # Check if there are restored orders, they should be canceled before strategy starts.
+            restored_orders = self._exchange.limit_orders
+            if len(restored_orders) > 0:
+                # Re-issue cancels (start() already tried once) and wait for them to clear
+                for order in restored_orders:
+                    self._exchange.cancel(order.trading_pair, order.client_order_id)
+                return
+            if self._validate_order_book_for_markets() < 1:
+                self.logger().warning(f"{self._exchange.name} has no pairs with order book. Consider redefining your strategy.")
+                return
+            self._ready_to_trade = True
+            self.logger().info(f"{self._exchange.name} is ready. Trading started.")
+            # ARB-12: allocate budgets exactly once, on the False->True readiness transition
+            self.create_budget_allocation()
 
         self.update_mid_prices()
         self.update_volatility()
@@ -314,6 +322,14 @@ class LiquidityMiningStrategy(StrategyPyBase):
             if self._max_spread > s_decimal_zero:
                 spread = min(spread, self._max_spread)
             mid_price = market_info.get_mid_price()
+            # ARB-9: a NaN mid price (momentarily empty book) must not produce NaN-priced orders -
+            # skip this market for the tick only
+            if mid_price.is_nan() or mid_price <= s_decimal_zero:
+                if self._last_nan_mid_report_ts + 30 <= self.current_timestamp:
+                    self.logger().warning(f"{market} mid price is unavailable (NaN/zero order book). "
+                                          f"Skipping the market for this tick.")
+                    self._last_nan_mid_report_ts = self.current_timestamp
+                continue
             buy_price = mid_price * (Decimal("1") - spread)
             buy_price = self._exchange.quantize_order_price(market, buy_price)
             buy_size = self.base_order_size(market, buy_price)
@@ -563,6 +579,10 @@ class LiquidityMiningStrategy(StrategyPyBase):
         """
         for market in self._market_infos:
             mid_price = self._market_infos[market].get_mid_price()
+            # ARB-9: one NaN sample used to poison the volatility window (max/min raise
+            # InvalidOperation) for up to volatility_interval * avg_volatility_period seconds
+            if mid_price.is_nan():
+                continue
             self._mid_prices[market].append(mid_price)
             # To avoid memory leak, we store only the last part of the list needed for volatility calculation
             max_len = self._volatility_interval * self._avg_volatility_period
@@ -579,7 +599,8 @@ class LiquidityMiningStrategy(StrategyPyBase):
             first_index = last_index - (self._volatility_interval * self._avg_volatility_period)
             first_index = max(first_index, 0)
             for i in range(last_index, first_index, self._volatility_interval * -1):
-                prices = mid_prices[i - self._volatility_interval + 1: i + 1]
+                # ARB-9: defensively drop NaN samples - max/min would raise InvalidOperation
+                prices = [p for p in mid_prices[i - self._volatility_interval + 1: i + 1] if not p.is_nan()]
                 if not prices:
                     break
                 atr.append((max(prices) - min(prices)) / min(prices))

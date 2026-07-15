@@ -13,7 +13,13 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, Position
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.market_order import MarketOrder
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
-from hummingbot.core.event.events import BuyOrderCompletedEvent, PositionModeChangeEvent, SellOrderCompletedEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    PositionModeChangeEvent,
+    SellOrderCompletedEvent,
+)
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -97,6 +103,8 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
         self._position_mode_ready = False
         self._position_mode_not_ready_counter = 0
         self._trading_started = False
+        self._last_gate_report_ts = 0
+        self._last_missing_position_report_ts = 0
 
     def all_markets_ready(self):
         return all([market.ready for market in self.active_markets])
@@ -139,11 +147,14 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
         Clock tick entry point, is run every second (on normal tick setting).
         :param timestamp: current tick timestamp
         """
-        if not self._all_markets_ready or not self._position_mode_ready or not self._trading_started:
-            self._all_markets_ready = self.all_markets_ready()
+        if not self._trading_started:
+            # ARB-11: the whole readiness gate re-runs every tick until every check passes.
+            # _trading_started must not latch before the budget/position checks - a transient
+            # startup condition (e.g. funds not yet visible) used to disable trading permanently.
             if not self._all_markets_ready:
-                return
-            else:
+                self._all_markets_ready = self.all_markets_ready()
+                if not self._all_markets_ready:
+                    return
                 self.logger().info("Markets are ready.")
 
             if not self._position_mode_ready:
@@ -155,16 +166,13 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
                 return
             self._position_mode_not_ready_counter = 0
 
-            self.logger().info("Trading started.")
-            self._trading_started = True
-
             if not self.check_budget_available():
-                self.logger().info("Trading not possible.")
+                self._gate_log("Trading not possible. Will retry the readiness checks every tick.")
                 return
 
             if self._perp_market_info.market.position_mode != PositionMode.ONEWAY or \
                     len(self.perp_positions) > 1:
-                self.logger().info("This strategy supports only Oneway position mode. Attempting to switch ...")
+                self._gate_log("This strategy supports only Oneway position mode. Attempting to switch ...")
                 self._perp_market_info.market.set_position_mode(PositionMode.ONEWAY)
                 return
 
@@ -178,16 +186,25 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
                     self._strategy_state = StrategyState.Opened
                     self._ready_to_start = True
                 else:
-                    self.logger().info(f"There is an existing {self._perp_market_info.trading_pair} "
-                                       f"{self.perp_positions[0].position_side.name} position with unmatched "
-                                       f"position amount. Please manually close out the position before starting "
-                                       f"this strategy.")
+                    self._gate_log(f"There is an existing {self._perp_market_info.trading_pair} "
+                                   f"{self.perp_positions[0].position_side.name} position with unmatched "
+                                   f"position amount. Please manually close out the position before starting "
+                                   f"this strategy.")
                     return
             else:
                 self._ready_to_start = True
 
+            self._trading_started = True
+            self.logger().info("Trading started.")
+
         if self._ready_to_start and (self._main_task is None or self._main_task.done()):
             self._main_task = safe_ensure_future(self.main(timestamp))
+
+    def _gate_log(self, message: str):
+        """Log a readiness-gate message at most once every 30 seconds (the gate re-runs every tick)."""
+        if self._last_gate_report_ts + 30 <= self.current_timestamp:
+            self.logger().info(message)
+            self._last_gate_report_ts = self.current_timestamp
 
     async def main(self, timestamp):
         """
@@ -200,6 +217,17 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
             return
         proposals = await self.create_base_proposals()
         if self._strategy_state == StrategyState.Opened:
+            # ARB-4: the position can vanish (liquidation, manual close) while state is Opened -
+            # indexing [0] unguarded raised IndexError every tick. Warn loudly and skip the tick.
+            if not self.perp_positions:
+                if self._last_missing_position_report_ts + 30 <= self.current_timestamp:
+                    msg = (f"Strategy state is Opened but no {self._perp_market_info.trading_pair} perpetual "
+                           f"position was found. It may have been closed externally - please verify your "
+                           f"positions manually.")
+                    self.logger().warning(msg)
+                    self.notify_hb_app_with_timestamp(msg)
+                    self._last_missing_position_report_ts = self.current_timestamp
+                return
             perp_is_buy = False if self.perp_positions[0].amount > 0 else True
             proposals = [p for p in proposals if p.perp_side.is_buy == perp_is_buy and p.profit_pct() >=
                          self._min_closing_arbitrage_pct]
@@ -245,6 +273,16 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
                  self._perp_market_info.market.get_order_price(self._perp_market_info.trading_pair, False,
                                                                self._order_amount)]
         prices = await safe_gather(*tasks, return_exceptions=True)
+        # ARB-11: gathered prices can be Exceptions (connector error) or NaN (empty book) -
+        # building proposals from them poisons the profitability comparisons downstream.
+        invalid_prices = [
+            p for p in prices
+            if isinstance(p, Exception) or p is None or (isinstance(p, Decimal) and p.is_nan())
+        ]
+        if invalid_prices:
+            self.logger().warning(f"Failed to obtain valid order prices for proposals ({invalid_prices}). "
+                                  f"Skipping this cycle.")
+            return []
         spot_buy, spot_sell, perp_buy, perp_sell = [*prices]
         return [
             ArbProposal(ArbProposalSide(self._spot_market_info, True, spot_buy),
@@ -353,7 +391,9 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
         if self.perp_positions and abs(self.perp_positions[0].amount) == order_amount:
             perp_side = proposal.perp_side
             cur_perp_pos_is_buy = True if self.perp_positions[0].amount > 0 else False
-            if perp_side != cur_perp_pos_is_buy:
+            # ARB-11: compare the side's direction, not the ArbProposalSide object itself
+            # (object != bool is always True, which mislabeled every order as position_close)
+            if perp_side.is_buy != cur_perp_pos_is_buy:
                 position_close = True
 
         order_candidate = PerpetualOrderCandidate(
@@ -528,6 +568,37 @@ class SpotPerpetualArbitrageStrategy(StrategyPyBase):
 
     def did_complete_sell_order(self, event: SellOrderCompletedEvent):
         self.update_complete_order_id_lists(event.order_id)
+
+    def did_fail_order(self, order_failed_event: MarketOrderFailureEvent):
+        self._handle_arb_leg_terminated_unfilled(order_failed_event.order_id, "failed")
+
+    def did_cancel_order(self, cancelled_event: OrderCancelledEvent):
+        self._handle_arb_leg_terminated_unfilled(cancelled_event.order_id, "was cancelled")
+
+    def _handle_arb_leg_terminated_unfilled(self, order_id: str, reason: str):
+        """
+        ARB-4: a failed/cancelled leg used to leave the state machine in Opening/Closing forever,
+        with a naked one-sided position and no alarm. Alarm loudly and reset the state machine;
+        unwinding the surviving leg is intentionally left to the operator.
+        """
+        if self._strategy_state not in (StrategyState.Opening, StrategyState.Closing):
+            return
+        previous_state = self._strategy_state
+        msg = (f"An arbitrage leg order {order_id} {reason} while the strategy was "
+               f"{previous_state.name.lower()}. The other leg may have filled - please check your "
+               f"positions and balances, and unwind manually if required.")
+        self.logger().warning(msg)
+        self.notify_hb_app_with_timestamp(msg)
+        if previous_state is StrategyState.Opening:
+            self._strategy_state = StrategyState.Closed
+            self._completed_opening_order_ids.clear()
+            # Hold off the next opening attempt like a completed close does
+            self._next_arbitrage_opening_ts = self.current_timestamp + self._next_arbitrage_opening_delay
+        else:
+            # A failed closing leg means the perpetual position may still be open -
+            # returning to Opened lets the strategy look for closing opportunities again.
+            self._strategy_state = StrategyState.Opened
+            self._completed_closing_order_ids.clear()
 
     def did_change_position_mode_succeed(self, position_mode_changed_event: PositionModeChangeEvent):
         if position_mode_changed_event.position_mode is PositionMode.ONEWAY:
