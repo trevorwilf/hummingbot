@@ -67,6 +67,9 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
     ORDER_ADJUST_SAMPLE_INTERVAL = 5
     ORDER_ADJUST_SAMPLE_WINDOW = 12
 
+    # Number of consecutive hedge failures for the same maker order before escalating to the operator
+    HEDGE_FAILURE_ALERT_THRESHOLD = 3
+
     SHADOW_MAKER_ORDER_KEEP_ALIVE_DURATION = 60.0 * 15
     CANCEL_EXPIRY_DURATION = 60.0
 
@@ -132,6 +135,8 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
         self._taker_to_maker_order_ids = {}
         # Holds hedging trade ids for respective maker orders
         self._maker_to_hedging_trades = {}
+        # Holds consecutive hedge failure counts per maker order id
+        self._hedge_failure_counts = {}
 
         all_markets = list(self._maker_markets | self._taker_markets)
 
@@ -178,18 +183,6 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
         return self._config_map.adjust_order_enabled
 
     @property
-    def use_oracle_conversion_rate(self):
-        return self._config_map.use_oracle_conversion_rate
-
-    @property
-    def taker_to_maker_base_conversion_rate(self):
-        return self._config_map.conversion_rate_mode.taker_to_maker_base_conversion_rate
-
-    @property
-    def taker_to_maker_quote_conversion_rate(self):
-        return self._config_map.taker_to_maker_quote_conversion_rate
-
-    @property
     def slippage_buffer(self):
         return self._config_map.slippage_buffer / Decimal("100")
 
@@ -219,10 +212,6 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
     @property
     def adjust_orders_enabled(self):
         return self._config_map.adjust_orders_enabled
-
-    @property
-    def gas_to_maker_base_conversion_rate(self):
-        return self._config_map.gas_to_maker_base_conversion_rate
 
     @property
     def logging_options(self) -> int:
@@ -613,16 +602,42 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
 
     def handle_unfilled_taker_order(self, order_event):
         order_id = order_event.order_id
+        # ARB-1: resolve the maker order id BEFORE removing the taker mapping. The retry must
+        # re-hedge the MAKER order's fills - passing the taker id would crash place_order later.
+        maker_order_id = self._taker_to_maker_order_ids[order_id]
         market_pair = self._market_pair_tracker.get_market_pair_from_order_id(order_id)
+        if market_pair is None:
+            market_pair = self._market_pair_tracker.get_market_pair_from_order_id(maker_order_id)
 
-        # Resubmit hedging order
-        self.hedge_tasks_cleanup()
-        self._hedge_maker_order_tasks += [safe_ensure_future(
-            self.check_and_hedge_orders(order_id, market_pair)
-        )]
+        # ARB-1: release the fill records held by the failed hedge so they become unhedged again.
+        # Without this, ready_for_new_trades() stays False forever and the retry finds nothing to hedge.
+        try:
+            self.del_order_from_ongoing_hedging(order_id)
+        except KeyError:
+            self.logger().warning(f"Ongoing hedging not found for taker order id {order_id}")
 
         # Remove the cancelled, failed or expired taker order
-        del self._taker_to_maker_order_ids[order_event.order_id]
+        del self._taker_to_maker_order_ids[order_id]
+        self._market_pair_tracker.stop_tracking_order_id(order_id)
+
+        failure_count = self._hedge_failure_counts.get(maker_order_id, 0) + 1
+        self._hedge_failure_counts[maker_order_id] = failure_count
+        alert_msg = (f"Taker hedge order {order_id} was not filled (cancelled/failed/expired). "
+                     f"Maker order {maker_order_id} is unhedged. Resubmitting hedge "
+                     f"(attempt {failure_count}).")
+        self.logger().warning(alert_msg)
+        self.notify_hb_app(alert_msg)
+        if failure_count >= self.HEDGE_FAILURE_ALERT_THRESHOLD:
+            escalation_msg = (f"Hedging maker order {maker_order_id} has failed {failure_count} "
+                              f"consecutive times. Manual intervention may be required.")
+            self.logger().error(escalation_msg)
+            self.notify_hb_app(escalation_msg)
+
+        # Resubmit hedging order for the maker order's now-unhedged fills
+        self.hedge_tasks_cleanup()
+        self._hedge_maker_order_tasks += [safe_ensure_future(
+            self.check_and_hedge_orders(maker_order_id, market_pair)
+        )]
 
     def did_fill_order(self, order_filled_event: OrderFilledEvent):
         maker_order_id = order_filled_event.order_id
@@ -646,14 +661,21 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
     def did_cancel_order(self, order_canceled_event: OrderCancelledEvent):
         if order_canceled_event.order_id in self._taker_to_maker_order_ids.keys():
             self.handle_unfilled_taker_order(order_canceled_event)
+        else:
+            # ARB-14: let terminated (e.g. maker) order ids expire from the market pair tracker
+            self._market_pair_tracker.stop_tracking_order_id(order_canceled_event.order_id)
 
     def did_fail_order(self, order_failed_event: MarketOrderFailureEvent):
         if order_failed_event.order_id in self._taker_to_maker_order_ids.keys():
             self.handle_unfilled_taker_order(order_failed_event)
+        else:
+            self._market_pair_tracker.stop_tracking_order_id(order_failed_event.order_id)
 
     def did_expire_order(self, order_expired_event: OrderExpiredEvent):
         if order_expired_event.order_id in self._taker_to_maker_order_ids.keys():
             self.handle_unfilled_taker_order(order_expired_event)
+        else:
+            self._market_pair_tracker.stop_tracking_order_id(order_expired_event.order_id)
 
     def did_complete_buy_order(self, order_completed_event: BuyOrderCompletedEvent):
         """
@@ -692,8 +714,11 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                     f"{order_completed_event.quote_asset}) is filled."
                 )
                 maker_order_id = self._taker_to_maker_order_ids[order_id]
+                # The hedge completed - reset the consecutive failure count for this maker order
+                self._hedge_failure_counts.pop(maker_order_id, None)
                 # Remove the completed taker order
                 del self._taker_to_maker_order_ids[order_id]
+                self._market_pair_tracker.stop_tracking_order_id(order_id)
                 # Get all active taker order ids for the maker order id
                 active_taker_ids = set(self._taker_to_maker_order_ids.keys()).intersection(set(
                     self._maker_to_taker_order_ids[maker_order_id]))
@@ -704,18 +729,22 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                         # Remove the completed fully hedged maker order
                         del self._maker_to_taker_order_ids[maker_order_id]
                         del self._maker_to_hedging_trades[maker_order_id]
+                        self._market_pair_tracker.stop_tracking_order_id(maker_order_id)
 
+                hedged_trade_ids = ()
                 try:
-                    self.del_order_from_ongoing_hedging(order_id)
+                    hedged_trade_ids = self.del_order_from_ongoing_hedging(order_id)
                 except KeyError:
                     self.logger().warning(f"Ongoing hedging not found for order id {order_id}")
 
-                # Delete hedged maker fill event
-                fill_events = []
-                for fill_event in self._order_fill_sell_events[market_pair]:
-                    if self.is_fill_event_in_ongoing_hedging(fill_event):
-                        fill_events += [fill_event]
-                self._order_fill_sell_events[market_pair] = fill_events
+                # ARB-2: delete ONLY the maker fill events covered by the completed hedge. Fill
+                # records not attached to this hedge (e.g. the shortfall of a balance-capped hedge
+                # or fills awaiting a hedge) must survive so they can still be hedged later.
+                remaining_fill_events = [
+                    fill_event for fill_event in self._order_fill_sell_events.get(market_pair, [])
+                    if fill_event[1].exchange_trade_id not in hedged_trade_ids
+                ]
+                self._order_fill_sell_events[market_pair] = remaining_fill_events
 
                 # Cleanup maker fill events - no longer needed to create taker orders if all fills were hedged
                 if len(self._order_fill_sell_events[market_pair]) == 0:
@@ -759,8 +788,11 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                     f"{order_completed_event.quote_asset}) is filled."
                 )
                 maker_order_id = self._taker_to_maker_order_ids[order_id]
+                # The hedge completed - reset the consecutive failure count for this maker order
+                self._hedge_failure_counts.pop(maker_order_id, None)
                 # Remove the completed taker order
                 del self._taker_to_maker_order_ids[order_id]
+                self._market_pair_tracker.stop_tracking_order_id(order_id)
                 # Get all active taker order ids for the maker order id
                 active_taker_ids = set(self._taker_to_maker_order_ids.keys()).intersection(set(
                     self._maker_to_taker_order_ids[maker_order_id]))
@@ -771,18 +803,22 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                         # Remove the completed fully hedged maker order
                         del self._maker_to_taker_order_ids[maker_order_id]
                         del self._maker_to_hedging_trades[maker_order_id]
+                        self._market_pair_tracker.stop_tracking_order_id(maker_order_id)
 
+                hedged_trade_ids = ()
                 try:
-                    self.del_order_from_ongoing_hedging(order_id)
+                    hedged_trade_ids = self.del_order_from_ongoing_hedging(order_id)
                 except KeyError:
                     self.logger().warning(f"Ongoing hedging not found for order id {order_id}")
 
-                # Delete hedged maker fill event
-                fill_events = []
-                for fill_event in self._order_fill_buy_events[market_pair]:
-                    if self.is_fill_event_in_ongoing_hedging(fill_event):
-                        fill_events += [fill_event]
-                self._order_fill_buy_events[market_pair] = fill_events
+                # ARB-2: delete ONLY the maker fill events covered by the completed hedge. Fill
+                # records not attached to this hedge (e.g. the shortfall of a balance-capped hedge
+                # or fills awaiting a hedge) must survive so they can still be hedged later.
+                remaining_fill_events = [
+                    fill_event for fill_event in self._order_fill_buy_events.get(market_pair, [])
+                    if fill_event[1].exchange_trade_id not in hedged_trade_ids
+                ]
+                self._order_fill_buy_events[market_pair] = remaining_fill_events
 
                 # Cleanup maker fill events - no longer needed to create taker orders if all fills were hedged
                 if len(self._order_fill_buy_events[market_pair]) == 0:
@@ -877,6 +913,15 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                     taker_trading_pair, False, quantized_hedge_amount
                 ).result_price
 
+            # ARB-2: a NaN price (empty/thin taker book) must not abort silently nor produce a NaN
+            # order - leave the fill records intact so the hedge is retried on the next event.
+            if order_price is None or Decimal.is_nan(order_price):
+                self.logger().warning(
+                    f"({market_pair.maker.trading_pair}) Taker sell price is unavailable for hedging "
+                    f"{buy_fill_quantity} {market_pair.maker.base_asset}. Hedge will be retried."
+                )
+                return
+
             self.log_with_clock(logging.INFO, f"Calculated by HB order_price: {order_price}")
             order_price *= taker_slippage_adjustment_factor
             order_price = taker_market.quantize_order_price(taker_trading_pair, order_price)
@@ -901,8 +946,9 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                         f"(maker avg price={avg_fill_price}, taker top={taker_top})"
                     )
             else:
+                # ARB-2: WARNING, not INFO - un-hedged maker exposure is accumulating
                 self.log_with_clock(
-                    logging.INFO,
+                    logging.WARNING,
                     f"({market_pair.maker.trading_pair}) Current maker buy fill amount of "
                     f"{buy_fill_quantity} {market_pair.maker.base_asset} is less than the minimum order amount "
                     f"allowed on the taker market. No hedging possible yet."
@@ -929,10 +975,21 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                     sell_fill_quantity / base_rate
                 ).result_price
 
+            # ARB-2: a NaN/zero price (empty/thin taker book) must not abort silently - leave the
+            # fill records intact so the hedge is retried on the next event.
+            if taker_price is None or Decimal.is_nan(taker_price) or taker_price <= s_decimal_zero:
+                self.logger().warning(
+                    f"({market_pair.maker.trading_pair}) Taker buy price is unavailable for hedging "
+                    f"{sell_fill_quantity} {market_pair.maker.base_asset}. Hedge will be retried."
+                )
+                return
+
+            # ARB-3: the balance leg must be sized against the slippage-adjusted price the order
+            # will actually be submitted at, otherwise the exchange rejects it for insufficient funds.
             hedged_order_quantity = min(
                 sell_fill_quantity / base_rate,
                 taker_market.get_available_balance(market_pair.taker.quote_asset) /
-                taker_price * self.order_size_taker_balance_factor
+                (taker_price * taker_slippage_adjustment_factor) * self.order_size_taker_balance_factor
             )
             quantized_hedge_amount = taker_market.quantize_order_amount(
                 taker_trading_pair,
@@ -958,6 +1015,13 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                     taker_trading_pair, True, quantized_hedge_amount
                 ).result_price
 
+            if order_price is None or Decimal.is_nan(order_price):
+                self.logger().warning(
+                    f"({market_pair.maker.trading_pair}) Taker buy price is unavailable for hedging "
+                    f"{sell_fill_quantity} {market_pair.maker.base_asset}. Hedge will be retried."
+                )
+                return
+
             self.log_with_clock(logging.INFO, f"Calculated by HB order_price: {order_price}")
             order_price *= taker_slippage_adjustment_factor
             order_price = taker_market.quantize_order_price(taker_trading_pair, order_price)
@@ -982,8 +1046,9 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                         f"(maker avg price={avg_fill_price}, taker top={taker_top})"
                     )
             else:
+                # ARB-2: WARNING, not INFO - un-hedged maker exposure is accumulating
                 self.log_with_clock(
-                    logging.INFO,
+                    logging.WARNING,
                     f"({market_pair.maker.trading_pair}) Current maker sell fill amount of "
                     f"{sell_fill_quantity} {market_pair.maker.base_asset} is less than the minimum order amount "
                     f"allowed on the taker market. No hedging possible yet."
@@ -1078,10 +1143,10 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                         taker_trading_pair, False, taker_size
                     ).result_price
                 except ZeroDivisionError:
-                    assert size == s_decimal_zero
+                    # ARB-7: an empty taker book can raise this for a non-zero size - fail closed
                     return s_decimal_zero
 
-            if taker_price is None:
+            if taker_price is None or Decimal.is_nan(taker_price):
                 self.logger().warning("Failed to obtain a taker sell order price. No order will be submitted.")
                 order_amount = Decimal("0")
             else:
@@ -1113,10 +1178,10 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
                         taker_trading_pair, True, taker_balance_in_quote
                     ).result_price
                 except ZeroDivisionError:
-                    assert size == s_decimal_zero
+                    # ARB-7: an empty taker book can raise this for a non-zero size - fail closed
                     return s_decimal_zero
 
-            if taker_price is None:
+            if taker_price is None or Decimal.is_nan(taker_price):
                 self.logger().warning("Failed to obtain a taker buy order price. No order will be submitted.")
                 order_amount = Decimal("0")
             else:
@@ -1147,6 +1212,8 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
         taker_market = market_pair.taker.market
         top_bid_price = s_decimal_nan
         top_ask_price = s_decimal_nan
+        # ARB-6: initialize so an empty maker bid book cannot raise UnboundLocalError below
+        price_above_bid = s_decimal_nan
         next_price_below_top_ask = s_decimal_nan
 
         # Convert maker order size (in maker base asset) to taker order size (in taker base asset)
@@ -1422,7 +1489,9 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
         if cancel_order_threshold.is_nan():
             cancel_order_threshold = self.min_profitability
 
-        if current_hedging_price is None:
+        # ARB-7: a NaN hedging price (thin-but-not-empty taker book) must cancel the maker order
+        # like None does - comparing NaN below raises InvalidOperation and leaves the order live.
+        if current_hedging_price is None or Decimal.is_nan(current_hedging_price):
             if LogOption.REMOVING_ORDER in self.logging_options:
                 self.log_with_clock(
                     logging.INFO,
@@ -1738,11 +1807,11 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
     # ----------------------------------------------------------------------------------------------------------
     def stop_tracking_limit_order(self, market_trading_pair_tuple, order_id: str):
         self._market_pair_tracker.stop_tracking_order_id(order_id)
-        self.stop_tracking_limit_order(self, market_trading_pair_tuple, order_id)
+        super().stop_tracking_limit_order(market_trading_pair_tuple, order_id)
 
     def stop_tracking_market_order(self, market_trading_pair_tuple, order_id: str):
         self._market_pair_tracker.stop_tracking_order_id(order_id)
-        self.stop_tracking_market_order(self, market_trading_pair_tuple, order_id)
+        super().stop_tracking_market_order(market_trading_pair_tuple, order_id)
     # ----------------------------------------------------------------------------------------------------------
     # </editor-fold>
 
@@ -1798,6 +1867,7 @@ class CrossExchangeMarketMakingStrategy(StrategyPyBase):
         maker_exchange_trade_ids = tuple(r.exchange_trade_id for _, r in fill_records)
         self._ongoing_hedging[maker_exchange_trade_ids] = order_id
 
-    def del_order_from_ongoing_hedging(self, taker_order_id: str):
+    def del_order_from_ongoing_hedging(self, taker_order_id: str) -> Tuple[str, ...]:
         maker_exchange_trade_ids = self._ongoing_hedging.inverse[taker_order_id]
         del self._ongoing_hedging[maker_exchange_trade_ids]
+        return maker_exchange_trade_ids

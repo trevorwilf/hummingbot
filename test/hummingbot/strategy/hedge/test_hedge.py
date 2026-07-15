@@ -214,3 +214,75 @@ class HedgeConfigMapPydanticTest(unittest.TestCase):
             offsets = self.offsets,
         )
         self.assertIsNone(strategy.hedge_by_amount())
+
+    def test_zero_amount_closing_candidate_is_not_submitted(self):
+        """Would have caught ARB-15: a closing candidate fully rejected by the budget checker
+        (amount 0) was still appended and submitted."""
+        from unittest.mock import patch
+
+        trading_pair = self.market_trading_pairs["binance_perpetual"].trading_pair
+        self.markets["binance_perpetual"]._account_positions[trading_pair] = Position(
+            trading_pair,
+            PositionSide.SHORT,
+            Decimal("0"),
+            Decimal("95"),
+            Decimal("-1"),
+            self.markets["binance_perpetual"].get_leverage(trading_pair)
+        )
+        self.config_map.hedge_position_mode = "HEDGE"
+        strategy = HedgeStrategy(
+            config_map = self.config_map,
+            hedge_market_pairs = [self.market_trading_pairs["binance_perpetual"]],
+            market_pairs = [self.market_trading_pairs["kucoin"], self.market_trading_pairs["binance"]],
+            offsets = self.offsets,
+        )
+        budget_checker = self.markets["binance_perpetual"].budget_checker
+        original_adjust = budget_checker.adjust_candidate
+
+        def zero_out_closing(candidate, all_or_none=True):
+            if getattr(candidate, "position_close", False):
+                candidate.amount = Decimal("0")
+                return candidate
+            return original_adjust(candidate, all_or_none)
+
+        with patch.object(budget_checker, "adjust_candidate", side_effect=zero_out_closing):
+            candidates = strategy.get_perpetual_order_candidates(
+                self.market_trading_pairs["binance_perpetual"], True, Decimal("1"), Decimal("100"))
+        # No zero-amount candidate may survive
+        self.assertTrue(all(candidate.amount > 0 for candidate in candidates))
+        self.assertFalse(any(getattr(candidate, "position_close", False) for candidate in candidates))
+
+    def test_nan_mid_price_skips_hedge_by_amount_cycle(self):
+        """Would have caught ARB-15: a NaN/zero mid price poisoned the hedge math
+        (InvalidOperation / DivisionByZero) instead of skipping the cycle."""
+        from unittest.mock import MagicMock, patch
+
+        self.config_map.value_mode = False
+        strategy = HedgeStrategy(
+            config_map = self.config_map,
+            hedge_market_pairs = [self.market_trading_pairs["binance_perpetual"]],
+            market_pairs = [self.market_trading_pairs["kucoin"], self.market_trading_pairs["binance"]],
+            offsets = self.offsets,
+        )
+        strategy.get_order_candidates = MagicMock()
+        with patch.object(MarketTradingPairTuple, "get_mid_price", return_value=Decimal("nan")):
+            strategy.hedge_by_amount()
+        strategy.get_order_candidates.assert_not_called()
+        self.assertTrue(any("Hedge skipped" in message for message in strategy._status_messages))
+
+    def test_nan_mid_price_skips_hedge_by_value_cycle(self):
+        """ARB-15: the value-mode hedge cycle is skipped on a NaN mid price as well."""
+        from unittest.mock import MagicMock, patch
+
+        self.config_map.value_mode = True
+        strategy = HedgeStrategy(
+            config_map = self.config_map,
+            hedge_market_pairs = [self.market_trading_pairs["binance_perpetual"]],
+            market_pairs = [self.market_trading_pairs["kucoin"], self.market_trading_pairs["binance"]],
+            offsets = self.offsets,
+        )
+        strategy.get_order_candidates = MagicMock()
+        with patch.object(MarketTradingPairTuple, "get_mid_price", return_value=Decimal("nan")):
+            strategy.hedge_by_value()
+        strategy.get_order_candidates.assert_not_called()
+        self.assertTrue(any("Hedge skipped" in message for message in strategy._status_messages))

@@ -117,7 +117,9 @@ class TestSpotPerpetualArbitrage(unittest.TestCase):
         self.perp_connector.set_position_mode(PositionMode.HEDGE)
         self.clock.backtest_til(self.start_timestamp + 2)
         self.assertTrue(self._is_logged("INFO", "Markets are ready."))
-        self.assertTrue(self._is_logged("INFO", "Trading started."))
+        # ARB-11 fix: trading must NOT be reported as started while the position-mode gate fails -
+        # the old behavior (asserted here before the fix) latched _trading_started prematurely.
+        self.assertFalse(self._is_logged("INFO", "Trading started."))
         self.assertTrue(self._is_logged("INFO", "This strategy supports only Oneway position mode. Attempting to switch ..."))
         # assert the strategy stopped here
         # self.assertIsNone(self.strategy.clock)
@@ -144,7 +146,10 @@ class TestSpotPerpetualArbitrage(unittest.TestCase):
         self.clock.add_iterator(self.strategy)
         self.clock.backtest_til(self.start_timestamp + 2)
         self.assertTrue(self._is_logged("INFO", "Markets are ready."))
-        self.assertTrue(self._is_logged("INFO", "Trading started."))
+        # ARB-11 fix: with multiple positions open the readiness gate keeps failing, so trading
+        # must NOT be reported as started (the pre-fix assertion pinned the premature latch).
+        self.assertFalse(self._is_logged("INFO", "Trading started."))
+        self.assertTrue(self._is_logged("INFO", "This strategy supports only Oneway position mode. Attempting to switch ..."))
         # self.assertIsNone(self.strategy.clock)
 
     def test_strategy_starts_with_existing_position(self):
@@ -188,7 +193,9 @@ class TestSpotPerpetualArbitrage(unittest.TestCase):
         )
         self.clock.backtest_til(self.start_timestamp + 2)
         self.assertTrue(self._is_logged("INFO", "Markets are ready."))
-        self.assertTrue(self._is_logged("INFO", "Trading started."))
+        # ARB-11 fix: an unmatched position keeps the readiness gate failing, so trading must NOT
+        # be reported as started (the pre-fix assertion pinned the premature latch).
+        self.assertFalse(self._is_logged("INFO", "Trading started."))
         self.assertTrue(self._is_logged("INFO", f"There is an existing {trading_pair} "
                                                 f"{PositionSide.SHORT.name} position with unmatched position amount. "
                                                 f"Please manually close out the position before starting this "
@@ -428,6 +435,140 @@ class TestSpotPerpetualArbitrage(unittest.TestCase):
         connector.trigger_event(event_tag,
                                 event_class(connector.current_timestamp, order_id, base_asset, quote_asset,
                                             amount, amount * price, OrderType.LIMIT))
+
+    def test_budget_gate_recovers_after_transient_startup_condition(self):
+        """Would have caught ARB-11: an empty balance at startup used to latch _trading_started
+        and permanently disable the strategy even after funds arrived."""
+        self.strategy._position_mode_ready = True
+        self.spot_connector.set_balance(base_asset, 0)
+        self.spot_connector.set_balance(quote_asset, 0)
+        self.clock.add_iterator(self.strategy)
+        self.clock.backtest_til(self.start_timestamp + 2)
+        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.01))
+
+        self.assertTrue(self._is_logged("INFO", "Trading not possible. Will retry the readiness checks every tick."))
+        self.assertFalse(self._is_logged("INFO", "Trading started."))
+        self.assertFalse(self.strategy._trading_started)
+
+        # Funds arrive later - the gate must re-run and let trading start
+        self.spot_connector.set_balance(base_asset, 5)
+        self.spot_connector.set_balance(quote_asset, 500)
+        self.clock.backtest_til(self.start_timestamp + 4)
+        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.01))
+
+        self.assertTrue(self._is_logged("INFO", "Trading started."))
+        self.assertTrue(self.strategy._trading_started)
+        self.assertTrue(self.strategy._ready_to_start)
+
+    def test_failed_leg_while_opening_resets_state_and_alarms(self):
+        """Would have caught ARB-4: a failed leg used to leave the state machine wedged in
+        Opening forever with no alarm."""
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self.clock.add_iterator(self.strategy)
+        self.clock.backtest_til(self.start_timestamp + 1)
+        self.strategy._strategy_state = StrategyState.Opening
+        with patch.object(self.strategy, "notify_hb_app_with_timestamp") as notify_mock:
+            self.strategy.did_fail_order(
+                MarketOrderFailureEvent(self.start_timestamp + 1, "order_1", OrderType.LIMIT))
+        self.assertEqual(StrategyState.Closed, self.strategy.strategy_state)
+        notify_mock.assert_called_once()
+        self.assertTrue(self._is_logged("WARNING", "An arbitrage leg order order_1 failed while the strategy "
+                                                   "was opening."))
+        # The next opening attempt is delayed, like after a completed close
+        self.assertGreater(self.strategy._next_arbitrage_opening_ts, self.strategy.current_timestamp)
+
+    def test_cancelled_leg_while_closing_returns_to_opened(self):
+        """ARB-4: a cancelled closing leg returns the state machine to Opened so closing retries."""
+        from hummingbot.core.event.events import OrderCancelledEvent
+
+        self.clock.add_iterator(self.strategy)
+        self.clock.backtest_til(self.start_timestamp + 1)
+        self.strategy._strategy_state = StrategyState.Closing
+        with patch.object(self.strategy, "notify_hb_app_with_timestamp") as notify_mock:
+            self.strategy.did_cancel_order(OrderCancelledEvent(self.start_timestamp + 1, "order_2"))
+        self.assertEqual(StrategyState.Opened, self.strategy.strategy_state)
+        notify_mock.assert_called_once()
+
+    def test_terminal_events_outside_arb_states_are_ignored(self):
+        """ARB-4: fail/cancel events must not disturb the state machine outside Opening/Closing."""
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self.strategy._strategy_state = StrategyState.Closed
+        with patch.object(self.strategy, "notify_hb_app_with_timestamp") as notify_mock:
+            self.strategy.did_fail_order(
+                MarketOrderFailureEvent(self.start_timestamp, "order_3", OrderType.LIMIT))
+        self.assertEqual(StrategyState.Closed, self.strategy.strategy_state)
+        notify_mock.assert_not_called()
+
+    def test_opened_state_with_vanished_position_warns_and_skips(self):
+        """Would have caught ARB-4: perp_positions[0] raised IndexError per tick if the position
+        vanished while the state was Opened."""
+        self.clock.add_iterator(self.strategy)
+        self.clock.backtest_til(self.start_timestamp + 1)
+        self.strategy._strategy_state = StrategyState.Opened
+        with patch.object(self.strategy, "notify_hb_app_with_timestamp") as notify_mock:
+            asyncio.get_event_loop().run_until_complete(self.strategy.main(self.start_timestamp + 1))
+        self.assertTrue(self._is_logged("WARNING", "Strategy state is Opened but no HBOT-USDT perpetual "
+                                                   "position was found"))
+        notify_mock.assert_called_once()
+        # State is left for the operator to resolve - fail closed
+        self.assertEqual(StrategyState.Opened, self.strategy.strategy_state)
+
+    def test_create_base_proposals_rejects_invalid_prices(self):
+        """ARB-11: gathered prices containing Exceptions or NaN must not produce proposals."""
+        self.clock.add_iterator(self.strategy)
+        self.clock.backtest_til(self.start_timestamp + 1)
+        gather_target = ("hummingbot.strategy.spot_perpetual_arbitrage.spot_perpetual_arbitrage."
+                         "safe_gather")
+        with patch(gather_target, new=unittest.mock.AsyncMock(
+                return_value=[Decimal("100"), Decimal("99"), IOError("book unavailable"), Decimal("101")])):
+            props = asyncio.get_event_loop().run_until_complete(self.strategy.create_base_proposals())
+        self.assertEqual([], props)
+        self.assertTrue(self._is_logged("WARNING", "Failed to obtain valid order prices for proposals"))
+
+        self.log_records.clear()
+        with patch(gather_target, new=unittest.mock.AsyncMock(
+                return_value=[Decimal("100"), Decimal("nan"), Decimal("101"), Decimal("102")])):
+            props = asyncio.get_event_loop().run_until_complete(self.strategy.create_base_proposals())
+        self.assertEqual([], props)
+        self.assertTrue(self._is_logged("WARNING", "Failed to obtain valid order prices for proposals"))
+
+    def test_position_close_flag_compares_direction_not_object(self):
+        """Would have caught ARB-11's latent bug: `perp_side != cur_perp_pos_is_buy` compared an
+        object to a bool (always True), mislabeling same-side orders as position_close."""
+        self.perp_connector._account_positions[trading_pair] = Position(
+            trading_pair,
+            PositionSide.SHORT,
+            Decimal("0"),
+            Decimal("95"),
+            Decimal("-1"),
+            self.perp_connector.get_leverage(trading_pair)
+        )
+        captured = []
+        budget_checker = self.perp_connector.budget_checker
+        original_adjust = budget_checker.adjust_candidate
+
+        def capture_adjust(candidate, all_or_none=True):
+            captured.append(candidate)
+            return original_adjust(candidate, all_or_none)
+
+        # A SELL perp order on an existing SHORT position must NOT be marked position_close
+        proposal = ArbProposal(ArbProposalSide(self.spot_market_info, True, Decimal("100")),
+                               ArbProposalSide(self.perp_market_info, False, Decimal("100")),
+                               Decimal("1"))
+        with patch.object(budget_checker, "adjust_candidate", side_effect=capture_adjust):
+            self.strategy.check_perpetual_budget_constraint(proposal)
+        self.assertFalse(captured[-1].position_close)
+
+        # A BUY perp order on an existing SHORT position IS a close
+        captured.clear()
+        proposal = ArbProposal(ArbProposalSide(self.spot_market_info, False, Decimal("100")),
+                               ArbProposalSide(self.perp_market_info, True, Decimal("100")),
+                               Decimal("1"))
+        with patch.object(budget_checker, "adjust_candidate", side_effect=capture_adjust):
+            self.strategy.check_perpetual_budget_constraint(proposal)
+        self.assertTrue(captured[-1].position_close)
 
     @patch("hummingbot.connector.perpetual_trading.PerpetualTrading.set_position_mode")
     def test_position_mode_change_success(self, set_position_mode_mock):

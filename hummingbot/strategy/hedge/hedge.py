@@ -448,10 +448,23 @@ class HedgeStrategy(StrategyPyBase):
         quantized_amount = self._hedge_market_pair.market.quantize_order_amount(trading_pair, amount)
         return quantized_price, quantized_amount
 
+    def _is_valid_mid_price(self, market_pair: MarketTradingPairTuple) -> bool:
+        """
+        ARB-15: a NaN (empty book) or zero mid price poisons the hedge math
+        (InvalidOperation / DivisionByZero) - callers skip the cycle instead.
+        """
+        mid_price = market_pair.get_mid_price()
+        return mid_price is not None and not mid_price.is_nan() and mid_price > 0
+
     def hedge_by_value(self) -> None:
         """
         The main process of the strategy for value mode = True.
         """
+        if not all(self._is_valid_mid_price(market_pair)
+                   for market_pair in [self._hedge_market_pair] + list(self._market_pairs)):
+            self.logger().warning("A market mid price is unavailable (NaN/zero). Skipping this hedge cycle.")
+            self._status_messages.append("Mid price unavailable. Hedge skipped.")
+            return
         is_buy, value_to_hedge = self.get_hedge_direction_and_value()
         price, amount = self.calculate_hedge_price_and_amount(is_buy, value_to_hedge)
         if amount == Decimal("0"):
@@ -496,6 +509,11 @@ class HedgeStrategy(StrategyPyBase):
         The main process of the strategy for value mode = False.
         """
         for hedge_market, market_list in self._market_pair_by_asset.items():
+            if not self._is_valid_mid_price(hedge_market):
+                self.logger().warning(f"{hedge_market.trading_pair} mid price is unavailable (NaN/zero). "
+                                      f"Skipping its hedge cycle.")
+                self._status_messages.append(f"{hedge_market.trading_pair} mid price unavailable. Hedge skipped.")
+                continue
             is_buy, amount_to_hedge = self.get_hedge_direction_and_amount_by_asset(hedge_market, market_list)
             asset = hedge_market.trading_pair.split("-")[0]
             self.logger().debug("Hedge by amount for %s: %s", asset, amount_to_hedge)
@@ -554,7 +572,8 @@ class HedgeStrategy(StrategyPyBase):
         order_candidates = []
         if self._position_mode == PositionMode.HEDGE:
             order_candidate = get_closing_order_candidate(is_buy, amount, price)
-            if order_candidate:
+            # ARB-15: a zero-amount closing candidate (e.g. fully budget-rejected) must not be submitted
+            if order_candidate and order_candidate.amount > 0:
                 order_candidates.append(order_candidate)
                 amount -= order_candidate.amount
         order_candidate = PerpetualOrderCandidate(

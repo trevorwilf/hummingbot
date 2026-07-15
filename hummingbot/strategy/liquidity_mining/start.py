@@ -13,6 +13,13 @@ async def start(self):
     quote_markets = [m for m in el_markets if m.split("-")[1] == token]
     base_markets = [m for m in el_markets if m.split("-")[0] == token]
     markets = quote_markets if quote_markets else base_markets
+    # ARB-16: token-position selection can silently drop configured markets (e.g. mixed
+    # base/quote token positions) - the operator must be told they will not be traded
+    dropped_markets = [m for m in el_markets if m not in markets]
+    if dropped_markets:
+        self.notify(f"WARNING: The following markets will NOT be traded because the token position "
+                    f"of '{token}' does not match: {', '.join(dropped_markets)}. Only markets where "
+                    f"{token} is the {'quote' if quote_markets else 'base'} asset are used.")
     order_amount = c_map.get("order_amount").value
     spread = c_map.get("spread").value / Decimal("100")
     inventory_skew_enabled = c_map.get("inventory_skew_enabled").value
