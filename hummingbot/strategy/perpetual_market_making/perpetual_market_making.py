@@ -600,12 +600,13 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
                                               or (position.amount < 0 and order.is_buy))]
             if (not existent_stop_loss_orders
                     or (self._should_renew_stop_loss(existent_stop_loss_orders[0]))):
-                previous_stop_loss_price = None
                 for order in existent_stop_loss_orders:
-                    previous_stop_loss_price = order.price
                     self.cancel_order(self._market_info, order.client_order_id)
                     self.logger().info(f"Canceling the limit order {order.client_order_id} to renew stop loss.")
-                new_price = previous_stop_loss_price or stop_loss_price
+                # PMM-14: always recompute from the entry-derived stop_loss_price. Renewing from
+                # the previous order's price re-applied the slippage buffer each cycle, walking
+                # the stop away from the entry geometrically.
+                new_price = stop_loss_price
                 if (top_ask <= stop_loss_price and position.amount > 0):
                     price = market.quantize_order_price(
                         self.trading_pair,
@@ -784,33 +785,37 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
             # Get the top bid price in the market using order_optimization_depth and your buy order volume
             top_bid_price = self._market_info.get_price_for_volume(
                 False, self._bid_order_optimization_depth + own_buy_size).result_price
-            price_quantum = market.get_order_price_quantum(
-                self.trading_pair,
-                top_bid_price
-            )
-            # Get the price above the top bid
-            price_above_bid = (ceil(top_bid_price / price_quantum) + 1) * price_quantum
+            # PMM-3: on a thin (but non-empty) book get_price_for_volume returns NaN and
+            # ceil(NaN) raises, aborting the whole tick. Skip optimization for the side instead.
+            if not top_bid_price.is_nan():
+                price_quantum = market.get_order_price_quantum(
+                    self.trading_pair,
+                    top_bid_price
+                )
+                # Get the price above the top bid
+                price_above_bid = (ceil(top_bid_price / price_quantum) + 1) * price_quantum
 
-            # If the price_above_bid is lower than the price suggested by the pricing proposal,
-            # lower your price to this
-            lower_buy_price = min(proposal.buys[0].price, price_above_bid)
-            proposal.buys[0].price = market.quantize_order_price(self.trading_pair, lower_buy_price)
+                # If the price_above_bid is lower than the price suggested by the pricing proposal,
+                # lower your price to this
+                lower_buy_price = min(proposal.buys[0].price, price_above_bid)
+                proposal.buys[0].price = market.quantize_order_price(self.trading_pair, lower_buy_price)
 
         if len(proposal.sells) == 1:
             # Get the top ask price in the market using order_optimization_depth and your sell order volume
             top_ask_price = self._market_info.get_price_for_volume(
                 True, self._ask_order_optimization_depth + own_sell_size).result_price
-            price_quantum = market.get_order_price_quantum(
-                self.trading_pair,
-                top_ask_price
-            )
-            # Get the price below the top ask
-            price_below_ask = (floor(top_ask_price / price_quantum) - 1) * price_quantum
+            if not top_ask_price.is_nan():
+                price_quantum = market.get_order_price_quantum(
+                    self.trading_pair,
+                    top_ask_price
+                )
+                # Get the price below the top ask
+                price_below_ask = (floor(top_ask_price / price_quantum) - 1) * price_quantum
 
-            # If the price_below_ask is higher than the price suggested by the pricing proposal,
-            # increase your price to this
-            higher_sell_price = max(proposal.sells[0].price, price_below_ask)
-            proposal.sells[0].price = market.quantize_order_price(self.trading_pair, higher_sell_price)
+                # If the price_below_ask is higher than the price suggested by the pricing proposal,
+                # increase your price to this
+                higher_sell_price = max(proposal.sells[0].price, price_below_ask)
+                proposal.sells[0].price = market.quantize_order_price(self.trading_pair, higher_sell_price)
 
     def did_fill_order(self, order_filled_event: OrderFilledEvent):
         order_id = order_filled_event.order_id

@@ -48,6 +48,20 @@ class FromDateToDateModel(BaseClientModel):
             raise ValueError(ret)
         return v
 
+    @model_validator(mode="after")
+    def validate_end_after_start(self):
+        # PMM-13: an end <= start window would silently never trade (there is no wrap-around
+        # support) — reject it at config time with a clear message. Models built via
+        # model_construct() are populated field by field, so only check once both are set.
+        start = getattr(self, "start_datetime", None)
+        end = getattr(self, "end_datetime", None)
+        if start is not None and end is not None and end <= start:
+            raise ValueError(
+                f"end_datetime ({end}) must be after start_datetime ({start}). "
+                f"Wrap-around execution windows are not supported."
+            )
+        return self
+
 
 class DailyBetweenTimesModel(BaseClientModel):
     start_time: time = Field(
@@ -71,6 +85,21 @@ class DailyBetweenTimesModel(BaseClientModel):
         if ret is not None:
             raise ValueError(ret)
         return v
+
+    @model_validator(mode="after")
+    def validate_end_after_start(self):
+        # PMM-13: a daily window with end <= start would silently never trade (there is no
+        # wrap-around/overnight support) — reject it at config time with a clear message.
+        # Models built via model_construct() are populated field by field, so only check once
+        # both are set.
+        start = getattr(self, "start_time", None)
+        end = getattr(self, "end_time", None)
+        if start is not None and end is not None and end <= start:
+            raise ValueError(
+                f"end_time ({end}) must be after start_time ({start}). "
+                f"Overnight (wrap-around) daily windows are not supported."
+            )
+        return self
 
 
 EXECUTION_TIMEFRAME_MODELS = {

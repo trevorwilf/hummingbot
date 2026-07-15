@@ -391,6 +391,10 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
             hanging_orders_cancel_pct = Decimal("0")
 
         if self._hanging_orders_enabled != hanging_orders_enabled:
+            # PMM-12: unregister the old tracker's market listeners before replacing it, or the
+            # orphaned instance keeps reacting to order events forever.
+            if self._hanging_orders_tracker is not None:
+                self._hanging_orders_tracker.unregister_events(self.active_markets)
             # Hanging order tracker instance doesn't exist - create from scratch
             self._hanging_orders_enabled = hanging_orders_enabled
             self._hanging_orders_cancel_pct = hanging_orders_cancel_pct
@@ -577,7 +581,9 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
             # start tracking any restored limit order
             restored_order_ids = self.c_track_restored_orders(self.market_info)
             for order_id in restored_order_ids:
-                order = next(o for o in self.market_info.market.limit_orders if o.client_order_id == order_id)
+                # PMM-11: default None — a bare next() raising StopIteration would escape into the
+                # clock loop and halt every iterator in the process.
+                order = next((o for o in self.market_info.market.limit_orders if o.client_order_id == order_id), None)
                 if order:
                     self._hanging_orders_tracker.add_as_hanging_order(order)
 
@@ -660,6 +666,10 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
                 self.c_apply_budget_constraint(proposal)
 
                 self.c_cancel_active_orders(proposal)
+            else:
+                # PMM-2: quoting is impossible (NaN mid price or degenerate indicators) — fail
+                # closed: the cancel wave must still run so stale quotes don't survive the tick.
+                self.c_cancel_active_orders(None)
 
         if self.c_to_create_orders(proposal):
             self.c_execute_orders_proposal(proposal)
@@ -672,7 +682,10 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
         self._last_sampling_timestamp = timestamp
 
         price = self.get_price()
-        self._avg_vol.add_sample(price)
+        # PMM-2: one NaN mid-price sample poisons the volatility buffer for a full buffer length —
+        # skip the sample instead.
+        if not price.is_nan():
+            self._avg_vol.add_sample(price)
         self._trading_intensity.calculate(timestamp)
         # Calculate adjustment factor to have 0.01% of inventory resolution
         base_balance = market.get_balance(base_asset)
@@ -717,6 +730,14 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
         # Current mid price
         price = self.get_price()
 
+        # PMM-2: a NaN mid price would flow into the reservation-price/optimal-spread math and
+        # raise InvalidOperation on the ordered comparisons below, aborting the tick before the
+        # cancel wave. Zero the optimal prices (the caller's `> 0` gate then fails closed) and bail.
+        if price.is_nan():
+            self._optimal_bid = s_decimal_zero
+            self._optimal_ask = s_decimal_zero
+            return
+
         # The amount of stocks owned - q - has to be in relative units, not absolute, because changing the portfolio size shouldn't change the reservation price
         # The reservation price should concern itself only with the strategy performance, i.e. amount of stocks relative to the target
         inventory = Decimal(str(self.c_calculate_inventory()))
@@ -731,7 +752,7 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
 
         # order book liquidity - kappa and alpha have to represent absolute values because the second member of the optimal spread equation has to be an absolute price
         # and from the reservation price calculation we know that gamma's unit is not absolute price
-        if all((self.gamma, self._kappa)) and self._alpha != 0 and self._kappa > 0 and vol != 0:
+        if all((self.gamma, self._kappa)) and self._alpha != 0 and self._kappa > 0 and not vol.is_nan() and vol != 0:
             if self._execution_state.time_left is not None and self._execution_state.closing_time is not None:
                 # Avellaneda-Stoikov for a fixed timespan
                 time_left_fraction = Decimal(str(self._execution_state.time_left / self._execution_state.closing_time))
@@ -1043,37 +1064,41 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
             # Get the top bid price in the market using order_optimization_depth and your buy order volume
             top_bid_price = self._market_info.get_price_for_volume(
                 False, own_buy_size).result_price
-            price_quantum = market.c_get_order_price_quantum(
-                self.trading_pair,
-                top_bid_price
-            )
-            # Get the price above the top bid
-            price_above_bid = (ceil(top_bid_price / price_quantum) + 1) * price_quantum
+            # PMM-3: on a thin (but non-empty) book get_price_for_volume returns NaN and
+            # ceil(NaN) raises, aborting the whole tick. Skip optimization for the side instead.
+            if not top_bid_price.is_nan():
+                price_quantum = market.c_get_order_price_quantum(
+                    self.trading_pair,
+                    top_bid_price
+                )
+                # Get the price above the top bid
+                price_above_bid = (ceil(top_bid_price / price_quantum) + 1) * price_quantum
 
-            # If the price_above_bid is lower than the price suggested by the top pricing proposal,
-            # lower the price and from there apply the best_order_spread to each order in the next levels
-            proposal.buys = sorted(proposal.buys, key = lambda p: p.price, reverse = True)
-            for i, proposed in enumerate(proposal.buys):
-                if proposal.buys[i].price > price_above_bid:
-                    proposal.buys[i].price = market.c_quantize_order_price(self.trading_pair, price_above_bid)
+                # If the price_above_bid is lower than the price suggested by the top pricing proposal,
+                # lower the price and from there apply the best_order_spread to each order in the next levels
+                proposal.buys = sorted(proposal.buys, key = lambda p: p.price, reverse = True)
+                for i, proposed in enumerate(proposal.buys):
+                    if proposal.buys[i].price > price_above_bid:
+                        proposal.buys[i].price = market.c_quantize_order_price(self.trading_pair, price_above_bid)
 
         if len(proposal.sells) > 0:
             # Get the top ask price in the market using order_optimization_depth and your sell order volume
             top_ask_price = self._market_info.get_price_for_volume(
                 True, own_sell_size).result_price
-            price_quantum = market.c_get_order_price_quantum(
-                self.trading_pair,
-                top_ask_price
-            )
-            # Get the price below the top ask
-            price_below_ask = (floor(top_ask_price / price_quantum) - 1) * price_quantum
+            if not top_ask_price.is_nan():
+                price_quantum = market.c_get_order_price_quantum(
+                    self.trading_pair,
+                    top_ask_price
+                )
+                # Get the price below the top ask
+                price_below_ask = (floor(top_ask_price / price_quantum) - 1) * price_quantum
 
-            # If the price_below_ask is higher than the price suggested by the pricing proposal,
-            # increase your price and from there apply the best_order_spread to each order in the next levels
-            proposal.sells = sorted(proposal.sells, key = lambda p: p.price)
-            for i, proposed in enumerate(proposal.sells):
-                if proposal.sells[i].price < price_below_ask:
-                    proposal.sells[i].price = market.c_quantize_order_price(self.trading_pair, price_below_ask)
+                # If the price_below_ask is higher than the price suggested by the pricing proposal,
+                # increase your price and from there apply the best_order_spread to each order in the next levels
+                proposal.sells = sorted(proposal.sells, key = lambda p: p.price)
+                for i, proposed in enumerate(proposal.sells):
+                    if proposal.sells[i].price < price_below_ask:
+                        proposal.sells[i].price = market.c_quantize_order_price(self.trading_pair, price_below_ask)
 
     def apply_order_optimization(self, proposal: Proposal):
         return self.c_apply_order_optimization(proposal)
@@ -1273,6 +1298,9 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
             double expiration_seconds = NaN
             str bid_order_id, ask_order_id
             bint orders_created = False
+        # PMM-4: stale pairs from a previous cycle (e.g. both sides filled) would mis-index the
+        # buy/sell pairing below — start every proposal execution from a clean list.
+        self._hanging_orders_tracker.current_created_pairs_of_orders.clear()
         # Number of pair of orders to track for hanging orders
         number_of_pairs = min((len(proposal.buys), len(proposal.sells))) if self._hanging_orders_enabled else 0
 
@@ -1295,7 +1323,9 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
                 )
                 orders_created = True
                 if idx < number_of_pairs:
-                    order = next((o for o in self.active_orders if o.client_order_id == bid_order_id))
+                    # PMM-11: default None — a bare next() raising StopIteration would escape into
+                    # the clock loop and halt every iterator in the process.
+                    order = next((o for o in self.active_orders if o.client_order_id == bid_order_id), None)
                     if order:
                         self._hanging_orders_tracker.add_current_pairs_of_proposal_orders_executed_by_strategy(
                             CreatedPairOfOrders(order, None))
@@ -1318,8 +1348,8 @@ cdef class AvellanedaMarketMakingStrategy(StrategyBase):
                 )
                 orders_created = True
                 if idx < number_of_pairs:
-                    order = next((o for o in self.active_orders if o.client_order_id == ask_order_id))
-                    if order:
+                    order = next((o for o in self.active_orders if o.client_order_id == ask_order_id), None)
+                    if order is not None and idx < len(self._hanging_orders_tracker.current_created_pairs_of_orders):
                         self._hanging_orders_tracker.current_created_pairs_of_orders[idx].sell_order = order
         if orders_created:
             self.c_set_timers()

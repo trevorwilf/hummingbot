@@ -144,6 +144,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         self._last_own_trade_price = Decimal('nan')
         self._should_wait_order_cancel_confirmation = should_wait_order_cancel_confirmation
         self._moving_price_band = moving_price_band
+        self._nan_price_warning_ts = 0
         self.c_add_markets([market_info.market])
 
     def all_markets_ready(self):
@@ -358,6 +359,10 @@ cdef class PureMarketMakingStrategy(StrategyBase):
     @property
     def split_order_levels_enabled(self):
         return self._split_order_levels_enabled
+
+    @property
+    def should_wait_order_cancel_confirmation(self):
+        return self._should_wait_order_cancel_confirmation
 
     @property
     def bid_order_level_spreads(self):
@@ -691,6 +696,12 @@ cdef class PureMarketMakingStrategy(StrategyBase):
     def cancel_order(self, order_id: str):
         return self.c_cancel_order(self._market_info, order_id)
 
+    def apply_order_optimization(self, proposal: Proposal):
+        return self.c_apply_order_optimization(proposal)
+
+    def create_base_proposal(self):
+        return self.c_create_base_proposal()
+
     # ---------------------------------------------------------------
 
     cdef c_start(self, Clock clock, double timestamp):
@@ -704,7 +715,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             restored_order_ids = self.c_track_restored_orders(self.market_info)
             # make restored order hanging orders
             for order_id in restored_order_ids:
-                order = next(o for o in self.market_info.market.limit_orders if o.client_order_id == order_id)
+                # PMM-11: default None — a bare next() raising StopIteration would escape into the
+                # clock loop and halt every iterator in the process.
+                order = next((o for o in self.market_info.market.limit_orders if o.client_order_id == order_id), None)
                 if order:
                     self._hanging_orders_tracker.add_as_hanging_order(order)
 
@@ -736,6 +749,20 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 if not all([market.network_status is NetworkStatus.CONNECTED for market in self._sb_markets]):
                     self.logger().warning(f"WARNING: Some markets are not connected or are down at the moment. Market "
                                           f"making may be dangerous when markets or networks are unstable.")
+
+            # PMM-1: a NaN reference price (one-sided/empty book) makes the optional-feature
+            # comparisons (price bands, moving band, inventory skew, hanging tracker, min-spread
+            # cancel) raise InvalidOperation before the cancel wave. Fail closed: cancel the
+            # non-hanging orders and skip the rest of the tick so stale quotes never survive.
+            reference_price = self.get_price()
+            if reference_price.is_nan():
+                if self._current_timestamp - self._nan_price_warning_ts >= 30:
+                    self.logger().warning(f"({self.trading_pair}) Reference price is NaN (order book may be "
+                                          f"empty or one-sided). Cancelling active orders for this tick.")
+                    self._nan_price_warning_ts = self._current_timestamp
+                for order in self.active_non_hanging_orders:
+                    self.c_cancel_order(self._market_info, order.client_order_id)
+                return
 
             proposal = None
             if self._create_timestamp <= self._current_timestamp:
@@ -785,6 +812,10 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         # to order spread, amount, and levels setting.
         order_override = self._order_override
         if order_override is not None and len(order_override) > 0:
+            # PMM-9: track the configured level index per side so downstream repricing
+            # (split order levels) stays aligned with the spread lists even when earlier
+            # levels are dropped (ping-pong, bands, quantization).
+            buy_level = sell_level = 0
             for key, value in order_override.items():
                 if str(value[0]) in ["buy", "sell"]:
                     if str(value[0]) == "buy" and not buy_reference_price.is_nan():
@@ -793,14 +824,16 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                         size = Decimal(str(value[2]))
                         size = market.c_quantize_order_amount(self.trading_pair, size)
                         if size > 0 and price > 0:
-                            buys.append(PriceSize(price, size))
+                            buys.append(PriceSize(price, size, buy_level))
+                        buy_level += 1
                     elif str(value[0]) == "sell" and not sell_reference_price.is_nan():
                         price = sell_reference_price * (Decimal("1") + Decimal(str(value[1])) / Decimal("100"))
                         price = market.c_quantize_order_price(self.trading_pair, price)
                         size = Decimal(str(value[2]))
                         size = market.c_quantize_order_amount(self.trading_pair, size)
                         if size > 0 and price > 0:
-                            sells.append(PriceSize(price, size))
+                            sells.append(PriceSize(price, size, sell_level))
+                        sell_level += 1
         else:
             if not buy_reference_price.is_nan():
                 for level in range(0, self._buy_levels):
@@ -808,16 +841,18 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                     price = market.c_quantize_order_price(self.trading_pair, price)
                     size = self._order_amount + (self._order_level_amount * level)
                     size = market.c_quantize_order_amount(self.trading_pair, size)
-                    if size > 0:
-                        buys.append(PriceSize(price, size))
+                    # PMM-7: deep levels can go non-positive on wide spreads; drop them so the
+                    # budget constraint never sees a negative quote size.
+                    if size > 0 and price > 0:
+                        buys.append(PriceSize(price, size, level))
             if not sell_reference_price.is_nan():
                 for level in range(0, self._sell_levels):
                     price = sell_reference_price * (Decimal("1") + self._ask_spread + (level * self._order_level_spread))
                     price = market.c_quantize_order_price(self.trading_pair, price)
                     size = self._order_amount + (self._order_level_amount * level)
                     size = market.c_quantize_order_amount(self.trading_pair, size)
-                    if size > 0:
-                        sells.append(PriceSize(price, size))
+                    if size > 0 and price > 0:
+                        sells.append(PriceSize(price, size, level))
 
         return Proposal(buys, sells)
 
@@ -998,47 +1033,57 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             # Get the top bid price in the market using order_optimization_depth and your buy order volume
             top_bid_price = self._market_info.get_price_for_volume(
                 False, self._bid_order_optimization_depth + own_buy_size).result_price
-            price_quantum = market.c_get_order_price_quantum(
-                self.trading_pair,
-                top_bid_price
-            )
-            # Get the price above the top bid
-            price_above_bid = (ceil(top_bid_price / price_quantum) + 1) * price_quantum
+            # PMM-3: on a thin (but non-empty) book get_price_for_volume returns NaN and
+            # ceil(NaN) raises, aborting the whole tick. Skip optimization for the side instead.
+            if not top_bid_price.is_nan():
+                price_quantum = market.c_get_order_price_quantum(
+                    self.trading_pair,
+                    top_bid_price
+                )
+                # Get the price above the top bid
+                price_above_bid = (ceil(top_bid_price / price_quantum) + 1) * price_quantum
 
-            # If the price_above_bid is lower than the price suggested by the top pricing proposal,
-            # lower the price and from there apply the order_level_spread to each order in the next levels
-            proposal.buys = sorted(proposal.buys, key = lambda p: p.price, reverse = True)
-            lower_buy_price = min(proposal.buys[0].price, price_above_bid)
-            for i, proposed in enumerate(proposal.buys):
-                if self._split_order_levels_enabled:
-                    proposal.buys[i].price = (market.c_quantize_order_price(self.trading_pair, lower_buy_price)
-                                              * (1 - self._bid_order_level_spreads[i] / Decimal("100"))
-                                              / (1-self._bid_order_level_spreads[0] / Decimal("100")))
-                    continue
-                proposal.buys[i].price = market.c_quantize_order_price(self.trading_pair, lower_buy_price) * (1 - self.order_level_spread * i)
+                # If the price_above_bid is lower than the price suggested by the top pricing proposal,
+                # lower the price and from there apply the order_level_spread to each order in the next levels
+                proposal.buys = sorted(proposal.buys, key = lambda p: p.price, reverse = True)
+                lower_buy_price = min(proposal.buys[0].price, price_above_bid)
+                # PMM-9: anchor the split-level repricing on the first level actually present so
+                # spread indices stay aligned when earlier levels were dropped upstream.
+                first_buy_level = proposal.buys[0].level if proposal.buys[0].level is not None else 0
+                for i, proposed in enumerate(proposal.buys):
+                    if self._split_order_levels_enabled:
+                        level_idx = proposed.level if proposed.level is not None else i
+                        proposal.buys[i].price = (market.c_quantize_order_price(self.trading_pair, lower_buy_price)
+                                                  * (1 - self._bid_order_level_spreads[level_idx] / Decimal("100"))
+                                                  / (1 - self._bid_order_level_spreads[first_buy_level] / Decimal("100")))
+                        continue
+                    proposal.buys[i].price = market.c_quantize_order_price(self.trading_pair, lower_buy_price) * (1 - self.order_level_spread * i)
 
         if len(proposal.sells) > 0:
             # Get the top ask price in the market using order_optimization_depth and your sell order volume
             top_ask_price = self._market_info.get_price_for_volume(
                 True, self._ask_order_optimization_depth + own_sell_size).result_price
-            price_quantum = market.c_get_order_price_quantum(
-                self.trading_pair,
-                top_ask_price
-            )
-            # Get the price below the top ask
-            price_below_ask = (floor(top_ask_price / price_quantum) - 1) * price_quantum
+            if not top_ask_price.is_nan():
+                price_quantum = market.c_get_order_price_quantum(
+                    self.trading_pair,
+                    top_ask_price
+                )
+                # Get the price below the top ask
+                price_below_ask = (floor(top_ask_price / price_quantum) - 1) * price_quantum
 
-            # If the price_below_ask is higher than the price suggested by the pricing proposal,
-            # increase your price and from there apply the order_level_spread to each order in the next levels
-            proposal.sells = sorted(proposal.sells, key = lambda p: p.price)
-            higher_sell_price = max(proposal.sells[0].price, price_below_ask)
-            for i, proposed in enumerate(proposal.sells):
-                if self._split_order_levels_enabled:
-                    proposal.sells[i].price = (market.c_quantize_order_price(self.trading_pair, higher_sell_price)
-                                               * (1 + self._ask_order_level_spreads[i] / Decimal("100"))
-                                               / (1 + self._ask_order_level_spreads[0] / Decimal("100")))
-                    continue
-                proposal.sells[i].price = market.c_quantize_order_price(self.trading_pair, higher_sell_price) * (1 + self.order_level_spread * i)
+                # If the price_below_ask is higher than the price suggested by the pricing proposal,
+                # increase your price and from there apply the order_level_spread to each order in the next levels
+                proposal.sells = sorted(proposal.sells, key = lambda p: p.price)
+                higher_sell_price = max(proposal.sells[0].price, price_below_ask)
+                first_sell_level = proposal.sells[0].level if proposal.sells[0].level is not None else 0
+                for i, proposed in enumerate(proposal.sells):
+                    if self._split_order_levels_enabled:
+                        level_idx = proposed.level if proposed.level is not None else i
+                        proposal.sells[i].price = (market.c_quantize_order_price(self.trading_pair, higher_sell_price)
+                                                   * (1 + self._ask_order_level_spreads[level_idx] / Decimal("100"))
+                                                   / (1 + self._ask_order_level_spreads[first_sell_level] / Decimal("100")))
+                        continue
+                    proposal.sells[i].price = market.c_quantize_order_price(self.trading_pair, higher_sell_price) * (1 + self.order_level_spread * i)
 
     cdef object c_apply_add_transaction_costs(self, object proposal):
         cdef:
@@ -1091,8 +1136,10 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         active_sell_ids = [x.client_order_id for x in self.active_orders if not x.is_buy]
 
         if self._hanging_orders_enabled:
-            # If the filled order is a hanging order, do nothing
-            if order_id in self.hanging_order_ids:
+            # PMM-5: the hanging-orders tracker's completion listener may run before this one and
+            # move the order to completed_hanging_orders — check both (mirrors Avellaneda).
+            if (self._hanging_orders_tracker.is_order_id_in_hanging_orders(order_id)
+                    or self._hanging_orders_tracker.is_order_id_in_completed_hanging_orders(order_id)):
                 self.log_with_clock(
                     logging.INFO,
                     f"({self.trading_pair}) Hanging maker buy order {order_id} "
@@ -1131,8 +1178,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             return
         active_buy_ids = [x.client_order_id for x in self.active_orders if x.is_buy]
         if self._hanging_orders_enabled:
-            # If the filled order is a hanging order, do nothing
-            if order_id in self.hanging_order_ids:
+            # PMM-5: dual check — see c_did_complete_buy_order.
+            if (self._hanging_orders_tracker.is_order_id_in_hanging_orders(order_id)
+                    or self._hanging_orders_tracker.is_order_id_in_completed_hanging_orders(order_id)):
                 self.log_with_clock(
                     logging.INFO,
                     f"({self.trading_pair}) Hanging maker sell order {order_id} "
@@ -1249,6 +1297,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             double expiration_seconds = NaN
             str bid_order_id, ask_order_id
             bint orders_created = False
+        # PMM-4: stale pairs from a previous cycle (e.g. both sides filled) would mis-index the
+        # buy/sell pairing below — start every proposal execution from a clean list.
+        self._hanging_orders_tracker.current_created_pairs_of_orders.clear()
         # Number of pair of orders to track for hanging orders
         number_of_pairs = min((len(proposal.buys), len(proposal.sells))) if self._hanging_orders_enabled else 0
 
@@ -1271,7 +1322,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 )
                 orders_created = True
                 if idx < number_of_pairs:
-                    order = next((o for o in self.active_orders if o.client_order_id == bid_order_id))
+                    order = next((o for o in self.active_orders if o.client_order_id == bid_order_id), None)
                     if order:
                         self._hanging_orders_tracker.add_current_pairs_of_proposal_orders_executed_by_strategy(
                             CreatedPairOfOrders(order, None))
@@ -1294,8 +1345,8 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 )
                 orders_created = True
                 if idx < number_of_pairs:
-                    order = next((o for o in self.active_orders if o.client_order_id == ask_order_id))
-                    if order:
+                    order = next((o for o in self.active_orders if o.client_order_id == ask_order_id), None)
+                    if order is not None and idx < len(self._hanging_orders_tracker.current_created_pairs_of_orders):
                         self._hanging_orders_tracker.current_created_pairs_of_orders[idx].sell_order = order
         if orders_created:
             self.set_timers()
