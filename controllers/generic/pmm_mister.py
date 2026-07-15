@@ -4,9 +4,10 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
-from hummingbot.core.data_type.common import MarketDict, OrderType, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import MarketDict, OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.utils.common import parse_comma_separated_list, parse_enum_value
@@ -54,6 +55,9 @@ class PMMisterConfig(ControllerConfigBase):
     min_skew: Decimal = Field(default=Decimal("1.0"), json_schema_extra={"is_updatable": True})
     global_take_profit: Decimal = Field(default=Decimal("0.03"), json_schema_extra={"is_updatable": True})
     global_stop_loss: Decimal = Field(default=Decimal("0.05"), json_schema_extra={"is_updatable": True})
+    # GEN-3: maximum age (seconds) the last successfully fetched reference price may be
+    # reused during a price outage. Beyond this the controller stops creating orders.
+    reference_price_max_age: int = Field(default=60, json_schema_extra={"is_updatable": True})
 
     @field_validator("take_profit", mode="before")
     @classmethod
@@ -200,19 +204,109 @@ class PMMister(ControllerBase):
         self.max_order_history = 20
         # Initialize processed_data to prevent access errors
         self.processed_data = {}
+        # GEN-3: timestamp of the last successful reference-price fetch and
+        # rate-limit state for the price-unavailable warning
+        self._last_valid_price_timestamp: Optional[float] = None
+        self._last_price_warning_timestamp: float = 0.0
+        # GEN-4: rate-limit state for the global TP/SL trigger log
+        self._last_global_exit_log_timestamp: float = 0.0
+        self._warning_interval: float = 30.0
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Determine actions based on the current state with advanced position management.
         """
+        # GEN-3: without a single successful price fetch there is nothing safe to do
+        if not self.processed_data or "reference_price" not in self.processed_data:
+            return []
+
+        # GEN-4: global take-profit / stop-loss enforcement takes precedence over quoting.
+        # While an exit is triggered the controller must not quote at all — even when the
+        # close is already fully in flight (empty action list).
+        global_exit_actions = self.global_tp_sl_actions()
+        if global_exit_actions is not None:
+            return global_exit_actions
+
         actions = []
 
-        # Create new executors
-        actions.extend(self.create_actions_proposal())
+        # Create new executors — only while the reference price is fresh enough (GEN-3)
+        if not self.processed_data.get("price_expired", False):
+            actions.extend(self.create_actions_proposal())
 
         # Stop executors (refresh and early stop)
         actions.extend(self.stop_actions_proposal())
 
+        return actions
+
+    def global_tp_sl_actions(self) -> Optional[List[ExecutorAction]]:
+        """
+        GEN-4: enforce global_take_profit / global_stop_loss against positions_held.
+        Returns None when not triggered. On trigger, returns the exit actions (possibly
+        an empty list when the close is already fully in flight): stop every active
+        executor (cancelling open orders, folding their fills into the held position)
+        and close the remaining held amount with a MARKET order executor. Active
+        close-side order executors are deducted from the close amount so the exit is
+        not re-emitted at full size every tick (GEN-2-style guard).
+        """
+        position = next((p for p in self.positions_held if
+                         p.trading_pair == self.config.trading_pair and
+                         p.connector_name == self.config.connector_name), None)
+        if position is None or position.amount <= Decimal("0") or position.amount_quote == Decimal("0"):
+            return None
+
+        pnl_pct = position.unrealized_pnl_quote / position.amount_quote
+        take_profit_hit = self.config.global_take_profit > 0 and pnl_pct >= self.config.global_take_profit
+        stop_loss_hit = self.config.global_stop_loss > 0 and pnl_pct <= -self.config.global_stop_loss
+        if not take_profit_hit and not stop_loss_hit:
+            return None
+
+        current_time = self.market_data_provider.time()
+        if current_time - self._last_global_exit_log_timestamp >= self._warning_interval:
+            self._last_global_exit_log_timestamp = current_time
+            trigger = "take profit" if take_profit_hit else "stop loss"
+            self.logger().warning(
+                f"Global {trigger} triggered for {self.config.trading_pair} "
+                f"(pnl {pnl_pct:.4%}) — closing position.")
+
+        actions: List[ExecutorAction] = []
+        close_side = TradeType.SELL if position.side == TradeType.BUY else TradeType.BUY
+
+        def is_in_flight_close(e) -> bool:
+            return (e.type == "order_executor" and
+                    e.config.trading_pair == self.config.trading_pair and
+                    e.config.connector_name == self.config.connector_name and
+                    e.config.side == close_side)
+
+        # Cancel all working executors EXCEPT in-flight close orders (stopping those
+        # would cancel the exit we are trying to make); keep_position folds partial
+        # fills into positions_held instead of letting each executor market-close
+        # independently.
+        for executor in self.filter_executors(
+                executors=self.executors_info,
+                filter_func=lambda e: e.is_active and not is_in_flight_close(e)):
+            actions.append(StopExecutorAction(
+                controller_id=self.config.id,
+                keep_position=True,
+                executor_id=executor.id))
+
+        # In-flight guard: subtract close orders already executing
+        in_flight_close_amount = Decimal(str(sum(
+            e.config.amount for e in self.executors_info
+            if e.is_active and is_in_flight_close(e))))
+        amount_to_close = position.amount - in_flight_close_amount
+        if amount_to_close > Decimal("0"):
+            actions.append(CreateExecutorAction(
+                controller_id=self.config.id,
+                executor_config=OrderExecutorConfig(
+                    timestamp=current_time,
+                    connector_name=self.config.connector_name,
+                    trading_pair=self.config.trading_pair,
+                    side=close_side,
+                    amount=amount_to_close,
+                    position_action=PositionAction.CLOSE,
+                    execution_strategy=ExecutionStrategy.MARKET,
+                    leverage=self.config.leverage,
+                )))
         return actions
 
     def should_effectivize_executor(self, executor_info, current_time: int) -> bool:
@@ -447,17 +541,42 @@ class PMMister(ControllerBase):
         """
         current_time = self.market_data_provider.time()
 
-        # Safely get reference price with fallback
+        # GEN-3: never fabricate a reference price. On price-unavailable, reuse the
+        # previous price only within reference_price_max_age; beyond that (or with no
+        # previous price at all) skip the cycle so no ladder is quoted around fiction.
+        reference_price = None
         try:
-            reference_price = self.market_data_provider.get_price_by_type(
+            fetched_price = self.market_data_provider.get_price_by_type(
                 self.config.connector_name, self.config.trading_pair, PriceType.MidPrice
             )
-            if reference_price is None or reference_price <= 0:
-                self.logger().warning("Invalid reference price received, using previous price if available")
-                reference_price = self.processed_data.get("reference_price", Decimal("100"))  # Default fallback
+            if fetched_price is not None:
+                fetched_price = Decimal(str(fetched_price))
+                if fetched_price.is_finite() and fetched_price > 0:
+                    reference_price = fetched_price
         except Exception as e:
-            self.logger().warning(f"Error getting reference price: {e}, using previous price if available")
-            reference_price = self.processed_data.get("reference_price", Decimal("100"))  # Default fallback
+            self._warn_price_unavailable(current_time, f"Error getting reference price: {e}")
+
+        if reference_price is not None:
+            self._last_valid_price_timestamp = current_time
+        else:
+            previous_price = self.processed_data.get("reference_price")
+            price_age_ok = (self._last_valid_price_timestamp is not None and
+                            current_time - self._last_valid_price_timestamp <= self.config.reference_price_max_age)
+            if previous_price is not None and price_age_ok:
+                self._warn_price_unavailable(
+                    current_time,
+                    f"Reference price unavailable for {self.config.trading_pair} — reusing previous "
+                    f"price {previous_price} (age within {self.config.reference_price_max_age}s).")
+                reference_price = Decimal(previous_price)
+            else:
+                self._warn_price_unavailable(
+                    current_time,
+                    f"Reference price unavailable for {self.config.trading_pair} and no previous price "
+                    f"within {self.config.reference_price_max_age}s — skipping cycle (no orders will be created).")
+                if self.processed_data:
+                    self.processed_data["price_expired"] = True
+                return
+        price_expired = False
 
         # Update price history for visualization
         self.price_history.append({
@@ -517,6 +636,7 @@ class PMMister(ControllerBase):
 
         self.processed_data = {
             "reference_price": Decimal(reference_price),
+            "price_expired": price_expired,
             "spread_multiplier": spread_multiplier,
             "deviation": deviation,
             "current_base_pct": current_base_pct,
@@ -534,6 +654,12 @@ class PMMister(ControllerBase):
             "refresh_tracking": refresh_tracking,
             "current_time": current_time
         }
+
+    def _warn_price_unavailable(self, current_time: float, message: str):
+        """Rate-limited (30s) warning for price-unavailable conditions (GEN-3)."""
+        if current_time - self._last_price_warning_timestamp >= self._warning_interval:
+            self._last_price_warning_timestamp = current_time
+            self.logger().warning(message)
 
     def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
         """Get executor config for a given level"""

@@ -43,8 +43,17 @@ class HedgeAssetConfig(ControllerConfigBase):
     min_notional_size: float = Field(default=10, ge=0)
     cooldown_time: float = Field(default=10.0, ge=0)
 
+    # GEN-13: quote asset of the spot reference pair registered for the hedged asset.
+    # Previously hardcoded to USDC — a nonexistent <asset>-USDC market blocks connector
+    # readiness for the whole bot. Default preserves prior behavior.
+    spot_reference_quote: str = Field(default="USDC")
+
+    @property
+    def spot_reference_pair(self) -> str:
+        return f"{self.asset_to_hedge}-{self.spot_reference_quote}"
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
-        markets.add_or_update(self.spot_connector_name, self.asset_to_hedge + "-USDC")
+        markets.add_or_update(self.spot_connector_name, self.spot_reference_pair)
         markets.add_or_update(self.hedge_connector_name, self.hedge_trading_pair)
         return markets
 
@@ -80,6 +89,27 @@ class HedgeAssetController(ControllerBase):
             return self.executors_info[-1].timestamp
         return 0
 
+    @property
+    def in_flight_hedge_amount(self) -> Decimal:
+        """
+        GEN-13: signed base amount of active hedge order executors on the hedge pair.
+        SELL adds to the short when it fills, BUY reduces it — the gap must be computed
+        as if those orders were already filled, otherwise every tick inside the fill-settle
+        window re-hedges the same gap (cooldown was the only guard).
+        """
+        in_flight = Decimal("0")
+        for executor in self.executors_info:
+            if not executor.is_active or executor.type != "order_executor":
+                continue
+            if (executor.config.connector_name != self.config.hedge_connector_name or
+                    executor.config.trading_pair != self.config.hedge_trading_pair):
+                continue
+            if executor.config.side == TradeType.SELL:
+                in_flight += executor.config.amount
+            else:
+                in_flight -= executor.config.amount
+        return in_flight
+
     async def update_processed_data(self):
         """
         Compute current spot balance, hedge position size, current hedge ratio, last hedge time, current hedge gap quote
@@ -88,7 +118,9 @@ class HedgeAssetController(ControllerBase):
         spot_balance = self.market_data_provider.get_balance(self.config.spot_connector_name, self.config.asset_to_hedge)
         perp_available_balance = self.market_data_provider.get_available_balance(self.config.hedge_connector_name, self.perp_collateral_asset)
         hedge_position_size = self.hedge_position_size
-        hedge_position_gap = spot_balance * self.config.hedge_ratio - hedge_position_size
+        in_flight_hedge_amount = self.in_flight_hedge_amount
+        # Deduct in-flight hedge orders from the gap (GEN-13)
+        hedge_position_gap = spot_balance * self.config.hedge_ratio - hedge_position_size - in_flight_hedge_amount
         hedge_position_gap_quote = hedge_position_gap * current_price
         last_hedge_timestamp = self.last_hedge_timestamp
 
@@ -100,6 +132,7 @@ class HedgeAssetController(ControllerBase):
             "spot_balance": spot_balance,
             "perp_available_balance": perp_available_balance,
             "hedge_position_size": hedge_position_size,
+            "in_flight_hedge_amount": in_flight_hedge_amount,
             "hedge_position_gap": hedge_position_gap,
             "hedge_position_gap_quote": hedge_position_gap_quote,
             "last_hedge_timestamp": last_hedge_timestamp,

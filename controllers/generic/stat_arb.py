@@ -76,15 +76,22 @@ class StatArb(ControllerBase):
         self.processed_data = {
             "dominant_price": None,
             "hedge_price": None,
-            "spread": None,
-            "z_score": None,
+            "spread": Decimal("0"),
+            "z_score": Decimal("0"),
             "hedge_ratio": None,
             "position_dominant": Decimal("0"),
             "position_hedge": Decimal("0"),
             "active_orders_dominant": [],
             "active_orders_hedge": [],
             "pair_pnl": Decimal("0"),
-            "signal": 0  # 0: no signal, 1: long dominant/short hedge, -1: short dominant/long hedge
+            "pair_pnl_pct": Decimal("0"),
+            "signal": 0,  # 0: no signal, 1: long dominant/short hedge, -1: short dominant/long hedge
+            "alpha": 0.0,
+            "beta": 0.0,
+            "executors_dominant_placed": [],
+            "executors_dominant_filled": [],
+            "executors_hedge_placed": [],
+            "executors_hedge_filled": [],
         }
 
         # Setup max records for safety
@@ -112,8 +119,10 @@ class StatArb(ControllerBase):
                               If the pnl of total position is greater than the take profit or lower than the stop loss, we close the position.
         """
         actions: List[ExecutorAction] = []
-        # Check global take profit and stop loss
-        if self.processed_data["pair_pnl_pct"] > self.config.tp_global or self.processed_data["pair_pnl_pct"] < -self.config.sl_global:
+        # Check global take profit and stop loss. This must run every tick, even when the
+        # z-score signal is unavailable (candles outage) — GEN-1.
+        pair_pnl_pct = self.processed_data.get("pair_pnl_pct", Decimal("0"))
+        if pair_pnl_pct > self.config.tp_global or pair_pnl_pct < -self.config.sl_global:
             # Close all positions
             for position in self.positions_held:
                 actions.extend(self.get_executors_to_reduce_position(position))
@@ -136,9 +145,10 @@ class StatArb(ControllerBase):
             dominant_side, hedge_side = TradeType.BUY, TradeType.SELL
         else:
             return []
-        # Get executors to stop
-        dominant_active_executors_to_stop = self.filter_executors(self.executors_info, filter_func=lambda e: e.connector_name == self.config.connector_pair_dominant.connector_name and e.trading_pair == self.config.connector_pair_dominant.trading_pair and e.side == dominant_side)
-        hedge_active_executors_to_stop = self.filter_executors(self.executors_info, filter_func=lambda e: e.connector_name == self.config.connector_pair_hedge.connector_name and e.trading_pair == self.config.connector_pair_hedge.trading_pair and e.side == hedge_side)
+        # Get executors to stop (only active ones — StopExecutorAction on a terminated
+        # executor is re-sent forever, GEN-2)
+        dominant_active_executors_to_stop = self.filter_executors(self.executors_info, filter_func=lambda e: e.is_active and e.connector_name == self.config.connector_pair_dominant.connector_name and e.trading_pair == self.config.connector_pair_dominant.trading_pair and e.side == dominant_side)
+        hedge_active_executors_to_stop = self.filter_executors(self.executors_info, filter_func=lambda e: e.is_active and e.connector_name == self.config.connector_pair_hedge.connector_name and e.trading_pair == self.config.connector_pair_hedge.trading_pair and e.side == hedge_side)
         stop_actions = [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id, keep_position=False) for executor in dominant_active_executors_to_stop + hedge_active_executors_to_stop]
 
         # Get order executors to reduce positions
@@ -219,18 +229,39 @@ class StatArb(ControllerBase):
             actions.append(CreateExecutorAction(controller_id=self.config.id, executor_config=hedge_executor_config))
         return actions
 
+    def get_active_close_amount(self, connector_name: str, trading_pair: str, close_side: TradeType) -> Decimal:
+        """
+        Sum the amounts of active close-side order executors for a pair. Used as an
+        in-flight guard so reduce actions are not re-emitted at full size every tick
+        while a previous close is still executing (GEN-2).
+        """
+        active_close_executors = self.filter_executors(
+            self.executors_info,
+            filter_func=lambda e: e.is_active and e.type == "order_executor" and
+            e.connector_name == connector_name and e.trading_pair == trading_pair and
+            e.config.side == close_side
+        )
+        return Decimal(str(sum(e.config.amount for e in active_close_executors)))
+
     def get_executors_to_reduce_position(self, position: PositionSummary) -> List[ExecutorAction]:
         """
-        Get Order Executor to reduce position.
+        Get Order Executor to reduce position. The target amount is reduced by the
+        amount already in flight on active close-side order executors (GEN-2).
         """
         if position.amount > Decimal("0"):
+            close_side = TradeType.BUY if position.side == TradeType.SELL else TradeType.SELL
+            in_flight_close_amount = self.get_active_close_amount(
+                position.connector_name, position.trading_pair, close_side)
+            amount_to_close = position.amount - in_flight_close_amount
+            if amount_to_close <= Decimal("0"):
+                return []
             # Close position
             config = OrderExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=position.connector_name,
                 trading_pair=position.trading_pair,
-                side=TradeType.BUY if position.side == TradeType.SELL else TradeType.SELL,
-                amount=position.amount,
+                side=close_side,
+                amount=amount_to_close,
                 position_action=PositionAction.CLOSE,
                 execution_strategy=ExecutionStrategy.MARKET,
                 leverage=self.config.leverage,
@@ -243,12 +274,22 @@ class StatArb(ControllerBase):
         Update processed data with the latest market information and statistical calculations
         needed for the statistical arbitrage strategy.
         """
-        # Stat arb analysis
+        # Stat arb analysis. The signal may be unavailable (empty candles, short lookback,
+        # zero spread std) — the rest of this method MUST still run so that the global
+        # TP/SL evaluation in determine_executor_actions keeps working (GEN-1).
         spread, z_score = self.get_spread_and_z_score()
+
+        # Current prices
+        dominant_price, hedge_price = self.get_pairs_prices()
+        prices_valid = self._is_valid_price(dominant_price) and self._is_valid_price(hedge_price)
 
         # Generate trading signal based on z-score
         entry_threshold = float(self.config.entry_threshold)
-        if z_score > entry_threshold:
+        if z_score is None or not prices_valid:
+            # Signal unavailable — fail closed on quoting, keep risk management running
+            signal = 0
+            dominant_side, hedge_side = None, None
+        elif z_score > entry_threshold:
             # Spread is too high, expect it to revert: long dominant, short hedge
             signal = 1
             dominant_side, hedge_side = TradeType.BUY, TradeType.SELL
@@ -260,9 +301,6 @@ class StatArb(ControllerBase):
             # No signal
             signal = 0
             dominant_side, hedge_side = None, None
-
-        # Current prices
-        dominant_price, hedge_price = self.get_pairs_prices()
 
         # Get current positions stats by signal
         positions_dominant = next((position for position in self.positions_held if position.connector_name == self.config.connector_pair_dominant.connector_name and position.trading_pair == self.config.connector_pair_dominant.trading_pair and (position.side == dominant_side or dominant_side is None)), None)
@@ -298,12 +336,12 @@ class StatArb(ControllerBase):
             # Avoid placing orders in the hedge market
             filter_connector_pair = self.config.connector_pair_hedge
 
-        # Update processed data
+        # Update processed data (safe defaults when the signal is unavailable — GEN-1)
         self.processed_data.update({
-            "dominant_price": Decimal(str(dominant_price)),
-            "hedge_price": Decimal(str(hedge_price)),
-            "spread": Decimal(str(spread)),
-            "z_score": Decimal(str(z_score)),
+            "dominant_price": self._safe_decimal(dominant_price),
+            "hedge_price": self._safe_decimal(hedge_price),
+            "spread": self._safe_decimal(spread),
+            "z_score": self._safe_decimal(z_score),
             "dominant_gap": Decimal(str(dominant_gap)),
             "hedge_gap": Decimal(str(hedge_gap)),
             "position_dominant_quote": position_dominant_quote,
@@ -315,16 +353,37 @@ class StatArb(ControllerBase):
             "imbalance": Decimal(str(imbalance)),
             "imbalance_scaled_pct": Decimal(str(imbalance_scaled_pct)),
             "filter_connector_pair": filter_connector_pair,
-            "min_price_dominant": min_price_dominant if min_price_dominant is not None else Decimal(str(dominant_price)),
-            "max_price_dominant": max_price_dominant if max_price_dominant is not None else Decimal(str(dominant_price)),
-            "min_price_hedge": min_price_hedge if min_price_hedge is not None else Decimal(str(hedge_price)),
-            "max_price_hedge": max_price_hedge if max_price_hedge is not None else Decimal(str(hedge_price)),
+            "min_price_dominant": min_price_dominant if min_price_dominant is not None else self._safe_decimal(dominant_price),
+            "max_price_dominant": max_price_dominant if max_price_dominant is not None else self._safe_decimal(dominant_price),
+            "min_price_hedge": min_price_hedge if min_price_hedge is not None else self._safe_decimal(hedge_price),
+            "max_price_hedge": max_price_hedge if max_price_hedge is not None else self._safe_decimal(hedge_price),
             "executors_dominant_filled": executors_dominant_filled,
             "executors_hedge_filled": executors_hedge_filled,
             "executors_dominant_placed": executors_dominant_placed,
             "executors_hedge_placed": executors_hedge_placed,
             "pair_pnl_pct": pair_pnl_pct,
         })
+
+    @staticmethod
+    def _is_valid_price(price) -> bool:
+        """A usable price is a finite, positive number."""
+        if price is None:
+            return False
+        try:
+            price_decimal = Decimal(str(price))
+        except Exception:
+            return False
+        return price_decimal.is_finite() and price_decimal > Decimal("0")
+
+    @staticmethod
+    def _safe_decimal(value) -> Decimal:
+        """Convert to Decimal, falling back to 0 for None/unparseable values (GEN-1)."""
+        if value is None:
+            return Decimal("0")
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal("0")
 
     def get_spread_and_z_score(self):
         # Fetch candle data for both assets
@@ -344,7 +403,7 @@ class StatArb(ControllerBase):
 
         if dominant_df.empty or hedge_df.empty:
             self.logger().warning("Not enough candle data available for statistical analysis")
-            return
+            return None, None
 
         # Extract close prices
         dominant_prices = dominant_df['close'].values
@@ -355,7 +414,7 @@ class StatArb(ControllerBase):
         if min_length < self.config.lookback_period:
             self.logger().warning(
                 f"Not enough data points for analysis. Required: {self.config.lookback_period}, Available: {min_length}")
-            return
+            return None, None
 
         # Use the most recent data points
         dominant_prices = dominant_prices[-self.config.lookback_period:]
@@ -396,7 +455,7 @@ class StatArb(ControllerBase):
         std_spread = np.std(spread_pct)
         if std_spread == 0:
             self.logger().warning("Standard deviation of spread is zero, cannot calculate z-score")
-            return
+            return None, None
 
         current_spread = spread_pct[-1]
         current_z_score = (current_spread - mean_spread) / std_spread
