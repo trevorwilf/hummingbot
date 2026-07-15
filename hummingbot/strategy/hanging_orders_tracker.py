@@ -244,6 +244,10 @@ class HangingOrdersTracker:
 
     def remove_orders_far_from_price(self):
         current_price = self.strategy.get_price()
+        # PMM-1: a NaN reference price (one-sided/empty book) would raise InvalidOperation in the
+        # distance comparison below — skip the distance check for this tick instead.
+        if current_price is None or current_price.is_nan():
+            return
         orders_to_be_removed = set()
         for order in self.original_orders:
             if (order.client_order_id not in self.orders_being_cancelled
@@ -271,10 +275,12 @@ class HangingOrdersTracker:
         return any((o.order_id == order_id for o in self.completed_hanging_orders))
 
     def is_hanging_order_in_strategy_active_orders(self, order: HangingOrder) -> bool:
-        return any(all(order.trading_pair == o.trading_pair,
-                       order.is_buy == o.is_buy,
-                       order.price == o.price,
-                       order.amount == o.quantity) for o in self.strategy.active_orders)
+        # PMM-15: all() takes a single iterable — the previous 4-positional-args form raised
+        # TypeError whenever this was called.
+        return any(all((order.trading_pair == o.trading_pair,
+                        order.is_buy == o.is_buy,
+                        order.price == o.price,
+                        order.amount == o.quantity)) for o in self.strategy.active_orders)
 
     def is_potential_hanging_order(self, order: LimitOrder) -> bool:
         """Checks if the order is registered as a hanging order."""

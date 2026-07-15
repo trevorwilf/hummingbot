@@ -12,6 +12,7 @@ from hummingbot.core.clock import Clock
 from hummingbot.core.clock_mode import ClockMode
 from hummingbot.core.data_type.common import OrderType, PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
+from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TradeFeeSchema
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.event.events import (
@@ -196,6 +197,22 @@ class PerpetualMarketMakingTests(TestCase):
         self.assertEqual(1, len(new_sells))  # cumulative 18 for leverage of 20
         self.assertEqual(sells[0], new_sells[0])
 
+    def test_order_optimization_nan_skipped(self):
+        # PMM-3 (CSF-V1 Phase 10): a one-sided book makes get_price_for_volume return NaN;
+        # before the fix ceil(NaN) raised ValueError and aborted the whole tick.
+        order_book = self.market.order_books[self.trading_pair]
+        update_id = order_book.last_diff_uid + 1
+        bid_diffs = [OrderBookRow(row.price, 0, update_id) for row in order_book.bid_entries()]
+        order_book.apply_diffs(bid_diffs, [], update_id)
+
+        proposal = Proposal([PriceSize(price=Decimal("98"), size=Decimal("1"))],
+                            [PriceSize(price=Decimal("102"), size=Decimal("1"))])
+        self.strategy.apply_order_optimization(proposal)
+
+        # bid side untouched (optimization skipped), ask side still processed
+        self.assertEqual(Decimal("98"), proposal.buys[0].price)
+        self.assertEqual(1, len(proposal.sells))
+
     def test_create_stop_loss_proposal_for_long_position(self):
         position = Position(
             trading_pair=self.trading_pair,
@@ -272,8 +289,14 @@ class PerpetualMarketMakingTests(TestCase):
         self.assertNotEqual(initial_stop_loss_order_id, new_stop_loss_order.client_order_id)
         self.assertFalse(new_stop_loss_order.is_buy)
         self.assertEqual(position.amount, new_stop_loss_order.quantity)
-        self.assertEqual(initial_stop_loss_price * (Decimal(1) - self.stop_loss_slippage_buffer),
-                         new_stop_loss_order.price)
+        # PMM-14: the renewal price is recomputed from the entry-derived stop-loss price.
+        # The previous expectation (initial order price * (1 - slippage_buffer)) pinned the bug
+        # where each renewal re-applied the slippage buffer to the prior order's price,
+        # compounding it geometrically.
+        expected_price = (position.entry_price
+                          * (Decimal(1) - self.stop_loss_spread)
+                          * (Decimal(1) - self.stop_loss_slippage_buffer))
+        self.assertEqual(expected_price, new_stop_loss_order.price)
 
     def test_stop_loss_order_recreated_after_wait_time_for_short_position(self):
         position = Position(
@@ -313,8 +336,12 @@ class PerpetualMarketMakingTests(TestCase):
         self.assertNotEqual(initial_stop_loss_order_id, new_stop_loss_order.client_order_id)
         self.assertTrue(new_stop_loss_order.is_buy)
         self.assertEqual(abs(position.amount), new_stop_loss_order.quantity)
-        self.assertEqual(initial_stop_loss_price * (Decimal(1) + self.stop_loss_slippage_buffer),
-                         new_stop_loss_order.price)
+        # PMM-14: the renewal price is recomputed from the entry-derived stop-loss price
+        # (see the long-position test above for the rationale).
+        expected_price = (position.entry_price
+                          * (Decimal(1) + self.stop_loss_spread)
+                          * (Decimal(1) + self.stop_loss_slippage_buffer))
+        self.assertEqual(expected_price, new_stop_loss_order.price)
 
     def test_create_profit_taking_proposal_logs_when_one_way_mode_and_multiple_positions(self):
         positions = [

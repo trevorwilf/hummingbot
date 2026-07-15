@@ -32,15 +32,22 @@ cdef class BaseStrategyEventListener(EventListener):
 
 
 cdef class BuyOrderCompletedListener(BaseStrategyEventListener):
+    # PMM-10: the strategy-side handler runs first because it reads the order from the tracker,
+    # but tracker cleanup must happen even if the handler raises (e.g. a notifier failure) —
+    # otherwise the filled order stays tracked forever and the strategy stops quoting.
     cdef c_call(self, object arg):
-        self._owner.c_did_complete_buy_order(arg)
-        self._owner.c_did_complete_buy_order_tracker(arg)
+        try:
+            self._owner.c_did_complete_buy_order(arg)
+        finally:
+            self._owner.c_did_complete_buy_order_tracker(arg)
 
 
 cdef class SellOrderCompletedListener(BaseStrategyEventListener):
     cdef c_call(self, object arg):
-        self._owner.c_did_complete_sell_order(arg)
-        self._owner.c_did_complete_sell_order_tracker(arg)
+        try:
+            self._owner.c_did_complete_sell_order(arg)
+        finally:
+            self._owner.c_did_complete_sell_order_tracker(arg)
 
 
 cdef class FundingPaymentCompletedListener(BaseStrategyEventListener):
@@ -63,20 +70,26 @@ cdef class OrderFilledListener(BaseStrategyEventListener):
 
 cdef class OrderFailedListener(BaseStrategyEventListener):
     cdef c_call(self, object arg):
-        self._owner.c_did_fail_order(arg)
-        self._owner.c_did_fail_order_tracker(arg)
+        try:
+            self._owner.c_did_fail_order(arg)
+        finally:
+            self._owner.c_did_fail_order_tracker(arg)
 
 
 cdef class OrderCancelledListener(BaseStrategyEventListener):
     cdef c_call(self, object arg):
-        self._owner.c_did_cancel_order(arg)
-        self._owner.c_did_cancel_order_tracker(arg)
+        try:
+            self._owner.c_did_cancel_order(arg)
+        finally:
+            self._owner.c_did_cancel_order_tracker(arg)
 
 
 cdef class OrderExpiredListener(BaseStrategyEventListener):
     cdef c_call(self, object arg):
-        self._owner.c_did_expire_order(arg)
-        self._owner.c_did_expire_order_tracker(arg)
+        try:
+            self._owner.c_did_expire_order(arg)
+        finally:
+            self._owner.c_did_expire_order_tracker(arg)
 
 
 cdef class BuyOrderCreatedListener(BaseStrategyEventListener):

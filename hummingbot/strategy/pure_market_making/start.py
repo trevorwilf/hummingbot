@@ -97,7 +97,9 @@ async def start(self):
             inventory_cost_price_delegate = InventoryCostPriceDelegate(db, trading_pair)
         take_if_crossed = c_map.get("take_if_crossed").value
 
-        should_wait_order_cancel_confirmation = c_map.get("should_wait_order_cancel_confirmation")
+        # PMM-8: read the ConfigVar's value — passing the ConfigVar object itself is always truthy,
+        # silently ignoring a configured "false".
+        should_wait_order_cancel_confirmation = c_map.get("should_wait_order_cancel_confirmation").value
 
         strategy_logging_options = PureMarketMakingStrategy.OPTION_LOG_ALL
         self.strategy = PureMarketMakingStrategy()

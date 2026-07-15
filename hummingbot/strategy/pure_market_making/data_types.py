@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 
 from hummingbot.core.data_type.common import OrderType
 
@@ -34,9 +34,12 @@ class InventorySkewBidAskRatios(NamedTuple):
 
 
 class PriceSize:
-    def __init__(self, price: Decimal, size: Decimal):
+    def __init__(self, price: Decimal, size: Decimal, level: Optional[int] = None):
         self.price: Decimal = price
         self.size: Decimal = size
+        # PMM-9: original configured level index, carried so repricing stays aligned with the
+        # per-level spread lists even after upstream modifiers drop levels.
+        self.level: Optional[int] = level
 
     def __repr__(self):
         return f"[ p: {self.price} s: {self.size} ]"

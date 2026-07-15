@@ -112,3 +112,15 @@ class PureMarketMakingStartTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.strategy.order_override, {"split_level_0": ['buy', Decimal("1"), Decimal("1")],
                                                         "split_level_1": ['buy', Decimal("2"), Decimal("2")],
                                                         })
+
+    async def test_should_wait_order_cancel_confirmation_false_is_respected(self):
+        # PMM-8 (CSF-V1 Phase 10): start.py passed the raw ConfigVar object (always truthy),
+        # so a configured "false" was silently ignored.
+        c_map.get("should_wait_order_cancel_confirmation").value = False
+        await strategy_start.start(self)
+        self.assertFalse(self.strategy.should_wait_order_cancel_confirmation)
+
+    async def test_should_wait_order_cancel_confirmation_true_is_respected(self):
+        c_map.get("should_wait_order_cancel_confirmation").value = True
+        await strategy_start.start(self)
+        self.assertTrue(self.strategy.should_wait_order_cancel_confirmation)
