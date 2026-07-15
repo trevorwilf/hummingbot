@@ -1,7 +1,7 @@
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Set
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from hummingbot.core.data_type.common import MarketDict, OrderType, PositionMode, PriceType, TradeType
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
@@ -9,6 +9,7 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
@@ -43,6 +44,10 @@ class GridStrikeConfig(ControllerConfigBase):
     activation_bounds: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
     keep_position: bool = Field(default=False, json_schema_extra={"is_updatable": True})
 
+    # GEN-10: re-entry throttling after a grid terminates
+    reentry_cooldown_seconds: int = Field(default=60, json_schema_extra={"is_updatable": True})
+    max_consecutive_stopouts: int = Field(default=3, json_schema_extra={"is_updatable": True})
+
     # Risk Management
     triple_barrier_config: TripleBarrierConfig = TripleBarrierConfig(
         take_profit=Decimal("0.001"),
@@ -50,17 +55,51 @@ class GridStrikeConfig(ControllerConfigBase):
         take_profit_order_type=OrderType.LIMIT_MAKER,
     )
 
+    @model_validator(mode="after")
+    def validate_grid_geometry(self):
+        # GEN-9: same geometry gate as GridExecutorConfig — reject at config time
+        # instead of failing (or instantly limit-breaching) at executor creation.
+        for field_name in ("start_price", "end_price", "limit_price"):
+            value = getattr(self, field_name)
+            if not value.is_finite():
+                raise ValueError(f"{field_name} must be a finite number, got {value}")
+        if self.start_price <= 0:
+            raise ValueError(f"start_price must be positive, got {self.start_price}")
+        if self.start_price >= self.end_price:
+            raise ValueError(
+                f"start_price ({self.start_price}) must be below end_price ({self.end_price})")
+        if self.side == TradeType.BUY and self.limit_price >= self.start_price:
+            raise ValueError(
+                f"BUY grid limit_price ({self.limit_price}) must be below start_price ({self.start_price})")
+        if self.side == TradeType.SELL and self.limit_price <= self.end_price:
+            raise ValueError(
+                f"SELL grid limit_price ({self.limit_price}) must be above end_price ({self.end_price})")
+        return self
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
 
 class GridStrike(ControllerBase):
+    # Close types that count as a stop-out for the consecutive-stop-out breaker.
+    # STOP_LOSS covers both the barrier stop and the limit-price breach
+    # (grid_executor sets STOP_LOSS on limit breach when keep_position is False).
+    STOPOUT_CLOSE_TYPES = {CloseType.STOP_LOSS}
+    # Close types that prove the grid traded to completion and reset the breaker.
+    BREAKER_RESET_CLOSE_TYPES = {CloseType.TAKE_PROFIT, CloseType.COMPLETED}
+    _WARNING_INTERVAL = 30.0
+
     def __init__(self, config: GridStrikeConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
         self._last_grid_levels_update = 0
         self.trading_rules = None
         self.grid_levels = []
+        # GEN-10: re-entry cooldown + consecutive-stop-out breaker state
+        self._processed_termination_ids: Set[str] = set()
+        self._last_termination_timestamp: Optional[float] = None
+        self._consecutive_stopouts: int = 0
+        self._last_breaker_warning_timestamp: float = 0.0
         self.initialize_rate_sources()
 
     def initialize_rate_sources(self):
@@ -76,10 +115,44 @@ class GridStrike(ControllerBase):
     def is_inside_bounds(self, price: Decimal) -> bool:
         return self.config.start_price <= price <= self.config.end_price
 
+    def _register_terminations(self):
+        """GEN-10: fold newly terminated executors into cooldown/breaker state."""
+        now = self.market_data_provider.time()
+        for executor in self.executors_info:
+            if not executor.is_done or executor.id in self._processed_termination_ids:
+                continue
+            self._processed_termination_ids.add(executor.id)
+            close_timestamp = executor.close_timestamp if executor.close_timestamp is not None else now
+            if self._last_termination_timestamp is None or close_timestamp > self._last_termination_timestamp:
+                self._last_termination_timestamp = close_timestamp
+            if executor.close_type in self.STOPOUT_CLOSE_TYPES:
+                self._consecutive_stopouts += 1
+            elif executor.close_type in self.BREAKER_RESET_CLOSE_TYPES:
+                self._consecutive_stopouts = 0
+
+    def _can_create_executor(self) -> bool:
+        """GEN-10: gate re-entry behind the cooldown and the stop-out breaker."""
+        now = self.market_data_provider.time()
+        if self._consecutive_stopouts >= self.config.max_consecutive_stopouts:
+            # Breaker latches until the operator intervenes (restart or raise the
+            # updatable max_consecutive_stopouts) — repeated stop-outs around the
+            # limit price mean the configured range is wrong for the market.
+            if now - self._last_breaker_warning_timestamp >= self._WARNING_INTERVAL:
+                self._last_breaker_warning_timestamp = now
+                self.logger().warning(
+                    f"Grid creation halted: {self._consecutive_stopouts} consecutive stop-outs "
+                    f"(max {self.config.max_consecutive_stopouts}). Review start/end/limit prices.")
+            return False
+        if (self._last_termination_timestamp is not None
+                and now - self._last_termination_timestamp < self.config.reentry_cooldown_seconds):
+            return False
+        return True
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
+        self._register_terminations()
         mid_price = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-        if len(self.active_executors()) == 0 and self.is_inside_bounds(mid_price):
+        if len(self.active_executors()) == 0 and self.is_inside_bounds(mid_price) and self._can_create_executor():
             return [CreateExecutorAction(
                 controller_id=self.config.id,
                 executor_config=GridExecutorConfig(

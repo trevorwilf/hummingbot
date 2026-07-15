@@ -1,8 +1,8 @@
-from decimal import Decimal
-from typing import Dict, List, Set, Union
+from decimal import Decimal, InvalidOperation
+from typing import Dict, List, Optional, Set, Union
 
 import pandas_ta as ta  # noqa: F401
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from hummingbot.core.data_type.common import OrderType, PositionMode, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -86,6 +86,21 @@ class QGAConfig(ControllerConfigBase):
             raise ValueError("USDT should not be explicitly allocated as it is the quote asset")
         return v
 
+    @model_validator(mode="after")
+    def validate_grid_geometry_params(self):
+        # GEN-9: the grid geometry is derived at runtime as
+        #   start/end = mid * (1 ± grid_range * tp/sl multipliers)
+        #   limit     = start/end * (1 ∓ limit_price_spread)
+        # These bounds guarantee start < end and a correct-side limit whenever the
+        # mid price is valid (NaN/zero mids are rejected at executor construction).
+        if not self.grid_range.is_finite() or self.grid_range <= 0:
+            raise ValueError(f"grid_range must be a positive finite number, got {self.grid_range}")
+        if not self.tp_sl_ratio.is_finite() or not (Decimal("0") < self.tp_sl_ratio < Decimal("1")):
+            raise ValueError(f"tp_sl_ratio must be strictly between 0 and 1, got {self.tp_sl_ratio}")
+        if not self.limit_price_spread.is_finite() or self.limit_price_spread <= 0:
+            raise ValueError(f"limit_price_spread must be a positive finite number, got {self.limit_price_spread}")
+        return self
+
     def update_markets(self, markets: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
         if self.connector_name not in markets:
             markets[self.connector_name] = set()
@@ -95,9 +110,13 @@ class QGAConfig(ControllerConfigBase):
 
 
 class QuantumGridAllocator(ControllerBase):
+    _WARNING_INTERVAL = 30.0
+
     def __init__(self, config: QGAConfig, *args, **kwargs):
         self.config = config
         self.metrics = {}
+        # GEN-9: rate-limit state for the invalid-geometry warning
+        self._last_invalid_geometry_warning_timestamp: float = 0.0
         # Track unfavorable grid IDs
         self.unfavorable_grid_ids = set()
         # Track held positions from unfavorable grids
@@ -125,11 +144,24 @@ class QuantumGridAllocator(ControllerBase):
                 interval=self.config.interval,
                 max_records=self.config.bb_length + 100
             )
-            if len(candles) == 0:
-                bb_width = self.config.grid_range
-            else:
+            # GEN-11: fall back to the static grid_range whenever the dynamic width
+            # is unavailable — ta.bbands returns None while 1 <= rows < bb_length,
+            # and the BBB column is NaN during warm-up. A NaN width propagates into
+            # NaN grid prices and fails executor creation every cycle. The bandwidth
+            # column is located by prefix because the suffix format changed across
+            # pandas_ta versions (0.4.x names it BBB_{len}_{std}_{std}).
+            bb_width = self.config.grid_range
+            if len(candles) > 0:
                 bb = ta.bbands(candles["close"], length=self.config.bb_length, std=self.config.bb_std_dev)
-                bb_width = bb[f"BBB_{self.config.bb_length}_{self.config.bb_std_dev}"].iloc[-1] / 100
+                bbb_columns = [c for c in bb.columns if c.startswith("BBB_")] if bb is not None else []
+                if bbb_columns:
+                    raw_width = bb[bbb_columns[0]].iloc[-1]
+                    try:
+                        width = Decimal(str(raw_width)) / Decimal("100")
+                    except (InvalidOperation, TypeError, ValueError):
+                        width = None
+                    if width is not None and width.is_finite() and width > 0:
+                        bb_width = width
             self.processed_data[trading_pair] = {
                 "bb_width": bb_width
             }
@@ -300,7 +332,9 @@ class QuantumGridAllocator(ControllerBase):
                 f"Grid Value %: {grid_value_pct:.1%}"
             )
             if self.config.dynamic_grid_range:
-                grid_range = Decimal(self.processed_data[trading_pair]["bb_width"])
+                # GEN-11: bb_width is a validated positive finite Decimal (or the
+                # static grid_range fallback); guard the key for pre-warm-up ticks.
+                grid_range = Decimal(self.processed_data.get(trading_pair, {}).get("bb_width", self.config.grid_range))
             else:
                 grid_range = self.config.grid_range
 
@@ -405,7 +439,7 @@ class QuantumGridAllocator(ControllerBase):
         end_price: Decimal,
         grid_value: Decimal,
         is_unfavorable: bool = False
-    ) -> CreateExecutorAction:
+    ) -> Optional[CreateExecutorAction]:
         """Creates a grid executor with dynamic sizing and range adjustments"""
         # Get trading rules and minimum notional
         trading_rules = self.market_data_provider.get_trading_rules(self.config.connector_name, trading_pair)
@@ -434,10 +468,12 @@ class QuantumGridAllocator(ControllerBase):
         else:
             # For sells, limit price should be higher than end price
             limit_price = end_price * (1 + self.config.limit_price_spread)
-        # Create the executor action
-        action = CreateExecutorAction(
-            controller_id=self.config.id,
-            executor_config=GridExecutorConfig(
+        # Create the executor action. The geometry here is computed from the live
+        # mid price, so GEN-9's GridExecutorConfig validators can reject it (e.g. a
+        # NaN/zero mid price yields non-finite prices) — fail closed: skip the grid
+        # for this cycle with a rate-limited warning instead of raising per tick.
+        try:
+            executor_config = GridExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.connector_name,
                 trading_pair=trading_pair,
@@ -463,7 +499,18 @@ class QuantumGridAllocator(ControllerBase):
                     stop_loss=None,
                     time_limit=None,
                     trailing_stop=None,
-                )))
+                ))
+        except ValidationError as e:
+            now = self.market_data_provider.time()
+            if now - self._last_invalid_geometry_warning_timestamp >= self._WARNING_INTERVAL:
+                self._last_invalid_geometry_warning_timestamp = now
+                self.logger().warning(
+                    f"Skipping grid creation for {trading_pair} ({side.name}): invalid geometry "
+                    f"start={start_price} end={end_price} limit={limit_price} — {e.errors()[0].get('msg', e)}")
+            return None
+        action = CreateExecutorAction(
+            controller_id=self.config.id,
+            executor_config=executor_config)
         # Track unfavorable grid configs
         if is_unfavorable:
             self.unfavorable_grid_ids.add(action.executor_config.id)

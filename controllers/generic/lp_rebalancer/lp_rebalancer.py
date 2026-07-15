@@ -219,18 +219,30 @@ class LPRebalancer(ControllerBase):
                 )
                 return actions
 
-            # Previous executor terminated - capture final amounts for rebalance sizing
+            # Previous executor terminated - capture final amounts for sizing the
+            # replacement position.
+            # GEN-17: capture on EVERY termination, not just rebalance-initiated ones —
+            # a failure-terminated executor otherwise recreates at the full configured
+            # size even though the closed position returned less.
             terminated_executor = self.get_tracked_executor()
-            if terminated_executor and self._pending_rebalance:
-                self._last_closed_base_amount = Decimal(str(terminated_executor.custom_info.get("base_amount", 0)))
-                self._last_closed_quote_amount = Decimal(str(terminated_executor.custom_info.get("quote_amount", 0)))
-                self._last_closed_base_fee = Decimal(str(terminated_executor.custom_info.get("base_fee", 0)))
-                self._last_closed_quote_fee = Decimal(str(terminated_executor.custom_info.get("quote_fee", 0)))
-                self.logger().info(
-                    f"Captured closed position amounts: base={self._last_closed_base_amount}, "
-                    f"quote={self._last_closed_quote_amount}, base_fee={self._last_closed_base_fee}, "
-                    f"quote_fee={self._last_closed_quote_fee}"
-                )
+            if terminated_executor:
+                closed_base = Decimal(str(terminated_executor.custom_info.get("base_amount", 0)))
+                closed_quote = Decimal(str(terminated_executor.custom_info.get("quote_amount", 0)))
+                closed_base_fee = Decimal(str(terminated_executor.custom_info.get("base_fee", 0)))
+                closed_quote_fee = Decimal(str(terminated_executor.custom_info.get("quote_fee", 0)))
+                if closed_base + closed_quote + closed_base_fee + closed_quote_fee > 0:
+                    self._last_closed_base_amount = closed_base
+                    self._last_closed_quote_amount = closed_quote
+                    self._last_closed_base_fee = closed_base_fee
+                    self._last_closed_quote_fee = closed_quote_fee
+                    self.logger().info(
+                        f"Captured closed position amounts: base={self._last_closed_base_amount}, "
+                        f"quote={self._last_closed_quote_amount}, base_fee={self._last_closed_base_fee}, "
+                        f"quote_fee={self._last_closed_quote_fee}"
+                    )
+                # All-zero amounts mean the executor never opened a position (e.g.
+                # failed at creation) — keep the previous clamp state so sizing
+                # falls back to the configured total.
 
             # Clear tracking
             self._current_executor_id = None

@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from hummingbot.core.data_type.common import MarketDict, OrderType, PositionMode, PriceType, TradeType
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
@@ -21,6 +21,29 @@ class GridConfig(BaseModel):
     side: TradeType = Field(json_schema_extra={"is_updatable": True})
     amount_quote_pct: Decimal = Field(json_schema_extra={"is_updatable": True})  # Percentage of total amount (0.0 to 1.0)
     enabled: bool = Field(default=True, json_schema_extra={"is_updatable": True})
+
+    @model_validator(mode="after")
+    def validate_grid_geometry(self):
+        # GEN-9: same geometry gate as GridExecutorConfig — these configs bypass the
+        # orchestrator budget preflight, so config-time validation is the only gate.
+        for field_name in ("start_price", "end_price", "limit_price", "amount_quote_pct"):
+            value = getattr(self, field_name)
+            if not value.is_finite():
+                raise ValueError(f"{field_name} must be a finite number, got {value}")
+        if self.start_price <= 0:
+            raise ValueError(f"start_price must be positive, got {self.start_price}")
+        if self.start_price >= self.end_price:
+            raise ValueError(
+                f"start_price ({self.start_price}) must be below end_price ({self.end_price})")
+        if self.side == TradeType.BUY and self.limit_price >= self.start_price:
+            raise ValueError(
+                f"BUY grid limit_price ({self.limit_price}) must be below start_price ({self.start_price})")
+        if self.side == TradeType.SELL and self.limit_price <= self.end_price:
+            raise ValueError(
+                f"SELL grid limit_price ({self.limit_price}) must be above end_price ({self.end_price})")
+        if self.amount_quote_pct <= 0:
+            raise ValueError(f"amount_quote_pct must be positive, got {self.amount_quote_pct}")
+        return self
 
 
 class MultiGridStrikeConfig(ControllerConfigBase):
@@ -62,6 +85,15 @@ class MultiGridStrikeConfig(ControllerConfigBase):
         take_profit_order_type=OrderType.LIMIT_MAKER,
     )
 
+    @model_validator(mode="after")
+    def validate_grid_allocation(self):
+        # GEN-9: the enabled grids' allocations must not overcommit the total budget.
+        enabled_pct_sum = sum((g.amount_quote_pct for g in self.grids if g.enabled), Decimal("0"))
+        if enabled_pct_sum > Decimal("1"):
+            raise ValueError(
+                f"Sum of enabled grids' amount_quote_pct ({enabled_pct_sum}) exceeds 1")
+        return self
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
@@ -72,6 +104,10 @@ class MultiGridStrike(ControllerBase):
         self.config = config
         self._last_config_hash = self._get_config_hash()
         self._grid_executor_mapping: Dict[str, str] = {}  # grid_id -> executor_id
+        # GEN-8: per-grid parameter hashes so edits to a still-enabled grid are applied
+        self._grid_param_hashes: Dict[str, str] = {
+            g.grid_id: self._grid_param_hash(g) for g in self.config.grids
+        }
         self.trading_rules = None
         self.initialize_rate_sources()
 
@@ -85,6 +121,11 @@ class MultiGridStrike(ControllerBase):
             (g.grid_id, g.start_price, g.end_price, g.limit_price, g.side, g.amount_quote_pct, g.enabled)
             for g in self.config.grids
         )))
+
+    @staticmethod
+    def _grid_param_hash(grid: GridConfig) -> str:
+        """GEN-8: hash of the parameters that require re-issuing the grid's executor."""
+        return str((grid.start_price, grid.end_price, grid.limit_price, grid.side, grid.amount_quote_pct))
 
     def _has_config_changed(self) -> bool:
         """Check if configuration has changed"""
@@ -101,11 +142,16 @@ class MultiGridStrike(ControllerBase):
         ]
 
     def get_executor_by_grid_id(self, grid_id: str) -> Optional[ExecutorInfo]:
-        """Get executor associated with a specific grid"""
+        """Get the ACTIVE executor associated with a specific grid.
+
+        GEN-6: terminated executors linger in executors_info until they fall out of
+        the newest-100 archival window across ALL controllers — returning the corpse
+        here blocked the grid's respawn indefinitely on quiet deployments.
+        """
         executor_id = self._grid_executor_mapping.get(grid_id)
         if executor_id:
             for executor in self.executors_info:
-                if executor.id == executor_id:
+                if executor.id == executor_id and executor.is_active:
                     return executor
         return None
 
@@ -128,11 +174,13 @@ class MultiGridStrike(ControllerBase):
             current_grid_ids = {g.grid_id for g in self.config.grids if g.enabled}
             for grid_id, executor_id in list(self._grid_executor_mapping.items()):
                 if grid_id not in current_grid_ids:
-                    # Stop executor for removed/disabled grid
-                    actions.append(StopExecutorAction(
-                        controller_id=self.config.id,
-                        executor_id=executor_id
-                    ))
+                    # GEN-6: only stop executors that are still active — sending a
+                    # StopExecutorAction to a terminated executor raises upstream.
+                    if self.get_executor_by_grid_id(grid_id) is not None:
+                        actions.append(StopExecutorAction(
+                            controller_id=self.config.id,
+                            executor_id=executor_id
+                        ))
                     del self._grid_executor_mapping[grid_id]
 
         # Process each enabled grid
@@ -141,6 +189,20 @@ class MultiGridStrike(ControllerBase):
                 continue
 
             executor = self.get_executor_by_grid_id(grid.grid_id)
+
+            # GEN-8: apply parameter edits to a still-enabled grid — stop its active
+            # executor so the create path re-issues with the new parameters. The
+            # grid stays mapped until the executor terminates, so no new executor is
+            # created while the old one is still winding down.
+            current_param_hash = self._grid_param_hash(grid)
+            if self._grid_param_hashes.get(grid.grid_id) != current_param_hash:
+                self._grid_param_hashes[grid.grid_id] = current_param_hash
+                if executor is not None:
+                    actions.append(StopExecutorAction(
+                        controller_id=self.config.id,
+                        executor_id=executor.id
+                    ))
+                    continue
 
             # Create new executor if none exists and price is in bounds
             if executor is None and self.is_inside_bounds(mid_price, grid):
@@ -177,6 +239,12 @@ class MultiGridStrike(ControllerBase):
         return actions
 
     async def update_processed_data(self):
+        # GEN-6: prune mapping entries whose executor is done (or already archived
+        # out of executors_info) so the grid can respawn.
+        active_ids = {executor.id for executor in self.active_executors()}
+        for grid_id, executor_id in list(self._grid_executor_mapping.items()):
+            if executor_id not in active_ids:
+                del self._grid_executor_mapping[grid_id]
         # Update executor mapping for newly created executors
         for executor in self.active_executors():
             if hasattr(executor.config, 'level_id') and executor.config.level_id:

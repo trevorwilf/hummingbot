@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
@@ -36,6 +36,32 @@ class GridExecutorConfig(ExecutorConfigBase):
     deduct_base_fees: bool = False
     keep_position: bool = False
     coerce_tp_to_step: bool = False
+
+    @model_validator(mode="after")
+    def validate_grid_geometry(self):
+        # GEN-9: grid configs bypass the orchestrator budget preflight (no `.amount`
+        # attribute), so this validator is the only gate against degenerate geometry:
+        # start=0 divides by zero at level construction, an inverted range produces a
+        # silent single-level "grid" with negative step, and a wrong-side limit_price
+        # triggers an instant limit-breach stop on every creation.
+        for field_name in ("start_price", "end_price", "limit_price"):
+            value = getattr(self, field_name)
+            if not value.is_finite():
+                raise ValueError(f"{field_name} must be a finite number, got {value}")
+        if self.start_price <= 0:
+            raise ValueError(f"start_price must be positive, got {self.start_price}")
+        if self.start_price >= self.end_price:
+            raise ValueError(
+                f"start_price ({self.start_price}) must be below end_price ({self.end_price})")
+        if self.side == TradeType.BUY and self.limit_price >= self.start_price:
+            raise ValueError(
+                f"BUY grid limit_price ({self.limit_price}) must be below start_price "
+                f"({self.start_price}) or the limit breach triggers immediately")
+        if self.side == TradeType.SELL and self.limit_price <= self.end_price:
+            raise ValueError(
+                f"SELL grid limit_price ({self.limit_price}) must be above end_price "
+                f"({self.end_price}) or the limit breach triggers immediately")
+        return self
 
 
 class GridLevelStates(Enum):
