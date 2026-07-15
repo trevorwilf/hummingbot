@@ -349,6 +349,10 @@ class MarketsRecorder:
                 existing_position.amount = position.amount
                 existing_position.breakeven_price = position.breakeven_price
                 existing_position.unrealized_pnl_quote = position.unrealized_pnl_quote
+                # realized_pnl_quote must be updated too: it holds the position's cumulative gross
+                # realized PnL. Omitting it froze the stored value at first-insert, so realized PnL
+                # accrued after the first session was never persisted and was lost on restart.
+                existing_position.realized_pnl_quote = position.realized_pnl_quote
                 existing_position.cum_fees_quote = position.cum_fees_quote
             else:
                 # Insert new position

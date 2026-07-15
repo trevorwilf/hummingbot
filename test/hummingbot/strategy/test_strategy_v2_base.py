@@ -324,6 +324,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         mock_report_controller_1.unrealized_pnl_quote = Decimal("50.00")
         mock_report_controller_1.global_pnl_quote = Decimal("150.00")
         mock_report_controller_1.global_pnl_pct = Decimal("15.00")
+        mock_report_controller_1.cum_fees_quote = Decimal("7.50")
         mock_report_controller_1.volume_traded = Decimal("1000.00")
         mock_report_controller_1.close_type_counts = {CloseType.TAKE_PROFIT: 10, CloseType.STOP_LOSS: 5}
 

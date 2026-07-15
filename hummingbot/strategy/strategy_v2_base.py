@@ -652,6 +652,7 @@ class StrategyV2Base(StrategyPyBase):
                         "Unrealized PnL": f"${performance_report.unrealized_pnl_quote:.2f}",
                         "Global PnL": f"${performance_report.global_pnl_quote:.2f}",
                         "Global PnL %": f"{performance_report.global_pnl_pct:.2f}%",
+                        "Fees": f"${performance_report.cum_fees_quote:.2f}",
                         "Volume Traded": f"${performance_report.volume_traded:.2f}"
                     })
 
@@ -665,6 +666,7 @@ class StrategyV2Base(StrategyPyBase):
                 global_realized = sum(Decimal(p["Realized PnL"].replace("$", "")) for p in performance_data)
                 global_unrealized = sum(Decimal(p["Unrealized PnL"].replace("$", "")) for p in performance_data)
                 global_total = global_realized + global_unrealized
+                global_fees = sum(Decimal(p["Fees"].replace("$", "")) for p in performance_data)
                 global_volume = sum(Decimal(p["Volume Traded"].replace("$", "")) for p in performance_data)
                 global_pnl_pct = (global_total / global_volume) * 100 if global_volume > 0 else Decimal(0)
 
@@ -675,6 +677,7 @@ class StrategyV2Base(StrategyPyBase):
                     "Unrealized PnL": f"${global_unrealized:.2f}",
                     "Global PnL": f"${global_total:.2f}",
                     "Global PnL %": f"{global_pnl_pct:.2f}%",
+                    "Fees": f"${global_fees:.2f}",
                     "Volume Traded": f"${global_volume:.2f}"
                 })
 

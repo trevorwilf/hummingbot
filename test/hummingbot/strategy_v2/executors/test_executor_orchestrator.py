@@ -447,6 +447,116 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(report.positions_summary[0].breakeven_price, Decimal("1000"))
 
     @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_loaded_position_realized_pnl_survives_restart(self, mock_get_instance):
+        """Realized PnL banked before a restart must be restored into the live report.
+
+        Regression for realized PnL resetting to ~0 after every restart: _load_position_from_db
+        reconstructs only the remaining NET inventory (one side is zero), so the freshly-computed
+        matched realized is 0. The banked realized must be carried via realized_pnl_offset.
+        Before the fix, report.realized_pnl_quote would be -10 (0 realized minus 10 fees) instead
+        of 40 (50 banked gross minus 10 fees).
+        """
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+        db_position = Position(
+            id="pos1", timestamp=1234, controller_id="test",
+            connector_name="binance", trading_pair="ETH-USDT", side=TradeType.BUY.name,
+            amount=Decimal("2"), breakeven_price=Decimal("1000"),
+            unrealized_pnl_quote=Decimal("0"), realized_pnl_quote=Decimal("50"),
+            cum_fees_quote=Decimal("10"), volume_traded_quote=Decimal("2000"))
+        mock_markets_recorder.get_all_executors.return_value = []
+        mock_markets_recorder.get_all_positions.return_value = [db_position]
+        self.mock_strategy.controllers = {"test": MagicMock()}
+        # Mid price == breakeven so unrealized is 0 and we isolate the realized/fee accounting.
+        self.mock_strategy.market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("1000"))
+
+        orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
+        # The banked realized is carried as an offset, not lost.
+        self.assertEqual(orchestrator.positions_held["test"][0].realized_pnl_offset, Decimal("50"))
+
+        report = orchestrator.generate_performance_report(controller_id="test")
+
+        # Banked gross realized (50) - fees (10) = 40; unrealized 0 at breakeven.
+        self.assertEqual(report.realized_pnl_quote, Decimal("40"))
+        self.assertEqual(report.unrealized_pnl_quote, Decimal("0"))
+        self.assertEqual(report.cum_fees_quote, Decimal("10"))
+        self.assertEqual(report.global_pnl_quote, Decimal("40"))
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_generate_performance_report_subtracts_held_position_fees(self, mock_get_instance):
+        """Held-position fees must be netted out of global PnL.
+
+        Regression for the dashboard overstating PnL: PositionSummary.realized_pnl_quote is the
+        GROSS matched-breakeven spread (see PositionHold.get_position_summary), so
+        generate_performance_report must subtract cum_fees_quote. Before the fix, global_pnl_quote
+        silently ignored every fee paid on held inventory, which overstates PnL for any
+        POSITION_HOLD-based strategy (e.g. market making). This test fails against the old code
+        because it would report global_pnl_quote == 100 (gross) instead of 95 (net of fees).
+        """
+        mock_get_instance.return_value = MagicMock(spec=MarketsRecorder)
+        # Fully matched round trip: buy 10 @ 100, sell 10 @ 110 -> gross realized 100, 0 net inventory.
+        position_held = PositionHold("binance", "ETH-USDT", side=TradeType.BUY)
+        position_held.add_orders_from_executor(ExecutorInfo(
+            id="ph", timestamp=1234, type="position_executor",
+            status=RunnableStatus.TERMINATED, close_type=CloseType.POSITION_HOLD,
+            config=PositionExecutorConfig(
+                timestamp=1234, trading_pair="ETH-USDT", connector_name="binance",
+                side=TradeType.BUY, amount=Decimal(10), entry_price=Decimal(100)),
+            net_pnl_pct=Decimal(0), net_pnl_quote=Decimal(0), cum_fees_quote=Decimal(0),
+            filled_amount_quote=Decimal(0), is_active=False, is_trading=False,
+            custom_info={"held_position_orders": [
+                {"client_order_id": "b1", "trade_type": "BUY",
+                 "executed_amount_base": Decimal("10"), "executed_amount_quote": Decimal("1000"),
+                 "cumulative_fee_paid_quote": Decimal("2")},
+                {"client_order_id": "s1", "trade_type": "SELL",
+                 "executed_amount_base": Decimal("10"), "executed_amount_quote": Decimal("1100"),
+                 "cumulative_fee_paid_quote": Decimal("3")},
+            ]},
+            controller_id="test"))
+        self.orchestrator.active_executors["test"] = []
+        self.orchestrator.positions_held["test"] = [position_held]
+
+        report = self.orchestrator.generate_performance_report(controller_id="test")
+
+        # Gross matched realized = (110 - 100) * 10 = 100; fees = 2 + 3 = 5.
+        self.assertEqual(report.cum_fees_quote, Decimal("5"))
+        self.assertEqual(report.realized_pnl_quote, Decimal("95"))   # 100 gross - 5 fees
+        self.assertEqual(report.unrealized_pnl_quote, Decimal("0"))  # fully matched, no inventory
+        self.assertEqual(report.global_pnl_quote, Decimal("95"))
+        # The bug: global would have been 100 (gross) if held-position fees were dropped.
+        self.assertNotEqual(report.global_pnl_quote, Decimal("100"))
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_generate_performance_report_aggregates_executor_fees_without_double_subtracting(self, mock_get_instance):
+        """Executor fees are already inside net_pnl_quote; the report exposes them via
+        cum_fees_quote for display but must NOT subtract them from global PnL a second time."""
+        mock_get_instance.return_value = MagicMock(spec=MarketsRecorder)
+        config_mock = PositionExecutorConfig(
+            timestamp=1234, trading_pair="ETH-USDT", connector_name="binance",
+            side=TradeType.BUY, amount=Decimal(10), entry_price=Decimal(100))
+        active = MagicMock(spec=PositionExecutor)
+        active.executor_info = ExecutorInfo(
+            id="a", timestamp=1234, type="position_executor", status=RunnableStatus.RUNNING,
+            config=config_mock, filled_amount_quote=Decimal(100), net_pnl_quote=Decimal(10),
+            net_pnl_pct=Decimal(10), cum_fees_quote=Decimal(1), is_trading=True, is_active=True,
+            custom_info={"side": TradeType.BUY})
+        tp = MagicMock(spec=PositionExecutor)
+        tp.executor_info = ExecutorInfo(
+            id="b", timestamp=1234, type="position_executor", status=RunnableStatus.TERMINATED,
+            close_type=CloseType.TAKE_PROFIT, config=config_mock, filled_amount_quote=Decimal(100),
+            net_pnl_quote=Decimal(10), net_pnl_pct=Decimal(10), cum_fees_quote=Decimal(2),
+            is_trading=False, is_active=False, custom_info={"side": TradeType.BUY})
+        self.orchestrator.active_executors["test"] = [active, tp]
+        self.orchestrator.positions_held["test"] = []
+
+        report = self.orchestrator.generate_performance_report(controller_id="test")
+
+        self.assertEqual(report.unrealized_pnl_quote, Decimal(10))
+        self.assertEqual(report.realized_pnl_quote, Decimal(10))
+        self.assertEqual(report.cum_fees_quote, Decimal(3))     # 1 + 2, display only
+        self.assertEqual(report.global_pnl_quote, Decimal(20))  # NOT reduced by fees again
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
     def test_initial_positions_override(self, mock_get_instance: MagicMock):
         # Create mock markets recorder
         mock_markets_recorder = MagicMock(spec=MarketsRecorder)

@@ -66,5 +66,10 @@ class PerformanceReport(BaseModel):
     global_pnl_quote: Decimal = Decimal("0")
     global_pnl_pct: Decimal = Decimal("0")
     volume_traded: Decimal = Decimal("0")
+    # Total fees paid across all executors and held positions, expressed in the quote asset.
+    # Informational: executor fees are already inside their net_pnl_quote, while held-position
+    # fees are subtracted from realized_pnl_quote in generate_performance_report so that
+    # global_pnl_quote is net of fees for every accounting path (not just closed executors).
+    cum_fees_quote: Decimal = Decimal("0")
     positions_summary: List = []
     close_type_counts: Dict[CloseType, int] = {}

@@ -47,6 +47,13 @@ class PositionHold:
         self.volume_traded_quote = Decimal("0")
         self.cum_fees_quote = Decimal("0")
 
+        # Realized PnL banked from prior sessions, restored from the DB on reload. The live
+        # matched-breakeven realized is derived from buy/sell amounts, but on reload those are
+        # reconstructed as the remaining NET inventory only (one side is zero), so their matched
+        # volume is zero. Without this offset, realized PnL accrued before a restart would be
+        # silently reset to zero every time the bot restarts.
+        self.realized_pnl_offset = Decimal("0")
+
         # Separate tracking for buys and sells
         self.buy_amount_base = Decimal("0")
         self.buy_amount_quote = Decimal("0")
@@ -100,8 +107,10 @@ class PositionHold:
         # Calculate matched volume (minimum of buy and sell base amounts)
         matched_amount_base = min(self.buy_amount_base, self.sell_amount_base)
 
-        # Calculate realized PnL from matched volume
-        realized_pnl_quote = (sell_breakeven_price - buy_breakeven_price) * matched_amount_base if matched_amount_base > 0 else Decimal("0")
+        # Calculate realized PnL from matched volume, then add PnL banked from prior sessions
+        # so cumulative realized survives restarts (see realized_pnl_offset in __init__).
+        matched_realized_quote = (sell_breakeven_price - buy_breakeven_price) * matched_amount_base if matched_amount_base > 0 else Decimal("0")
+        realized_pnl_quote = self.realized_pnl_offset + matched_realized_quote
 
         # Calculate net position amount and direction
         net_amount_base = self.buy_amount_base - self.sell_amount_base
@@ -227,10 +236,13 @@ class ExecutorOrchestrator:
         if controller_id not in self.cached_performance:
             self.cached_performance[controller_id] = PerformanceReport()
         report = self.cached_performance[controller_id]
-        # Only add to realized PnL if not a position hold (consistent with generate_performance_report)
+        # Only add to realized PnL if not a position hold (consistent with generate_performance_report).
+        # net_pnl_quote is already net of fees; cum_fees_quote is tracked separately for display only
+        # and must NOT be subtracted again from realized/global.
         if executor_info.close_type != CloseType.POSITION_HOLD:
             report.realized_pnl_quote += executor_info.net_pnl_quote
             report.volume_traded += executor_info.filled_amount_quote
+            report.cum_fees_quote += executor_info.cum_fees_quote
         if executor_info.close_type:
             report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type,
                                                                                               0) + 1
@@ -248,6 +260,10 @@ class ExecutorOrchestrator:
         # Set the aggregated values from the database
         position_hold.volume_traded_quote = db_position.volume_traded_quote
         position_hold.cum_fees_quote = db_position.cum_fees_quote
+        # Restore realized PnL banked before the restart. The buy/sell amounts set below are the
+        # remaining NET inventory only, so matched volume (and thus freshly-computed realized) is
+        # zero on reload; without this the dashboard's realized PnL would drop to zero on restart.
+        position_hold.realized_pnl_offset = db_position.realized_pnl_quote
 
         # Since the database stores the net position, we need to reconstruct the buy/sell amounts
         # We assume this represents the remaining unmatched position after any realized trades
@@ -1091,6 +1107,7 @@ class ExecutorOrchestrator:
         # Start with cached values (from DB)
         report.realized_pnl_quote = cached_report.realized_pnl_quote
         report.volume_traded = cached_report.volume_traded
+        report.cum_fees_quote = cached_report.cum_fees_quote
         report.close_type_counts = cached_report.close_type_counts.copy() if cached_report.close_type_counts else {}
 
         # Add data from active executors
@@ -1102,12 +1119,15 @@ class ExecutorOrchestrator:
             if not executor_info.is_done:
                 report.unrealized_pnl_quote += executor_info.net_pnl_quote
                 report.volume_traded += executor_info.filled_amount_quote
+                # net_pnl_quote already nets fees; cum_fees_quote is display-only here.
+                report.cum_fees_quote += executor_info.cum_fees_quote
             else:
                 # For done executors, only add to realized PnL if they're not already in position holds
                 # Position holds will be counted separately to avoid double counting
                 if executor_info.close_type != CloseType.POSITION_HOLD:
                     report.realized_pnl_quote += executor_info.net_pnl_quote
                     report.volume_traded += executor_info.filled_amount_quote
+                    report.cum_fees_quote += executor_info.cum_fees_quote
                 if executor_info.close_type:
                     report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type, 0) + 1
 
@@ -1124,11 +1144,17 @@ class ExecutorOrchestrator:
                 position.connector_name, position.trading_pair, PriceType.MidPrice)
             position_summary = position.get_position_summary(mid_price if not mid_price.is_nan() else Decimal("0"))
 
-            # Update report with position data
-            # Position summary realized_pnl_quote is already net of fees (calculated correctly in position logic)
-            report.realized_pnl_quote += position_summary.realized_pnl_quote
+            # Update report with position data.
+            # PositionSummary.realized_pnl_quote is GROSS of fees (it is the matched-volume
+            # breakeven spread, see PositionHold.get_position_summary), while cum_fees_quote is
+            # tracked separately. Subtract fees here so held-position PnL is net of fees, matching
+            # both PositionSummary.global_pnl_quote and the net_pnl_quote used for closed executors.
+            # Without this, the dashboard's global_pnl_quote silently omitted all fees paid on held
+            # inventory, overstating PnL for any POSITION_HOLD-based strategy (e.g. market making).
+            report.realized_pnl_quote += position_summary.realized_pnl_quote - position_summary.cum_fees_quote
             report.volume_traded += position_summary.volume_traded_quote
             report.unrealized_pnl_quote += position_summary.unrealized_pnl_quote
+            report.cum_fees_quote += position_summary.cum_fees_quote
             positions_summary.append(position_summary)
 
         # Set the positions summary (don't use dynamic attribute)
