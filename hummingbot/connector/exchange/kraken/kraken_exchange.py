@@ -57,6 +57,9 @@ class KrakenExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._kraken_api_tier = KrakenAPITier(kraken_api_tier.upper() if kraken_api_tier else "STARTER")
         self._asset_pairs = {}
+        # KRK-7: Ticker responses key by canonical pair name (e.g. XXBTZUSD) even when queried by
+        # altname (XBTUSD); this reverse map (canonical -> altname) is built alongside _asset_pairs.
+        self._canonical_to_altname: Dict[str, str] = {}
         self._client_order_id_nonce_provider = NonceCreator.for_microseconds()
         self._rate_limits_share_pct = rate_limits_share_pct
         self._throttler = self._build_async_throttler(api_tier=self._kraken_api_tier)
@@ -144,7 +147,15 @@ class KrakenExchange(ExchangePyBase):
         return False
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return False
+        # KRK-6: QueryOrders with an unknown txid returns `error: [], result: {}` (live-verified
+        # 2026-07-14), which _request_order_status surfaces as IOError(ORDER_NOT_EXIST_ERROR_CODE ...).
+        # The EOrder strings cover the explicit error-shaped variants. Without this classification,
+        # process_order_not_found is never invoked from the status poll and unknown orders stay in
+        # in_flight_orders forever, occupying strategy budget/level slots.
+        error_text = str(status_update_exception)
+        return (CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE in error_text
+                or "EOrder:Invalid order" in error_text
+                or "EOrder:Unknown order" in error_text)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
@@ -204,6 +215,12 @@ class KrakenExchange(ExchangePyBase):
         return await self._api_request_with_retry(*args, **kwargs)
 
     @staticmethod
+    def _is_retryable_kraken_error(error_text: str) -> bool:
+        # KRK-8: rate-limit and busy/unavailable-service errors are transient; failing an order (or a
+        # poll) hard on the first hit turns a throttling blip into a strategy-visible failure.
+        return any(message in error_text for message in CONSTANTS.RETRYABLE_ERROR_MESSAGES)
+
+    @staticmethod
     def is_cloudflare_exception(exception: Exception):
         """
         Error status 5xx or 10xx are related to Cloudflare.
@@ -218,7 +235,73 @@ class KrakenExchange(ExchangePyBase):
                                                   is_auth_required=True,
                                                   data=data)
 
+    async def get_closed_orders_with_userref(self, userref: int):
+        data = {'userref': userref}
+        return await self._api_request_with_retry(RESTMethod.POST,
+                                                  CONSTANTS.CLOSED_ORDERS_PATH_URL,
+                                                  is_auth_required=True,
+                                                  data=data)
+
+    @staticmethod
+    def _orders_matching_userref(orders: Dict[str, Any], userref) -> Dict[str, Any]:
+        # Kraken returns userref as an int; only adopt orders that actually carry our userref.
+        return {txid: order for txid, order in orders.items()
+                if str(order.get("userref", "")) == str(userref)}
+
+    async def _reconcile_ambiguous_add_order(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        KRK-4/KRK-9: after an ambiguous AddOrder outcome (Cloudflare 5xx/10xx, EService:*, request
+        timeout) the order may be live — or already executed — on the exchange. Reconcile by userref
+        against OpenOrders AND ClosedOrders (userref is live-verified present and reliable in both).
+        Returns an AddOrder-shaped result ({"descr": ..., "txid": [...]}) when the order reached the
+        exchange, or None when reconciliation positively found nothing. Errors raised by the
+        reconciliation queries propagate (fail closed): the caller must not resubmit blindly when
+        the order's existence could not be determined.
+        """
+        userref = (data or {}).get("userref")
+        if userref is None:
+            return None
+        response = await self.get_open_orders_with_userref(userref)
+        matched = self._orders_matching_userref(response.get("open", {}) or {}, userref)
+        if not matched:
+            response = await self.get_closed_orders_with_userref(userref)
+            matched = self._orders_matching_userref(response.get("closed", {}) or {}, userref)
+        if matched:
+            matched_txids = list(matched.keys())
+            self.logger().info(
+                f"Reconciled ambiguous AddOrder via userref {userref}: found {matched_txids}.")
+            # Return an AddOrder-shaped result so _place_order can read result["txid"][0],
+            # marking the order OPEN rather than crashing with KeyError('txid') and FAILED.
+            return {
+                "descr": matched[matched_txids[0]].get("descr", {}),
+                "txid": matched_txids,
+            }
+        return None
+
     # === Orders placing ===
+
+    def _next_client_order_id(self) -> str:
+        """
+        Generates a new numeric client order id (Kraken userref). The 31-bit userref space allows
+        birthday collisions with orders still in flight; a collision would silently overwrite the
+        tracked order (plain dict assignment) and orphan the live one, so regenerate while the id
+        is already tracked (bounded, in case the nonce source is degenerate).
+        """
+        order_id = str(get_new_numeric_client_order_id(
+            nonce_creator=self._client_order_id_nonce_provider,
+            max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
+        ))
+        for _ in range(10):
+            if order_id not in self._order_tracker.all_fillable_orders:
+                break
+            order_id = str(get_new_numeric_client_order_id(
+                nonce_creator=self._client_order_id_nonce_provider,
+                max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
+            ))
+        else:
+            self.logger().warning(
+                f"Could not generate a collision-free client order id after 10 attempts; using {order_id}.")
+        return order_id
 
     def buy(self,
             trading_pair: str,
@@ -236,10 +319,7 @@ class KrakenExchange(ExchangePyBase):
 
         :return: the id assigned by the connector to the order (the client id)
         """
-        order_id = str(get_new_numeric_client_order_id(
-            nonce_creator=self._client_order_id_nonce_provider,
-            max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
-        ))
+        order_id = self._next_client_order_id()
         safe_ensure_future(self._create_order(
             trade_type=TradeType.BUY,
             order_id=order_id,
@@ -263,10 +343,7 @@ class KrakenExchange(ExchangePyBase):
         :param price: the order price
         :return: the id assigned by the connector to the order (the client id)
         """
-        order_id = str(get_new_numeric_client_order_id(
-            nonce_creator=self._client_order_id_nonce_provider,
-            max_id_bit_count=CONSTANTS.MAX_ID_BIT_COUNT,
-        ))
+        order_id = self._next_client_order_id()
         safe_ensure_future(self._create_order(
             trade_type=TradeType.SELL,
             order_id=order_id,
@@ -284,6 +361,10 @@ class KrakenExchange(ExchangePyBase):
                                  for _, details in asset_pairs.items()
                                  if web_utils.is_exchange_information_valid(details)
                                  and details.get('base') and details.get('quote')}
+            self._canonical_to_altname = {canonical: details["altname"]
+                                          for canonical, details in asset_pairs.items()
+                                          if web_utils.is_exchange_information_valid(details)
+                                          and details.get("altname")}
         return self._asset_pairs
 
     async def _place_order(self,
@@ -295,13 +376,15 @@ class KrakenExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        # KRK-13: str(Decimal) emits scientific notation for sub-1e-6 values (e.g. "1.2E-7");
+        # serialize fixed-point, which Kraken unconditionally accepts.
         data = {
             "pair": trading_pair,
             "type": "buy" if trade_type is TradeType.BUY else "sell",
             "ordertype": "market" if order_type is OrderType.MARKET else "limit",
-            "volume": str(amount),
+            "volume": f"{amount:f}",
             "userref": order_id,
-            "price": str(price)
+            "price": f"{price:f}"
         }
 
         if order_type is OrderType.MARKET:
@@ -351,26 +434,66 @@ class KrakenExchange(ExchangePyBase):
                 if result is None or error:
                     raise IOError({"error": response_json})
                 break
+            except asyncio.TimeoutError:
+                if path_url == CONSTANTS.ADD_ORDER_PATH_URL:
+                    # KRK-9: a timed-out AddOrder may still have been accepted. Reconcile before
+                    # declaring the order failed; never blind-resubmit on an ambiguous outcome.
+                    recovered = await self._reconcile_ambiguous_add_order(data=data)
+                    if recovered is not None:
+                        return recovered
+                    raise IOError(
+                        f"AddOrder request for userref {(data or {}).get('userref')} timed out and "
+                        "reconciliation found no matching order; failing without retry.")
+                raise
             except IOError as e:
+                error_text = str(e)
+                # KRK-8: AddOrder failures that are transient (EService:*, rate limits) or Cloudflare
+                # errors are treated as AMBIGUOUS — the order may have reached the engine — and are
+                # reconciled by userref, never blind-retried.
+                is_ambiguous_add_order = (
+                    path_url == CONSTANTS.ADD_ORDER_PATH_URL
+                    and (self.is_cloudflare_exception(e)
+                         or "EService:" in error_text
+                         or self._is_retryable_kraken_error(error_text))
+                )
+                if is_ambiguous_add_order:
+                    # KRK-4/KRK-9: order placement could have been successful despite the error.
+                    # Reconcile by userref (OpenOrders + ClosedOrders) before any resubmission.
+                    self.logger().info(f"Ambiguous AddOrder outcome ({error_text}); reconciling by userref.")
+                    recovered = await self._reconcile_ambiguous_add_order(data=data)
+                    if recovered is not None:
+                        return recovered
+                    if data.get("ordertype") == "market":
+                        # A MARKET order never rests; if the first request was accepted it executed
+                        # immediately. Resubmitting could double-execute, so a market AddOrder with
+                        # no reconciled match fails WITHOUT retry.
+                        raise IOError(
+                            f"Ambiguous market AddOrder outcome for userref {data.get('userref')} "
+                            f"({error_text}); reconciliation found no matching order. "
+                            "Failing without retry.")
+                    if not self.is_cloudflare_exception(e):
+                        # EService:* / rate-limit on a limit AddOrder with no reconciled match: fail
+                        # closed rather than blind-retrying against a busy matching engine.
+                        raise e
+                    # Cloudflare error on a limit AddOrder: reconciliation positively found no order,
+                    # so a resubmission cannot duplicate — retry.
+                    self.logger().warning(
+                        f"Cloudflare error on AddOrder; no order with userref {data.get('userref')} found."
+                        f" Resubmitting. Attempt {retry_attempt + 1}/{self.REQUEST_ATTEMPTS}"
+                    )
+                    await asyncio.sleep(retry_interval ** retry_attempt)
+                    continue
+                if self._is_retryable_kraken_error(error_text):
+                    # KRK-8: non-AddOrder rate-limit / EService errors back off and retry instead of
+                    # failing hard on the first hit (Kraken's counters decay within seconds).
+                    self.logger().warning(
+                        f"Retryable Kraken error ({error_text})."
+                        f" Attempt {retry_attempt + 1}/{self.REQUEST_ATTEMPTS}"
+                        f" API command {method}: {path_url}"
+                    )
+                    await asyncio.sleep(retry_interval ** retry_attempt)
+                    continue
                 if self.is_cloudflare_exception(e):
-                    if path_url == CONSTANTS.ADD_ORDER_PATH_URL:
-                        self.logger().info(f"Retrying {path_url}")
-                        # Order placement could have been successful despite the IOError, so check for the open order.
-                        userref = data.get('userref')
-                        response = await self.get_open_orders_with_userref(userref)
-                        open_orders = response.get("open", {}) or {}
-                        # Only adopt orders that actually carry our userref (Kraken returns userref as an int).
-                        matched_txids = [
-                            txid for txid, order in open_orders.items()
-                            if str(order.get("userref", "")) == str(userref)
-                        ]
-                        if matched_txids:
-                            # Return an AddOrder-shaped result so _place_order can read result["txid"][0],
-                            # marking the order OPEN rather than crashing with KeyError('txid') and FAILED.
-                            return {
-                                "descr": open_orders[matched_txids[0]].get("descr", {}),
-                                "txid": matched_txids,
-                            }
                     self.logger().warning(
                         f"Cloudflare error. Attempt {retry_attempt + 1}/{self.REQUEST_ATTEMPTS}"
                         f" API command {method}: {path_url}"
@@ -473,6 +596,16 @@ class KrakenExchange(ExchangePyBase):
             except Exception:
                 self.logger().error(f"Error parsing the trading pair rule {rule}. Skipping.", exc_info=True)
         return retval
+
+    async def _update_trading_rules(self):
+        # Refresh the symbol map BEFORE formatting trading rules so that a new
+        # listing (e.g. SN75USD class) is resolvable on the same refresh cycle.
+        exchange_info = await self._make_trading_rules_request()
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+        trading_rules_list = await self._format_trading_rules(exchange_info)
+        self._trading_rules.clear()
+        for trading_rule in trading_rules_list:
+            self._trading_rules[trading_rule.trading_pair] = trading_rule
 
     async def _update_trading_fees(self):
         """
@@ -612,34 +745,52 @@ class KrakenExchange(ExchangePyBase):
                     self._order_tracker.process_order_update(order_update=order_update)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        # KRK-3: QueryTrades only accepts T-prefixed TRADE txids; querying it with the ORDER txid
+        # returns EOrder:Invalid order (live-verified 2026-07-14), which the whitelist below used to
+        # swallow as "no fills" — REST fill recovery was structurally dead. Fetch the order's
+        # trade-id list via QueryOrders (trades=true) first, then fetch the fills themselves via
+        # QueryTrades in batches of at most 20 ids.
         trade_updates = []
 
         try:
             exchange_order_id = await order.get_exchange_order_id()
+        except asyncio.TimeoutError:
+            raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
+                          "- waiting for exchange order id.")
+
+        try:
+            orders_response = await self._api_request_with_retry(
+                method=RESTMethod.POST,
+                path_url=CONSTANTS.QUERY_ORDERS_PATH_URL,
+                data={"txid": exchange_order_id, "trades": "true"},
+                is_auth_required=True)
+            order_data = orders_response.get(exchange_order_id) or {}
+            trade_ids: List[str] = list(order_data.get("trades") or [])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # An unknown/invalid order id genuinely has no fills. This whitelist applies ONLY to the
+            # QueryOrders step: any error from the QueryTrades fetch below must propagate so the base
+            # class logs it and retries next cycle — swallowing it would understate executed amounts.
+            if "EOrder:Unknown order" in str(e) or "EOrder:Invalid order" in str(e):
+                return trade_updates
+            raise
+
+        for start in range(0, len(trade_ids), CONSTANTS.QUERY_TRADES_MAX_IDS_PER_REQUEST):
+            batch = trade_ids[start:start + CONSTANTS.QUERY_TRADES_MAX_IDS_PER_REQUEST]
             all_fills_response = await self._api_request_with_retry(
                 method=RESTMethod.POST,
                 path_url=CONSTANTS.QUERY_TRADES_PATH_URL,
-                data={"txid": exchange_order_id},
+                data={"txid": ",".join(batch)},
                 is_auth_required=True)
 
             for trade_id, trade_fill in all_fills_response.items():
-                trade: Dict[str, str] = all_fills_response[trade_id]
+                trade: Dict[str, Any] = dict(trade_fill)
                 trade["trade_id"] = trade_id
                 trade_update = self._create_trade_update_with_order_fill_data(
                     order_fill=trade,
                     order=order)
                 trade_updates.append(trade_update)
-
-        except asyncio.TimeoutError:
-            raise IOError(f"Skipped order update with order fills for {order.client_order_id} "
-                          "- waiting for exchange order id.")
-        except Exception as e:
-            # An unknown/invalid order id genuinely has no fills (mirrors REST QueryTrades semantics).
-            # Any OTHER error (network failure, Cloudflare 5xx, IOError) must propagate so the base class
-            # logs it and retries next cycle — swallowing it would silently understate executed amounts.
-            if "EOrder:Unknown order" in str(e) or "EOrder:Invalid order" in str(e):
-                return trade_updates
-            raise
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
@@ -696,39 +847,29 @@ class KrakenExchange(ExchangePyBase):
                     elif details.get("type") == "buy":
                         locked[convert_from_exchange_symbol(quote)] += vol_locked * Decimal(details.get("price"))
 
+        # KRK-2: totals are accumulated in a fresh local dict computed ONLY from this response, and the
+        # Flex/earn (".F") fold happens during accumulation. Folding in-place on self._account_* (the
+        # previous implementation) double-counted against stale prior-poll state and never added the
+        # folded target to remote_asset_names, so a flex-only asset (e.g. "XBT.F" with no co-held
+        # "XXBT") oscillated present -> absent on alternating polls.
+        total_balances: Dict[str, Decimal] = {}
         for asset_name, balance in balances.items():
             # Skip Kraken non-spot sub-balances: staked (".S"), bonded / opt-in rewards (".B"),
             # on-hold (".HOLD") and any other ".<suffix>" that is not Flex/earn (".F"). These funds are
             # not spot-tradable, so counting them would surface phantom assets (e.g. "SOL03.S") and
-            # overstate available balances. Flex (".F") IS spot-liquid and is folded into its base below.
+            # overstate available balances. Flex (".F") IS spot-liquid and folds into its spot asset.
             if "." in asset_name and not asset_name.endswith(".F"):
                 continue
-            cleaned_name = convert_from_exchange_symbol(asset_name).upper()
-            total_balance = Decimal(balance)
-            free_balance = total_balance - Decimal(locked[cleaned_name])
-            self._account_available_balances[cleaned_name] = free_balance
+            if asset_name.endswith(".F"):
+                cleaned_name = convert_from_exchange_symbol(asset_name.split(".")[0]).upper()
+            else:
+                cleaned_name = convert_from_exchange_symbol(asset_name).upper()
+            total_balances[cleaned_name] = total_balances.get(cleaned_name, Decimal("0")) + Decimal(balance)
+
+        for cleaned_name, total_balance in total_balances.items():
+            self._account_available_balances[cleaned_name] = total_balance - Decimal(locked[cleaned_name])
             self._account_balances[cleaned_name] = total_balance
             remote_asset_names.add(cleaned_name)
-
-        # Fold Kraken Flex/earn (".F") balances into their spot asset. Iterate over a list() snapshot
-        # because the fold can introduce a brand-new spot key (when a ".F" balance is held without a
-        # co-held spot balance) — mutating the dict mid-iteration would raise RuntimeError. Delete the
-        # ".F" entry after folding rather than zeroing it, so no phantom zero-balance key lingers.
-        for cleaned_name, ava_balance in list(self._account_available_balances.items()):
-            if cleaned_name.endswith(".F"):
-                asset_normal_name = cleaned_name.split(".")[0]
-                cleaned_normal_name = convert_from_exchange_symbol(asset_normal_name).upper()
-                new_total_amount = self._account_available_balances.get(cleaned_normal_name, 0) + ava_balance
-                self._account_available_balances[cleaned_normal_name] = new_total_amount
-                del self._account_available_balances[cleaned_name]
-
-        for cleaned_name, total_balance in list(self._account_balances.items()):
-            if cleaned_name.endswith(".F"):
-                asset_normal_name = cleaned_name.split(".")[0]
-                cleaned_normal_name = convert_from_exchange_symbol(asset_normal_name).upper()
-                new_total_amount = self._account_balances.get(cleaned_normal_name, 0) + total_balance
-                self._account_balances[cleaned_normal_name] = new_total_amount
-                del self._account_balances[cleaned_name]
 
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
@@ -764,11 +905,24 @@ class KrakenExchange(ExchangePyBase):
         exchange_symbols = [await self.exchange_symbol_associated_to_pair(tp) for tp in trading_pairs]
         # Create a mapping from exchange symbols to trading pairs to avoid repeated async calls
         symbol_to_pair = {symbol: tp for symbol, tp in zip(exchange_symbols, trading_pairs)}
-        return {
-            symbol_to_pair[symbol]: float(data["c"][0])
-            for symbol, data in resp_json.items()
-            if symbol in symbol_to_pair
-        }
+        # KRK-7 (live-confirmed): the all-pairs Ticker response keys by CANONICAL pair name (e.g.
+        # XXBTZUSD) while the symbol map holds altnames (XBTUSD), silently omitting legacy pairs.
+        # Translate response keys through the canonical->altname map built from AssetPairs. If the
+        # map cannot be refreshed, degrade to raw-key matching (correct for non-legacy pairs).
+        try:
+            await self.get_asset_pairs()
+        except Exception:
+            self.logger().warning(
+                "Could not refresh asset pairs for Ticker key translation; matching raw keys only.")
+        results: Dict[str, float] = {}
+        for symbol, data in resp_json.items():
+            trading_pair = symbol_to_pair.get(symbol)
+            if trading_pair is None:
+                altname = self._canonical_to_altname.get(symbol)
+                trading_pair = symbol_to_pair.get(altname) if altname is not None else None
+            if trading_pair is not None:
+                results[trading_pair] = float(data["c"][0])
+        return results
 
     async def _get_ticker_data(self, trading_pair: str = None) -> Dict[str, Any]:
         """

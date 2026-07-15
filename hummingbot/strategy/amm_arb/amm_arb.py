@@ -16,6 +16,7 @@ from hummingbot.core.data_type.trade_fee import TokenAmount
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     MarketOrderFailureEvent,
+    OrderCancelledEvent,
     OrderExpiredEvent,
     OrderType,
     SellOrderCompletedEvent,
@@ -39,6 +40,10 @@ class AmmArbStrategy(StrategyPyBase):
     For a given order amount, the strategy checks both sides of the trade (market_1 and market_2) for arb opportunity.
     If presents, the strategy submits taker orders to both market.
     """
+
+    # ARB-8: maximum time to wait for an arb leg to reach a final state before the strategy
+    # cancels it and gives up on the proposal (the wait() used to hang forever)
+    ORDER_COMPLETION_WAIT_TIMEOUT = 60.0 * 10
 
     _market_info_1: MarketTradingPairTuple
     _market_info_2: MarketTradingPairTuple
@@ -301,7 +306,7 @@ class AmmArbStrategy(StrategyPyBase):
 
             self.logger().info(f"Found arbitrage opportunity!: {arb_proposal}")
 
-            for arb_side in (arb_proposal.first_side, arb_proposal.second_side):
+            for side_index, arb_side in enumerate((arb_proposal.first_side, arb_proposal.second_side)):
                 side: str = "BUY" if arb_side.is_buy else "SELL"
                 self.log_with_clock(logging.INFO,
                                     f"Placing {side} order for {arb_side.amount} {arb_side.market_info.base_asset} "
@@ -319,14 +324,50 @@ class AmmArbStrategy(StrategyPyBase):
                 })
 
                 if not self._concurrent_orders_submission:
-                    await arb_side.completed_event.wait()
+                    # ARB-8: bound the wait - a stuck/never-terminating order used to hang the
+                    # main task forever, leaving the strategy dead until restart.
+                    try:
+                        await asyncio.wait_for(arb_side.completed_event.wait(),
+                                               timeout=self.ORDER_COMPLETION_WAIT_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        msg = (f"Arbitrage leg order {order_id} did not reach a final state within "
+                               f"{self.ORDER_COMPLETION_WAIT_TIMEOUT} seconds. Cancelling it and dropping "
+                               f"the arbitrage proposal.")
+                        self.log_with_clock(logging.WARNING, msg)
+                        self.notify_hb_app_with_timestamp(msg)
+                        self.cancel_order(arb_side.market_info, order_id)
+                        return
                     if arb_side.is_failed:
                         self.log_with_clock(logging.ERROR,
                                             f"Order {order_id} seems to have failed in this arbitrage opportunity. "
                                             f"Dropping Arbitrage Proposal. ")
+                        if side_index == 1:
+                            # The first leg already filled - the operator must know the position is naked
+                            self.notify_hb_app_with_timestamp(
+                                f"The second arbitrage leg (order {order_id}) failed after the first leg "
+                                f"filled. The position is unhedged - please unwind manually if required."
+                            )
                         return
 
-            await arb_proposal.wait()
+            try:
+                await asyncio.wait_for(arb_proposal.wait(), timeout=self.ORDER_COMPLETION_WAIT_TIMEOUT)
+            except asyncio.TimeoutError:
+                msg = (f"Arbitrage legs did not reach a final state within "
+                       f"{self.ORDER_COMPLETION_WAIT_TIMEOUT} seconds. Cancelling the outstanding legs.")
+                self.log_with_clock(logging.WARNING, msg)
+                self.notify_hb_app_with_timestamp(msg)
+                for order_id, side in list(self._order_id_side_map.items()):
+                    if side in (arb_proposal.first_side, arb_proposal.second_side) and \
+                            not side.completed_event.is_set():
+                        self.cancel_order(side.market_info, order_id)
+                return
+            first_failed = arb_proposal.first_side.is_failed
+            second_failed = arb_proposal.second_side.is_failed
+            if first_failed != second_failed:
+                self.notify_hb_app_with_timestamp(
+                    "One arbitrage leg failed while the other completed. The position is unhedged - "
+                    "please unwind manually if required."
+                )
 
     async def place_arb_order(
             self,
@@ -443,12 +484,13 @@ class AmmArbStrategy(StrategyPyBase):
         return "\n".join(lines)
 
     def set_order_completed(self, order_id: str):
-        arb_side: Optional[ArbProposalSide] = self._order_id_side_map.get(order_id)
+        # ARB-8: pop instead of get so the map cannot grow without bound
+        arb_side: Optional[ArbProposalSide] = self._order_id_side_map.pop(order_id, None)
         if arb_side:
             arb_side.set_completed()
 
     def set_order_failed(self, order_id: str):
-        arb_side: Optional[ArbProposalSide] = self._order_id_side_map.get(order_id)
+        arb_side: Optional[ArbProposalSide] = self._order_id_side_map.pop(order_id, None)
         if arb_side:
             arb_side.set_failed()
             arb_side.set_completed()
@@ -486,6 +528,11 @@ class AmmArbStrategy(StrategyPyBase):
 
     def did_expire_order(self, expired_event: OrderExpiredEvent):
         self.set_order_completed(order_id=expired_event.order_id)
+
+    def did_cancel_order(self, cancelled_event: OrderCancelledEvent):
+        # ARB-8: a cancelled leg never terminated its completed_event, hanging the main task
+        # forever. A cancelled order did not fill, so it is treated like a failed one.
+        self.set_order_failed(order_id=cancelled_event.order_id)
 
     @property
     def tracked_limit_orders(self) -> List[Tuple[ConnectorBase, LimitOrder]]:

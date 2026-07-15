@@ -81,3 +81,30 @@ class KrakenUtilTestCases(unittest.TestCase):
             KrakenConfigMap(kraken_api_key="k", kraken_secret_key="s", kraken_api_tier=123)
         cfg = KrakenConfigMap(kraken_api_key="k", kraken_secret_key="s", kraken_api_tier="Pro")
         self.assertEqual("Pro", cfg.kraken_api_tier)
+
+    def test_cancel_order_rate_limit_weight_is_conservative(self):
+        # KRK-8: CancelOrder carries an age-based matching-engine penalty (documented worst case 8 on
+        # starter tier). Both the endpoint weight and the shared matching-engine pool contribution
+        # must use the conservative constant, not 1.
+        from hummingbot.connector.exchange.kraken import kraken_constants as CONSTANTS
+        from hummingbot.connector.exchange.kraken.kraken_constants import KrakenAPITier
+
+        for tier in KrakenAPITier:
+            limits = utils.build_rate_limits_by_tier(tier)
+            cancel = next(limit for limit in limits if limit.limit_id == CONSTANTS.CANCEL_ORDER_PATH_URL)
+            self.assertEqual(CONSTANTS.CANCEL_ORDER_RATE_LIMIT_WEIGHT, cancel.weight)
+            self.assertEqual(8, cancel.weight)
+            linked = cancel.linked_limits[0]
+            self.assertEqual(CONSTANTS.MATCHING_ENGINE_LIMIT_ID, linked.limit_id)
+            self.assertEqual(CONSTANTS.CANCEL_ORDER_RATE_LIMIT_WEIGHT, linked.weight)
+
+    def test_add_order_rate_limit_weight_unchanged(self):
+        # KRK-8 guard: only CancelOrder is re-weighted; AddOrder keeps weight 1 so the fix cannot
+        # starve order placement.
+        from hummingbot.connector.exchange.kraken import kraken_constants as CONSTANTS
+        from hummingbot.connector.exchange.kraken.kraken_constants import KrakenAPITier
+
+        limits = utils.build_rate_limits_by_tier(KrakenAPITier.STARTER)
+        add_order = next(limit for limit in limits if limit.limit_id == CONSTANTS.ADD_ORDER_PATH_URL)
+        self.assertEqual(1, add_order.weight)
+        self.assertEqual(1, add_order.linked_limits[0].weight)

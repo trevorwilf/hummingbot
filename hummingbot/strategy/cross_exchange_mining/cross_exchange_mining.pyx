@@ -249,8 +249,9 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
             # market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(active_order.client_order_id)
             market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(active_order.client_order_id)
             if market_trading_pair_tuple:
+                # ARB-13: do not untrack eagerly - the order stays tracked until the cancelled
+                # event confirms it, otherwise a failed cancel leaks a live untracked order.
                 StrategyBase.c_cancel_order(self, market_trading_pair_tuple, active_order.client_order_id)
-                StrategyBase.stop_tracking_limit_order(self, market_trading_pair_tuple, active_order.client_order_id)
 
     cdef set_order(self, object market_pair, object is_buy):
         cdef:
@@ -259,16 +260,18 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
 
         maker_base_side_balance = maker_market.c_get_balance(market_pair.maker.base_asset)
         taker_base_side_balance = taker_market.c_get_balance(market_pair.taker.base_asset)
+        # ARB-13: an empty book raises ZeroDivisionError - skip this side for the tick.
+        # (The old fallback queried the OTHER exchange's book for the same trading pair.)
         try:
             # Average Price for buying order amount on maker market
             maker_buy_price = maker_market.c_get_vwap_for_volume(market_pair.maker.trading_pair, True, self.order_amount).result_price  # True = buy
         except ZeroDivisionError:
-            maker_buy_price = taker_market.c_get_vwap_for_volume(market_pair.maker.trading_pair, True, self.order_amount).result_price  # True = buy
+            return s_decimal_nan, s_decimal_nan
         try:
             # Average Price for buying order amount on taker market
             taker_buy_price = taker_market.c_get_vwap_for_volume(market_pair.taker.trading_pair, True, self.order_amount).result_price  # True = buy
         except ZeroDivisionError:
-            taker_buy_price = maker_market.c_get_vwap_for_volume(market_pair.taker.trading_pair, True, self.order_amount).result_price  # True = buy
+            return s_decimal_nan, s_decimal_nan
         # quantity of maker quote amount in base if sold on maker market
         maker_quote_side_balance_in_base = maker_market.c_get_available_balance(market_pair.maker.quote_asset) / maker_buy_price
         # quantity of taker quote amount in base if sold on taker market
@@ -320,14 +323,16 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
         if (self.order_amount - self.min_order_amount) <= (taker_base_side_balance + maker_base_side_balance) <= (self.order_amount + self.min_order_amount):
             return
 
+        # ARB-13: an empty book raises ZeroDivisionError - skip the rebalance for this tick.
+        # (The old fallback queried the OTHER exchange's book for the same trading pair.)
         try:
             maker_buy_price = maker_market.c_get_vwap_for_volume(market_pair.maker.trading_pair, True, self.order_amount).result_price  # True = buy
         except ZeroDivisionError:
-            maker_buy_price = taker_market.c_get_vwap_for_volume(market_pair.maker.trading_pair, True, self.order_amount).result_price  # True = buy
+            return
         try:
             taker_buy_price = taker_market.c_get_vwap_for_volume(market_pair.taker.trading_pair, True, self.order_amount).result_price  # True = buy
         except ZeroDivisionError:
-            taker_buy_price = maker_market.c_get_vwap_for_volume(market_pair.taker.trading_pair, True, self.order_amount).result_price  # True = buy
+            return
 
         maker_quote_side_balance_in_base = maker_market.c_get_available_balance(market_pair.maker.quote_asset) / maker_buy_price
         taker_quote_side_balance_in_base = taker_market.c_get_available_balance(market_pair.taker.quote_asset) / taker_buy_price
@@ -341,13 +346,17 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
         check_mat = []
         buytaker = False
         selltaker = False
+        # ARB-5: taker_price was previously unbound when the taker-side quantity came out zero
+        # (depleted balance), crashing the maker-branch comparison below with UnboundLocalError.
+        taker_price = s_decimal_nan
+        maker_price = s_decimal_nan
 
         if taker_base_side_balance + maker_base_side_balance < (self.order_amount - self.min_order_amount):  # Need to Buy taker base balance as maker side does not balance
             taker_qty = Decimal.min((self.order_amount - (taker_base_side_balance + maker_base_side_balance)), taker_quote_side_balance_in_base)
             if taker_qty:
                 taker_price = taker_market.c_get_vwap_for_volume(market_pair.taker.trading_pair, True, Decimal(taker_qty)).result_price
                 # self.notify_hb_app(str(taker_qty) + " t " + str(taker_price))
-                if taker_qty > self.min_order_amount:
+                if taker_qty > self.min_order_amount and not Decimal.is_nan(taker_price):
                     buytaker = True
                     check_mat = [False, market_pair, True, taker_qty, taker_price]
 
@@ -355,7 +364,7 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
             taker_qty = Decimal.min(((taker_base_side_balance + maker_base_side_balance) - self.order_amount), taker_base_side_balance)
             if taker_qty:
                 taker_price = taker_market.c_get_vwap_for_volume(market_pair.taker.trading_pair, False, Decimal(taker_qty)).result_price
-                if taker_qty > self.min_order_amount:
+                if taker_qty > self.min_order_amount and not Decimal.is_nan(taker_price):
                     selltaker = True
                     check_mat = [False, market_pair, False, taker_qty, taker_price]
 
@@ -364,16 +373,16 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
             if maker_qty:
                 maker_price = maker_market.c_get_vwap_for_volume(market_pair.maker.trading_pair, True, Decimal(maker_qty)).result_price
                 # self.notify_hb_app(str(maker_qty) + " m " + str(maker_price))
-                if maker_qty > self.min_order_amount:
-                    if ((maker_price < taker_price and buytaker) or not buytaker):
+                if maker_qty > self.min_order_amount and not Decimal.is_nan(maker_price):
+                    if (not buytaker) or (not Decimal.is_nan(taker_price) and maker_price < taker_price):
                         check_mat = [True, market_pair, True, maker_qty, maker_price]
 
         if maker_base_side_balance + taker_base_side_balance > (self.order_amount + self.min_order_amount):  # Need to Sell maker base balance as taker side does not balance
             maker_qty = Decimal.min(((maker_base_side_balance + taker_base_side_balance) - self.order_amount), maker_base_side_balance)
             if maker_qty:
                 maker_price = maker_market.c_get_vwap_for_volume(market_pair.maker.trading_pair, False, Decimal(maker_qty)).result_price
-                if maker_qty > self.min_order_amount:
-                    if ((maker_price > taker_price and selltaker) or not selltaker):
+                if maker_qty > self.min_order_amount and not Decimal.is_nan(maker_price):
+                    if (not selltaker) or (not Decimal.is_nan(taker_price) and maker_price > taker_price):
                         check_mat = [True, market_pair, False, maker_qty, maker_price]
         # self.notify_hb_app(str(check_mat))
         if check_mat:
@@ -414,15 +423,16 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
             sell_orders = []
             active_orders = []
 
-            # Check for active limit orders and create buy and sell order lists
-            limit_orders = list(self._sb_order_tracker.c_get_limit_orders().values())
-            if limit_orders:
-                for key in [elem for elem in limit_orders[0]]:
-                    active_orders.append(limit_orders[0][key])
-                    if limit_orders[0][key].is_buy:
-                        buy_orders.append(limit_orders[0][key])
-                    else:
-                        sell_orders.append(limit_orders[0][key])
+            # Check for active limit orders and create buy and sell order lists.
+            # ARB-13: index by the CURRENT market pair - taking element [0] of the tracker dict
+            # returned another pair's orders when multiple pairs are traded.
+            orders_for_pair = self._sb_order_tracker.c_get_limit_orders().get(market_pair.maker, {})
+            for order in list(orders_for_pair.values()):
+                active_orders.append(order)
+                if order.is_buy:
+                    buy_orders.append(order)
+                else:
+                    sell_orders.append(order)
 
             self.volatility_rate(market_pair)
             # If there are buy orders check buy orders
@@ -569,8 +579,8 @@ cdef class CrossExchangeMiningStrategy(StrategyBase):
         for active_order in active_orders:
             market_trading_pair_tuple = self._sb_order_tracker.c_get_market_pair_from_order_id(active_order.client_order_id)
             if market_trading_pair_tuple:
+                # ARB-13: do not untrack eagerly - rely on the cancelled event (see check_order)
                 StrategyBase.c_cancel_order(self, market_trading_pair_tuple, active_order.client_order_id)
-                StrategyBase.stop_tracking_limit_order(self, market_trading_pair_tuple, active_order.client_order_id)
 
     def did_complete_buy_order(self, order_completed_event: BuyOrderCompletedEvent):
         """

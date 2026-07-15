@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import pandas as pd
 
@@ -11,6 +11,7 @@ from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import Arbit
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
 
 
 class ArbitrageControllerConfig(ControllerConfigBase):
@@ -36,6 +37,10 @@ class ArbitrageController(ControllerBase):
         self._last_sell_closed_timestamp = 0
         self._len_active_buy_arbitrages = 0
         self._len_active_sell_arbitrages = 0
+        # GEN-12: imbalance is kept cumulatively in controller state, fill-derived.
+        # Ids already counted, so an executor falling out of the archival-coupled
+        # executors_info buffer does not change the imbalance.
+        self._counted_executor_ids: Set[str] = set()
         self.base_asset = self.config.exchange_pair_1.trading_pair.split("-")[0]
         self._gas_token_cache = {}  # Cache for gas tokens by connector
         self._initialize_gas_tokens()  # Fetch gas tokens during init
@@ -146,14 +151,24 @@ class ArbitrageController(ControllerBase):
             else:
                 gas_conversion_price = None
             rate = self.market_data_provider.get_rate(self.base_asset + "-" + self.config.quote_conversion_asset)
-            if not rate:
+            # GEN-12: `if not rate` let Decimal("NaN") through — require finite and positive
+            rate = Decimal(str(rate)) if rate is not None else None
+            if rate is None or not rate.is_finite() or rate <= 0:
                 self.logger().warning(
-                    f"Cannot get conversion rate for {self.base_asset}-{self.config.quote_conversion_asset}. "
-                    f"Skipping executor creation.")
+                    f"Cannot get a valid conversion rate for {self.base_asset}-{self.config.quote_conversion_asset} "
+                    f"(got {rate}). Skipping executor creation.")
                 return None
             amount_quantized = self.market_data_provider.quantize_order_amount(
                 buying_exchange_pair.connector_name, buying_exchange_pair.trading_pair,
                 self.config.total_amount_quote / rate)
+            # GEN-12: a zero/negative quantized amount would create a never-trading executor
+            # that blocks both directions via the active-executor gates
+            if amount_quantized is None or amount_quantized <= 0:
+                self.logger().warning(
+                    f"Quantized order amount is not positive ({amount_quantized}) for "
+                    f"{buying_exchange_pair.connector_name}:{buying_exchange_pair.trading_pair}. "
+                    f"Skipping executor creation.")
+                return None
             arbitrage_config = ArbitrageExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 buying_market=buying_exchange_pair,
@@ -170,17 +185,29 @@ class ArbitrageController(ControllerBase):
                 f"Error creating executor to buy on {buying_exchange_pair.connector_name} and sell on {selling_exchange_pair.connector_name}, {e}")
 
     def update_arbitrage_stats(self):
-        closed_executors = [e for e in self.executors_info if e.status == RunnableStatus.TERMINATED]
+        # GEN-12: only executors that actually traded count toward the imbalance —
+        # FAILED / zero-fill executors must not stall a direction. Counting is
+        # cumulative (controller state) so archival of the executors_info buffer
+        # does not re-derive (and silently reset) the imbalance.
         active_executors = [e for e in self.executors_info if e.status != RunnableStatus.TERMINATED]
-        buy_arbitrages = [arbitrage for arbitrage in closed_executors if
-                          arbitrage.config.buying_market == self.config.exchange_pair_1]
-        sell_arbitrages = [arbitrage for arbitrage in closed_executors if
-                           arbitrage.config.buying_market == self.config.exchange_pair_2]
-        self._imbalance = len(buy_arbitrages) - len(sell_arbitrages)
-        self._last_buy_closed_timestamp = max([arbitrage.close_timestamp for arbitrage in buy_arbitrages]) if len(
-            buy_arbitrages) > 0 else 0
-        self._last_sell_closed_timestamp = max([arbitrage.close_timestamp for arbitrage in sell_arbitrages]) if len(
-            sell_arbitrages) > 0 else 0
+        completed_executors = [e for e in self.executors_info if
+                               e.status == RunnableStatus.TERMINATED and
+                               e.close_type == CloseType.COMPLETED and
+                               e.filled_amount_quote > 0]
+        for executor in completed_executors:
+            if executor.id in self._counted_executor_ids:
+                continue
+            self._counted_executor_ids.add(executor.id)
+            close_timestamp = executor.close_timestamp or 0
+            if executor.config.buying_market == self.config.exchange_pair_1:
+                self._imbalance += 1
+                self._last_buy_closed_timestamp = max(self._last_buy_closed_timestamp, close_timestamp)
+            elif executor.config.buying_market == self.config.exchange_pair_2:
+                self._imbalance -= 1
+                self._last_sell_closed_timestamp = max(self._last_sell_closed_timestamp, close_timestamp)
+        # Prune ids that already fell out of the buffer — they can never be re-counted
+        current_ids = {e.id for e in self.executors_info}
+        self._counted_executor_ids &= current_ids
         self._len_active_buy_arbitrages = len([arbitrage for arbitrage in active_executors if
                                                arbitrage.config.buying_market == self.config.exchange_pair_1])
         self._len_active_sell_arbitrages = len([arbitrage for arbitrage in active_executors if

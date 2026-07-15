@@ -864,7 +864,8 @@ class TestGridExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             order_frequency=1.0,
             max_open_orders=5,
             max_orders_per_batch=2,
-            limit_price=Decimal("90"),
+            # GEN-9: a SELL grid's limit must sit above end_price (90 pinned the bug)
+            limit_price=Decimal("130"),
             triple_barrier_config=TripleBarrierConfig(
                 take_profit=Decimal("0.001"),
                 stop_loss=Decimal("0.05"),

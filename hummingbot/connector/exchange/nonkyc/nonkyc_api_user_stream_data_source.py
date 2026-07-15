@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     HEARTBEAT_TIME_INTERVAL = 30.0
+    SUBSCRIBE_ACK_TIMEOUT = 10.0  # seconds to wait for the subscribeReports ack (NKC-2)
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -53,12 +54,18 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
         Subscribes to user order reports and balance updates.
         :param websocket_assistant: the websocket assistant used to connect to the exchange
         """
+        subscribe_request_id = self._next_ws_id()
         subscribe_user_orders_request: WSJSONRequest = WSJSONRequest(payload={
             "method": CONSTANTS.WS_METHOD_SUBSCRIBE_USER_ORDERS,
             "params": {},
-            "id": self._next_ws_id()
+            "id": subscribe_request_id
         })
         await websocket_assistant.send(subscribe_user_orders_request)
+        # NKC-2: the subscription used to be fire-and-forget — a rejected subscribeReports
+        # meant no real-time order/fill events with zero diagnostics. Validate the ack the
+        # same way login is validated; a raise here propagates to the base listen loop,
+        # which logs and reconnects (retry).
+        await self._wait_for_subscribe_reports_ack(websocket_assistant, subscribe_request_id)
         self.logger().info("Subscribed to user orders")
 
         # Balance updates -- undocumented API, subscribe but don't fail if rejected
@@ -86,6 +93,50 @@ class NonkycAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     f"NonKYC private balance WebSocket: UNAVAILABLE (subscription request failed: {e}). "
                     f"Using REST polling for balance updates."
                 )
+
+    async def _wait_for_subscribe_reports_ack(self, websocket_assistant: WSAssistant, request_id: int):
+        """
+        Waits for and validates the subscribeReports acknowledgement, correlating on the
+        JSON-RPC request id. Live-verified frame shapes (2026-07-14):
+          success: {"id": <reqid>, "jsonrpc": "2.0", "method": "subscribeReports",
+                    "result": [<snapshot of every open order, incl. manual ones>]}
+          error:   {"id": <reqid>, "jsonrpc": "2.0",
+                    "error": {"code": 404, "message": "Requested method not found"}}
+        Raises IOError on an error frame, a closed socket, or a silent socket (timeout) so
+        the base-class reconnect loop retries the whole connect/auth/subscribe sequence.
+        """
+        try:
+            async with timeout(self.SUBSCRIBE_ACK_TIMEOUT):
+                async for ws_response in websocket_assistant.iter_messages():
+                    data = ws_response.data
+                    if not isinstance(data, dict):
+                        continue
+                    if data.get("id") != request_id:
+                        continue
+                    if "error" in data:
+                        error = data.get("error") or {}
+                        raise IOError(
+                            f"subscribeReports subscription rejected: "
+                            f"code={error.get('code')} message={error.get('message')}"
+                        )
+                    # Success ack: "result" holds a live snapshot of ALL open orders on the
+                    # account (including the operator's manual ones). Feed it to the
+                    # connector's read-only external-holds accounting — never adopt, track
+                    # or cancel those orders.
+                    snapshot = data.get("result")
+                    if isinstance(snapshot, list):
+                        try:
+                            await self._connector._update_external_holds_from_order_snapshot(snapshot)
+                        except Exception:
+                            self.logger().debug(
+                                "Failed to update external order holds from subscribeReports snapshot",
+                                exc_info=True,
+                            )
+                    return
+                raise IOError("WebSocket closed before subscribeReports was acknowledged")
+        except asyncio.TimeoutError:
+            raise IOError(
+                f"subscribeReports ack not received within {self.SUBSCRIBE_ACK_TIMEOUT}s")
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:

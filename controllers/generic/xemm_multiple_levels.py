@@ -1,9 +1,8 @@
-import time
 from decimal import Decimal
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.core.data_type.common import PriceType, TradeType
@@ -54,6 +53,33 @@ class XEMMMultipleLevelsConfig(ControllerConfigBase):
         if isinstance(v, str):
             v = [list(map(Decimal, x.split(","))) for x in v.split("-")]
         return v
+
+    @model_validator(mode="after")
+    def validate_levels_profitability_floor(self):
+        """
+        GEN-5 / GEN-15: every level must keep a strictly positive profitability floor
+        (target_profitability - min_profitability > 0 — the executor hedges with a MARKET
+        taker order once profitability decays to that floor, so a floor of 0 realizes
+        slippage as a loss), and level amounts must be positive with a positive sum
+        (the sum is a divisor in determine_executor_actions).
+        """
+        for side_name, levels in (("buy", self.buy_levels_targets_amount),
+                                  ("sell", self.sell_levels_targets_amount)):
+            if len(levels) == 0:
+                raise ValueError(f"{side_name}_levels_targets_amount must define at least one level")
+            for level in levels:
+                if len(level) != 2:
+                    raise ValueError(
+                        f"Each {side_name} level must be (target_profitability, amount), got: {level}")
+                target_profitability, amount = level
+                if target_profitability - self.min_profitability <= Decimal("0"):
+                    raise ValueError(
+                        f"{side_name} level target_profitability {target_profitability} minus "
+                        f"min_profitability {self.min_profitability} must be > 0 — a level with a "
+                        f"zero/negative floor hedges via MARKET order at guaranteed slippage loss")
+                if amount <= Decimal("0"):
+                    raise ValueError(f"{side_name} level amounts must be > 0, got: {amount}")
+        return self
 
     def update_markets(self, markets: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
         if self.maker_connector not in markets:
@@ -143,9 +169,18 @@ class XEMMMultipleLevels(ControllerBase):
     async def update_processed_data(self):
         pass
 
+    # Backstop floor for the executor's min_profitability — config validation already
+    # guarantees target - min_profitability > 0, this clamp protects hot-updated configs.
+    MIN_PROFITABILITY_FLOOR = Decimal("0.0001")
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         executor_actions = []
         mid_price = self.market_data_provider.get_price_by_type(self.config.maker_connector, self.config.maker_trading_pair, PriceType.MidPrice)
+        if mid_price is None or not Decimal(str(mid_price)).is_finite() or mid_price <= 0:
+            self.logger().warning(
+                f"Maker mid price unavailable for {self.config.maker_connector}:"
+                f"{self.config.maker_trading_pair} — skipping executor creation this tick.")
+            return executor_actions
         active_buy_executors = self.filter_executors(
             executors=self.executors_info,
             filter_func=lambda e: not e.is_done and e.config.maker_side == TradeType.BUY
@@ -173,12 +208,13 @@ class XEMMMultipleLevels(ControllerBase):
         sell_side_quote = self.config.total_amount_quote * Decimal("0.5")
 
         for target_profitability, amount in self.buy_levels_targets_amount:
-            active_buy_executors_target = [e.config.target_profitability == target_profitability for e in active_buy_executors]
+            # GEN-7: filter (not map to booleans) so each level replenishes independently
+            active_buy_executors_target = [e for e in active_buy_executors if e.config.target_profitability == target_profitability]
 
             if len(active_buy_executors_target) == 0 and imbalance < self.config.max_executors_imbalance:
                 # Calculate proportional amount: (level_amount / total_side_amount) * (total_quote * 0.5)
                 proportional_amount_quote = (amount / total_buy_amount) * buy_side_quote
-                min_profitability = target_profitability - self.config.min_profitability
+                min_profitability = max(target_profitability - self.config.min_profitability, self.MIN_PROFITABILITY_FLOOR)
                 max_profitability = target_profitability + self.config.max_profitability
                 config = XEMMExecutorConfig(
                     controller_id=self.config.id,
@@ -195,15 +231,16 @@ class XEMMMultipleLevels(ControllerBase):
                 )
                 executor_actions.append(CreateExecutorAction(executor_config=config, controller_id=self.config.id))
         for target_profitability, amount in self.sell_levels_targets_amount:
-            active_sell_executors_target = [e.config.target_profitability == target_profitability for e in active_sell_executors]
+            # GEN-7: filter (not map to booleans) so each level replenishes independently
+            active_sell_executors_target = [e for e in active_sell_executors if e.config.target_profitability == target_profitability]
             if len(active_sell_executors_target) == 0 and imbalance > -self.config.max_executors_imbalance:
                 # Calculate proportional amount: (level_amount / total_side_amount) * (total_quote * 0.5)
                 proportional_amount_quote = (amount / total_sell_amount) * sell_side_quote
-                min_profitability = target_profitability - self.config.min_profitability
+                min_profitability = max(target_profitability - self.config.min_profitability, self.MIN_PROFITABILITY_FLOOR)
                 max_profitability = target_profitability + self.config.max_profitability
                 config = XEMMExecutorConfig(
                     controller_id=self.config.id,
-                    timestamp=time.time(),
+                    timestamp=self.market_data_provider.time(),
                     buying_market=ConnectorPair(connector_name=self.config.taker_connector,
                                                 trading_pair=self.config.taker_trading_pair),
                     selling_market=ConnectorPair(connector_name=self.config.maker_connector,

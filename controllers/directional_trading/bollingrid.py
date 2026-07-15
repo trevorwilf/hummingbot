@@ -27,7 +27,7 @@ class BollinGridControllerConfig(DirectionalTradingControllerConfigBase):
             "prompt": "Enter the trading pair for the candles data, leave empty to use the same trading pair as the connector: ",
             "prompt_on_new": True})
     interval: str = Field(
-        default="3m",
+        default="5m",
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True})
@@ -82,7 +82,7 @@ class BollinGridControllerConfig(DirectionalTradingControllerConfigBase):
 class BollinGridController(DirectionalTradingControllerBase):
     def __init__(self, config: BollinGridControllerConfig, *args, **kwargs):
         self.config = config
-        self.max_records = self.config.bb_length
+        self.max_records = self.config.bb_length + 20
         super().__init__(config, *args, **kwargs)
 
     async def update_processed_data(self):
@@ -91,9 +91,9 @@ class BollinGridController(DirectionalTradingControllerBase):
                                                       interval=self.config.interval,
                                                       max_records=self.max_records)
         # Add indicators
-        df.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
-        bbp = df[f"BBP_{self.config.bb_length}_{self.config.bb_std}"]
-        bb_width = df[f"BBB_{self.config.bb_length}_{self.config.bb_std}"]
+        df.ta.bbands(length=self.config.bb_length, lower_std=self.config.bb_std, upper_std=self.config.bb_std, append=True)
+        bbp = df[f"BBP_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"]
+        bb_width = df[f"BBB_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"]
 
         # Generate signal
         long_condition = bbp < self.config.bb_long_threshold

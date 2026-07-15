@@ -205,3 +205,78 @@ class KrakenAPIUserStreamDataSourceTest(IsolatedAsyncioWrapperTestCase):
 
         with self.assertRaises(IOError):
             await self.data_source._process_event_message({"errorMessage": "boom"}, queue)
+
+    # ------------------------------------------------------------------
+    # CSF-V1 Phase 2: KRK-12 private-channel sequence validation
+    # ------------------------------------------------------------------
+
+    async def test_sequence_gap_raises_and_resets_tracking(self):
+        # KRK-12 (would-have-caught): a sequence gap on ownTrades/openOrders means missed
+        # fills/status transitions on a connection that still looks healthy. It must raise so the
+        # reconnect + subscription snapshot replay recovers the missed events.
+        queue = asyncio.Queue()
+
+        base = self.get_open_orders_mock()  # sequence 59342 — first observed value becomes the base
+        await self.data_source._process_event_message(base, queue)
+
+        in_sequence = self.get_open_orders_mock()
+        in_sequence[-1]["sequence"] = 59343
+        await self.data_source._process_event_message(in_sequence, queue)
+
+        gapped = self.get_open_orders_mock()
+        gapped[-1]["sequence"] = 59345  # 59344 was lost
+        with self.assertRaises(IOError):
+            await self.data_source._process_event_message(gapped, queue)
+
+        # The two in-sequence frames were queued; the gapped frame was not (replayed after reconnect).
+        self.assertEqual(2, queue.qsize())
+        # Tracking is reset so the next frame after the reconnect establishes a fresh base.
+        self.assertEqual({}, self.data_source._channel_sequences)
+
+    async def test_sequence_channels_tracked_independently(self):
+        queue = asyncio.Queue()
+
+        await self.data_source._process_event_message(self.get_open_orders_mock(), queue)  # openOrders 59342
+        await self.data_source._process_event_message(self.get_own_trades_mock(), queue)  # ownTrades 2948
+
+        own_trades_next = self.get_own_trades_mock()
+        own_trades_next[-1]["sequence"] = 2949
+        await self.data_source._process_event_message(own_trades_next, queue)
+
+        self.assertEqual(3, queue.qsize())
+        self.assertEqual(59342, self.data_source._channel_sequences["openOrders"])
+        self.assertEqual(2949, self.data_source._channel_sequences["ownTrades"])
+
+    async def test_sequence_duplicate_raises(self):
+        # A repeated sequence number is as anomalous as a gap — the stream state is no longer trusted.
+        queue = asyncio.Queue()
+        await self.data_source._process_event_message(self.get_open_orders_mock(), queue)
+        with self.assertRaises(IOError):
+            await self.data_source._process_event_message(self.get_open_orders_mock(), queue)
+
+    async def test_subscribe_channels_resets_sequence_tracking(self):
+        # A fresh subscription restarts each channel's numbering; stale expectations must be dropped
+        # or the first post-reconnect frame would always be misread as a gap.
+        ws = AsyncMock()
+        self.data_source._channel_sequences["openOrders"] = 10
+
+        with patch.object(self.data_source, "get_auth_token", new=AsyncMock(return_value="token")):
+            await self.data_source._subscribe_channels(ws)
+
+        self.assertEqual({}, self.data_source._channel_sequences)
+
+        # Any first value is then accepted as the new base (start-at-1 is not relied upon).
+        queue = asyncio.Queue()
+        fresh = self.get_open_orders_mock()
+        fresh[-1]["sequence"] = 1
+        await self.data_source._process_event_message(fresh, queue)
+        self.assertEqual(1, self.data_source._channel_sequences["openOrders"])
+
+    async def test_frame_without_sequence_passes_through(self):
+        # A frame whose trailing dict carries no sequence number must keep flowing untouched
+        # (no tracking, no gap detection) — the validation is strictly opt-in on Kraken's field.
+        queue = asyncio.Queue()
+        frame = [[{"OGTT3Y-C6I3P-XRI6HX": {"status": "closed"}}], "openOrders", {}]
+        await self.data_source._process_event_message(frame, queue)
+        self.assertEqual(frame, await queue.get())
+        self.assertEqual({}, self.data_source._channel_sequences)

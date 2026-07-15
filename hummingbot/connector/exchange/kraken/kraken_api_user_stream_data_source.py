@@ -23,6 +23,8 @@ class KrakenAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._api_factory = api_factory
         self._connector = connector
         self._current_auth_token: Optional[str] = None
+        # KRK-12: last seen per-channel sequence number on ownTrades/openOrders frames.
+        self._channel_sequences: Dict[str, int] = {}
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
@@ -51,6 +53,8 @@ class KrakenAPIUserStreamDataSource(UserStreamTrackerDataSource):
         :param websocket_assistant: the websocket assistant used to connect to the exchange
         """
         try:
+            # KRK-12: a fresh subscription restarts each private channel's sequence numbering.
+            self._channel_sequences.clear()
 
             # Always mint a fresh WS token on (re)subscribe. Kraken tokens expire ~15 minutes and are only
             # valid to ESTABLISH a connection within that window; reusing a cached token after a reconnect
@@ -90,6 +94,7 @@ class KrakenAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 CONSTANTS.USER_TRADES_ENDPOINT_NAME,
                 CONSTANTS.USER_ORDERS_ENDPOINT_NAME,
         )):
+            self._track_channel_sequence(event_message)
             queue.put_nowait(event_message)
         elif isinstance(event_message, dict) and event_message.get("errorMessage") is not None:
             # Only dict control frames carry errorMessage; a short/unknown list frame is safely ignored
@@ -99,3 +104,25 @@ class KrakenAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 "label": "WSS_ERROR",
                 "message": f"Error received via websocket - {err_msg}."
             })
+
+    def _track_channel_sequence(self, event_message: list):
+        """
+        KRK-12: ownTrades/openOrders frames end with {"sequence": N}, incrementing by 1 per channel.
+        A gap means missed fills/status transitions on a connection that still looks healthy;
+        raising tears the connection down so the reconnect + subscription snapshot replay recovers
+        the missed events. The first value observed after a (re)subscribe is accepted as the base —
+        the documented start-at-1 behavior is deliberately not relied upon.
+        """
+        tail = event_message[-1]
+        sequence = tail.get("sequence") if isinstance(tail, dict) else None
+        if sequence is None:
+            return
+        channel = event_message[-2]
+        sequence = int(sequence)
+        last_sequence = self._channel_sequences.get(channel)
+        if last_sequence is not None and sequence != last_sequence + 1:
+            self._channel_sequences.clear()
+            raise IOError(
+                f"Sequence gap on Kraken private channel {channel}: expected {last_sequence + 1}, "
+                f"received {sequence}. Reconnecting user stream to replay missed events.")
+        self._channel_sequences[channel] = sequence

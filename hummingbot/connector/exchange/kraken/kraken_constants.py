@@ -66,9 +66,30 @@ ADD_ORDER_PATH_URL = "/0/private/AddOrder"
 CANCEL_ORDER_PATH_URL = "/0/private/CancelOrder"
 BALANCE_PATH_URL = "/0/private/Balance"
 OPEN_ORDERS_PATH_URL = "/0/private/OpenOrders"
+CLOSED_ORDERS_PATH_URL = "/0/private/ClosedOrders"
 QUERY_ORDERS_PATH_URL = "/0/private/QueryOrders"
 QUERY_TRADES_PATH_URL = "/0/private/QueryTrades"
 
+# QueryTrades accepts a comma-delimited list of trade txids, capped at 20 per request.
+QUERY_TRADES_MAX_IDS_PER_REQUEST = 20
+
+
+# KRK-8 — UNVERIFIED: Kraken's exact matching-engine penalty weights are not read-only probeable
+# (measuring them requires real order+cancel bursts against the live shared key). Kraken documents
+# the young-order CancelOrder penalty as up to 8 on the starter tier; over-weighting cancels is the
+# safe direction (measurement can only reveal headroom, not incorrectness), so the documented
+# worst-case constant is used.
+CANCEL_ORDER_RATE_LIMIT_WEIGHT = 8
+
+# KRK-8: transient Kraken errors that are safe to retry with backoff — EXCEPT on AddOrder, where an
+# ambiguous outcome must be reconciled by userref instead of blind-resubmitted (see
+# _api_request_with_retry / _reconcile_ambiguous_add_order).
+RETRYABLE_ERROR_MESSAGES = (
+    "EAPI:Rate limit exceeded",
+    "EOrder:Rate limit exceeded",
+    "EService:Busy",
+    "EService:Unavailable",
+)
 
 UNKNOWN_ORDER_MESSAGE = "Unknown order"
 # Order States

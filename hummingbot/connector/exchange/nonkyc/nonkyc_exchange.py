@@ -7,7 +7,7 @@ from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from async_timeout import timeout
-from bidict import bidict
+from bidict import ValueDuplicationError, bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.exchange.nonkyc import (
@@ -42,6 +42,11 @@ class NonkycExchange(ExchangePyBase):
     ENABLE_BALANCE_WS = True  # Undocumented WS methods (subscribeBalances/currentBalances/balanceUpdate).
                                # Confirmed working 2026-03-29. Auto-disables if no response within 60s.
                                # unsubscribeBalances does NOT exist (404). Do not attempt to unsubscribe.
+    # Sentinel stored as exchange_order_id when createorder returns an ambiguous 503 (the order may
+    # exist server-side). It is never a real NonKYC id and must never be sent to the API as one.
+    UNKNOWN_EXCHANGE_ORDER_ID = "UNKNOWN"
+    # NKC-9: unknown status strings coerce to OPEN (fail-open on state) but must be loud in logs.
+    _UNKNOWN_STATUS_WARN_INTERVAL_S = 30.0
 
     web_utils = web_utils
 
@@ -107,6 +112,18 @@ class NonkycExchange(ExchangePyBase):
         # path can otherwise see and re-process the same trade many times across pairs and poll cycles.
         # Persisted via tracking_states so it survives restarts.
         self._processed_trade_ids: "OrderedDict[str, None]" = OrderedDict()
+        # NKC-9: rate-limit state for unknown-order-status warnings, and per-order consecutive
+        # unknown REST status counts (repeated unknowns trigger a reconciliation log).
+        self._unknown_status_last_warn: Dict[str, float] = {}
+        self._unknown_status_counts: Dict[str, int] = {}
+        # NKC-2: rate-limit state for the catch-all WS error-frame warning.
+        self._ws_error_frame_last_warn: float = 0.0
+        # Read-only accounting of balance held by untracked ("orphan" = the operator's manual)
+        # active exchange orders, per trading pair: {pair: {"quote": Decimal, "base": Decimal}}.
+        # Refreshed by the post-reconnect reconciliation snapshot and by the subscribeReports
+        # ack snapshot. Feeds the ladder understatement check (LOG-2'); never used to adopt,
+        # track or cancel those orders.
+        self._external_order_holds: Dict[str, Dict[str, Decimal]] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.logger().info(
             "NonKYC connector supports LIMIT and MARKET order types. "
@@ -254,6 +271,8 @@ class NonkycExchange(ExchangePyBase):
                     )
             # Replace (not update) so an orphan that resolves and later reappears warns again.
             self._warned_orphan_ids = set(orphans)
+            # Refresh the read-only external-holds accounting from this reconciliation snapshot.
+            await self._update_external_holds_from_order_snapshot(exchange_orders)
             if missing:
                 self.logger().warning(
                     f"Post-reconnect reconciliation: {len(missing)} tracked orders "
@@ -279,6 +298,66 @@ class NonkycExchange(ExchangePyBase):
             # Now try to exit balance settling (balances may already be refreshed)
             self._exit_balance_settling()
 
+    def external_order_holds(self, trading_pair: str) -> Dict[str, Decimal]:
+        """Balance held by untracked (manual/external) active exchange orders for the pair.
+        Returns {"quote": Decimal, "base": Decimal}; zeros when no snapshot has run or no
+        external orders exist. Read-only accounting — feeds the ladder understatement check."""
+        holds = self._external_order_holds.get(trading_pair)
+        if holds is None:
+            return {"quote": Decimal("0"), "base": Decimal("0")}
+        return dict(holds)
+
+    async def _update_external_holds_from_order_snapshot(self, orders: List[Dict[str, Any]]):
+        """Recompute `_external_order_holds` from a full open-orders snapshot (the REST
+        post-reconnect reconciliation response, or the subscribeReports ack `result`).
+
+        For each ACTIVE order not tracked locally (matched by neither exchange id nor
+        client/userProvidedId — the latter covers UNKNOWN-sentinel orders):
+          BUY:  quote hold = price × (quantity − executedQuantity)
+          SELL: base hold  = remaining quantity
+        The dict is REPLACED wholesale so holds of orders that resolved since the last
+        snapshot are cleared. NO cancellation, NO tracking-adoption."""
+        if not isinstance(orders, list):
+            return
+        tracked = self._order_tracker.active_orders
+        tracked_exchange_ids = {o.exchange_order_id for o in tracked.values() if o.exchange_order_id}
+        tracked_client_ids = set(tracked.keys())
+        holds: Dict[str, Dict[str, Decimal]] = {}
+        for eo in orders:
+            if not isinstance(eo, dict):
+                continue
+            try:
+                if eo.get("isActive") is False:
+                    continue
+                eo_id = str(eo.get("id") or "")
+                client_id = str(eo.get("userProvidedId") or "")
+                if (eo_id and eo_id in tracked_exchange_ids) or (client_id and client_id in tracked_client_ids):
+                    continue
+                symbol = eo.get("symbol")
+                if not symbol and isinstance(eo.get("market"), dict):
+                    symbol = eo["market"].get("symbol")
+                if not symbol:
+                    continue
+                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=str(symbol))
+                quantity = Decimal(str(eo.get("quantity", "0")))
+                executed = Decimal(str(eo.get("executedQuantity") or "0"))
+                remaining = quantity - executed
+                if remaining <= 0:
+                    continue
+                pair_holds = holds.setdefault(
+                    trading_pair, {"quote": Decimal("0"), "base": Decimal("0")})
+                side = str(eo.get("side", "")).lower()
+                if side == "buy":
+                    price = Decimal(str(eo.get("price", "0")))
+                    pair_holds["quote"] += price * remaining
+                elif side == "sell":
+                    pair_holds["base"] += remaining
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                self.logger().debug(
+                    f"Skipping malformed order in external-holds snapshot: {eo}", exc_info=True)
+                continue
+        self._external_order_holds = holds
+
     def _on_nonce_error_detected(self):
         """Set a short cooldown on private REST requests after nonce error."""
         self._nonce_error_cooldown_until = time.time() + 2.0
@@ -296,13 +375,16 @@ class NonkycExchange(ExchangePyBase):
             pass
         try:
             import json
+            import logging as _logging
             event = {
                 "event_type": event_type,
                 "connector": "nonkyc",
                 "timestamp_ms": int(time.time() * 1e3),
                 **payload
             }
-            self.logger().info(f"[STRUCTURED_EVENT] {json.dumps(event)}")
+            json_str = json.dumps(event)
+            self.logger().info(f"[STRUCTURED_EVENT] {json_str}")
+            _logging.getLogger("hummingbot.structured_events").info(json_str)
         except Exception:
             pass
 
@@ -576,7 +658,7 @@ class NonkycExchange(ExchangePyBase):
             is_server_overloaded = ("503" in error_description
                                     and "Unknown error, please check your request or try again later." in error_description)
             if is_server_overloaded:
-                o_id = "UNKNOWN"
+                o_id = self.UNKNOWN_EXCHANGE_ORDER_ID
                 transact_time = self._time_synchronizer.time()
             else:
                 raise
@@ -644,6 +726,17 @@ class NonkycExchange(ExchangePyBase):
                         "adjusted": str(adjusted),
                         "order_id": order.client_order_id,
                     })
+            elif order.price is None or order.price.is_nan():
+                # NKC-6: market BUY orders carry no price (None/NaN) — `amount * price` raised into
+                # the non-fatal except on EVERY market buy, so no local hold was ever recorded.
+                # Without a price there is nothing sound to hold locally; skip quietly and let the
+                # WS balanceUpdate / REST poll report the real hold.
+                # NOTE: NonKYC market-buy quantity semantics (base vs quote denomination) are
+                # UNVERIFIED against the live API — confirm before any strategy uses MARKET buys.
+                self.logger().debug(
+                    f"Skipping local balance pre-adjust for {order.client_order_id}: "
+                    f"no valid order price (market order)."
+                )
             else:
                 # Buy order: exchange holds quote asset (amount * price + fee)
                 current = self._account_available_balances.get(quote_asset, Decimal("0"))
@@ -768,7 +861,7 @@ class NonkycExchange(ExchangePyBase):
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         cancel_id = tracked_order.exchange_order_id
-        if not cancel_id or cancel_id == "UNKNOWN":
+        if not cancel_id or cancel_id == self.UNKNOWN_EXCHANGE_ORDER_ID:
             # Fallback: NonKYC API accepts cancel by userProvidedId
             cancel_id = tracked_order.client_order_id
             self.logger().info(
@@ -1124,10 +1217,14 @@ class NonkycExchange(ExchangePyBase):
             self._trading_rules[trading_rule.trading_pair] = trading_rule
 
     async def _status_polling_loop_fetch_updates(self):
+        # NKC-7: try/finally — an exception mid-cycle previously left the flag stuck True,
+        # permanently disabling per-order fill recovery in _all_trade_updates_for_order.
         self._bulk_fills_fetched_this_cycle = True
-        await self._update_order_fills_from_trades()
-        await super()._status_polling_loop_fetch_updates()
-        self._bulk_fills_fetched_this_cycle = False
+        try:
+            await self._update_order_fills_from_trades()
+            await super()._status_polling_loop_fetch_updates()
+        finally:
+            self._bulk_fills_fetched_this_cycle = False
 
     async def _update_trading_fees(self):
         """
@@ -1308,6 +1405,9 @@ class NonkycExchange(ExchangePyBase):
                                     f"Could not parse quote asset from symbol '{symbol}' in trade report. Skipping.")
                                 continue
                         if tracked_order is not None:
+                            # NKC-1(b): a WS report carries the real exchange id — repair the
+                            # "UNKNOWN" placement sentinel so REST polling/cancel can use it.
+                            self._repair_unknown_exchange_order_id(tracked_order, message_params.get("id"))
                             fee_token, fee_amount = self._extract_fee_token_and_amount(message_params, quote_asset)
                             fee = TradeFeeBase.new_spot_fee(
                                 fee_schema=self.trade_fee_schema(),
@@ -1365,7 +1465,11 @@ class NonkycExchange(ExchangePyBase):
 
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
-                        new_state = CONSTANTS.ORDER_STATE.get(message_params["status"], OrderState.OPEN)
+                        # NKC-1(b): repair the "UNKNOWN" placement sentinel from the WS report.
+                        self._repair_unknown_exchange_order_id(tracked_order, message_params.get("id"))
+                        # NKC-9: unknown statuses coerce to OPEN with a rate-limited WARNING.
+                        new_state = self._order_state_for_status(
+                            message_params["status"], client_order_id, "ws")
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=message_params["updatedAt"] * 1e-3,
@@ -1458,7 +1562,10 @@ class NonkycExchange(ExchangePyBase):
                         client_order_id = str(order_data.get("userProvidedId", ""))
                         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                         if tracked_order is not None:
-                            new_state = CONSTANTS.ORDER_STATE.get(order_data.get("status", ""), OrderState.OPEN)
+                            # NKC-1(b) + NKC-9 (see the report branch above).
+                            self._repair_unknown_exchange_order_id(tracked_order, order_data.get("id"))
+                            new_state = self._order_state_for_status(
+                                order_data.get("status", ""), client_order_id, "ws")
                             order_update = OrderUpdate(
                                 trading_pair=tracked_order.trading_pair,
                                 update_timestamp=order_data.get("updatedAt", 0) * 1e-3,
@@ -1467,6 +1574,20 @@ class NonkycExchange(ExchangePyBase):
                                 exchange_order_id=str(order_data.get("id", "")),
                             )
                             self._order_tracker.process_order_update(order_update)
+
+                # NKC-2: server error frames ({"id": N, "error": {...}}) used to fall through
+                # every branch unlogged — a rejected subscription or failed request was
+                # invisible. Catch-all WARNING, rate-limited to one per 30s window.
+                elif "error" in event_message:
+                    now = time.time()
+                    if now - self._ws_error_frame_last_warn >= self._UNKNOWN_STATUS_WARN_INTERVAL_S:
+                        self._ws_error_frame_last_warn = now
+                        error = event_message.get("error") or {}
+                        self.logger().warning(
+                            f"NonKYC WS error frame (unhandled): id={event_message.get('id')} "
+                            f"code={error.get('code') if isinstance(error, dict) else None} "
+                            f"message={error.get('message') if isinstance(error, dict) else error}"
+                        )
 
             except asyncio.CancelledError:
                 raise
@@ -1496,129 +1617,142 @@ class NonkycExchange(ExchangePyBase):
             query_time = int(self._last_trades_poll_nonkyc_timestamp * 1e3)
             self._last_trades_poll_nonkyc_timestamp = self._time_synchronizer.time()
             order_by_exchange_id_map = {}
+            sentinel_orders = []
             for order in self._order_tracker.all_fillable_orders.values():
-                if order.exchange_order_id is not None:
-                    order_by_exchange_id_map[str(order.exchange_order_id)] = order
-            tasks = []
-            trading_pairs = self.trading_pairs
-            for trading_pair in trading_pairs:
-                symbol = str(await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair))
-                params = {
-                    "symbol": symbol
-                }
+                if order.exchange_order_id is None:
+                    continue
+                if str(order.exchange_order_id) == self.UNKNOWN_EXCHANGE_ORDER_ID:
+                    sentinel_orders.append(order)
+                    continue
+                order_by_exchange_id_map[str(order.exchange_order_id)] = order
+            # NKC-1(c): never key the fill map under the "UNKNOWN" placement sentinel — a real
+            # trade's orderid can never match it, so its fills would fall into the untracked branch
+            # and be dropped. Resolve the real id by client id first (repairs the tracked order);
+            # orders that cannot be resolved yet stay out of the map for this cycle.
+            for order in sentinel_orders:
+                repaired_id = await self._resolve_unknown_exchange_order_id(order)
+                if repaired_id is not None:
+                    order_by_exchange_id_map[repaired_id] = order
 
-                if self._last_poll_timestamp > 0:
-                    params["since"] = query_time
-                else:
-                    # First poll: /account/trades is GLOBAL, so omitting `since` pulls the
-                    # account's entire trade history on startup. Floor to the last 3 days.
-                    params["since"] = int((self._time_synchronizer.time() - 3 * 24 * 3600) * 1e3)
-                tasks.append(self._api_get(
+            # NKC-8: /account/trades IGNORES the symbol param and returns the GLOBAL account trade
+            # list, so the previous per-pair fan-out fetched N identical copies of the same list
+            # every cycle (20 weight each). Fetch ONCE per cycle; attribution below is by orderid /
+            # market.symbol — never a poll pair — so the dedupe makes this behavior-neutral.
+            params = {}
+            if self._last_poll_timestamp > 0:
+                params["since"] = query_time
+            else:
+                # First poll: /account/trades is GLOBAL, so omitting `since` pulls the
+                # account's entire trade history on startup. Floor to the last 3 days.
+                params["since"] = int((self._time_synchronizer.time() - 3 * 24 * 3600) * 1e3)
+
+            self.logger().debug(
+                f"Polling for order fills (single global trades fetch covering "
+                f"{len(self.trading_pairs or [])} trading pairs).")
+            try:
+                trades = await self._api_get(
                     path_url=CONSTANTS.ACCOUNT_TRADES_PATH_URL,
                     params=params,
-                    is_auth_required=True))
+                    is_auth_required=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as request_error:
+                self.logger().network(
+                    f"Error fetching account trades update: {request_error}.",
+                    app_warning_msg="Failed to fetch trade updates for nonkyc."
+                )
+                return
+            if not isinstance(trades, list):
+                return
 
-            self.logger().debug(f"Polling for order fills of {len(tasks)} trading pairs.")
-            results = await safe_gather(*tasks, return_exceptions=True)
-
-            # IMPORTANT: /account/trades IGNORES the symbol param and returns the GLOBAL account trade
-            # list, so every per-pair response is the same full list. Attribute each trade to its OWN
-            # order (by orderid) / its OWN market (resolved from market.symbol) -- NEVER the poll pair --
-            # and dedupe by trade id so each trade is processed exactly once. This eliminates both the
-            # cross-pair fill leak and the duplicate-fill re-insert.
-            for trades, poll_pair in zip(results, trading_pairs):
-                if isinstance(trades, Exception):
-                    self.logger().network(
-                        f"Error fetching trades update for {poll_pair}: {trades}.",
-                        app_warning_msg=f"Failed to fetch trade update for {poll_pair}."
-                    )
+            # Attribute each trade to its OWN order (by orderid) / its OWN market (resolved from
+            # market.symbol) -- NEVER a poll pair -- and dedupe by trade id so each trade is
+            # processed exactly once. This eliminates both the cross-pair fill leak and the
+            # duplicate-fill re-insert.
+            for trade in trades:
+                trade_id = str(trade["id"])
+                if self._is_trade_processed(trade_id):
                     continue
-                if not isinstance(trades, list):
-                    continue
-                for trade in trades:
-                    trade_id = str(trade["id"])
-                    if self._is_trade_processed(trade_id):
+                exchange_order_id = str(trade["orderid"])
+                if exchange_order_id in order_by_exchange_id_map:
+                    # Fill for a currently-tracked order. The ORDER (not the poll pair) is
+                    # authoritative for the trading pair.
+                    tracked_order = order_by_exchange_id_map[exchange_order_id]
+                    order_pair = tracked_order.trading_pair
+                    # Secondary guard: if the trade's market resolves and disagrees with the order's
+                    # pair, skip it -- never attribute a trade to the wrong market.
+                    resolved_pair = await self._safe_resolve_trading_pair(trade)
+                    if resolved_pair is not None and resolved_pair != order_pair:
+                        self.logger().debug(
+                            f"Skipping trade {trade_id}: market {resolved_pair} != order pair {order_pair}.")
                         continue
-                    exchange_order_id = str(trade["orderid"])
-                    if exchange_order_id in order_by_exchange_id_map:
-                        # Fill for a currently-tracked order. The ORDER (not the poll pair) is
-                        # authoritative for the trading pair.
-                        tracked_order = order_by_exchange_id_map[exchange_order_id]
-                        order_pair = tracked_order.trading_pair
-                        # Secondary guard: if the trade's market resolves and disagrees with the order's
-                        # pair, skip it -- never attribute a trade to the wrong market.
-                        resolved_pair = await self._safe_resolve_trading_pair(trade)
-                        if resolved_pair is not None and resolved_pair != order_pair:
-                            self.logger().debug(
-                                f"Skipping trade {trade_id}: market {resolved_pair} != order pair {order_pair}.")
-                            continue
-                        _, quote_asset = split_hb_trading_pair(trading_pair=order_pair)
-                        fee_token, fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=tracked_order.trade_type,
-                            percent_token=fee_token,
-                            flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
-                        )
-                        # Derive maker/taker from side vs triggeredBy
-                        _side = str(trade.get("side", "")).lower()
-                        _triggered_by = str(trade.get("triggeredBy", "")).lower()
-                        _is_taker = (_side == _triggered_by) if (_side and _triggered_by) else True
-                        trade_update = TradeUpdate(
-                            trade_id=trade_id,
-                            client_order_id=tracked_order.client_order_id,
-                            exchange_order_id=exchange_order_id,
-                            trading_pair=order_pair,
-                            fee=fee,
-                            fill_base_amount=Decimal(trade["quantity"]),
-                            fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
-                            fill_price=Decimal(trade["price"]),
-                            fill_timestamp=trade["timestamp"] * 1e-3,
-                            is_taker=_is_taker,
-                            received_timestamp_ms=int(time.time() * 1e3),
-                            source_channel="rest_poll",
-                        )
-                        self._order_tracker.process_trade_update(trade_update)
-                        # Tag fill source for provenance tracking
-                        tracked_order.fill_sources[trade_id] = "rest_poll"
-                        self._mark_trade_processed(trade_id)
-                    else:
-                        # Fill for an order registered in the DB but no longer tracked. Recover it ONLY
-                        # for the trade's ACTUAL market (resolved from market.symbol) -- never fan it out
-                        # across every connector market, and never use the poll pair.
-                        resolved_pair = await self._safe_resolve_trading_pair(trade)
-                        if resolved_pair is None:
-                            self.logger().debug(
-                                f"Skipping untracked trade {trade_id}: cannot resolve its market.")
-                            continue
-                        if self.is_confirmed_new_order_filled_event(trade_id, exchange_order_id, resolved_pair):
-                            self._current_trade_fills.add(TradeFillOrderDetails(
-                                market=self.display_name,
-                                exchange_trade_id=trade_id,
-                                symbol=resolved_pair))
-                            _, quote_asset = split_hb_trading_pair(trading_pair=resolved_pair)
-                            _fee_token, _fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
-                            _trade_type = TradeType.BUY if str(trade["side"]).lower() == "buy" else TradeType.SELL
-                            self.trigger_event(
-                                MarketEvent.OrderFilled,
-                                OrderFilledEvent(
-                                    timestamp=float(trade["timestamp"]) * 1e-3,
-                                    order_id=self._exchange_order_ids.get(exchange_order_id, None),
-                                    trading_pair=resolved_pair,
+                    _, quote_asset = split_hb_trading_pair(trading_pair=order_pair)
+                    fee_token, fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
+                    fee = TradeFeeBase.new_spot_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        trade_type=tracked_order.trade_type,
+                        percent_token=fee_token,
+                        flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
+                    )
+                    # Derive maker/taker from side vs triggeredBy
+                    _side = str(trade.get("side", "")).lower()
+                    _triggered_by = str(trade.get("triggeredBy", "")).lower()
+                    _is_taker = (_side == _triggered_by) if (_side and _triggered_by) else True
+                    trade_update = TradeUpdate(
+                        trade_id=trade_id,
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=exchange_order_id,
+                        trading_pair=order_pair,
+                        fee=fee,
+                        fill_base_amount=Decimal(trade["quantity"]),
+                        fill_quote_amount=Decimal(trade["quantity"]) * Decimal(trade["price"]),
+                        fill_price=Decimal(trade["price"]),
+                        fill_timestamp=trade["timestamp"] * 1e-3,
+                        is_taker=_is_taker,
+                        received_timestamp_ms=int(time.time() * 1e3),
+                        source_channel="rest_poll",
+                    )
+                    self._order_tracker.process_trade_update(trade_update)
+                    # Tag fill source for provenance tracking
+                    tracked_order.fill_sources[trade_id] = "rest_poll"
+                    self._mark_trade_processed(trade_id)
+                else:
+                    # Fill for an order registered in the DB but no longer tracked. Recover it ONLY
+                    # for the trade's ACTUAL market (resolved from market.symbol) -- never fan it out
+                    # across every connector market, and never use the poll pair.
+                    resolved_pair = await self._safe_resolve_trading_pair(trade)
+                    if resolved_pair is None:
+                        self.logger().debug(
+                            f"Skipping untracked trade {trade_id}: cannot resolve its market.")
+                        continue
+                    if self.is_confirmed_new_order_filled_event(trade_id, exchange_order_id, resolved_pair):
+                        self._current_trade_fills.add(TradeFillOrderDetails(
+                            market=self.display_name,
+                            exchange_trade_id=trade_id,
+                            symbol=resolved_pair))
+                        _, quote_asset = split_hb_trading_pair(trading_pair=resolved_pair)
+                        _fee_token, _fee_amount = self._extract_fee_token_and_amount(trade, quote_asset)
+                        _trade_type = TradeType.BUY if str(trade["side"]).lower() == "buy" else TradeType.SELL
+                        self.trigger_event(
+                            MarketEvent.OrderFilled,
+                            OrderFilledEvent(
+                                timestamp=float(trade["timestamp"]) * 1e-3,
+                                order_id=self._exchange_order_ids.get(exchange_order_id, None),
+                                trading_pair=resolved_pair,
+                                trade_type=_trade_type,
+                                order_type=OrderType.LIMIT,
+                                price=Decimal(trade["price"]),
+                                amount=Decimal(trade["quantity"]),
+                                trade_fee=TradeFeeBase.new_spot_fee(
+                                    fee_schema=self.trade_fee_schema(),
                                     trade_type=_trade_type,
-                                    order_type=OrderType.LIMIT,
-                                    price=Decimal(trade["price"]),
-                                    amount=Decimal(trade["quantity"]),
-                                    trade_fee=TradeFeeBase.new_spot_fee(
-                                        fee_schema=self.trade_fee_schema(),
-                                        trade_type=_trade_type,
-                                        flat_fees=[TokenAmount(_fee_token, _fee_amount)]
-                                    ),
-                                    exchange_trade_id=trade_id
-                                ))
-                            self._mark_trade_processed(trade_id)
-                            self.logger().info(
-                                f"Recreating missing trade in TradeFill (pair={resolved_pair}): {trade}")
+                                    flat_fees=[TokenAmount(_fee_token, _fee_amount)]
+                                ),
+                                exchange_trade_id=trade_id
+                            ))
+                        self._mark_trade_processed(trade_id)
+                        self.logger().info(
+                            f"Recreating missing trade in TradeFill (pair={resolved_pair}): {trade}")
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         # Skip per-order fill fetching if bulk _update_order_fills_from_trades()
@@ -1630,8 +1764,14 @@ class NonkycExchange(ExchangePyBase):
 
         trade_updates = []
 
-        if order.exchange_order_id is not None:
-            exchange_order_id = str(order.exchange_order_id)
+        order_exchange_id = order.exchange_order_id
+        if order_exchange_id is not None and str(order_exchange_id) == self.UNKNOWN_EXCHANGE_ORDER_ID:
+            # NKC-1(c): the "UNKNOWN" placement sentinel can never match a trade's orderid —
+            # resolve the real id by client id first (repairs the tracked order on success).
+            order_exchange_id = await self._resolve_unknown_exchange_order_id(order)
+
+        if order_exchange_id is not None:
+            exchange_order_id = str(order_exchange_id)
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
             base_asset, quote_asset = split_hb_trading_pair(trading_pair=order.trading_pair)
 
@@ -1686,20 +1826,97 @@ class NonkycExchange(ExchangePyBase):
 
         return trade_updates
 
+    def _repair_unknown_exchange_order_id(self, tracked_order: InFlightOrder, exchange_order_id: Any) -> None:
+        """NKC-1(b): overwrite the "UNKNOWN" placement sentinel with the real exchange id carried by
+        a later WS/REST update. InFlightOrder.update_with_order_update only repairs a None id, so
+        the sentinel would otherwise stick forever and keep poisoning the REST status poll."""
+        if exchange_order_id is None:
+            return
+        exchange_order_id = str(exchange_order_id)
+        if not exchange_order_id or exchange_order_id == self.UNKNOWN_EXCHANGE_ORDER_ID:
+            return
+        if tracked_order.exchange_order_id == self.UNKNOWN_EXCHANGE_ORDER_ID:
+            tracked_order.update_exchange_order_id(exchange_order_id)
+            self.logger().info(
+                f"Repaired exchange order id for {tracked_order.client_order_id}: "
+                f"{self.UNKNOWN_EXCHANGE_ORDER_ID} -> {exchange_order_id}")
+
+    async def _resolve_unknown_exchange_order_id(self, order: InFlightOrder) -> Optional[str]:
+        """NKC-1(c): resolve an order stuck on the "UNKNOWN" placement sentinel to its real exchange
+        id via GET /getorder/{client_order_id} (the endpoint accepts the userProvidedId as a path
+        segment — live-verified 2026-07-14; the ?userProvidedId= query form 404s). Returns the real
+        id (repairing the tracked order) or None if the order cannot be resolved yet."""
+        try:
+            order_data = await self._api_get(
+                path_url=f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order.client_order_id}",
+                is_auth_required=True,
+                limit_id=CONSTANTS.ORDER_INFO_PATH_URL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().debug(
+                f"Could not resolve exchange order id for {order.client_order_id} "
+                f"(placement outcome still unknown): {repr(e)}")
+            return None
+        raw_id = order_data.get("id") if isinstance(order_data, dict) else None
+        if raw_id is None or str(raw_id) in ("", self.UNKNOWN_EXCHANGE_ORDER_ID):
+            return None
+        self._repair_unknown_exchange_order_id(order, raw_id)
+        return str(raw_id)
+
+    def _order_state_for_status(self, raw_status: Any, client_order_id: Optional[str], source: str) -> OrderState:
+        """NKC-9: map a NonKYC status string to an OrderState. Unknown statuses coerce to OPEN
+        (fail-open on state: never silently terminalize an order on an unrecognized spelling) with
+        a rate-limited WARNING; repeated unknown REST statuses for the same order additionally
+        trigger a reconciliation log."""
+        new_state = CONSTANTS.ORDER_STATE.get(raw_status)
+        if new_state is not None:
+            if client_order_id is not None:
+                self._unknown_status_counts.pop(client_order_id, None)
+            return new_state
+        now = time.time()
+        warn_key = f"{source}:{raw_status}"
+        if now - self._unknown_status_last_warn.get(warn_key, 0.0) >= self._UNKNOWN_STATUS_WARN_INTERVAL_S:
+            self._unknown_status_last_warn[warn_key] = now
+            self.logger().warning(
+                f"Unknown order status '{raw_status}' from NonKYC {source} update"
+                f"{f' for order {client_order_id}' if client_order_id else ''} — treating as OPEN.")
+        if source == "rest" and client_order_id is not None:
+            count = self._unknown_status_counts.get(client_order_id, 0) + 1
+            self._unknown_status_counts[client_order_id] = count
+            if count >= 2:
+                recon_key = f"reconcile:{client_order_id}"
+                if now - self._unknown_status_last_warn.get(recon_key, 0.0) >= self._UNKNOWN_STATUS_WARN_INTERVAL_S:
+                    self._unknown_status_last_warn[recon_key] = now
+                    self.logger().warning(
+                        f"Order {client_order_id} has returned unknown status '{raw_status}' {count} "
+                        f"consecutive times via REST — its local state may be stale; reconcile it "
+                        f"manually against the exchange.")
+        return OrderState.OPEN
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        # Prefer exchange_order_id (NonKYC internal id) when available;
-        # fall back to client_order_id (userProvidedId) for orders not yet confirmed
-        order_id_for_query = tracked_order.exchange_order_id or tracked_order.client_order_id
+        # Prefer exchange_order_id (NonKYC internal id) when available; fall back to
+        # client_order_id (userProvidedId) for orders not yet confirmed. The "UNKNOWN"
+        # placement sentinel (ambiguous 503 on createorder) is NOT a queryable id — polling
+        # /getorder/UNKNOWN returns 400/20002 "Order not found", which falsely feeds the
+        # lost-order counter and gets a LIVE order marked LOST/FAILED (NKC-1a). /getorder
+        # accepts the userProvidedId as a path segment (live-verified 2026-07-14).
+        exchange_order_id = tracked_order.exchange_order_id
+        if not exchange_order_id or exchange_order_id == self.UNKNOWN_EXCHANGE_ORDER_ID:
+            order_id_for_query = tracked_order.client_order_id
+        else:
+            order_id_for_query = exchange_order_id
         updated_order_data = await self._api_get(
             path_url=f"{CONSTANTS.ORDER_INFO_PATH_URL}/{order_id_for_query}",
             is_auth_required=True,
             limit_id=CONSTANTS.ORDER_INFO_PATH_URL)
 
+        # NKC-1(b): the response carries the real exchange id — repair the sentinel so later
+        # polls/cancels use it.
+        self._repair_unknown_exchange_order_id(tracked_order, updated_order_data.get("id"))
+
         raw_status = updated_order_data["status"]
-        new_state = CONSTANTS.ORDER_STATE.get(raw_status)
-        if new_state is None:
-            self.logger().warning(f"Unknown order state from NonKYC: {raw_status}")
-            new_state = OrderState.OPEN
+        new_state = self._order_state_for_status(raw_status, tracked_order.client_order_id, "rest")
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -1716,6 +1933,9 @@ class NonkycExchange(ExchangePyBase):
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
 
+        # NKC-4: request-start reference for the pre-adjust freshness check below. Uses time.time()
+        # (not monotonic) because _pre_adjusted_assets timestamps come from time.time().
+        poll_start_time = time.time()
         t_start = time.monotonic()
         balances = await self._api_get(
             path_url=CONSTANTS.USER_BALANCES_PATH_URL,
@@ -1736,6 +1956,21 @@ class NonkycExchange(ExchangePyBase):
             # Total trading balance = available + held (pending excluded intentionally)
             available_balance = Decimal(balance_entry["available"])
             total_balance = Decimal(balance_entry["available"]) + Decimal(balance_entry["held"])
+            remote_asset_names.add(asset_name)
+
+            # NKC-4 (LOG-3): a REST snapshot requested BEFORE a local pre-adjust hold was applied
+            # must not clobber that fresher hold — the stale snapshot otherwise lands ~1s after
+            # order placement and briefly re-inflates available (co-deployed controllers over-place
+            # in that window). Keep the local available; total is unaffected by order holds
+            # (available+held is conserved by placement), so the REST total still applies.
+            pre_adjust_ts = self._pre_adjusted_assets.get(asset_name)
+            if pre_adjust_ts is not None and pre_adjust_ts >= poll_start_time:
+                self.logger().debug(
+                    f"Skipping REST available-balance overwrite for {asset_name}: local pre-adjust "
+                    f"is newer than the REST snapshot request start "
+                    f"({pre_adjust_ts - poll_start_time:+.3f}s).")
+                self._account_balances[asset_name] = total_balance
+                continue
 
             # REST vs WS reconciliation check (LOG 10)
             ws_available = self._account_available_balances.get(asset_name)
@@ -1749,7 +1984,6 @@ class NonkycExchange(ExchangePyBase):
 
             self._account_available_balances[asset_name] = available_balance
             self._account_balances[asset_name] = total_balance
-            remote_asset_names.add(asset_name)
 
         if reconciliation_diffs:
             self.logger().info(
@@ -1851,7 +2085,26 @@ class NonkycExchange(ExchangePyBase):
                 base = base or parts[0]
                 quote = quote or parts[1]
 
-            mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
+            # NKC-5: a base/quote containing a HB or exchange separator would corrupt the
+            # derived trading pair (and any later split of it). 0 occurrences in the 347
+            # live markets — cheap insurance against a future listing.
+            if any(sep in str(base) or sep in str(quote) for sep in ("-", "_", "/")):
+                self.logger().warning(
+                    f"Skipping market {symbol}: base '{base}' or quote '{quote}' "
+                    f"contains a separator character"
+                )
+                continue
+
+            try:
+                mapping[symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
+            except ValueDuplicationError:
+                # NKC-5: a second market resolving to the same HB pair used to crash the
+                # whole symbol-map build (connector dead). Keep the first mapping.
+                self.logger().warning(
+                    f"Duplicate trading pair for market {symbol} "
+                    f"({combine_to_hb_trading_pair(base=base, quote=quote)}): "
+                    f"keeping the first mapping"
+                )
         self._set_trading_pair_symbol_map(mapping)
 
     # How long one bulk /tickers snapshot serves price lookups. Half the hummingbot-api

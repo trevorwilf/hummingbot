@@ -67,3 +67,22 @@ class LiquidityMiningStartTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.strategy._volatility_to_spread_multiplier, Decimal("1.1"))
         self.assertEqual(self.strategy._max_spread, Decimal("0.04"))
         self.assertEqual(self.strategy._max_order_age, 300.)
+
+    def notify(self, message):
+        self.notifications.append(message)
+
+    async def test_mixed_token_position_markets_warn_about_dropped_markets(self):
+        """Would have caught ARB-16: markets dropped by the token-position selection were
+        silently excluded from trading."""
+        strategy_cmap.get("markets").value = "BTC-USDT,USDT-BRL"
+        await strategy_start.start(self)
+        # Only the quote-position market is traded
+        self.assertEqual(["BTC-USDT"], list(self.strategy._market_infos.keys()))
+        # ... and the operator is warned about the dropped one
+        self.assertTrue(any("USDT-BRL" in message for message in self.notifications))
+
+    async def test_uniform_token_position_markets_do_not_warn(self):
+        strategy_cmap.get("markets").value = "BTC-USDT,ETH-USDT"
+        await strategy_start.start(self)
+        self.assertEqual(["BTC-USDT", "ETH-USDT"], list(self.strategy._market_infos.keys()))
+        self.assertEqual([], self.notifications)

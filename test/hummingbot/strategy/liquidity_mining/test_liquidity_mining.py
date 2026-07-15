@@ -577,3 +577,85 @@ class LiquidityMiningTest(unittest.TestCase):
 
         self.assertIn("Test message", cli_logs)
         self.assertIn(f"({pd.Timestamp.fromtimestamp(timestamp)}) Test message 2", cli_logs)
+
+    @unittest.mock.patch('hummingbot.strategy.liquidity_mining.liquidity_mining.build_trade_fee')
+    def test_nan_mid_price_market_skipped_for_the_tick(self, estimate_fee_mock):
+        """Would have caught ARB-9: a NaN mid price (empty book) poisoned the mid-price window and
+        produced NaN-priced proposals. The market must be skipped for the tick only."""
+        estimate_fee_mock.return_value = AddedToCostTradeFee(
+            percent=0, flat_fees=[TokenAmount('ETH', Decimal(0.00005))]
+        )
+        strategy = self.default_strategy
+        self.clock.add_iterator(strategy)
+        self.clock.backtest_til(self.start_timestamp + 2)
+
+        # Empty the ETH-BTC book -> its mid price becomes NaN
+        order_book: OrderBook = self.market.get_order_book("ETH-BTC")
+        update_id = order_book.last_diff_uid + 1
+        from hummingbot.core.data_type.order_book_row import OrderBookRow
+        bid_diffs = [OrderBookRow(r.price, 0, update_id) for r in order_book.bid_entries()]
+        ask_diffs = [OrderBookRow(r.price, 0, update_id) for r in order_book.ask_entries()]
+        order_book.apply_diffs(bid_diffs, ask_diffs, update_id)
+        self.assertTrue(self.market_infos["ETH-BTC"].get_mid_price().is_nan())
+
+        # The NaN mid is not appended to the volatility window
+        eth_btc_samples = len(strategy._mid_prices["ETH-BTC"])
+        eth_usdt_samples = len(strategy._mid_prices["ETH-USDT"])
+        strategy.update_mid_prices()
+        self.assertEqual(eth_btc_samples, len(strategy._mid_prices["ETH-BTC"]))
+        self.assertEqual(eth_usdt_samples + 1, len(strategy._mid_prices["ETH-USDT"]))
+
+        # Volatility update does not raise, and the NaN market produces no proposal this tick
+        strategy.update_volatility()
+        proposals = strategy.create_base_proposals()
+        self.assertEqual(["ETH-USDT"], [p.market for p in proposals])
+
+    def test_update_volatility_filters_nan_samples(self):
+        """Would have caught ARB-9: a NaN sample in the window made max()/min() raise
+        InvalidOperation on every tick for up to interval * period seconds."""
+        strategy = self.default_strategy
+        strategy._mid_prices["ETH-USDT"] = [Decimal("100"), Decimal("nan"), Decimal("110")] * 200
+        strategy._mid_prices["ETH-BTC"] = [Decimal("nan")] * 600
+        # Must not raise
+        strategy.update_volatility()
+        self.assertFalse(strategy._volatility["ETH-USDT"].is_nan())
+        self.assertTrue(strategy._volatility["ETH-BTC"].is_nan())
+
+    @unittest.mock.patch('hummingbot.strategy.liquidity_mining.liquidity_mining.build_trade_fee')
+    def test_not_ready_with_leftover_orders_does_not_allocate_budgets_or_trade(self, estimate_fee_mock):
+        """Would have caught ARB-12: with leftover (restored) orders on the exchange the strategy
+        used to fall through, allocating budgets and trading every tick while not ready."""
+        estimate_fee_mock.return_value = AddedToCostTradeFee(
+            percent=0, flat_fees=[TokenAmount('ETH', Decimal(0.00005))]
+        )
+        strategy = self.default_strategy
+        # A leftover order from a previous session, unknown to the strategy
+        from hummingbot.core.data_type.common import OrderType
+        self.market.buy("ETH-USDT", Decimal("1"), OrderType.LIMIT, Decimal("90"))
+        self.assertEqual(1, len(self.market.limit_orders))
+
+        strategy.tick(self.start_timestamp)
+
+        self.assertFalse(strategy._ready_to_trade)
+        # Pre-fix this tick would have allocated budgets and placed orders
+        self.assertEqual({}, strategy.sell_budgets)
+        self.assertEqual({}, strategy.buy_budgets)
+        self.assertEqual(0, len(strategy.active_orders))
+
+    @unittest.mock.patch('hummingbot.strategy.liquidity_mining.liquidity_mining.build_trade_fee')
+    def test_budgets_allocated_once_on_ready_transition(self, estimate_fee_mock):
+        """ARB-12: budgets are allocated exactly once when the strategy becomes ready, and fill
+        adjustments are not wiped by later ticks."""
+        estimate_fee_mock.return_value = AddedToCostTradeFee(
+            percent=0, flat_fees=[TokenAmount('ETH', Decimal(0.00005))]
+        )
+        strategy = self.default_strategy
+        self.clock.add_iterator(strategy)
+        self.clock.backtest_til(self.start_timestamp + 2)
+        self.assertTrue(strategy._ready_to_trade)
+        self.assertIn("ETH-USDT", strategy.buy_budgets)
+
+        # Simulate a fill-driven budget adjustment - later ticks must not wipe it
+        strategy._buy_budgets["ETH-USDT"] = Decimal("123")
+        self.clock.backtest_til(self.start_timestamp + 4)
+        self.assertEqual(Decimal("123"), strategy._buy_budgets["ETH-USDT"])

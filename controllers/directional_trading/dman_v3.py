@@ -1,4 +1,4 @@
-import time
+import math
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
@@ -29,7 +29,7 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
             "prompt": "Enter the trading pair for the candles data, leave empty to use the same trading pair as the connector: ",
             "prompt_on_new": True})
     interval: str = Field(
-        default="3m",
+        default="5m",
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True})
@@ -50,9 +50,15 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
         default="0.001,0.018,0.15,0.25",
         json_schema_extra={
             "prompt": "Enter the spreads for each DCA level (comma-separated) if dynamic_spread=True this value "
-                      "will multiply the Bollinger Bands width, e.g. if the Bollinger Bands width is 0.1 (10%)"
-                      "and the spread is 0.2, the distance of the order to the current price will be 0.02 (2%) ",
+                      "will multiply BBB/200 (half the BB width fraction), e.g. if the Bollinger Bands width is "
+                      "10 (10%) and the spread is 0.2, the distance of the order to the current price will be "
+                      "0.01 (1%) ",
             "prompt_on_new": True},
+    )
+    min_spread_multiplier: Decimal = Field(
+        default=Decimal("0.01"), gt=0,
+        json_schema_extra={
+            "prompt": "Enter the floor for the dynamic spread multiplier (e.g., 0.01): "},
     )
     dca_amounts_pct: List[Decimal] = Field(
         default=None,
@@ -90,7 +96,12 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
     @classmethod
     def validate_spreads(cls, v):
         if isinstance(v, str):
-            return [Decimal(val) for val in v.split(",")]
+            v = [Decimal(val) for val in v.split(",")]
+        if isinstance(v, list):
+            spreads = [Decimal(str(val)) for val in v]
+            if any(spread <= 0 for spread in spreads):
+                raise ValueError("All DCA spreads must be positive")
+            return spreads
         return v
 
     @field_validator('dca_amounts_pct', mode="before")
@@ -100,12 +111,16 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
         if isinstance(v, str):
             if v == "":
                 return [Decimal('1.0') / len(spreads) for _ in spreads]
-            amounts = [Decimal(val) for val in v.split(",")]
-            if len(amounts) != len(spreads):
-                raise ValueError("Amounts and spreads must have the same length")
-            return amounts
+            v = [Decimal(val) for val in v.split(",")]
         if v is None:
             return [Decimal('1.0') / len(spreads) for _ in spreads]
+        if isinstance(v, list):
+            amounts = [Decimal(str(val)) for val in v]
+            if spreads is not None and len(amounts) != len(spreads):
+                raise ValueError("Amounts and spreads must have the same length")
+            if sum(amounts) <= 0:
+                raise ValueError("Sum of DCA amounts must be positive")
+            return amounts
         return v
 
     @field_validator("candles_connector", mode="before")
@@ -145,7 +160,7 @@ class DManV3Controller(DirectionalTradingControllerBase):
 
     def __init__(self, config: DManV3ControllerConfig, *args, **kwargs):
         self.config = config
-        self.max_records = config.bb_length
+        self.max_records = config.bb_length + 20
         super().__init__(config, *args, **kwargs)
 
     async def update_processed_data(self):
@@ -169,11 +184,38 @@ class DManV3Controller(DirectionalTradingControllerBase):
         self.processed_data["signal"] = df["signal"].iloc[-1]
         self.processed_data["features"] = df
 
+    def _latest_bb_width(self) -> Optional[float]:
+        df = self.processed_data.get("features")
+        if df is None or len(df) == 0:
+            return None
+        column = f"BBB_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+        if column not in df.columns:
+            return None
+        return float(df[column].iloc[-1])
+
+    def _bb_width_ok(self) -> bool:
+        bb_width = self._latest_bb_width()
+        return bb_width is not None and math.isfinite(bb_width) and bb_width > 0
+
+    def can_create_executor(self, signal: int) -> bool:
+        dynamic = self.config.dynamic_order_spread or self.config.dynamic_target
+        if dynamic and not self._bb_width_ok():
+            self.logger().warning("Skipping executor creation: Bollinger band width is zero/NaN "
+                                  "(degenerate flat window) and dynamic spread/target is enabled.")
+            return False
+        return super().can_create_executor(signal)
+
     def get_spread_multiplier(self) -> Decimal:
+        """
+        Dynamic spread multiplier = BBB / 200, i.e. half the BB width expressed
+        as a fraction (BBB is a percentage), floored at config.min_spread_multiplier
+        so a flat window can never collapse spreads, stop-loss or trailing stop to zero.
+        """
         if self.config.dynamic_order_spread:
-            df = self.processed_data["features"]
-            bb_width = df[f"BBB_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"].iloc[-1]
-            return Decimal(bb_width / 200)
+            bb_width = self._latest_bb_width()
+            if bb_width is None or not math.isfinite(bb_width) or bb_width <= 0:
+                return self.config.min_spread_multiplier
+            return max(Decimal(str(bb_width)) / Decimal("200"), self.config.min_spread_multiplier)
         else:
             return Decimal("1.0")
 
@@ -185,7 +227,8 @@ class DManV3Controller(DirectionalTradingControllerBase):
         else:
             prices = [price * (1 + spread * spread_multiplier) for spread in spread]
         if self.config.dynamic_target:
-            stop_loss = self.config.stop_loss * spread_multiplier
+            stop_loss = self.config.stop_loss * spread_multiplier if self.config.stop_loss is not None else None
+            take_profit = self.config.take_profit * spread_multiplier if self.config.take_profit is not None else None
             if self.config.trailing_stop:
                 trailing_stop = TrailingStop(
                     activation_price=self.config.trailing_stop.activation_price * spread_multiplier,
@@ -194,9 +237,10 @@ class DManV3Controller(DirectionalTradingControllerBase):
                 trailing_stop = None
         else:
             stop_loss = self.config.stop_loss
+            take_profit = self.config.take_profit
             trailing_stop = self.config.trailing_stop
         return DCAExecutorConfig(
-            timestamp=time.time(),
+            timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=trade_type,
@@ -205,6 +249,7 @@ class DManV3Controller(DirectionalTradingControllerBase):
             amounts_quote=amounts_quote,
             time_limit=self.config.time_limit,
             stop_loss=stop_loss,
+            take_profit=take_profit,
             trailing_stop=trailing_stop,
             leverage=self.config.leverage,
             activation_bounds=self.config.activation_bounds,

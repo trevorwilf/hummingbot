@@ -1,4 +1,4 @@
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DivisionByZero, InvalidOperation
 from typing import Optional
 
 from hummingbot.core.data_type.common import TradeType
@@ -28,9 +28,14 @@ class InventoryCostPriceDelegate:
                 if record is None or record.base_volume is None or record.quote_volume is None:
                     return None
 
+                # PMM-6: after the base asset is fully sold base_volume is 0 — a bare division
+                # raised DivisionByZero (uncaught) and wedged inventory_cost mode.
+                if record.base_volume == 0:
+                    return None
+
                 try:
                     price = record.quote_volume / record.base_volume
-                except InvalidOperation:
+                except (InvalidOperation, DivisionByZero, ZeroDivisionError):
                     return None
                 return Decimal(price)
 
@@ -62,7 +67,9 @@ class InventoryCostPriceDelegate:
             with session.begin():
                 if fill_event.trade_type == TradeType.SELL:
                     record = InventoryCost.get_record(session, base_asset, quote_asset)
-                    if not record:
+                    # PMM-6: a record with zero base volume would raise DivisionByZero below —
+                    # treat it the same as a missing record.
+                    if not record or not record.base_volume:
                         raise RuntimeError("Sold asset without having inventory price set. This should not happen.")
 
                     # We're keeping initial buy price intact. Profits are not changing inventory price intentionally.
