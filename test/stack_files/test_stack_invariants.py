@@ -153,14 +153,34 @@ class TestPatchBindMountRemoved(unittest.TestCase):
 
 
 class TestProvenanceEmitted(unittest.TestCase):
-    """Boot provenance makes runtime-source-vs-image verification a log read."""
+    """Boot provenance makes runtime-source-vs-image verification a log read.
+
+    Static locks on the EXACT emission forms. Asserting that the words appear
+    somewhere is not enough: pointing DS_FILE at the wrong file, or grepping for
+    a symbol that cannot exist, leaves every word of the output in place while
+    the emitted value becomes a lie. Each assertion below names the relationship
+    (which file is hashed, which symbol is counted), not just the vocabulary.
+    """
 
     def test_api_init_emits_provenance_for_docker_service(self):
         for stack in STACKS:
             with self.subTest(stack=stack.name):
                 command = command_text(service_of(stack, API_INIT_SERVICE))
                 self.assertIn("[provenance]", command)
-                self.assertIn("services/docker_service.py", command)
+                self.assertRegex(
+                    command,
+                    re.compile(r'^\s*DS_FILE="\$\$API_ROOT/services/docker_service\.py"\s*$', re.M),
+                    "the hashed file must BE services/docker_service.py",
+                )
+                self.assertRegex(
+                    command,
+                    re.compile(
+                        r'^\s*echo "\[provenance\] services/docker_service\.py '
+                        r'\$\$\(provenance_hash "\$\$DS_FILE"\)',
+                        re.M,
+                    ),
+                    "the docker_service.py provenance line must hash DS_FILE itself",
+                )
                 self.assertIn("sha256sum", command)
                 self.assertIn("md5sum", command)
 
@@ -171,13 +191,38 @@ class TestProvenanceEmitted(unittest.TestCase):
         for stack in STACKS:
             with self.subTest(stack=stack.name):
                 command = command_text(service_of(stack, API_INIT_SERVICE))
-                self.assertIn("seed_resume_state_defs=", command)
-                self.assertIn("seed_resume_state_refs=", command)
-                self.assertIn("services/resume_service.py", command)
+                self.assertRegex(
+                    command,
+                    re.compile(r'^\s*RS_FILE="\$\$API_ROOT/services/resume_service\.py"\s*$', re.M),
+                    "the definition count must be taken over services/resume_service.py",
+                )
+                # The closing quote is the anchor: a widened or fabricated grep
+                # pattern (e.g. 'def seed_resume_state_DOES_NOT_EXIST') no longer
+                # matches these, so a count that can only ever be 0 fails here.
+                self.assertIn(
+                    """seed_resume_state_refs=$$(grep -c 'seed_resume_state' "$$DS_FILE" || true)""",
+                    command,
+                )
+                self.assertIn(
+                    """seed_resume_state_defs=$$(grep -c 'def seed_resume_state' "$$RS_FILE" || true)""",
+                    command,
+                )
 
 
 class TestApiInitUnrelatedDutiesPreserved(unittest.TestCase):
-    """Removal had to be surgical: api-init's seeding duties must survive."""
+    """Removal had to be surgical: api-init's seeding duties must survive.
+
+    Counting occurrences of `version_aware_seed` is not enough -- the name
+    survives inside a comment, a `:` no-op or a quoted string while the seed
+    never runs. Each duty is locked to its anchored, executable command form.
+    """
+
+    # (source var, destination var, fingerprint tag) for each retained duty.
+    SEED_DUTIES = (
+        ("CTRL_SRC", "CTRL_DST", "api-ctrl"),
+        ("SCRIPTS_SRC", "SCRIPTS_DST", "api-scripts"),
+        ("CONF_SRC", "CONF_DST", "api-conf"),
+    )
 
     def test_version_aware_seeds_still_present(self):
         for stack in STACKS:
@@ -185,9 +230,20 @@ class TestApiInitUnrelatedDutiesPreserved(unittest.TestCase):
                 command = command_text(service_of(stack, API_INIT_SERVICE))
                 self.assertIn("seed_helpers.sh", command)
                 self.assertIn("fingerprint_dir", command)
-                for destination in ("controllers", "scripts", "conf"):
-                    self.assertIn(destination, command)
-                self.assertGreaterEqual(command.count("version_aware_seed"), 3)
+                for src, dst, tag in self.SEED_DUTIES:
+                    # Anchored to start-of-line: the call must be the command the
+                    # line executes, not text embedded in something inert.
+                    pattern = re.compile(
+                        rf'^\s*version_aware_seed "\$\${src}" "\$\${dst}" '
+                        rf'"{tag}-\$\$API_VERSION"\s*$',
+                        re.M,
+                    )
+                    self.assertRegex(
+                        command,
+                        pattern,
+                        f"{stack.name}: api-init must still invoke version_aware_seed for "
+                        f"{src} -> {dst}; removal of the patch machinery had to be surgical.",
+                    )
 
 
 class TestPatchSuppliedEnvPinned(unittest.TestCase):
@@ -202,16 +258,22 @@ class TestPatchSuppliedEnvPinned(unittest.TestCase):
     def test_bot_network_mode_pinned_in_both_stacks(self):
         # Patch default was "none"; image source default is "host" (a VPN leak in
         # the vpn stack). Both stacks must set the var so the default is unreachable.
-        expected = {VPN_STACK: "none", NO_VPN_STACK: "hbnet-us"}
+        # Exact equality, not containment: "none-typo" contains "none" but is not
+        # the patch's fail-closed fallback, and docker_service.py passes whatever
+        # it resolves straight to containers.run(network_mode=...).
+        expected = {
+            VPN_STACK: "${DOCKER_BOT_NETWORK_MODE:-none}",
+            NO_VPN_STACK: "${DOCKER_BOT_NETWORK_MODE:-hbnet-us}",
+        }
         for stack in STACKS:
             with self.subTest(stack=stack.name):
                 value = env_map(service_of(stack, API_SERVICE)).get("DOCKER_BOT_NETWORK_MODE")
-                self.assertIsNotNone(value, f"{stack.name}: DOCKER_BOT_NETWORK_MODE not pinned")
-                self.assertTrue(
-                    value.startswith("${DOCKER_BOT_NETWORK_MODE:-"),
-                    f"{stack.name}: expected an explicit `:-` fallback, got {value!r}",
+                self.assertEqual(
+                    expected[stack],
+                    value,
+                    f"{stack.name}: DOCKER_BOT_NETWORK_MODE must pin the exact fallback the "
+                    f"removed patch supplied (a host override stays possible).",
                 )
-                self.assertIn(expected[stack], value)
 
     def test_compose_service_prefix_pinned_in_both_stacks(self):
         # The patch defaulted this to "hummingbot-bot" (vpn) / "hummingbot-us-bot"
@@ -230,11 +292,20 @@ class TestPatchSuppliedEnvPinned(unittest.TestCase):
                 )
 
     def test_compose_project_name_pinned_in_both_stacks(self):
-        # _get_compose_labels adds the compose labels only when this is non-empty.
+        # _get_compose_labels adds the com.docker.compose.* labels only when this
+        # resolves non-empty. A raw `${SOMETHING_UNSET}` is truthy as YAML text but
+        # compose resolves it to "", silently dropping every compose label, so the
+        # literal project identity is asserted rather than mere non-emptiness.
+        expected = {VPN_STACK: "hummingbot_stack_1", NO_VPN_STACK: "hummingbot-us"}
         for stack in STACKS:
             with self.subTest(stack=stack.name):
                 value = env_map(service_of(stack, API_SERVICE)).get("COMPOSE_PROJECT_NAME")
-                self.assertTrue(value, f"{stack.name}: COMPOSE_PROJECT_NAME must be non-empty")
+                self.assertEqual(
+                    expected[stack],
+                    value,
+                    f"{stack.name}: COMPOSE_PROJECT_NAME must be the literal project name so "
+                    f"spawned bots keep their pre-cutover compose labels.",
+                )
 
 
 @unittest.skipIf(BASH is None, "no working bash available to syntax-check api-init")
@@ -280,11 +351,56 @@ class TestProvenanceBlockBehaviour(unittest.TestCase):
         end_marker = "# --- 2. Version-aware seed: controllers ---" if stack is VPN_STACK else 'CTRL_SRC=""'
         return command[start:command.index(end_marker)]
 
-    def _run(self, stack, fake_root):
+    @staticmethod
+    def _path_for_bash(path):
+        """Render a path in the form bash's PATH understands.
+
+        On Windows `as_posix()` still yields `C:/...`, and the drive-letter colon
+        is a PATH separator -- the entry would silently never be searched. cygpath
+        maps it to `/c/...`; on a real Linux host it is absent and unnecessary.
+        """
+        probe = subprocess.run(
+            [BASH, "-c", f'cygpath -u "{path}"'], capture_output=True, text=True
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            return probe.stdout.strip()
+        return path
+
+    def _md5_only_path(self, tmpdir):
+        """Build a PATH exposing md5sum/awk/grep but NOT sha256sum.
+
+        Forces provenance_hash down its md5 branch. Wrapper scripts (not copies)
+        so the real tools do the work and the digest stays trustworthy.
+        """
+        bindir = Path(tmpdir) / "shim-bin"
+        bindir.mkdir()
+        for tool in ("md5sum", "awk", "grep"):
+            probe = subprocess.run([BASH, "-c", f"command -v {tool}"], capture_output=True, text=True)
+            if probe.returncode != 0 or not probe.stdout.strip():
+                self.skipTest(f"{tool} unavailable; cannot build an md5-only PATH")
+            wrapper = bindir / tool
+            wrapper.write_text(
+                f'#!/bin/sh\nexec "{probe.stdout.strip()}" "$@"\n', encoding="utf-8", newline="\n"
+            )
+            wrapper.chmod(0o755)
+        shim = self._path_for_bash(bindir.as_posix())
+        # The experiment is only meaningful if sha256sum is genuinely unreachable.
+        leaked = subprocess.run(
+            [BASH, "-c", f'export PATH="{shim}"; command -v sha256sum'],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(
+            0, leaked.returncode, "shim PATH still exposes sha256sum; md5 branch unreachable"
+        )
+        return shim
+
+    def _run(self, stack, fake_root, path_shim=None):
         block = self._provenance_block(stack)
         rewritten, count = self.ROOT_LOOP.subn(f'for candidate in "{fake_root}"; do\n', block)
         self.assertEqual(1, count, f"{stack.name}: candidate-root loop not found to rewrite")
-        script = f'set -eu\nAPI_VERSION=test-fingerprint\n{rewritten}\n'
+        preamble = f'export PATH="{path_shim}"\n' if path_shim else ""
+        script = f'set -eu\nAPI_VERSION=test-fingerprint\n{preamble}{rewritten}\n'
         with tempfile.NamedTemporaryFile(
             "w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
         ) as handle:
@@ -320,6 +436,38 @@ class TestProvenanceBlockBehaviour(unittest.TestCase):
                     self.assertIn("seed_resume_state_refs=2", out)
                     self.assertIn("seed_resume_state_defs=1", out)
                     self.assertIn("image_fingerprint=test-fingerprint", out)
+
+    def test_provenance_falls_back_to_md5_when_sha256sum_unavailable(self):
+        # The human's post-merge gate is a log read, so the fallback must emit a
+        # real, file-specific digest on an image without coreutils sha256sum --
+        # exactly the environment where the sha256 branch cannot cover it.
+        import hashlib
+
+        for stack in STACKS:
+            with self.subTest(stack=stack.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    services = Path(tmp) / "services"
+                    services.mkdir()
+                    docker_service = b"from services.resume_service import seed_resume_state\n"
+                    resume_service = b"async def seed_resume_state(arg):\n    pass\n"
+                    (services / "docker_service.py").write_bytes(docker_service)
+                    (services / "resume_service.py").write_bytes(resume_service)
+
+                    out = self._run(
+                        stack, Path(tmp).as_posix(), path_shim=self._md5_only_path(tmp)
+                    )
+
+                    # Digest tied to its file: a fabricated constant fails both.
+                    self.assertIn(
+                        f"services/docker_service.py md5:{hashlib.md5(docker_service).hexdigest()}",
+                        out,
+                    )
+                    self.assertIn(
+                        f"services/resume_service.py md5:{hashlib.md5(resume_service).hexdigest()}",
+                        out,
+                    )
+                    self.assertNotIn("sha256:", out)
+                    self.assertNotIn("hash-unavailable", out)
 
     def test_provenance_warns_when_docker_service_missing_from_image(self):
         # Fail-loud: the human's post-merge gate is a log read, so a missing file
