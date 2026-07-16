@@ -23,6 +23,14 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
+# CDX-009 — gateway network reachability contract (declared, not implied):
+# hbnet-us is created BY this stack (not external) and is the only network here.
+# No gateway service is attached to it, and none is deployed by this stack at
+# all -- so a bot attached to hbnet-us has NO gateway route by design. That is
+# why GATEWAY_URL below is pinned to a reserved .invalid host that fails fast
+# instead of silently defaulting to https://localhost:15888 inside the API
+# container. Attaching a gateway would mean deploying one onto hbnet-us and
+# setting GATEWAY_URL to it.
 networks:
   hbnet-us:
     name: hbnet-us       # explicit (no project prefix) so spawned bots can attach
@@ -368,6 +376,14 @@ services:
       - BROKER_HOST=emqx
       - BROKER_PORT=1883
       - DATABASE_URL=postgresql+asyncpg://hbot:${POSTGRES_PASSWORD}@postgres:5432/hummingbot_api
+      # CDX-009: this stack deliberately ships NO gateway service, so gateway routes
+      # MUST fail fast and loudly by design. Left unset, the API falls back to its
+      # built-in https://localhost:15888 default, which inside the API container
+      # points at nothing -- a silent, confusing failure. '.invalid' is reserved by
+      # RFC 6761 and is guaranteed never to resolve, so any gateway call fails
+      # immediately with an unmistakable DNS error naming this contract.
+      # To ACTUALLY use a gateway here, deploy one and set GATEWAY_URL to it.
+      - GATEWAY_URL=https://gateway-not-deployed.invalid:15888
       - DOCKER_BOT_NETWORK_MODE=${DOCKER_BOT_NETWORK_MODE:-hbnet-us}
       # Pinned explicitly: the removed docker_service.py patch defaulted this to
       # "hummingbot-us-bot"; the image's own source defaults to "hummingbot-bot".
