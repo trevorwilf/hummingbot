@@ -984,6 +984,23 @@ def line_number_of(text, pattern):
     return text[: match.start()].count("\n") + 1
 
 
+def enclosing_if_predicate(text, pattern):
+    """The nearest `if ...; then` line above the first match of `pattern`.
+
+    Presence and line order prove nothing about reachability: a call sitting under
+    an inverted predicate keeps its text and its position, so an ordering-only
+    assertion stays green while the branch never runs. This resolves the predicate
+    a call actually executes under, putting the condition itself under test.
+    """
+    index = line_number_of(text, pattern)
+    if index is None:
+        return None
+    for line in reversed(text.splitlines()[: index - 1]):
+        if re.match(r"^\s*if .*; then\s*$", line):
+            return line.strip()
+    return None
+
+
 class TestControllersDestinationIsExplicit(unittest.TestCase):
     """CDX-010 static locks: no default destination, and the guard runs first.
 
@@ -1182,6 +1199,51 @@ class TestControllersProvenanceRecorded(unittest.TestCase):
         sync_line = line_number_of(text, r"^\s*sync_controllers \"\$HBOT_CONTROLLERS_SRC\"$")
         self.assertLess(fetch_line, build_line, "fetch must precede the build it labels")
         self.assertLess(build_line, sync_line, "the sync stays post-build")
+        # Order is not reachability. Invert the predicate guarding these calls and
+        # a normal --sync build fetches nothing and hashes nothing, labels the image
+        # "unknown", then dies expanding an unset source AFTER the purge and build --
+        # with every line above still in this exact order. So pin the predicate too:
+        # the calls must sit in the TRUE branch of an equality test on the opt-in.
+        expected = 'if [ "$SYNC_CONTROLLERS" = "1" ]; then'
+        for call in (
+            r"^\s*fetch_controllers_source$",
+            r"^\s*compute_controllers_manifest \"",
+            r"^\s*sync_controllers \"\$HBOT_CONTROLLERS_SRC\"$",
+        ):
+            self.assertEqual(
+                expected,
+                enclosing_if_predicate(text, call),
+                f"the call matching {call!r} must run under {expected!r}; a negated or "
+                f"rewritten predicate silently disables it while every line order holds.",
+            )
+
+
+    def test_bot_main_wires_the_sync_call_verbatim_after_the_build(self):
+        # Every behavioural test below executes sync_controllers() as an EXTRACTED
+        # function, which leaves the one line that invokes it in a real build with
+        # no coverage at all. Delete that line and the bot build still reports
+        # success while the API keeps mounting whatever stale controllers the
+        # destination already held -- CDX-010's exact failure, restored.
+        # The call is pinned verbatim: `:` or a deletion fails the count, and an
+        # env prefix (`SYNC_CONTROLLERS=1 sync_controllers ...`, which would force
+        # destination validation onto an explicit --no-controllers-sync run, after
+        # the purge and build) fails the top-level anchor.
+        text = read_text(BOT_BUILD_SCRIPT)
+        call = r'^sync_controllers "\$SRC_DIR/controllers"$'
+        self.assertEqual(
+            1,
+            len(re.findall(call, text, re.M)),
+            "the bot script must invoke sync_controllers exactly once, unprefixed, at top "
+            "level -- an absent, renamed, or env-prefixed call changes what a build does.",
+        )
+        call_line = line_number_of(text, call)
+        final_build_line = text[: text.rindex("docker build $DOCKER_BUILD_FLAGS")].count("\n") + 1
+        self.assertLess(
+            final_build_line,
+            call_line,
+            "the sync must stay post-build: syncing controllers a build then fails to "
+            "produce would leave the tree ahead of the image.",
+        )
 
 
 def _harness(script_path, functions, preamble="", body=""):
@@ -1475,11 +1537,11 @@ class TestControllersSyncWritesManifest(unittest.TestCase):
     about. Nothing docker-adjacent is assembled; only the function under test.
     """
 
-    def _sync(self, script_path, src, dest):
+    def _sync(self, script_path, src, dest, sync=1):
         harness = _harness(
             script_path,
             ["controllers_manifest_body", "compute_controllers_manifest", "sync_controllers"],
-            f'SYNC_CONTROLLERS=1\nCONTROLLERS_DEST="{dest}"\n'
+            f'SYNC_CONTROLLERS={sync}\nCONTROLLERS_DEST="{dest}"\n'
             f'CONTROLLERS_MANIFEST_SHA256="unknown"\nCONTROLLERS_MANIFEST_BODY=""',
             f'sync_controllers "{src}"',
         )
@@ -1497,6 +1559,62 @@ class TestControllersSyncWritesManifest(unittest.TestCase):
             return result
         finally:
             Path(path).unlink(missing_ok=True)
+
+    def test_vanished_destination_fails_the_sync_instead_of_being_recreated(self):
+        # validate_controllers_dest() ran long before this point -- before the purge
+        # and the build. If the tree disappears in between (share unmounted, path
+        # renamed), the copy loop's `mkdir -p "$(dirname "$dstf")"` would cheerfully
+        # rebuild it on the container-local disk, copy into that orphan, write a
+        # manifest attesting to it and report success: the silent-wrong-tree
+        # outcome CDX-010 exists to kill, with a real mounted tree left stale.
+        # Grepping the guard's text cannot tell a guard that fires from a dead one,
+        # so execute the real function against a destination that is not there.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    src.mkdir()
+                    (src / "aaa.py").write_bytes(b"a = 1\n")
+                    dest = Path(tmp) / "vanished" / "controllers"
+
+                    result = self._sync(script, src.as_posix(), dest.as_posix())
+
+                    self.assertNotEqual(
+                        0,
+                        result.returncode,
+                        f"{script.name}: a destination that vanished after validation must FAIL "
+                        f"the build; stdout={result.stdout!r}",
+                    )
+                    self.assertFalse(
+                        dest.exists(),
+                        f"{script.name}: the vanished destination must not be recreated -- a "
+                        f"synced orphan tree is worse than a failed build, nothing reads it.",
+                    )
+
+    def test_opt_out_copies_nothing_even_with_a_real_source_present(self):
+        # The escape hatch executed, not grepped: --no-controllers-sync must remain
+        # a genuine skip even when a perfectly syncable source is sitting right
+        # there -- no copy, no manifest, no destination writes.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    src.mkdir()
+                    (src / "aaa.py").write_bytes(b"a = 1\n")
+                    dest = Path(tmp) / "dest"
+                    dest.mkdir()
+
+                    result = self._sync(script, src.as_posix(), dest.as_posix(), sync=0)
+
+                    self.assertEqual(
+                        0, result.returncode, f"{script.name}: opt-out must succeed: {result.stderr}"
+                    )
+                    self.assertEqual(
+                        [],
+                        sorted(p.name for p in dest.iterdir()),
+                        f"{script.name}: --no-controllers-sync must write nothing to the "
+                        f"destination -- not the controllers, not the manifest.",
+                    )
 
     def test_sync_writes_a_manifest_matching_the_files_it_copied(self):
         import hashlib
