@@ -110,3 +110,7 @@ CLAUDE.md
 test_logs/
 
 /instances/*
+/reviews/*
+/reviews_old/*
+
+/batch_logs/*

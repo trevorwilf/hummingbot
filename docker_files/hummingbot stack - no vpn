@@ -1,0 +1,531 @@
+# =============================================================================
+# Hummingbot Trading Pod — US / LEAN / NO-VPN — ISOLATED INSTANCE
+# (stack v4.2-us-novpn)
+#
+# CHANGES vs v4.1 (applied 2026-07-09):
+#   - Stock/infra images PINNED BY DIGEST
+#   - Local-built images given `pull_policy: never`
+#   - NEW init container `hummingbot-api-migrate` (Alembic; bridge-networked;
+#     safe no-op until Alembic is scaffolded in the API fork)
+#   - dashboard LEFT on :latest because you are pulling it; pin to new digest
+#     after the pull.
+#
+# Runs ALONGSIDE the anon stack. Namespaced: bind root hummingbot_us,
+# container names hummingbot-us-*, network hbnet-us, project hummingbot-us,
+# host ports 8502 / 18084 / 8001.
+# =============================================================================
+
+name: hummingbot-us     # compose project name (matches the Portainer stack name)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+networks:
+  hbnet-us:
+    name: hbnet-us       # explicit (no project prefix) so spawned bots can attach
+    driver: bridge
+
+services:
+
+  autoheal:
+    image: willfarrell/autoheal@sha256:8dbe9c99adf2d353f0fff59a0cf605e1e2f996a9766426367eb7f8de41c37ca5
+    container_name: hummingbot-us-autoheal
+    network_mode: none
+    environment:
+      - TZ=America/Boise
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ===========================================================================
+  # INIT CONTAINERS (run once, then exit) — filesystem only
+  # ===========================================================================
+
+  hummingbot-seed:
+    image: emqx@sha256:2829687a7e7d14df0ad2a2d17d83c2002e9aacae5e663b8bda586fdaaa01e949
+    container_name: hummingbot-us-seed
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      - TZ=America/Boise
+      - ADMIN_USER_ID=${ADMIN_USER_ID}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - SEED_IMAGE_VERSION=
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us:/humming_dir
+    command: "/humming_dir/bootstrap/hummingbot_seed.sh"
+    restart: "no"
+    logging: *default-logging
+
+  hummingbot-api-init:
+    image: hummingbot/hummingbot-api:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-us-api-init
+    network_mode: none
+    user: "0:0"
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        BASE="/humming_dir"
+
+        if [ -f "$$BASE/bootstrap/seed_helpers.sh" ]; then
+          . "$$BASE/bootstrap/seed_helpers.sh"
+        else
+          echo "[api-init] ERROR: seed_helpers.sh not found"
+          exit 1
+        fi
+
+        API_VERSION="$$(fingerprint_dir /hummingbot-api 2>/dev/null || fingerprint_dir /app 2>/dev/null || echo unknown)"
+        echo "[api-init] Image fingerprint: $$API_VERSION"
+
+        PATCH_DIR="$$BASE/patches"
+        TARGET="$$PATCH_DIR/docker_service.py"
+        UPSTREAM_REF="$$PATCH_DIR/.docker_service.py.upstream"
+        UPSTREAM_SUM="$$PATCH_DIR/.docker_service_upstream.md5"
+
+        mkdir -p "$$PATCH_DIR"
+
+        ORIGINAL=""
+        for candidate in \
+          /hummingbot-api/services/docker_service.py \
+          /app/services/docker_service.py \
+          /opt/hummingbot-api/services/docker_service.py; do
+          if [ -f "$$candidate" ]; then
+            ORIGINAL="$$candidate"
+            break
+          fi
+        done
+
+        if [ -z "$$ORIGINAL" ]; then
+          echo "[api-init] WARNING: docker_service.py not found in image."
+        else
+          CURR_MD5="$$(md5sum "$$ORIGINAL" | awk '{print $$1}')"
+          PREV_MD5=""
+          if [ -f "$$UPSTREAM_SUM" ]; then
+            PREV_MD5="$$(cat "$$UPSTREAM_SUM" 2>/dev/null || true)"
+          fi
+
+          cp -f "$$ORIGINAL" "$$UPSTREAM_REF"
+          printf '%s' "$$CURR_MD5" > "$$UPSTREAM_SUM"
+
+          if [ ! -f "$$TARGET" ] || grep -q 'Placeholder' "$$TARGET" 2>/dev/null; then
+            echo "[api-init] First run — applying network patch to docker_service.py"
+            python3 - "$$ORIGINAL" "$$TARGET" <<'PATCH_SCRIPT'
+        import sys, re
+
+        src_path, dst_path = sys.argv[1], sys.argv[2]
+        with open(src_path) as f:
+            code = f.read()
+
+        HELPER_METHODS = '''
+            # ------------------------------------------------------------------ #
+            #  Network / Compose-stack integration helpers  (auto-patched)
+            # ------------------------------------------------------------------ #
+
+            @staticmethod
+            def _get_bot_network_mode() -> str:
+                """Return the network_mode for spawned bot containers.
+                Reads DOCKER_BOT_NETWORK_MODE from env (default: 'none').
+                For this stack it is the bridge network name (hbnet-us) so bots
+                resolve emqx/postgres by service name.
+                """
+                return os.environ.get("DOCKER_BOT_NETWORK_MODE", "none")
+
+            @staticmethod
+            def _get_compose_labels(instance_name: str) -> dict:
+                """Return Docker labels that graft the bot into the Compose project
+                so it appears in docker compose ps and autoheal.
+                """
+                project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+                service = os.environ.get("COMPOSE_SERVICE_PREFIX", "hummingbot-us-bot")
+                labels = {"autoheal": "true"}
+                if project:
+                    labels.update({
+                        "com.docker.compose.project":         project,
+                        "com.docker.compose.service":          f"{service}-{instance_name}",
+                        "com.docker.compose.container-number": "1",
+                        "com.docker.compose.oneoff":           "False",
+                    })
+                return labels
+
+            # ------------------------------------------------------------------ #
+        '''
+
+        anchor = 'logger.error(f"It was not possible to connect to Docker'
+        anchor_line = None
+        lines = code.split('\n')
+        for i, line in enumerate(lines):
+            if anchor in line:
+                anchor_line = i
+                break
+
+        if anchor_line is None:
+            print("[api-init] WARNING: Could not find insertion anchor in docker_service.py")
+            print("[api-init] Copying unpatched file — you will need to patch manually.")
+            with open(dst_path, 'w') as f:
+                f.write(code)
+            sys.exit(0)
+
+        insert_at = anchor_line + 1
+        while insert_at < len(lines) and lines[insert_at].strip() != '':
+            insert_at += 1
+        insert_at += 1
+
+        patched_lines = lines[:insert_at] + HELPER_METHODS.split('\n') + lines[insert_at:]
+        code = '\n'.join(patched_lines)
+
+        code = code.replace(
+            'network_mode="host",',
+            'network_mode=self._get_bot_network_mode(),\n'
+            '                labels=self._get_compose_labels(instance_name),'
+        )
+
+        run_anchor = 'self.client.containers.run('
+        if run_anchor in code:
+            inject = (
+                '\n        # ── Network mode & stack integration (auto-patched) ─────\n'
+                '        network_mode = self._get_bot_network_mode()\n'
+                '        labels = self._get_compose_labels(instance_name)\n'
+                '        logger.info(\n'
+                '            f"Launching bot \'{instance_name}\' with "\n'
+                '            f"network_mode={network_mode}, labels={labels}"\n'
+                '        )\n'
+            )
+            idx = code.index(run_anchor)
+            try_search = code.rfind('try:', 0, idx)
+            if try_search > 0:
+                line_start = code.rfind('\n', 0, try_search)
+                if line_start > 0:
+                    code = code[:line_start] + inject + code[line_start:]
+
+        with open(dst_path, 'w') as f:
+            f.write(code)
+        print(f"[api-init] Patched docker_service.py written to {dst_path}")
+        PATCH_SCRIPT
+            chmod 644 "$$TARGET"
+
+          elif [ -n "$$PREV_MD5" ] && [ "$$CURR_MD5" != "$$PREV_MD5" ]; then
+            echo ""
+            echo "==================================================================="
+            echo "  !  UPSTREAM docker_service.py HAS CHANGED"
+            echo "  Your patched version is still in use (not overwritten)."
+            echo "  New upstream saved for comparison at: $$UPSTREAM_REF"
+            echo "  Review:   diff $$UPSTREAM_REF $$TARGET"
+            echo "  Re-patch: rm $$TARGET && docker compose -f hummingbot_us_App.yaml up hummingbot-api-init"
+            echo "==================================================================="
+            echo ""
+          else
+            echo "[api-init] docker_service.py: patched file in use, upstream unchanged."
+          fi
+        fi
+
+        CTRL_SRC=""
+        for candidate in \
+          /hummingbot-api/bots/controllers \
+          /app/bots/controllers \
+          /hummingbot-api/controllers; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            CTRL_SRC="$$candidate"
+            break
+          fi
+        done
+        CTRL_DST="$$BASE/api/data/bots/controllers"
+        if [ -n "$$CTRL_SRC" ]; then
+          echo "[api-init] Seeding controllers: $$CTRL_SRC -> $$CTRL_DST"
+          version_aware_seed "$$CTRL_SRC" "$$CTRL_DST" "api-ctrl-$$API_VERSION"
+        else
+          echo "[api-init] No controllers source found in image — skipping."
+        fi
+
+        SCRIPTS_SRC=""
+        for candidate in \
+          /hummingbot-api/bots/scripts \
+          /app/bots/scripts \
+          /hummingbot-api/scripts; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            SCRIPTS_SRC="$$candidate"
+            break
+          fi
+        done
+        SCRIPTS_DST="$$BASE/api/data/bots/scripts"
+        if [ -n "$$SCRIPTS_SRC" ]; then
+          echo "[api-init] Seeding scripts: $$SCRIPTS_SRC -> $$SCRIPTS_DST"
+          version_aware_seed "$$SCRIPTS_SRC" "$$SCRIPTS_DST" "api-scripts-$$API_VERSION"
+        else
+          echo "[api-init] No scripts source found in image — skipping."
+        fi
+
+        CONF_SRC=""
+        for candidate in \
+          /hummingbot-api/bots/conf \
+          /app/bots/conf; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            CONF_SRC="$$candidate"
+            break
+          fi
+        done
+        CONF_DST="$$BASE/api/data/bots/conf"
+        if [ -n "$$CONF_SRC" ]; then
+          echo "[api-init] Seeding api bots/conf: $$CONF_SRC -> $$CONF_DST"
+          version_aware_seed "$$CONF_SRC" "$$CONF_DST" "api-conf-$$API_VERSION"
+        else
+          echo "[api-init] No bots/conf source found in image — skipping."
+        fi
+
+        chmod -R 777 "$$BASE/api" 2>/dev/null || true
+        chmod -R 777 "$$BASE/patches" 2>/dev/null || true
+        echo "[api-init] Done."
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us:/humming_dir
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # INIT 2c: API DB migrations (Alembic) — bridge-networked, service-name DB host
+  #   Safe no-op until Alembic is scaffolded in the API fork image.
+  # ---------------------------------------------------------------------------
+  hummingbot-api-migrate:
+    image: hummingbot/hummingbot-api:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-us-api-migrate
+    networks:
+      - hbnet-us
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hummingbot-api-init:
+        condition: service_completed_successfully
+    environment:
+      - TZ=America/Boise
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - DATABASE_URL=postgresql+asyncpg://hbot:${POSTGRES_PASSWORD}@postgres:5432/hummingbot_api
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        [ -f /opt/conda/etc/profile.d/conda.sh ] && . /opt/conda/etc/profile.d/conda.sh && conda activate hummingbot-api 2>/dev/null || true
+        cd /hummingbot-api 2>/dev/null || cd /app 2>/dev/null || { echo "[migrate] app dir not found — skipping"; exit 0; }
+        if [ -f alembic.ini ]; then
+          echo "[migrate] alembic.ini found — running: alembic upgrade head"
+          alembic upgrade head
+          echo "[migrate] Alembic migrations applied."
+        else
+          echo "[migrate] No alembic.ini in image yet — skipping (scaffold Alembic to enable)."
+        fi
+    restart: "no"
+    logging: *default-logging
+
+  hummingbot-password-init:
+    image: hummingbot/hummingbot:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-us-password-init
+    network_mode: none
+    user: "0:0"
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        . /opt/conda/etc/profile.d/conda.sh
+        conda activate hummingbot
+
+        CONF_DIR="/humming_dir/hummingbot/conf"
+        API_MASTER="/humming_dir/api/data/bots/credentials/master_account"
+        PW="$${CONFIG_PASSWORD:-admin}"
+
+        if [ ! -f "$$CONF_DIR/.password_verification" ]; then
+          echo "=== generating hummingbot .password_verification ==="
+          cd /home/hummingbot
+          python -c "
+        import os, sys
+        os.environ['CONF_DIR_PATH'] = '$$CONF_DIR'
+        sys.path.insert(0, '/home/hummingbot')
+        from hummingbot.client.config.config_crypt import store_password_verification, ETHKeyFileSecretManger
+        sm = ETHKeyFileSecretManger('$$PW')
+        store_password_verification(sm)
+        print('Created: $$CONF_DIR/.password_verification')
+        "
+        else
+          echo "=== .password_verification already exists, skipping ==="
+        fi
+
+        if [ ! -f "$$API_MASTER/.password_verification" ] && [ -f "$$CONF_DIR/.password_verification" ]; then
+          echo "=== copying .password_verification to API master_account ==="
+          cp "$$CONF_DIR/.password_verification" "$$API_MASTER/.password_verification"
+        else
+          echo "=== API .password_verification already exists, skipping ==="
+        fi
+
+        echo "=== password init complete ==="
+    environment:
+      - TZ=America/Boise
+      - CONFIG_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us:/humming_dir
+    restart: "no"
+    logging: *default-logging
+
+  # ===========================================================================
+  # APP CONTAINERS — all on hbnet-us, addressed by service name
+  # ===========================================================================
+
+  postgres:
+    image: postgres@sha256:004f63c1e58096cd86ba6d4ccc80e89897776553f654e935b33e920b6e141ba9
+    container_name: hummingbot-us-postgres
+    networks:
+      - hbnet-us
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=America/Boise
+      - POSTGRES_DB=hummingbot_api
+      - POSTGRES_USER=hbot
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us/postgres/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hbot -d hummingbot_api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  emqx:
+    image: emqx@sha256:2829687a7e7d14df0ad2a2d17d83c2002e9aacae5e663b8bda586fdaaa01e949
+    container_name: hummingbot-us-broker
+    networks:
+      - hbnet-us
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=America/Boise
+      - EMQX_NODE__NAME=emqx@127.0.0.1
+      - EMQX_LISTENERS__TCP__DEFAULT__BIND=0.0.0.0:1883
+      - EMQX_DASHBOARD__LISTENERS__HTTP__BIND=0.0.0.0:18083
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us/emqx/data:/opt/emqx/data
+      - /mnt/sharedrive/apps/hummingbot_us/emqx/log:/opt/emqx/log
+      - /mnt/sharedrive/apps/hummingbot_us/emqx/etc:/opt/emqx/etc
+    ports:
+      - "18084:18083"   # EMQX dashboard on host 18084 (anon stack uses 18083)
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx_ctl", "status", "--name", "emqx@127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  hummingbot-api:
+    image: hummingbot/hummingbot-api:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-us-api
+    networks:
+      - hbnet-us
+    depends_on:
+      postgres:
+        condition: service_healthy
+      emqx:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+      hummingbot-api-init:
+        condition: service_completed_successfully
+      hummingbot-api-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us/patches/docker_service.py:/hummingbot-api/services/docker_service.py:ro
+      - /mnt/sharedrive/apps/hummingbot_us/api/data/bots:/hummingbot-api/bots
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=America/Boise
+      - USERNAME=${HBOT_API_USERNAME:-admin}
+      - PASSWORD=${HBOT_API_PASSWORD:-admin}
+      - HBOT_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - HBOT_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+      - HBOT_API_CONFIG_PASSWORD=${CONFIG_PASSWORD:-admin}
+      - HBOT_API_DEBUG_MODE=${DEV_VAR:-true}
+      - BROKER_HOST=emqx
+      - BROKER_PORT=1883
+      - DATABASE_URL=postgresql+asyncpg://hbot:${POSTGRES_PASSWORD}@postgres:5432/hummingbot_api
+      - DOCKER_BOT_NETWORK_MODE=${DOCKER_BOT_NETWORK_MODE:-hbnet-us}
+      - COMPOSE_PROJECT_NAME=hummingbot-us   # match Portainer stack name so spawned bots group here
+      - BOTS_PATH=/mnt/sharedrive/apps/hummingbot_us/api/data
+    ports:
+      - "8001:8000"     # API / Swagger on host 8001 (anon stack uses 8000)
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8000),2); s.close()"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  dashboard:
+    image: hummingbot/dashboard:latest   # ON :latest — pin to new digest AFTER you pull
+    container_name: hummingbot-us-dashboard
+    networks:
+      - hbnet-us
+    depends_on:
+      hummingbot-api:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=America/Boise
+      - AUTH_SYSTEM_ENABLED=False
+      - BACKEND_API_HOST=hummingbot-api
+      - BACKEND_API_PORT=8000
+      - BACKEND_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - BACKEND_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us/dashboard/credentials.yml:/home/dashboard/credentials.yml
+    ports:
+      - "8502:8501"     # dashboard on host 8502 (anon stack uses 8501)
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8501),2); s.close()"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging

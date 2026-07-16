@@ -1,0 +1,1202 @@
+version: "4.2"
+
+# =============================================================================
+# Hummingbot Trading Pod — v4.2
+#
+# CHANGES vs v4.1 (applied 2026-07-09):
+#   - Stock/infra images PINNED BY DIGEST (frozen to the exact bytes you run now)
+#   - Local-built images given `pull_policy: never` (never clobbered by a pull)
+#   - NEW init container `hummingbot-api-migrate` (Alembic; safe no-op until you
+#     scaffold Alembic in the API fork)
+#   - dashboard / condor / hummingbot-mcp intentionally LEFT on :latest because
+#     you are pulling those to newer versions; pin them to their new digests
+#     after the pull.
+#
+# FRESH DEPLOY:
+#   1. Run setup.sh (places seed scripts, creates .env)
+#   2. Fill in .env
+#   3. docker compose up -d
+#
+# Init container boot order (all run-once, then exit):
+#   1. hummingbot-seed          → dirs, user configs, EMQX etc
+#   2. hummingbot-api-init      → docker_service.py, controllers, scripts
+#      gateway-init             → gateway conf (chains, connectors, tokens)
+#   2c. hummingbot-api-migrate  → alembic upgrade head (no-op until scaffolded)
+#   3. hummingbot-password-init → .password_verification
+#   (then all app containers start)
+# =============================================================================
+
+name: hummingbot_stack_1    # compose project name (matches the Portainer stack name)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # VPN Gateway
+  # ---------------------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:v3.41.1   # already version-pinned (immutable tag)
+    container_name: hummingbot-gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/gluetun:/gluetun
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+      - net.ipv6.conf.lo.disable_ipv6=1
+
+    environment:
+      - TZ=Europe/Tirane
+      - HTTP_CONTROL_SERVER_ADDRESS=:8002
+
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+
+      # REQUIRED GEO (keep exactly)
+      - SERVER_COUNTRIES=albania
+      - SERVER_CITIES=tirana
+
+      - BLOCK_IPV6=on
+      - FIREWALL=on
+      - FIREWALL_OUTBOUND_SUBNETS=172.16.1.0/24,192.168.1.0/24
+      - FIREWALL_INPUT_PORTS=8501,8080,15888,18083,27017,28081,8100,8888,5432,9443
+
+      - UPDATER_PERIOD=24h
+
+      - WIREGUARD_MTU=1320
+      # IMPORTANT: prevent UDP/NAT idle timeouts over hours
+      - WIREGUARD_PERSISTENT_KEEPALIVE_INTERVAL=25s
+
+      # IMPORTANT: your log showed ICMP timeouts => force DNS small check
+      - HEALTH_SMALL_CHECK_TYPE=dns
+
+      # DNS: DoH (443) + multiple upstreams
+      - DNS_UPSTREAM_RESOLVER_TYPE=doh
+      - DNS_UPSTREAM_RESOLVERS=cloudflare,google,quad9
+
+    ports:
+      - "8501:8501"  # Hummingbot api
+      - "8080:8080"  # dozzle
+      - "15888:15888"
+      - "18083:18083"
+      - "27017:27017"  # mongodb
+      - "28081:28081"
+      - "8100:8100"  # tax collecter
+      - "8888:8888"
+      - "5432:5432"  # postgresql
+      - "9443:9443"  # side caddy for mpc
+      
+
+    healthcheck:
+      test: ["CMD-SHELL", "/gluetun-entrypoint healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+
+    restart: unless-stopped
+    logging: *default-logging
+
+  wait-for-vpn:
+    image: alpine
+    container_name: hummingbot-wait-for-vpn
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    command: sh -c "echo 'Starting 30s countdown...'; sleep 30; echo 'Timer finished!'"
+
+  autoheal:
+    image: willfarrell/autoheal@sha256:8dbe9c99adf2d353f0fff59a0cf605e1e2f996a9766426367eb7f8de41c37ca5
+    container_name: hummingbot-autoheal
+    network_mode: none
+    environment:
+      - TZ=Europe/Tirane
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ===========================================================================
+  # INIT CONTAINERS (run once, then exit)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # INIT 1: Bootstrap — dirs, user configs, EMQX etc (emqx:5 image)
+  # ---------------------------------------------------------------------------
+  hummingbot-seed:
+    image: emqx@sha256:2829687a7e7d14df0ad2a2d17d83c2002e9aacae5e663b8bda586fdaaa01e949
+    container_name: hummingbot-seed
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      - TZ=Europe/Tirane
+      - ADMIN_USER_ID=${ADMIN_USER_ID}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - SEED_IMAGE_VERSION=
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot:/humming_dir
+    command: "/humming_dir/bootstrap/hummingbot_seed.sh"
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # INIT 2a: API init — docker_service.py + controllers + scripts
+  # ---------------------------------------------------------------------------
+  hummingbot-api-init:
+    image: hummingbot/hummingbot-api:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-api-init
+    network_mode: none
+    user: "0:0"
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        BASE="/humming_dir"
+
+        # Source shared helpers
+        if [ -f "$$BASE/bootstrap/seed_helpers.sh" ]; then
+          . "$$BASE/bootstrap/seed_helpers.sh"
+        else
+          echo "[api-init] ERROR: seed_helpers.sh not found"
+          exit 1
+        fi
+
+        # --- Detect image version ---
+        API_VERSION="$$(fingerprint_dir /hummingbot-api 2>/dev/null || fingerprint_dir /app 2>/dev/null || echo unknown)"
+        echo "[api-init] Image fingerprint: $$API_VERSION"
+
+        # --- 1. docker_service.py patch management ---
+        PATCH_DIR="$$BASE/patches"
+        TARGET="$$PATCH_DIR/docker_service.py"
+        UPSTREAM_REF="$$PATCH_DIR/.docker_service.py.upstream"
+        UPSTREAM_SUM="$$PATCH_DIR/.docker_service_upstream.md5"
+
+        mkdir -p "$$PATCH_DIR"
+
+        # Find the original in the image
+        ORIGINAL=""
+        for candidate in \
+          /hummingbot-api/services/docker_service.py \
+          /app/services/docker_service.py \
+          /opt/hummingbot-api/services/docker_service.py; do
+          if [ -f "$$candidate" ]; then
+            ORIGINAL="$$candidate"
+            break
+          fi
+        done
+
+        if [ -z "$$ORIGINAL" ]; then
+          echo "[api-init] WARNING: docker_service.py not found in image."
+        else
+          CURR_MD5="$$(md5sum "$$ORIGINAL" | awk '{print $$1}')"
+          PREV_MD5=""
+          if [ -f "$$UPSTREAM_SUM" ]; then
+            PREV_MD5="$$(cat "$$UPSTREAM_SUM" 2>/dev/null || true)"
+          fi
+
+          # Always save the upstream reference for diffing
+          cp -f "$$ORIGINAL" "$$UPSTREAM_REF"
+          printf '%s' "$$CURR_MD5" > "$$UPSTREAM_SUM"
+
+          if [ ! -f "$$TARGET" ] || grep -q 'Placeholder' "$$TARGET" 2>/dev/null; then
+            # --- FIRST RUN: auto-apply the VPN/Compose patch ---
+            echo "[api-init] First run — applying VPN network patch to docker_service.py"
+            python3 - "$$ORIGINAL" "$$TARGET" <<'PATCH_SCRIPT'
+        import sys, re
+
+        src_path, dst_path = sys.argv[1], sys.argv[2]
+        with open(src_path) as f:
+            code = f.read()
+
+        # ── Patch block: static helper methods ──
+        HELPER_METHODS = '''
+            # ------------------------------------------------------------------ #
+            #  VPN / Compose-stack integration helpers  (auto-patched by api-init)
+            # ------------------------------------------------------------------ #
+
+            @staticmethod
+            def _get_bot_network_mode() -> str:
+                """Return the network_mode for spawned bot containers.
+                Reads DOCKER_BOT_NETWORK_MODE from env (default: 'host').
+                Recommended: 'container:gluetun' for VPN routing.
+                """
+                return os.environ.get("DOCKER_BOT_NETWORK_MODE", "none")
+
+            @staticmethod
+            def _get_compose_labels(instance_name: str) -> dict:
+                """Return Docker labels that graft the bot into the Compose project
+                so it appears in docker compose ps, Dozzle, and autoheal.
+                """
+                project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+                service = os.environ.get("COMPOSE_SERVICE_PREFIX", "hummingbot-bot")
+                labels = {"autoheal": "true"}
+                if project:
+                    labels.update({
+                        "com.docker.compose.project":         project,
+                        "com.docker.compose.service":          f"{service}-{instance_name}",
+                        "com.docker.compose.container-number": "1",
+                        "com.docker.compose.oneoff":           "False",
+                    })
+                return labels
+
+            # ------------------------------------------------------------------ #
+        '''
+
+        # Insert helpers after the __init__ / DockerException block
+        anchor = 'logger.error(f"It was not possible to connect to Docker'
+        anchor_line = None
+        lines = code.split('\n')
+        for i, line in enumerate(lines):
+            if anchor in line:
+                anchor_line = i
+                break
+
+        if anchor_line is None:
+            print("[api-init] WARNING: Could not find insertion anchor in docker_service.py")
+            print("[api-init] Copying unpatched file — you will need to patch manually.")
+            with open(dst_path, 'w') as f:
+                f.write(code)
+            sys.exit(0)
+
+        # Find the end of the except block (next blank line or unindented line)
+        insert_at = anchor_line + 1
+        while insert_at < len(lines) and lines[insert_at].strip() != '':
+            insert_at += 1
+        insert_at += 1  # after the blank line
+
+        patched_lines = lines[:insert_at] + HELPER_METHODS.split('\n') + lines[insert_at:]
+        code = '\n'.join(patched_lines)
+
+        # ── Patch the containers.run() call site ──
+        # Replace network_mode="host" with dynamic version + add labels
+        code = code.replace(
+            'network_mode="host",',
+            'network_mode=self._get_bot_network_mode(),\n'
+            '                labels=self._get_compose_labels(instance_name),'
+        )
+
+        # Add setup logging before the try block that calls containers.run
+        run_anchor = 'self.client.containers.run('
+        if run_anchor in code:
+            inject = (
+                '\n        # ── Network mode & stack integration (auto-patched) ─────\n'
+                '        network_mode = self._get_bot_network_mode()\n'
+                '        labels = self._get_compose_labels(instance_name)\n'
+                '        logger.info(\n'
+                '            f"Launching bot \'{instance_name}\' with "\n'
+                '            f"network_mode={network_mode}, labels={labels}"\n'
+                '        )\n'
+            )
+            # Insert before the try: block that contains containers.run
+            idx = code.index(run_anchor)
+            # Walk backwards to find the 'try:' line
+            try_search = code.rfind('try:', 0, idx)
+            if try_search > 0:
+                # Find line start
+                line_start = code.rfind('\n', 0, try_search)
+                if line_start > 0:
+                    code = code[:line_start] + inject + code[line_start:]
+
+        with open(dst_path, 'w') as f:
+            f.write(code)
+        print(f"[api-init] Patched docker_service.py written to {dst_path}")
+        PATCH_SCRIPT
+            chmod 644 "$$TARGET"
+
+          elif [ -n "$$PREV_MD5" ] && [ "$$CURR_MD5" != "$$PREV_MD5" ]; then
+            # --- UPSTREAM CHANGED: warn user ---
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║  ⚠  UPSTREAM docker_service.py HAS CHANGED                 ║"
+            echo "║                                                            ║"
+            echo "║  Your patched version is still in use (not overwritten).   ║"
+            echo "║  The new upstream has been saved for comparison at:        ║"
+            echo "║    $$UPSTREAM_REF"
+            echo "║                                                            ║"
+            echo "║  To review changes:                                        ║"
+            echo "║    diff $$UPSTREAM_REF $$TARGET"
+            echo "║                                                            ║"
+            echo "║  To re-apply patch on new upstream:                        ║"
+            echo "║    rm $$TARGET"
+            echo "║    docker compose up hummingbot-api-init                   ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+          else
+            echo "[api-init] docker_service.py: patched file in use, upstream unchanged."
+          fi
+        fi
+
+        # --- 2. Version-aware seed: controllers ---
+        # Find source controllers dir in the image
+        CTRL_SRC=""
+        for candidate in \
+          /hummingbot-api/bots/controllers \
+          /app/bots/controllers \
+          /hummingbot-api/controllers; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            CTRL_SRC="$$candidate"
+            break
+          fi
+        done
+
+        CTRL_DST="$$BASE/api/data/bots/controllers"
+        if [ -n "$$CTRL_SRC" ]; then
+          echo "[api-init] Seeding controllers: $$CTRL_SRC → $$CTRL_DST"
+          version_aware_seed "$$CTRL_SRC" "$$CTRL_DST" "api-ctrl-$$API_VERSION"
+        else
+          echo "[api-init] No controllers source found in image — skipping."
+        fi
+
+        # --- 3. Version-aware seed: scripts ---
+        SCRIPTS_SRC=""
+        for candidate in \
+          /hummingbot-api/bots/scripts \
+          /app/bots/scripts \
+          /hummingbot-api/scripts; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            SCRIPTS_SRC="$$candidate"
+            break
+          fi
+        done
+
+        SCRIPTS_DST="$$BASE/api/data/bots/scripts"
+        if [ -n "$$SCRIPTS_SRC" ]; then
+          echo "[api-init] Seeding scripts: $$SCRIPTS_SRC → $$SCRIPTS_DST"
+          version_aware_seed "$$SCRIPTS_SRC" "$$SCRIPTS_DST" "api-scripts-$$API_VERSION"
+        else
+          echo "[api-init] No scripts source found in image — skipping."
+        fi
+
+        # --- 4. Version-aware seed: conf (conf_client, etc.) ---
+        CONF_SRC=""
+        for candidate in \
+          /hummingbot-api/bots/conf \
+          /app/bots/conf; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            CONF_SRC="$$candidate"
+            break
+          fi
+        done
+
+        CONF_DST="$$BASE/api/data/bots/conf"
+        if [ -n "$$CONF_SRC" ]; then
+          echo "[api-init] Seeding api bots/conf: $$CONF_SRC → $$CONF_DST"
+          version_aware_seed "$$CONF_SRC" "$$CONF_DST" "api-conf-$$API_VERSION"
+        else
+          echo "[api-init] No bots/conf source found in image — skipping."
+        fi
+
+        chmod -R 777 "$$BASE/api" 2>/dev/null || true
+        chmod -R 777 "$$BASE/patches" 2>/dev/null || true
+        echo "[api-init] Done."
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot:/humming_dir
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # INIT 2c: API DB migrations (Alembic)
+  #   Safe no-op until Alembic is scaffolded in the API fork image.
+  # ---------------------------------------------------------------------------
+  hummingbot-api-migrate:
+    image: hummingbot/hummingbot-api:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-api-migrate
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      hummingbot-api-init:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - DATABASE_URL=postgresql+asyncpg://hbot:${POSTGRES_PASSWORD}@127.0.0.1:5432/hummingbot_api
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        [ -f /opt/conda/etc/profile.d/conda.sh ] && . /opt/conda/etc/profile.d/conda.sh && conda activate hummingbot-api 2>/dev/null || true
+        cd /hummingbot-api 2>/dev/null || cd /app 2>/dev/null || { echo "[migrate] app dir not found — skipping"; exit 0; }
+        if [ -f alembic.ini ]; then
+          echo "[migrate] alembic.ini found — running: alembic upgrade head"
+          alembic upgrade head
+          echo "[migrate] Alembic migrations applied."
+        else
+          echo "[migrate] No alembic.ini in image yet — skipping (scaffold Alembic to enable)."
+        fi
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # INIT 2b: Gateway init — chain configs, connectors, tokens, pools
+  # ---------------------------------------------------------------------------
+  gateway-init:
+    image: hummingbot/gateway@sha256:adb06e1853310bc98bf15655a1d0645177b5675887334d776f2f2fd53396eea8
+    container_name: hummingbot-gateway-init
+    network_mode: none
+    user: "0:0"
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -eu
+        BASE="/humming_dir"
+
+        # Source shared helpers
+        if [ -f "$$BASE/bootstrap/seed_helpers.sh" ]; then
+          . "$$BASE/bootstrap/seed_helpers.sh"
+        else
+          echo "[gw-init] ERROR: seed_helpers.sh not found"
+          exit 1
+        fi
+
+        # Detect gateway version
+        GW_VERSION="$$(fingerprint_dir /home/gateway/conf 2>/dev/null || echo unknown)"
+        echo "[gw-init] Gateway image fingerprint: $$GW_VERSION"
+
+        # Find gateway conf source in the image
+        GW_CONF_SRC=""
+        for candidate in \
+          /home/gateway/conf \
+          /gateway/conf \
+          /app/conf; do
+          if [ -d "$$candidate" ] && [ -n "$$(ls -A "$$candidate" 2>/dev/null)" ]; then
+            GW_CONF_SRC="$$candidate"
+            break
+          fi
+        done
+
+        GW_CONF_DST="$$BASE/gateway/conf"
+        if [ -n "$$GW_CONF_SRC" ]; then
+          echo "[gw-init] Seeding gateway conf: $$GW_CONF_SRC → $$GW_CONF_DST"
+          version_aware_seed "$$GW_CONF_SRC" "$$GW_CONF_DST" "gw-conf-$$GW_VERSION"
+        else
+          echo "[gw-init] WARNING: No gateway conf source found in image."
+          echo "[gw-init] The gateway container will create defaults on first start."
+        fi
+
+        chmod -R 777 "$$BASE/gateway" 2>/dev/null || true
+        echo "[gw-init] Done."
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot:/humming_dir
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # INIT 3: Password init (needs hummingbot image for crypto libs)
+  # ---------------------------------------------------------------------------
+  hummingbot-password-init:
+    image: hummingbot/hummingbot:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-password-init
+    network_mode: none
+    user: "0:0"
+    depends_on:
+      hummingbot-seed:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        . /opt/conda/etc/profile.d/conda.sh
+        conda activate hummingbot
+
+        CONF_DIR="/humming_dir/hummingbot/conf"
+        API_MASTER="/humming_dir/api/data/bots/credentials/master_account"
+        PW="$${CONFIG_PASSWORD:-admin}"
+
+        if [ ! -f "$$CONF_DIR/.password_verification" ]; then
+          echo "=== generating hummingbot .password_verification ==="
+          cd /home/hummingbot
+          python -c "
+        import os, sys
+        os.environ['CONF_DIR_PATH'] = '$$CONF_DIR'
+        sys.path.insert(0, '/home/hummingbot')
+        from hummingbot.client.config.config_crypt import store_password_verification, ETHKeyFileSecretManger
+        sm = ETHKeyFileSecretManger('$$PW')
+        store_password_verification(sm)
+        print('Created: $$CONF_DIR/.password_verification')
+        "
+        else
+          echo "=== .password_verification already exists, skipping ==="
+        fi
+
+        if [ ! -f "$$API_MASTER/.password_verification" ] && [ -f "$$CONF_DIR/.password_verification" ]; then
+          echo "=== copying .password_verification to API master_account ==="
+          cp "$$CONF_DIR/.password_verification" "$$API_MASTER/.password_verification"
+        else
+          echo "=== API .password_verification already exists, skipping ==="
+        fi
+
+        echo "=== password init complete ==="
+    environment:
+      - TZ=Europe/Tirane
+      - CONFIG_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot:/humming_dir
+    restart: "no"
+    logging: *default-logging
+
+  # ===========================================================================
+  # APP CONTAINERS
+  # ===========================================================================
+
+  hummingbot:
+    image: hummingbot/hummingbot:latest   # LOCAL BUILD (custom nonkyc image)
+    pull_policy: never
+    container_name: hummingbot
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+      hummingbot-password-init:
+        condition: service_completed_successfully
+    tty: true
+    stdin_open: true
+    environment:
+      - TZ=Europe/Tirane
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/hummingbot/conf:/home/hummingbot/conf
+      - /mnt/sharedrive/apps/hummingbot/hummingbot/logs:/home/hummingbot/logs
+      - /mnt/sharedrive/apps/hummingbot/hummingbot/data:/home/hummingbot/data
+      - /mnt/sharedrive/apps/hummingbot/hummingbot/certs:/home/hummingbot/certs
+      - /mnt/sharedrive/apps/hummingbot/hummingbot/scripts:/home/hummingbot/scripts
+      - /mnt/sharedrive/apps/hummingbot/hummingbot/controllers:/home/hummingbot/controllers
+    restart: "no"
+    logging: *default-logging
+
+  gateway:
+    image: hummingbot/gateway@sha256:adb06e1853310bc98bf15655a1d0645177b5675887334d776f2f2fd53396eea8
+    container_name: hummingbot-gateway
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+      gateway-init:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - GATEWAY_PASSPHRASE=${GATEWAY_PASSPHRASE}
+      - DEV=${DEV_VAR:-false}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/gateway/conf:/home/gateway/conf
+      - /mnt/sharedrive/apps/hummingbot/gateway/logs:/home/gateway/logs
+      - /mnt/sharedrive/apps/hummingbot/gateway/certs:/home/gateway/certs
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const net=require('net');const s=net.createConnection(15888,'127.0.0.1');s.setTimeout(2000);s.on('connect',()=>{s.end();process.exit(0)});s.on('timeout',()=>process.exit(1));s.on('error',()=>process.exit(1));"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  postgres:
+    image: postgres@sha256:004f63c1e58096cd86ba6d4ccc80e89897776553f654e935b33e920b6e141ba9
+    container_name: hummingbot-postgres
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - POSTGRES_DB=hummingbot_api
+      - POSTGRES_USER=hbot
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/postgres/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hbot -d hummingbot_api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  emqx:
+    image: emqx@sha256:2829687a7e7d14df0ad2a2d17d83c2002e9aacae5e663b8bda586fdaaa01e949
+    container_name: hummingbot-broker
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - EMQX_NODE__NAME=emqx@127.0.0.1
+      - EMQX_LISTENER__TCP__EXTERNAL=127.0.0.1:1883
+      - EMQX_DASHBOARD__LISTENERS__HTTP__BIND=127.0.0.1:18083
+      - EMQX_LOADED_PLUGINS=emqx_recon,emqx_retainer,emqx_management,emqx_dashboard
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/emqx/data:/opt/emqx/data
+      - /mnt/sharedrive/apps/hummingbot/emqx/log:/opt/emqx/log
+      - /mnt/sharedrive/apps/hummingbot/emqx/etc:/opt/emqx/etc
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx_ctl", "status", "--name", "emqx@127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  hummingbot-api:
+    image: hummingbot/hummingbot-api:latest   # LOCAL BUILD (custom)
+    pull_policy: never
+    container_name: hummingbot-api
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      emqx:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+      hummingbot-api-init:
+        condition: service_completed_successfully
+      hummingbot-api-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/patches/docker_service.py:/hummingbot-api/services/docker_service.py:ro
+      - /mnt/sharedrive/apps/hummingbot/api/data/bots:/hummingbot-api/bots
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - COMPOSE_SERVICE_PREFIX=hummingbot-bot
+      - COMPOSE_PROJECT_NAME=hummingbot_stack_1
+      - TZ=Europe/Tirane
+      - USERNAME=${HBOT_API_USERNAME:-admin}
+      - PASSWORD=${HBOT_API_PASSWORD:-admin}
+      - HBOT_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - HBOT_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+      - HBOT_API_CONFIG_PASSWORD=${CONFIG_PASSWORD:-admin}
+      - HBOT_API_DEBUG_MODE=${DEV_VAR:-true}
+      - BROKER_HOST=127.0.0.1
+      - BROKER_PORT=1883
+      - DATABASE_URL=postgresql+asyncpg://hbot:${POSTGRES_PASSWORD}@127.0.0.1:5432/hummingbot_api
+      - GATEWAY_URL=http://127.0.0.1:15888
+      - DOCKER_BOT_NETWORK_MODE=${DOCKER_BOT_NETWORK_MODE:-none}
+      - BOTS_PATH=/mnt/sharedrive/apps/hummingbot/api/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8000),2); s.close()"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  hummingbot-mcp:
+    image: hummingbot/hummingbot-mcp:latest
+    container_name: hummingbot-mcp
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      hummingbot-api:
+        condition: service_healthy
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - HUMMINGBOT_API_URL=http://127.0.0.1:8000
+      - HUMMINGBOT_USERNAME=${HBOT_API_USERNAME:-admin}
+      - HUMMINGBOT_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/controllers/mcp:/root/.hummingbot_mcp
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        cd /app
+        /app/.venv/bin/pip install --quiet --no-input mcp-proxy || pip install --quiet mcp-proxy
+        PROXY=/app/.venv/bin/mcp-proxy; [ -x "$$PROXY" ] || PROXY=mcp-proxy
+        echo "[mcp-proxy] serving SSE on 0.0.0.0:9000/sse, wrapping main.py"
+        exec "$$PROXY" --host 0.0.0.0 --port 9000 -- /app/.venv/bin/python -u main.py
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',9000),2); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  dashboard:
+    image: hummingbot/dashboard:latest   # ON :latest — pin to new digest AFTER you pull
+    container_name: hummingbot-dashboard
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      hummingbot-api:
+        condition: service_healthy
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - AUTH_SYSTEM_ENABLED=False
+      - BACKEND_API_HOST=127.0.0.1
+      - BACKEND_API_PORT=8000
+      - BACKEND_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - BACKEND_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/dashboard/credentials.yml:/home/dashboard/credentials.yml
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8501),2); s.close()"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  caddy-mcp:
+      image: caddy:2
+      container_name: hummingbot-caddy-mcp
+      network_mode: "service:gluetun"
+      depends_on:
+        gluetun:
+          condition: service_healthy
+        hummingbot-mcp:
+          condition: service_started
+      volumes:
+        - /mnt/sharedrive/apps/hummingbot/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+        - /mnt/sharedrive/apps/hummingbot/caddy/certs:/certs:ro
+      restart: unless-stopped
+      labels:
+        autoheal: "true"
+      logging: *default-logging
+
+  condor:
+    image: hummingbot/condor:latest   # ON :latest — pin to new digest AFTER you pull
+    container_name: hummingbot-condor-bot
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      hummingbot-api:
+        condition: service_healthy
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ADMIN_USER_ID=${ADMIN_USER_ID}
+      - CONDOR_PERSISTENCE_FILE=/app/data/condor_bot_data.pickle
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/condor/data:/app/data
+      - /mnt/sharedrive/apps/hummingbot/condor/config.yml:/app/config.yml
+      - /mnt/sharedrive/apps/hummingbot/condor/routines:/app/routines
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('api.telegram.org',443),2); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  dozzle:
+    image: amir20/dozzle@sha256:4815df572d135ce24c14ec3c150e482c98693bc5cc20291693b582baab8eb0bf
+    container_name: hummingbot-dozzle
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "/dozzle", "healthcheck"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Jupyter Lab — lightweight dev/debug notebook inside the VPN
+  # ---------------------------------------------------------------------------
+  jupyter:
+    image: python@sha256:c8271b1f627d0068857dce5b53e14a9558603b527e46f1f901722f935b786a39
+    container_name: hummingbot-jupyter
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+    environment:
+      - TZ=Europe/Tirane
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-hbot}
+      # Stack connection strings (available as env vars in notebooks)
+      - POSTGRES_URL=postgresql://hbot:${POSTGRES_PASSWORD}@127.0.0.1:5432/hummingbot_api
+      - MONGO_URI=mongodb://admin:${MONGO_ROOT_PASSWORD:-admin}@127.0.0.1:27017/quants_lab?authSource=admin
+      - HBOT_API_URL=http://127.0.0.1:8000
+      - HBOT_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - HBOT_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+      - NONKYC_API_KEY=${NONKYC_API_KEY:-}
+      - NONKYC_API_SECRET=${NONKYC_API_SECRET:-}
+      - MEXC_API_KEY=${MEXC_API_KEY:-}
+      - MEXC_API_SECRET=${MEXC_API_SECRET:-}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/jupyter/notebooks:/notebooks
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        pip install --upgrade pip 
+        pip install --quiet \
+          jupyterlab \
+          requests \
+          websocket-client \
+          pandas \
+          psycopg2-binary \
+          pymongo \
+          ccxt \
+          matplotlib \
+          pyyaml \
+          sqlalchemy \
+          aiohttp
+        echo "[jupyter] Dependencies installed. Starting JupyterLab..."
+        jupyter lab \
+          --ip=0.0.0.0 \
+          --port=8888 \
+          --no-browser \
+          --allow-root \
+          --notebook-dir=/notebooks \
+          --NotebookApp.token="$${JUPYTER_TOKEN}" \
+          --ServerApp.terminado_settings='{"shell_command": ["/bin/bash"]}'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8888),2); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ── MongoDB (candle data store, LAN-accessible for Quants Lab) ──────────
+  mongodb:
+    image: mongo@sha256:81ed620b45935fb49704010b75d3fa73df547f71323cfdba49323a64412253a4
+    container_name: hummingbot-mongodb
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-seed:
+        condition: service_completed_successfully
+    environment:
+      - TZ=Europe/Tirane
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-admin}
+      - MONGO_INITDB_DATABASE=quants_lab
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/mongodb/data:/data/db
+    # Cap WiredTiger cache — adjust to your TrueNAS RAM headroom
+    command: ["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "2"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ── Mongo Express (optional web UI — localhost-only via Gluetun port) ───
+  mongo-express:
+    image: mongo-express@sha256:1b23d7976f0210dbec74045c209e52fbb26d29b2e873d6c6fa3d3f0ae32c2a64
+    container_name: hummingbot-mongo-express
+    network_mode: "service:gluetun"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      - TZ=Europe/Tirane
+      - ME_CONFIG_MONGODB_SERVER=127.0.0.1
+      - ME_CONFIG_MONGODB_PORT=27017
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=admin
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=${MONGO_ROOT_PASSWORD:-admin}
+      - ME_CONFIG_BASICAUTH_USERNAME=admin
+      - ME_CONFIG_BASICAUTH_PASSWORD=${MONGO_EXPRESS_PASSWORD:-changeme}
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── Candle Ingestion Service ────────────────────────────────────────────
+  candle-ingest:
+    image: python@sha256:c8271b1f627d0068857dce5b53e14a9558603b527e46f1f901722f935b786a39
+    container_name: hummingbot-candle-ingest
+    network_mode: "service:gluetun"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      gluetun:
+        condition: service_healthy
+    environment:
+      - TZ=Europe/Tirane
+      - MONGO_URI=mongodb://admin:${MONGO_ROOT_PASSWORD:-admin}@127.0.0.1:27017/quants_lab?authSource=admin
+      - MONGO_DATABASE=quants_lab
+      - INGEST_INTERVAL_HOURS=${INGEST_INTERVAL_HOURS:-6}
+      - CANDLE_LOG_FILE=/app/logs/candle_ingest.log
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_ingest.py:/app/candle_ingest.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_ingest_config.yaml:/app/config.yaml:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_gap_repair.py:/app/candle_gap_repair.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_ws_nonkyc.py:/app/candle_ws_nonkyc.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_ws_mexc.py:/app/candle_ws_mexc.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_schema_v3_upgrade.py:/app/candle_schema_v3_upgrade.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_features.py:/app/candle_features.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/candle_logging.py:/app/candle_logging.py:ro
+      - /mnt/sharedrive/apps/hummingbot/candleingest/logs:/app/logs
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+
+        # ── Step 0: Install dependencies ──
+        pip install --upgrade pip
+        pip install --quiet pymongo requests pyyaml websocket-client pymexc
+        echo "[candle-ingest] Dependencies installed."
+
+        mkdir -p /app/logs
+
+        # ── Step 2: Start NonKYC WebSocket (background) ──
+        echo "[candle-ingest] Starting NonKYC WebSocket …"
+        python /app/candle_ws_nonkyc.py --config /app/config.yaml &
+        NONKYC_WS_PID=$$!
+        echo "[candle-ingest] NonKYC WS running (PID=$${NONKYC_WS_PID})"
+
+        # ── Step 3: Start MEXC WebSocket (background) ──
+        echo "[candle-ingest] Starting MEXC WebSocket …"
+        python /app/candle_ws_mexc.py --config /app/config.yaml &
+        MEXC_WS_PID=$$!
+        echo "[candle-ingest] MEXC WS running (PID=$${MEXC_WS_PID})"
+
+        trap "kill $${NONKYC_WS_PID} $${MEXC_WS_PID} 2>/dev/null; exit 0" SIGTERM SIGINT
+
+        INTERVAL_HOURS=$${INGEST_INTERVAL_HOURS:-6}
+        SLEEP_SECONDS=$$(( INTERVAL_HOURS * 3600 ))
+        echo "[candle-ingest] REST cycle interval: $${INTERVAL_HOURS}h ($${SLEEP_SECONDS}s)"
+
+        while true; do
+          CYCLE_START=$$(date +%s)
+          echo "[candle-ingest] === Ingestion cycle started at $$(date -Iseconds) ==="
+
+          echo "[candle-ingest] --- Candles + trades + metadata ---"
+          python /app/candle_ingest.py --config /app/config.yaml || true
+
+          echo "[candle-ingest] --- Gap repair ---"
+          python /app/candle_gap_repair.py \
+            --config /app/config.yaml \
+            --config-only \
+            --fill-synthetic \
+            --revalidate-synthetic \
+            --revalidate-max-age-days 3 || true
+
+          echo "[candle-ingest] --- Feature aggregation ---"
+          python /app/candle_features.py --config /app/config.yaml || true
+
+          if ! kill -0 $${NONKYC_WS_PID} 2>/dev/null; then
+            echo "[candle-ingest] WARNING: NonKYC WS died, restarting …"
+            python /app/candle_ws_nonkyc.py --config /app/config.yaml &
+            NONKYC_WS_PID=$$!
+          fi
+          if ! kill -0 $${MEXC_WS_PID} 2>/dev/null; then
+            echo "[candle-ingest] WARNING: MEXC WS died, restarting …"
+            python /app/candle_ws_mexc.py --config /app/config.yaml &
+            MEXC_WS_PID=$$!
+          fi
+
+          CYCLE_END=$$(date +%s)
+          CYCLE_ELAPSED=$$(( CYCLE_END - CYCLE_START ))
+          REMAINING=$$(( SLEEP_SECONDS - CYCLE_ELAPSED ))
+          if [ $${REMAINING} -lt 60 ]; then
+            REMAINING=60
+          fi
+          echo "[candle-ingest] === Cycle complete ($${CYCLE_ELAPSED}s). Sleeping $${REMAINING}s ==="
+          sleep $${REMAINING}
+        done
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ── Tax Collector ───────────────────────────────────────────────────────
+  tax-collector:
+    image: tax-collector:latest   # LOCAL BUILD
+    pull_policy: never
+    container_name: hummingbot-tax-collector
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - TZ=Europe/Tirane
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - TAX_DATABASE_URL=postgresql+asyncpg://hbot:${POSTGRES_PASSWORD}@127.0.0.1:5432/hummingbot_api
+      - TAX_EXCHANGES=${TAX_EXCHANGES}
+      - TAX_SYNC_CRON=${TAX_SYNC_CRON:-0 3 * * *}
+      - TAX_EXPORT_DIR=/data/exports
+      - NONKYC_API_KEY=${NONKYC_API_KEY}
+      - NONKYC_API_SECRET=${NONKYC_API_SECRET}
+      - MEXC_API_KEY=${MEXC_API_KEY}
+      - MEXC_API_SECRET=${MEXC_API_SECRET}
+      - SALVIUM_API_KEY=wallet_rpc
+      - SALVIUM_API_SECRET=unused
+      - SALVIUM_RPC_URL=http://127.0.0.1:19082
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/tax-collector/exports:/data/exports
+      - /mnt/sharedrive/apps/hummingbot/tax-collector/logs:/data/logs
+      - /mnt/sharedrive/apps/hummingbot/salvium/wallet:/wallet
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8100),2); s.close()"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ── Salvium Wallet RPC (view-only, for Tax Collector) ───────────────────
+  salvium-wallet-rpc:
+    image: salvium-wallet-rpc:latest   # LOCAL BUILD
+    pull_policy: never
+    container_name: hummingbot-salvium-wallet-rpc
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+    command:
+      - --wallet-file=/wallet/${SALVIUM_WALLET_FILE:-tax_view_wallet}
+      - --password=${SALVIUM_WALLET_PASSWORD}
+      - --rpc-bind-port=19082
+      - --rpc-bind-ip=127.0.0.1
+      - --disable-rpc-login 
+      - --daemon-host=192.168.1.54
+      - --daemon-port=19081
+      - --trusted-daemon
+      - --non-interactive
+      - --log-level=1
+    environment:
+      - TZ=Europe/Tirane
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/salvium/wallet:/wallet
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:19082/json_rpc"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
