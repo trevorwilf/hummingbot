@@ -43,6 +43,20 @@ from range_inventory_ladder import (  # noqa: E402
 )
 
 
+def _symlinks_available() -> bool:
+    """Windows needs Developer Mode or admin to create symlinks. Verified available on the
+    dev host and on Linux (where the bot actually runs), so this guard skips only where the
+    escape it covers cannot be staged at all."""
+    with tempfile.TemporaryDirectory() as probe_dir:
+        target = Path(probe_dir) / "target"
+        target.write_text("")
+        try:
+            os.symlink(target, Path(probe_dir) / "link")
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+
 def _config(**overrides) -> RangeInventoryLadderConfig:
     """A minimal VALID ladder config. Any ValidationError raised by a test case is therefore
     attributable to the field under test, not to an unrelated invalid field."""
@@ -70,6 +84,9 @@ REJECTED = {
     "windows_drive_absolute": "C:\\x.json",
     "windows_unc": "\\\\share\\x",
     "dot": ".",
+    # Rooted with NO drive: the ONLY guard that sees this is the `no root/anchor` half of C1.
+    # is_absolute() is False under BOTH flavors, so an is_absolute()-only check accepts it.
+    "windows_rooted_driveless": "\\tmp\\x.json",
 }
 
 # C1 accept set.
@@ -130,11 +147,17 @@ class TestStateFileNameLexicalContract(unittest.TestCase):
             _config(state_file_name="sub\\..\\..\\x.json")
 
     def test_windows_rooted_but_driveless_path_is_rejected(self):
-        """`/tmp/x.json` has no drive, so PureWindowsPath.is_absolute() is False. C1 requires
-        'no drive AND no root/anchor' precisely so this cannot slip through an
-        is_absolute()-only check."""
+        r"""`\tmp\x.json` is rooted with NO drive. PureWindowsPath.is_absolute() is False (no
+        drive) and PurePosixPath parses it as one opaque relative component -- so NEITHER
+        is_absolute() check sees it, and only C1's `no root/anchor` half rejects it. On
+        Windows `Path("data") / r"\tmp\x.json"` discards `data` and targets the current
+        drive's root.
+
+        The input here must be backslash-rooted, not `/tmp/x.json`: the latter is
+        POSIX-absolute, so it is rejected by the is_absolute() guard and would leave the
+        root/anchor guard untested (CDX-R02)."""
         with self.assertRaises(ValidationError):
-            _config(state_file_name="/tmp/x.json")
+            _config(state_file_name="\\tmp\\x.json")
 
     def test_windows_drive_relative_path_is_rejected(self):
         """`C:x.json` is drive-relative: is_absolute() is False under both flavors, but it
@@ -252,15 +275,76 @@ class TestRuntimeContainmentAssertion(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.state_path
 
-    def test_memoized_pass_does_not_mask_a_later_escape(self):
-        """The containment result is cached to keep resolve() off the hot path. The cache key
-        carries the composed path, so a LATER mutation to an escaping name must still raise
-        rather than be served a stale pass."""
+    def test_an_earlier_pass_does_not_sanction_a_later_escape(self):
+        """A containment check that passed once must not license a later escaping name."""
         ctrl = self._controller(state_file_name="x.json")
-        self.assertEqual(Path("data") / "x.json", ctrl.state_path)  # populate the memo
+        self.assertEqual(Path("data") / "x.json", ctrl.state_path)
         self._bypass_validator(ctrl.config, "state_file_name", "/tmp/escaped.json")
         with self.assertRaises(ValueError):
             ctrl.state_path
+
+    @unittest.skipUnless(_symlinks_available(), "host cannot create symlinks")
+    def test_state_file_symlinked_out_of_data_after_a_passing_check_raises(self):
+        """The lexical path is IDENTICAL across both accesses -- only its filesystem
+        resolution changes. Containment is a property of the resolution, not of the string,
+        so it must be re-established on every use: a result cached against the path string
+        would serve a stale pass and let the ladder write its state through the link, over a
+        file outside data/ (CDX-R01)."""
+        victim_dir = Path(self._tmp.name) / "outside"
+        victim_dir.mkdir()
+        victim = victim_dir / "victim.json"
+        victim.write_text("{}")
+
+        ctrl = self._controller(state_file_name="state.json")
+        Path("data").mkdir(exist_ok=True)
+        self.assertEqual(Path("data") / "state.json", ctrl.state_path)  # first check passes
+
+        os.symlink(victim, Path("data") / "state.json")
+        with self.assertRaises(ValueError) as ctx:
+            ctrl.state_path
+        self.assertIn("state_file_name", str(ctx.exception))
+
+    @unittest.skipUnless(_symlinks_available(), "host cannot create symlinks")
+    def test_parent_directory_symlinked_out_of_data_after_a_passing_check_raises(self):
+        """The same escape one level up: the escaping component is a PARENT directory, so the
+        state file name itself never changes and never looks suspicious."""
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+
+        ctrl = self._controller(state_file_name="sub/state.json")
+        Path("data").mkdir(exist_ok=True)
+        self.assertEqual(Path("data") / "sub" / "state.json", ctrl.state_path)  # first check passes
+
+        os.symlink(outside, Path("data") / "sub", target_is_directory=True)
+        with self.assertRaises(ValueError):
+            ctrl.state_path
+
+    def test_foreign_flavor_absolute_opt_out_refuses_rather_than_going_relative(self):
+        r"""C1 accepts an absolute path of EITHER flavor under the opt-out, but composition is
+        platform-specific: the foreign flavor's absolute path is a RELATIVE name here. On
+        POSIX `Path("data") / "C:\\x.json"` is `data/C:\x.json`; on Windows `Path("data") /
+        "/tmp/x.json"` is the driveless, current-drive-dependent `\tmp\x.json`. Honouring the
+        opt-out in that state would write state to a location the operator did not name, so
+        the runtime refuses (CDX-R03).
+
+        The input is chosen per-platform because each host reinterprets only the OTHER
+        flavor's absolute form. No validator bypass is needed: C1 legitimately ACCEPTS this
+        config, which is exactly why the runtime has to be the one that refuses."""
+        foreign_absolute = "/tmp/x.json" if os.name == "nt" else "C:\\x.json"
+        ctrl = self._controller(
+            state_file_name=foreign_absolute, allow_absolute_state_file_name=True
+        )
+        self.assertEqual(foreign_absolute, ctrl.config.state_file_name)  # accepted lexically
+        with self.assertRaises(ValueError) as ctx:
+            ctrl.state_path
+        self.assertIn("state_file_name", str(ctx.exception))
+
+    def test_foreign_flavor_refusal_does_not_over_fire_on_a_native_absolute(self):
+        """No false positive: the opt-out's whole point is a native absolute destination, and
+        the refusal above must not swallow it."""
+        target = Path(self._tmp.name) / "native_abs.json"
+        ctrl = self._controller(state_file_name=str(target), allow_absolute_state_file_name=True)
+        self.assertEqual(target, ctrl.state_path)
 
     def test_diagnostic_log_path_escape_raises(self):
         ctrl = self._controller(diagnostic_log_file_name="d.jsonl")

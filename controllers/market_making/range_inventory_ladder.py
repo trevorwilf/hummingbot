@@ -121,7 +121,13 @@ def _assert_path_contained(composed: Path, configured_name: Optional[str], allow
     This exists because the lexical validator can be bypassed: configs are mutated at
     runtime by the is_updatable machinery and can be built with `model_construct`, and
     `Path("data") / name` silently honours an absolute right operand. Resolving also
-    catches symlink escapes that no lexical check can see."""
+    catches symlink escapes that no lexical check can see.
+
+    Called on EVERY use of a composed path and deliberately not memoized: the lexical path
+    string is not the thing being checked -- its filesystem resolution is, and that is
+    mutable. A pass cached on the path string would be served forever after a parent
+    directory or the state file itself was later replaced with a symlink pointing out of
+    data/. The resolve() cost is noise next to the file I/O every caller is about to do."""
     # Checked independently of the root below: when allow_absolute is set, the root is derived
     # from configured_name itself, so a traversal planted into configured_name would drag the
     # root along with it and "contain" itself. C1 permits absolute paths, never traversal.
@@ -129,6 +135,19 @@ def _assert_path_contained(composed: Path, configured_name: Optional[str], allow
         raise ValueError(
             f"{field_name} must not contain a '..' component (composed path: {composed}). "
             f"Refusing to read or write state through a traversing path."
+        )
+    stripped = configured_name.strip() if configured_name is not None else ""
+    if allow_absolute and stripped != "" and _is_absolute_either_flavor(stripped) and not composed.is_absolute():
+        # C1's accept set is lexical and platform-agnostic: under the opt-out it admits an
+        # absolute path of EITHER flavor. Composition is not platform-agnostic. A name that is
+        # absolute only under the foreign flavor is a relative name here -- `Path("data") /
+        # "C:\\x.json"` is `data/C:\x.json` on POSIX -- so honouring the opt-out would write
+        # state somewhere other than the destination the operator named. Refuse instead of
+        # silently reinterpreting it.
+        raise ValueError(
+            f"{field_name} {stripped!r} is absolute under a foreign path flavor but composes to the "
+            f"non-absolute {composed} on this platform. Refusing to write state to a location other "
+            f"than the configured one."
         )
     root = _resolve_allowed_root(configured_name, allow_absolute)
     try:
@@ -1547,9 +1566,6 @@ class RangeInventoryLadderController(ControllerBase):
         # a once-per-process flag for the <state>.owner contention-marker check.
         self._state_path_abs: Optional[Path] = None
         self._state_owner_checked: bool = False
-        # CONTRACT C1 runtime containment: composed paths already asserted contained, so the
-        # per-access resolve() stays off the hot path. See _assert_contained.
-        self._path_containment_verified: Set[Tuple[str, str, bool]] = set()
 
         # Refresh-wave records (refresh budget fix 1 + deferred-create re-propose fix 4).
         # Per side: None, or a dict with
@@ -1603,24 +1619,11 @@ class RangeInventoryLadderController(ControllerBase):
         self._plan_shave_last_emit: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
 
-    def _assert_contained(self, composed: Path, configured_name: Optional[str], allow_absolute: bool,
-                          field_name: str) -> Path:
-        """Memoized wrapper over _assert_path_contained: state_path is read on every save,
-        load and status call, and resolve() is a syscall. The memo key carries the composed
-        path AND the opt-out flag, so a post-validation mutation of either is re-checked
-        rather than served from a stale pass."""
-        cache_key = (field_name, str(composed), allow_absolute)
-        if cache_key in self._path_containment_verified:
-            return composed
-        _assert_path_contained(composed, configured_name, allow_absolute, field_name)
-        self._path_containment_verified.add(cache_key)
-        return composed
-
     @property
     def state_path(self) -> Path:
         file_name = self.config.state_file_name or f"range_inventory_ladder_{self.config.id}.json"
         composed = Path("data") / file_name
-        return self._assert_contained(
+        _assert_path_contained(
             composed,
             self.config.state_file_name,
             # `is True` rather than bool(): fail closed on a config that lacks the field or
@@ -1628,6 +1631,7 @@ class RangeInventoryLadderController(ControllerBase):
             getattr(self.config, "allow_absolute_state_file_name", False) is True,
             "state_file_name",
         )
+        return composed
 
     @property
     def state_path_abs(self) -> Path:
@@ -1656,9 +1660,8 @@ class RangeInventoryLadderController(ControllerBase):
         composed = Path("data") / stamped
         # Sibling use-site of state_path: same Path("data") / <name> composition, same escape.
         # No opt-out here -- C1 defines one for the state file only.
-        return self._assert_contained(
-            composed, self.config.diagnostic_log_file_name, False, "diagnostic_log_file_name",
-        )
+        _assert_path_contained(composed, self.config.diagnostic_log_file_name, False, "diagnostic_log_file_name")
+        return composed
 
     @staticmethod
     def _json_safe(value: Any):
