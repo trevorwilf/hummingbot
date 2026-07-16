@@ -65,7 +65,12 @@ class ControllerConfigBase(BaseClientModel):
         controller_name (str): The name of the trading strategy that the controller will use.
         candles_config (List[CandlesConfig]): A list of configurations for the candles data feed.
     """
-    id: str = Field(..., description="Unique identifier for the controller. Required.")
+    id: str = Field(
+        ...,
+        min_length=1,
+        description="Unique identifier for the controller. Required. Must be a non-empty, "
+                    "non-whitespace string; the canonical id is the stripped value.",
+    )
     controller_name: str
     controller_type: str = "generic"
     total_amount_quote: Decimal = Field(
@@ -86,6 +91,22 @@ class ControllerConfigBase(BaseClientModel):
             "is_updatable": False
         })
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @field_validator('id', mode="after")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        """
+        Canonicalize the controller id to its stripped value and reject ids that are empty
+        after stripping. An empty or whitespace-only id makes every identity derivation
+        (ledger filename, owner-sidecar match) ambiguous, so it must fail closed at config
+        load rather than at deploy time.
+
+        Non-str values are rejected by the str field annotation before this runs.
+        """
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("Controller id must not be empty or whitespace-only.")
+        return stripped
 
     @field_validator('initial_positions', mode="before")
     @classmethod
