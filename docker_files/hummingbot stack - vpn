@@ -181,164 +181,43 @@ services:
         API_VERSION="$$(fingerprint_dir /hummingbot-api 2>/dev/null || fingerprint_dir /app 2>/dev/null || echo unknown)"
         echo "[api-init] Image fingerprint: $$API_VERSION"
 
-        # --- 1. docker_service.py patch management ---
-        PATCH_DIR="$$BASE/patches"
-        TARGET="$$PATCH_DIR/docker_service.py"
-        UPSTREAM_REF="$$PATCH_DIR/.docker_service.py.upstream"
-        UPSTREAM_SUM="$$PATCH_DIR/.docker_service_upstream.md5"
-
-        mkdir -p "$$PATCH_DIR"
-
-        # Find the original in the image
-        ORIGINAL=""
+        # --- 1. Boot provenance: the image's own api source (CDX-002) ---
+        # The host bind-mount that shadowed services/docker_service.py is gone,
+        # so the image's source is authoritative and the copy-forward hook wiring
+        # (docker_service.py imports/calls seed_resume_state) ships with the build.
+        # These lines make runtime-source-vs-image verification a log read.
+        API_ROOT=""
         for candidate in \
-          /hummingbot-api/services/docker_service.py \
-          /app/services/docker_service.py \
-          /opt/hummingbot-api/services/docker_service.py; do
-          if [ -f "$$candidate" ]; then
-            ORIGINAL="$$candidate"
+          /hummingbot-api \
+          /app \
+          /opt/hummingbot-api; do
+          if [ -f "$$candidate/services/docker_service.py" ]; then
+            API_ROOT="$$candidate"
             break
           fi
         done
 
-        if [ -z "$$ORIGINAL" ]; then
-          echo "[api-init] WARNING: docker_service.py not found in image."
-        else
-          CURR_MD5="$$(md5sum "$$ORIGINAL" | awk '{print $$1}')"
-          PREV_MD5=""
-          if [ -f "$$UPSTREAM_SUM" ]; then
-            PREV_MD5="$$(cat "$$UPSTREAM_SUM" 2>/dev/null || true)"
-          fi
-
-          # Always save the upstream reference for diffing
-          cp -f "$$ORIGINAL" "$$UPSTREAM_REF"
-          printf '%s' "$$CURR_MD5" > "$$UPSTREAM_SUM"
-
-          if [ ! -f "$$TARGET" ] || grep -q 'Placeholder' "$$TARGET" 2>/dev/null; then
-            # --- FIRST RUN: auto-apply the VPN/Compose patch ---
-            echo "[api-init] First run — applying VPN network patch to docker_service.py"
-            python3 - "$$ORIGINAL" "$$TARGET" <<'PATCH_SCRIPT'
-        import sys, re
-
-        src_path, dst_path = sys.argv[1], sys.argv[2]
-        with open(src_path) as f:
-            code = f.read()
-
-        # ── Patch block: static helper methods ──
-        HELPER_METHODS = '''
-            # ------------------------------------------------------------------ #
-            #  VPN / Compose-stack integration helpers  (auto-patched by api-init)
-            # ------------------------------------------------------------------ #
-
-            @staticmethod
-            def _get_bot_network_mode() -> str:
-                """Return the network_mode for spawned bot containers.
-                Reads DOCKER_BOT_NETWORK_MODE from env (default: 'host').
-                Recommended: 'container:gluetun' for VPN routing.
-                """
-                return os.environ.get("DOCKER_BOT_NETWORK_MODE", "none")
-
-            @staticmethod
-            def _get_compose_labels(instance_name: str) -> dict:
-                """Return Docker labels that graft the bot into the Compose project
-                so it appears in docker compose ps, Dozzle, and autoheal.
-                """
-                project = os.environ.get("COMPOSE_PROJECT_NAME", "")
-                service = os.environ.get("COMPOSE_SERVICE_PREFIX", "hummingbot-bot")
-                labels = {"autoheal": "true"}
-                if project:
-                    labels.update({
-                        "com.docker.compose.project":         project,
-                        "com.docker.compose.service":          f"{service}-{instance_name}",
-                        "com.docker.compose.container-number": "1",
-                        "com.docker.compose.oneoff":           "False",
-                    })
-                return labels
-
-            # ------------------------------------------------------------------ #
-        '''
-
-        # Insert helpers after the __init__ / DockerException block
-        anchor = 'logger.error(f"It was not possible to connect to Docker'
-        anchor_line = None
-        lines = code.split('\n')
-        for i, line in enumerate(lines):
-            if anchor in line:
-                anchor_line = i
-                break
-
-        if anchor_line is None:
-            print("[api-init] WARNING: Could not find insertion anchor in docker_service.py")
-            print("[api-init] Copying unpatched file — you will need to patch manually.")
-            with open(dst_path, 'w') as f:
-                f.write(code)
-            sys.exit(0)
-
-        # Find the end of the except block (next blank line or unindented line)
-        insert_at = anchor_line + 1
-        while insert_at < len(lines) and lines[insert_at].strip() != '':
-            insert_at += 1
-        insert_at += 1  # after the blank line
-
-        patched_lines = lines[:insert_at] + HELPER_METHODS.split('\n') + lines[insert_at:]
-        code = '\n'.join(patched_lines)
-
-        # ── Patch the containers.run() call site ──
-        # Replace network_mode="host" with dynamic version + add labels
-        code = code.replace(
-            'network_mode="host",',
-            'network_mode=self._get_bot_network_mode(),\n'
-            '                labels=self._get_compose_labels(instance_name),'
-        )
-
-        # Add setup logging before the try block that calls containers.run
-        run_anchor = 'self.client.containers.run('
-        if run_anchor in code:
-            inject = (
-                '\n        # ── Network mode & stack integration (auto-patched) ─────\n'
-                '        network_mode = self._get_bot_network_mode()\n'
-                '        labels = self._get_compose_labels(instance_name)\n'
-                '        logger.info(\n'
-                '            f"Launching bot \'{instance_name}\' with "\n'
-                '            f"network_mode={network_mode}, labels={labels}"\n'
-                '        )\n'
-            )
-            # Insert before the try: block that contains containers.run
-            idx = code.index(run_anchor)
-            # Walk backwards to find the 'try:' line
-            try_search = code.rfind('try:', 0, idx)
-            if try_search > 0:
-                # Find line start
-                line_start = code.rfind('\n', 0, try_search)
-                if line_start > 0:
-                    code = code[:line_start] + inject + code[line_start:]
-
-        with open(dst_path, 'w') as f:
-            f.write(code)
-        print(f"[api-init] Patched docker_service.py written to {dst_path}")
-        PATCH_SCRIPT
-            chmod 644 "$$TARGET"
-
-          elif [ -n "$$PREV_MD5" ] && [ "$$CURR_MD5" != "$$PREV_MD5" ]; then
-            # --- UPSTREAM CHANGED: warn user ---
-            echo ""
-            echo "╔══════════════════════════════════════════════════════════════╗"
-            echo "║  ⚠  UPSTREAM docker_service.py HAS CHANGED                 ║"
-            echo "║                                                            ║"
-            echo "║  Your patched version is still in use (not overwritten).   ║"
-            echo "║  The new upstream has been saved for comparison at:        ║"
-            echo "║    $$UPSTREAM_REF"
-            echo "║                                                            ║"
-            echo "║  To review changes:                                        ║"
-            echo "║    diff $$UPSTREAM_REF $$TARGET"
-            echo "║                                                            ║"
-            echo "║  To re-apply patch on new upstream:                        ║"
-            echo "║    rm $$TARGET"
-            echo "║    docker compose up hummingbot-api-init                   ║"
-            echo "╚══════════════════════════════════════════════════════════════╝"
-            echo ""
+        provenance_hash() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            printf 'sha256:%s' "$$(sha256sum "$$1" | awk '{print $$1}')"
+          elif command -v md5sum >/dev/null 2>&1; then
+            printf 'md5:%s' "$$(md5sum "$$1" | awk '{print $$1}')"
           else
-            echo "[api-init] docker_service.py: patched file in use, upstream unchanged."
+            printf 'hash-unavailable'
+          fi
+        }
+
+        if [ -z "$$API_ROOT" ]; then
+          echo "[provenance] WARNING: services/docker_service.py not found in image — image source UNVERIFIED."
+        else
+          DS_FILE="$$API_ROOT/services/docker_service.py"
+          RS_FILE="$$API_ROOT/services/resume_service.py"
+          echo "[provenance] image_fingerprint=$$API_VERSION root=$$API_ROOT"
+          echo "[provenance] services/docker_service.py $$(provenance_hash "$$DS_FILE") seed_resume_state_refs=$$(grep -c 'seed_resume_state' "$$DS_FILE" || true)"
+          if [ -f "$$RS_FILE" ]; then
+            echo "[provenance] services/resume_service.py $$(provenance_hash "$$RS_FILE") seed_resume_state_defs=$$(grep -c 'def seed_resume_state' "$$RS_FILE" || true)"
+          else
+            echo "[provenance] WARNING: services/resume_service.py not found in image — seed_resume_state_defs=0"
           fi
         fi
 
@@ -711,7 +590,6 @@ services:
       hummingbot-api-migrate:
         condition: service_completed_successfully
     volumes:
-      - /mnt/sharedrive/apps/hummingbot/patches/docker_service.py:/hummingbot-api/services/docker_service.py:ro
       - /mnt/sharedrive/apps/hummingbot/api/data/bots:/hummingbot-api/bots
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
