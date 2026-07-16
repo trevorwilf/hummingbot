@@ -118,7 +118,18 @@ Two fresh-context Opus reviewers, each told to *break* it, verified with executa
 > | `0`, `False`, `123` | **REJECTED** — `ValidationError: Input should be a valid string` | **No** — such a config can never run |
 > | `""`, `"   "` | **ACCEPTED** (`controller_base.py:68` was `id: str = Field(...)`, no `min_length`) | **YES — the real trigger** |
 >
-> `id: 0` is therefore not "a fail-open needing a nonsensical id" — it is **not a fail-open at all**, because the engine rejects it before anything runs. The reachable path is **empty / whitespace `id:`**: engine accepts → hook's `if not controller_id:` (`resume_service.py:874`) drops it with one WARNING and `continue`s → engine finds no `range_inventory_ladder_.json` → **re-seeds the ladder from wallet balances**. This is CDX-008 / CLA-002 (High, cross-confirmed). Fix status: engine half **live** (batch phase 2, `min_length=1` + strip validator); API half in Run B (reject **and abort**, not `continue`). The §6 `str(...)` remedy for this cluster is **prohibited** — see the correction at §6.
+> `id: 0` is therefore not "a fail-open needing a nonsensical id" — it is **not a fail-open at all**, because the engine rejects it before anything runs. The reachable trigger is an **empty or whitespace-only `id:`** — but the two halves reach the re-seed by *different* mechanisms, and conflating them (as an earlier draft of this correction did) misdescribes the code:
+>
+> | staged `id:` | `not controller_id` @ `:874`? | historical path | outcome |
+> |---|---|---|---|
+> | `""` (also bare `id:` → `None`) | **True** — falsy | enters the missing-id branch: one WARNING + `continue` | controller dropped → engine finds no ledger → **re-seeds from wallet** |
+> | `"   "` (quoted) | **False** — a non-empty str is **truthy** | **bypasses** the guard; `_plan_controller` derives `range_inventory_ladder_   .json` from the **raw** id (`:617-618`), matching what the pre-C2 engine wrote (`range_inventory_ladder.py:1624`, also raw) | historically **copied** — contract-invalid, but not dropped by `:874` |
+>
+> So `:874` drops `""`, **not** `"   "`. Verified: `bool("   ") is True`; neither `:873` (`config.get("id")`) nor `:617` strips.
+>
+> **The whitespace hazard is real, but it is a strip *asymmetry*, not the falsy guard — and the engine half now activates it.** With batch phase 2 live, the engine canonicalizes `id: " abc "` → `"abc"` and writes `range_inventory_ladder_abc.json`, while the unstripped hook still derives `range_inventory_ladder_ abc .json` → no match → `fresh_seed` → **re-seed from wallet**. Until the API half lands, a padded `id` in an existing config is a *newly reachable* fail-open. This is why the triage requires the API to canonicalize by the same `.strip()` **and abort** — matching predicates on both sides, not merely a non-falsy check.
+>
+> This is CDX-008 / CLA-002 (High, cross-confirmed): both `""` and whitespace-only violate CONTRACT C2 and are rejected engine-side after stripping. Fix status: engine half **live** (batch phase 2, `min_length=1` + strip validator — `""` and `"   "` both `ValidationError`, `" abc "` → `"abc"`); API half in Run B (strip, reject **and abort**, not `continue`). The §6 `str(...)` remedy for this cluster is **prohibited** — see the correction at §6.
 >
 > Sources: `scope_triage.md` "Doc corrections owed" + Batch 1 CDX-008; `REPORT_hb_predeploy.md` §1.2, §4.7.
 

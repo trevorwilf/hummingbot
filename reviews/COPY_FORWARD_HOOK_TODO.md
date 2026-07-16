@@ -65,7 +65,16 @@
 > | `0`, `False`, `123` | **REJECTED** — `ValidationError: Input should be a valid string` | **No** — the engine never accepts these, so a container with such an id cannot run |
 > | `""`, `"   "` | **ACCEPTED** (`id: str = Field(...)`, no `min_length`) | **YES — this is the real trigger** |
 >
-> So the struck test is unrunnable-by-construction: `id: 0` never reaches a running engine. The reachable path is **empty / whitespace-only `id:`** — engine accepts it, hook's `if not controller_id:` (`:874`) drops it with one WARNING and `continue`s, engine then finds no `range_inventory_ladder_.json` and **re-seeds the ladder from wallet balances** — the exact insufficient-funds bug the hook exists to prevent. (Second-order: two empty-id controllers collide on the same ledger filename.)
+> So the struck test is unrunnable-by-construction: `id: 0` never reaches a running engine. The reachable trigger is an **empty or whitespace-only `id:`** — but note the two halves do **not** share a mechanism:
+>
+> | staged `id:` | `not controller_id` @ `:874`? | historical path | outcome |
+> |---|---|---|---|
+> | `""` (also bare `id:` → `None`) | **True** — falsy | missing-id branch: one WARNING + `continue` | dropped → no `range_inventory_ladder_.json` → **re-seeds from wallet** (the insufficient-funds bug this hook exists to prevent) |
+> | `"   "` (quoted) | **False** — a non-empty str is **truthy** | **bypasses** the guard; ledger name built from the **raw** id at `:617-618`, matching the pre-C2 engine's own raw derivation (`range_inventory_ladder.py:1624`) | historically **copied** — contract-invalid, but `:874` never drops it |
+>
+> Verified: `bool("   ") is True`; nothing in `:873` → `:617` strips. So the `if controller_id is None:` fix line above is **not sufficient** — it addresses only the `""` half.
+>
+> **The whitespace half is a strip asymmetry, and the engine half now activates it.** With batch phase 2 live the engine canonicalizes `id: " abc "` → `"abc"` (writing `range_inventory_ladder_abc.json`), while the unstripped hook looks for `range_inventory_ladder_ abc .json` → no match → `fresh_seed` → **wallet re-seed**. A padded `id` in an existing config is therefore a *newly reachable* fail-open until the API half lands — which is why the API must canonicalize with the same `.strip()` and **abort**, not merely swap the falsy test. (Second-order: two empty-id controllers collide on the same ledger filename.)
 >
 > This is CDX-008 / CLA-002 (**High**, cross-confirmed). Fix status: engine half **live** (batch phase 2 — `min_length=1` + strip validator, so empty/whitespace `id` is now rejected at engine startup); API half in Run B (reject **and abort**, never `continue`). See correction 3 for the fix that must **not** be applied here.
 >
