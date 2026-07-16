@@ -11,11 +11,16 @@ set -euo pipefail
 #
 # After a SUCCESSFUL build, the repo's controllers/ tree (custom V2 controller
 # strategies) is synced to the host directory hummingbot-api mounts into bot
-# containers (default: /mnt/sharedrive/apps/hummingbot/api/data/bots/controllers).
-# Bot containers never read controllers from the image -- the mount shadows
-# them -- so without this sync a rebuilt image runs with STALE strategy scripts.
-# Update/add only (never deletes), checksum-based, with timestamped backups of
-# every overwritten file. Control with --controllers-dest / --no-controllers-sync.
+# containers. Bot containers never read controllers from the image -- the mount
+# shadows them -- so without this sync a rebuilt image runs with STALE strategy
+# scripts. Update/add only (never deletes), checksum-based, with timestamped
+# backups of every overwritten file.
+#
+# The destination is REQUIRED and has no default (CDX-010): the VPN and no-VPN
+# trees both exist on the same share, so a defaulted build did not "skip" -- it
+# succeeded into the WRONG tree, with no warning, and the operator only found out
+# when the wrong stack's bots changed behaviour. Pass --controllers-dest DIR, or
+# --no-controllers-sync to skip the sync deliberately.
 #
 # PRE-BUILD PURGE (default ON, disable with --no-purge): before the first
 # docker build, every container -- running OR stopped -- that uses one of the
@@ -89,8 +94,28 @@ PATCHED_DOCKERFILE="Dockerfile.nonkyc-base"
 # controllers/ tree is synced here (update/add only, checksum-based; replaced
 # files are backed up to .backup-<timestamp>/ inside the destination; nothing
 # at the destination is ever deleted).
-CONTROLLERS_DEST="${CONTROLLERS_DEST:-/mnt/sharedrive/apps/hummingbot/api/data/bots/controllers}"
+#
+# CDX-010: NO DEFAULT. An unset destination is a hard error when the sync is
+# enabled -- see validate_controllers_dest(). An explicit CONTROLLERS_DEST env
+# var is still honoured; what is gone is the silent fallback to the VPN tree.
+CONTROLLERS_DEST="${CONTROLLERS_DEST:-}"
 SYNC_CONTROLLERS=1
+
+# The two known controller trees, named in the fail-fast error so the operator
+# can see at a glance that picking one is a decision, not a formality. Derived
+# from the stack files: `- /mnt/sharedrive/apps/hummingbot:/humming_dir`
+# ("hummingbot stack - vpn":176) and `- /mnt/sharedrive/apps/hummingbot_us:/humming_dir`
+# ("hummingbot stack - no vpn":71), each + the api-init CTRL_DST suffix
+# "$BASE/api/data/bots/controllers" (vpn:264 / no vpn:151).
+KNOWN_CONTROLLERS_TREE_VPN="/mnt/sharedrive/apps/hummingbot/api/data/bots/controllers"
+KNOWN_CONTROLLERS_TREE_NO_VPN="/mnt/sharedrive/apps/hummingbot_us/api/data/bots/controllers"
+
+# Provenance: the manifest of the synced controller set, and its hash. Both are
+# stamped onto the image as labels so a running container can be traced back to
+# the exact controller tree that shipped with it.
+CONTROLLERS_MANIFEST_NAME="controllers.manifest.sha256"
+CONTROLLERS_MANIFEST_SHA256="unknown"
+CONTROLLERS_MANIFEST_BODY=""
 
 # Pre-build purge: stop + remove containers using the images this script
 # rebuilds, then delete those images, so nothing can keep running (or later
@@ -116,8 +141,12 @@ while [[ $# -gt 0 ]]; do
       echo "  --tag TAG               Docker image tag (default: latest)"
       echo "  --no-cache              Force full Docker rebuild"
       echo "  --dir DIR               Working directory (default: /tmp/hummingbot-nonkyc-build)"
-      echo "  --controllers-dest DIR  Where hummingbot-api keeps bot controllers"
-      echo "                          (default: $CONTROLLERS_DEST)"
+      echo "  --controllers-dest DIR  Where hummingbot-api keeps bot controllers."
+      echo "                          REQUIRED unless --no-controllers-sync (no default:"
+      echo "                          the VPN and no-VPN trees are siblings on one share,"
+      echo "                          so a default silently syncs into the wrong stack)."
+      echo "                            vpn:    $KNOWN_CONTROLLERS_TREE_VPN"
+      echo "                            no-vpn: $KNOWN_CONTROLLERS_TREE_NO_VPN"
       echo "  --no-controllers-sync   Skip the post-build controller-strategy sync"
       echo "  --no-purge              Do NOT stop/remove containers or delete the old"
       echo "                          images before building (legacy behavior)"
@@ -259,6 +288,83 @@ purge_old_image_and_containers() {
   fi
 }
 
+# CDX-010: the controllers destination must be EXPLICIT.
+#
+# The old default pointed at the VPN tree. Because the no-VPN tree is its
+# sibling on the same share, a `--no-vpn` operator who forgot the flag did not
+# get a "destination missing" skip -- the default existed, so the sync SUCCEEDED
+# into the other stack's live controllers. Explicit-or-fail removes the class.
+#
+# Called from Main BEFORE the pre-build purge and before any docker build, so a
+# missing destination costs nothing: no container is stopped, no image deleted.
+validate_controllers_dest() {
+  if [ "$SYNC_CONTROLLERS" != "1" ]; then
+    log "Controller sync disabled (--no-controllers-sync): no destination required."
+    return 0
+  fi
+  if [ -z "${CONTROLLERS_DEST:-}" ]; then
+    echo "" >&2
+    echo "[build] ✗  No controllers destination set." >&2
+    echo "" >&2
+    echo "  This build syncs controller strategies onto a LIVE stack's share, so the" >&2
+    echo "  destination has no default -- the two known trees are siblings and picking" >&2
+    echo "  the wrong one silently rewrites the other stack's strategies:" >&2
+    echo "" >&2
+    echo "    vpn stack:     --controllers-dest $KNOWN_CONTROLLERS_TREE_VPN" >&2
+    echo "    no-vpn stack:  --controllers-dest $KNOWN_CONTROLLERS_TREE_NO_VPN" >&2
+    echo "" >&2
+    echo "  Or pass --no-controllers-sync to skip the sync deliberately." >&2
+    echo "" >&2
+    die "Refusing to build: pass --controllers-dest DIR or --no-controllers-sync."
+  fi
+  if [ ! -d "$CONTROLLERS_DEST" ]; then
+    echo "" >&2
+    echo "[build] ✗  Controllers destination is not an existing directory:" >&2
+    echo "             $CONTROLLERS_DEST" >&2
+    echo "" >&2
+    echo "  Refusing to create it: a typo'd path would be created happily and the" >&2
+    echo "  sync would land where no stack ever reads it. Known trees:" >&2
+    echo "    vpn stack:     $KNOWN_CONTROLLERS_TREE_VPN" >&2
+    echo "    no-vpn stack:  $KNOWN_CONTROLLERS_TREE_NO_VPN" >&2
+    echo "" >&2
+    die "Refusing to build: --controllers-dest must name an existing directory."
+  fi
+  ok "Controllers destination: $CONTROLLERS_DEST"
+}
+
+# Build the controller manifest for $1 (the controllers source tree).
+#
+# Format (one line per file, ordered by path):  <sha256><2 spaces><relative/path>
+# Sorted by PATH, not by line: a path ordering is stable across content changes,
+# so a manifest diff reads as "these files changed", not as a full reshuffle.
+#
+# The set is exactly what sync_controllers copies -- the same find predicate --
+# so the manifest cannot claim files the sync did not place.
+#
+# Each digest is taken from STDIN (`sha256sum < "$rel"`) rather than by passing
+# the path: sha256sum prints "<hash> *<path>" for a path argument on hosts where
+# it defaults to binary mode, which is NOT the format above. Reading stdin and
+# formatting the line here makes the output host-independent.
+controllers_manifest_body() {
+  local src="$1"
+  ( cd "$src" || exit 1
+    while IFS= read -r -d '' rel; do
+      printf '%s  %s\n' "$(sha256sum < "$rel" | awk '{print $1}')" "$rel"
+    done < <(find . -type f -name '*.py' -not -path '*/__pycache__/*' -printf '%P\0' \
+             | LC_ALL=C sort -z)
+  )
+}
+
+# Compute the manifest + its hash into CONTROLLERS_MANIFEST_BODY / _SHA256.
+compute_controllers_manifest() {
+  local src="$1"
+  [ -d "$src" ] || die "Controllers source not found: $src — cannot compute the manifest."
+  CONTROLLERS_MANIFEST_BODY="$(controllers_manifest_body "$src")"
+  [ -n "$CONTROLLERS_MANIFEST_BODY" ] || die "Controllers manifest is empty for $src — refusing to stamp an image with a meaningless provenance label."
+  CONTROLLERS_MANIFEST_SHA256="$(printf '%s\n' "$CONTROLLERS_MANIFEST_BODY" | sha256sum | awk '{print $1}')"
+  ok "Controllers manifest: $(printf '%s\n' "$CONTROLLERS_MANIFEST_BODY" | wc -l | tr -d ' ') files, sha256 $CONTROLLERS_MANIFEST_SHA256"
+}
+
 # Sync the repo's controller strategy scripts into the directory hummingbot-api
 # mounts into bot containers (CONTROLLERS_DEST). Bot containers never read
 # controllers from the image -- the mount shadows them -- so this keeps the
@@ -269,7 +375,12 @@ purge_old_image_and_containers() {
 #     $CONTROLLERS_DEST/.backup-<timestamp>/<same relative path>
 #   - new files inherit the destination directory's owner (containers must
 #     be able to read them) and 644 permissions
-# Never fatal: a missing source or destination logs a warning and skips.
+#   - a controllers.manifest.sha256 recording the synced set is written into
+#     the destination; the same hash is stamped on the image as a label
+# CDX-010: FATAL, not skippable. This used to warn-and-return-0 on a missing
+# source or destination, which is the silent-success failure mode the finding is
+# about: the build reported success while the live strategies stayed stale. The
+# only way to skip is now the explicit --no-controllers-sync.
 sync_controllers() {
   local src="$1"
   local dest="$CONTROLLERS_DEST"
@@ -279,13 +390,10 @@ sync_controllers() {
     return 0
   fi
   if [ ! -d "$src" ]; then
-    warn "Controllers source not found: $src — skipping controller sync."
-    return 0
+    die "Controllers source not found: $src — refusing to report a successful build that synced nothing."
   fi
   if [ ! -d "$dest" ]; then
-    warn "Controllers destination not found: $dest — skipping controller sync."
-    warn "Set CONTROLLERS_DEST or --controllers-dest if your API data dir differs."
-    return 0
+    die "Controllers destination vanished since validation: $dest — refusing to skip silently."
   fi
 
   log "Syncing controller strategies: $src -> $dest"
@@ -319,6 +427,23 @@ sync_controllers() {
     fi
   done < <(find "$src" -type f -name '*.py' -not -path '*/__pycache__/*' -print0)
 
+  # Provenance: record the synced set at the destination. Written unconditionally
+  # (even when no file changed) so a destination that predates this feature, or
+  # one drifted by hand, still gains a truthful manifest. Same backup contract as
+  # any other replaced file.
+  [ -n "$CONTROLLERS_MANIFEST_BODY" ] || compute_controllers_manifest "$src"
+  local manifest_path="$dest/$CONTROLLERS_MANIFEST_NAME"
+  if [ -f "$manifest_path" ] && ! printf '%s\n' "$CONTROLLERS_MANIFEST_BODY" | cmp -s - "$manifest_path"; then
+    mkdir -p "$backup_dir"
+    cp -p "$manifest_path" "$backup_dir/$CONTROLLERS_MANIFEST_NAME"
+  fi
+  printf '%s\n' "$CONTROLLERS_MANIFEST_BODY" > "$manifest_path"
+  chmod 644 "$manifest_path" 2>/dev/null || true
+  if [ -n "$dest_owner" ]; then
+    chown "$dest_owner" "$manifest_path" 2>/dev/null || true
+  fi
+  ok "Controllers manifest -> $manifest_path (sha256 $CONTROLLERS_MANIFEST_SHA256)"
+
   if [ "$((changed + added))" -eq 0 ]; then
     ok "Controllers already up to date: $dest"
   else
@@ -338,6 +463,12 @@ echo "╚═══════════════════════�
 echo ""
 
 check_prereqs
+
+# CDX-010: settle the controllers destination BEFORE anything destructive or
+# expensive happens -- no clone, no purge (which stops and REMOVES live bot
+# containers), no build. A missing --controllers-dest must cost the operator a
+# re-run, never a stopped bot or a sync into the wrong stack's tree.
+validate_controllers_dest
 
 SRC_DIR="$BUILD_DIR/src"
 mkdir -p "$BUILD_DIR"
@@ -373,6 +504,14 @@ if [ "${PY_COUNT:-0}" -lt 3 ]; then
   die "Only $PY_COUNT Python files found in $CONNECTOR_REL_PATH — connector seems incomplete."
 fi
 ok "Connector present ($PY_COUNT Python files)"
+
+# ── Provenance: controllers manifest + source commit ───────────────────────
+# CDX-010: computed from the tree that is about to be synced, BEFORE the build,
+# because the resulting hash is stamped onto the image as a label. Full (not
+# short) SHA: the label is the only durable link from a running container back
+# to the exact engine revision, and a short SHA can collide as the repo grows.
+HB_SHA_FULL="$(git -C "$SRC_DIR" rev-parse HEAD)"
+compute_controllers_manifest "$SRC_DIR/controllers"
 
 # ── Pre-build: retire containers + images from previous builds ─────────────
 # Placed AFTER the cheap clone/verify steps so an early failure never takes
@@ -485,6 +624,8 @@ docker build $DOCKER_BUILD_FLAGS \
   --label "hummingbot.pg.driver=${PG_DRIVER_PIP_PACKAGE}" \
   --label "hummingbot.pg.installed_to=conda:${CONDA_ENV}" \
   --label "hummingbot.build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --label "nonkyc.hummingbot_commit=$HB_SHA_FULL" \
+  --label "nonkyc.controllers_manifest_sha256=$CONTROLLERS_MANIFEST_SHA256" \
   "$BUILD_DIR"
 
 ok "Final image built: $FULL_TAG"
@@ -564,7 +705,9 @@ echo "  Branch:   $HB_BRANCH ($HB_SHA)"
 echo "  PG drv:   $PG_DRIVER_PIP_PACKAGE"
 echo "  Conda:    $CONDA_ENV ($CONDA_PYTHON)"
 echo "  User:     $DETECTED_USER"
-echo "  Ctrl dir: $CONTROLLERS_DEST (sync $( [ "$SYNC_CONTROLLERS" = "1" ] && echo enabled || echo disabled ))"
+echo "  Ctrl dir: ${CONTROLLERS_DEST:-<none>} (sync $( [ "$SYNC_CONTROLLERS" = "1" ] && echo enabled || echo disabled ))"
+echo "  Ctrl set: $CONTROLLERS_MANIFEST_SHA256"
+echo "  Commit:   $HB_SHA_FULL"
 echo ""
 echo "  Compose can use:"
 echo "    image: $FULL_TAG"
