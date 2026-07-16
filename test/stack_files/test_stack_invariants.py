@@ -21,6 +21,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -561,16 +562,81 @@ class TestGatewayTransportContract(unittest.TestCase):
         )
         value = env_map(parsed["services"][API_SERVICE]).get("GATEWAY_URL")
         self.assertIsNotNone(value, "no-vpn stack must set GATEWAY_URL explicitly, not rely on the default")
-        host = value.split("://", 1)[1].split(":")[0]
+        parts = urlsplit(value)
+        # Scheme is load-bearing, not decoration: the API derives gateway_use_ssl
+        # from it alone, so an http:// value here would silently define a plaintext
+        # gateway contract in a stack whose bots are configured for mTLS.
+        self.assertEqual(
+            "https",
+            parts.scheme,
+            f"no-vpn GATEWAY_URL must keep the https scheme -- it is what the API reads to decide "
+            f"gateway_use_ssl; got {value!r}",
+        )
         self.assertTrue(
-            host.endswith(".invalid"),
+            parts.hostname.endswith(".invalid"),
             f"no-vpn GATEWAY_URL must name a reserved, guaranteed-non-resolving host (RFC 6761 "
             f"'.invalid') so gateway routes fail fast by design; got {value!r}",
         )
         self.assertNotIn(
             "localhost",
-            host,
+            parts.hostname,
             "no-vpn GATEWAY_URL must not point at localhost -- nothing serves the gateway there",
+        )
+        self.assertEqual(
+            15888,
+            parts.port,
+            f"no-vpn GATEWAY_URL must keep the canonical gateway port; got {value!r}",
+        )
+
+
+class TestGatewayNetworkContract(unittest.TestCase):
+    """CDX-009 step 4: the gateway network dependency, machine-checked.
+
+    The vpn stack joins no external network *by construction*: gateway shares
+    gluetun's namespace via ``network_mode``, which compose forbids combining with
+    ``networks:``. So the honest declaration is the absence itself -- these tests
+    pin it, so anyone who later attaches gateway to a bridge network (or declares a
+    top-level network for it to join) must confront the contract comment first,
+    instead of the dependency staying implied either way.
+    """
+
+    def test_vpn_gateway_shares_the_vpn_namespace_and_joins_no_network(self):
+        parsed = load_stack(VPN_STACK)
+        gateway = parsed["services"][GATEWAY_SERVICE]
+        self.assertEqual(
+            "service:gluetun",
+            gateway.get("network_mode"),
+            "gateway must share gluetun's network namespace -- this is what makes the API's "
+            "loopback GATEWAY_URL correct and what forbids a networks: attachment",
+        )
+        self.assertNotIn(
+            "networks",
+            gateway,
+            "compose rejects `networks:` alongside `network_mode:`; the stack would fail to start",
+        )
+        self.assertNotIn(
+            "networks",
+            parsed,
+            "the vpn stack declares no top-level networks by contract (every service uses "
+            "network_mode). If you are adding one, update the CDX-009 network contract comment "
+            "at the head of the stack file and say which service joins it and why.",
+        )
+
+    def test_no_vpn_network_is_created_by_this_stack_not_external(self):
+        parsed = load_stack(NO_VPN_STACK)
+        networks = parsed["networks"]
+        self.assertIn("hbnet-us", networks)
+        self.assertEqual(
+            "hbnet-us",
+            networks["hbnet-us"].get("name"),
+            "the network needs an explicit unprefixed name so bots spawned from the API's own "
+            "compose project can attach to it by that name",
+        )
+        self.assertNotIn(
+            "external",
+            networks["hbnet-us"],
+            "hbnet-us is created BY this stack; declaring it external would make compose demand "
+            "a pre-existing network and fail the deploy",
         )
 
 
@@ -582,19 +648,44 @@ class TestGatewayHealthcheckIsNotTcpOnly(unittest.TestCase):
     that the probe actually verifies is in TestGatewayProbeBehaviour below.
     """
 
-    def test_probe_does_not_use_bare_tcp_connect(self):
+    def test_probe_speaks_https_and_no_other_transport(self):
+        # Banning the exact former spelling is not enough: `require('node:net')` or
+        # `require('tls')` are equivalent bare-socket probes that no denylist of
+        # literals catches. Allow-list the modules instead -- an https probe needs
+        # exactly https (transport) and fs (reading the cert set), nothing else.
         probe = gateway_probe_js()
-        self.assertNotIn("net.createConnection", probe)
-        self.assertNotIn("require('net')", probe)
+        required = set(re.findall(r"require\(\s*['\"](?:node:)?([A-Za-z_][\w/.]*)['\"]\s*\)", probe))
+        self.assertIn(
+            "https",
+            required,
+            f"probe must dial the gateway with the https module; it requires {sorted(required)}",
+        )
+        self.assertEqual(
+            set(),
+            required - {"https", "fs"},
+            f"probe may only require https (transport) and fs (cert material); a probe that reaches "
+            f"for another transport module is a bare-socket check wearing an https costume. "
+            f"Requires: {sorted(required)}",
+        )
 
     def test_probe_presents_client_credentials_and_verifies_server(self):
-        probe = gateway_probe_js()
-        self.assertIn("require('https')", probe)
-        for material in ("ca_cert.pem", "client_cert.pem", "client_key.pem"):
-            with self.subTest(material=material):
-                self.assertIn(material, probe, f"probe must present/trust {material}")
-        self.assertIn("rejectUnauthorized:true", probe.replace(" ", ""))
-        self.assertNotIn("rejectUnauthorized:false", probe.replace(" ", ""))
+        # Asserting that 'client_cert.pem' merely APPEARS somewhere proves nothing:
+        # node silently ignores unknown option keys, so `clientCertificate:` (or any
+        # typo) still mentions the file while never presenting it. Assert each cert
+        # file is bound to its ACTIVE https.request option key.
+        raw = gateway_probe_js()
+        probe = raw.replace(" ", "")
+        self.assertIn("require('https')", raw)
+        for option, filename in (("ca", "ca_cert.pem"), ("cert", "client_cert.pem"), ("key", "client_key.pem")):
+            with self.subTest(option=option):
+                self.assertRegex(
+                    probe,
+                    rf"(?<![A-Za-z]){option}:fs\.readFileSync\([^)]*{re.escape(filename)}[^)]*\)",
+                    f"probe must pass {filename} as the active https.request `{option}:` option -- node "
+                    f"ignores an unknown key silently, so the material would never reach the handshake",
+                )
+        self.assertIn("rejectUnauthorized:true", probe)
+        self.assertNotIn("rejectUnauthorized:false", probe)
 
 
 @unittest.skipIf(NODE is None, "no working node available to execute the gateway probe")
