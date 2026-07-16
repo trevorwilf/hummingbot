@@ -937,5 +937,760 @@ def _closed_port():
         return sock.getsockname()[1]
 
 
+# ── CDX-010: the controllers destination must be explicit ────────────────────
+
+BOT_BUILD_SCRIPT = REPO_ROOT / "build_hummingbot_nonkyc.sh"
+API_BUILD_SCRIPT = REPO_ROOT / "Build_hummingbot_api_nonkyc.sh"
+BUILD_SCRIPTS = (BOT_BUILD_SCRIPT, API_BUILD_SCRIPT)
+
+KNOWN_TREE_VPN = "/mnt/sharedrive/apps/hummingbot/api/data/bots/controllers"
+KNOWN_TREE_NO_VPN = "/mnt/sharedrive/apps/hummingbot_us/api/data/bots/controllers"
+MANIFEST_NAME = "controllers.manifest.sha256"
+
+
+def extract_block_function(text, name):
+    """Return the source of a multi-line `name() { ... }` shell function.
+
+    Relies on the closing brace being at column 0, which is this codebase's
+    style for every function in both build scripts.
+    """
+    match = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}$", text, re.M | re.S)
+    if match is None:
+        raise AssertionError(f"shell function {name}() not found")
+    return match.group(0)
+
+
+def extract_oneline_function(text, name):
+    """Return the source of a single-line `name() { ...; }` shell helper."""
+    match = re.search(rf"^{re.escape(name)}\(\)\s*\{{.*\}}$", text, re.M)
+    if match is None:
+        raise AssertionError(f"shell helper {name}() not found")
+    return match.group(0)
+
+
+def extract_assignment(text, name):
+    """Return the source of a top-level `NAME=...` assignment line."""
+    match = re.search(rf"^{re.escape(name)}=.*$", text, re.M)
+    if match is None:
+        raise AssertionError(f"assignment {name}= not found")
+    return match.group(0)
+
+
+def line_number_of(text, pattern):
+    """1-indexed line of the first regex match, or None."""
+    match = re.search(pattern, text, re.M)
+    if match is None:
+        return None
+    return text[: match.start()].count("\n") + 1
+
+
+def enclosing_if_predicate(text, pattern):
+    """The nearest `if ...; then` line above the first match of `pattern`.
+
+    Presence and line order prove nothing about reachability: a call sitting under
+    an inverted predicate keeps its text and its position, so an ordering-only
+    assertion stays green while the branch never runs. This resolves the predicate
+    a call actually executes under, putting the condition itself under test.
+    """
+    index = line_number_of(text, pattern)
+    if index is None:
+        return None
+    for line in reversed(text.splitlines()[: index - 1]):
+        if re.match(r"^\s*if .*; then\s*$", line):
+            return line.strip()
+    return None
+
+
+class TestControllersDestinationIsExplicit(unittest.TestCase):
+    """CDX-010 static locks: no default destination, and the guard runs first.
+
+    The triage corrected the report here: the old default did not make a
+    forgotten `--controllers-dest` *skip*. The VPN tree exists on the same share
+    as the no-VPN tree, so a defaulted no-VPN build SUCCEEDED into the wrong
+    stack's live controllers, silently. Hence: no default at all.
+    """
+
+    def test_controllers_dest_has_no_default_value(self):
+        # Exact-equality on the assignment, not a substring hunt: any default --
+        # the old /mnt VPN tree or a new one -- makes this differ. `${VAR:-}` keeps
+        # an explicit CONTROLLERS_DEST env var working while removing the fallback.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                self.assertEqual(
+                    'CONTROLLERS_DEST="${CONTROLLERS_DEST:-}"',
+                    extract_assignment(read_text(script), "CONTROLLERS_DEST"),
+                    f"{script.name}: CONTROLLERS_DEST must have NO default; a default is what "
+                    f"let a no-VPN build sync into the VPN stack's tree.",
+                )
+
+    # Every line permitted to assign CONTROLLERS_DEST. An allow-list, not a
+    # denylist of known-bad spellings: a default reintroduced as
+    # `CONTROLLERS_DEST="${CONTROLLERS_DEST:-/mnt/...}"`, as a bare
+    # `CONTROLLERS_DEST=/mnt/...`, or as a late re-assignment after the guard has
+    # already run, is a line that is not in this set.
+    ALLOWED_DEST_ASSIGNMENTS = {
+        'CONTROLLERS_DEST="${CONTROLLERS_DEST:-}"',
+        '--controllers-dest)   CONTROLLERS_DEST="$2"; shift 2 ;;',
+        '--controllers-dest=*) CONTROLLERS_DEST="${1#*=}"; shift ;;',
+    }
+
+    def test_no_defaulted_destination_anywhere_in_either_script(self):
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                assignments = [
+                    line.strip()
+                    for line in read_text(script).splitlines()
+                    if re.search(r"(?<![\w-])CONTROLLERS_DEST=", line) and not line.strip().startswith("#")
+                ]
+                self.assertTrue(assignments, "premise check: CONTROLLERS_DEST is assigned somewhere")
+                unexpected = set(assignments) - self.ALLOWED_DEST_ASSIGNMENTS
+                self.assertEqual(
+                    set(),
+                    unexpected,
+                    f"{script.name}: unreviewed assignment(s) to the controllers destination: "
+                    f"{sorted(unexpected)}. CDX-010 allows it to be set only by "
+                    f"--controllers-dest / an explicit env var -- never defaulted.",
+                )
+
+    def test_help_text_does_not_advertise_a_default(self):
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = read_text(script)
+                self.assertNotIn(
+                    'echo "                          (default: $CONTROLLERS_DEST)"',
+                    text,
+                    f"{script.name}: --help still claims a default destination",
+                )
+                self.assertIn("REQUIRED unless --no-controllers-sync", text)
+
+    def test_controllers_dest_flag_parsing_still_works(self):
+        # The fix removes a default, not the flag. Both spellings must survive.
+        # re.M is load-bearing: these are line-anchored patterns and assertRegex
+        # uses re.search, so without it `^` would only match the file's first line.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = read_text(script)
+                for pattern in (
+                    r'^\s*--controllers-dest\)\s+CONTROLLERS_DEST="\$2"; shift 2 ;;$',
+                    r'^\s*--controllers-dest=\*\)\s+CONTROLLERS_DEST="\$\{1#\*=\}"; shift ;;$',
+                    r'^\s*--no-controllers-sync\)\s+SYNC_CONTROLLERS=0; shift ;;$',
+                ):
+                    self.assertRegex(text, re.compile(pattern, re.M))
+
+    def test_validation_precedes_the_purge_and_every_docker_build(self):
+        # The ordering IS the fix: `exit 1` after the purge has already stopped and
+        # removed live bot containers is not a fail-fast, it is an outage. Compares
+        # real line numbers rather than asserting the guard merely exists.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = read_text(script)
+                # Column 0 => a top-level call in Main, not nested in a conditional
+                # that could skip it.
+                call = line_number_of(text, r"^validate_controllers_dest$")
+                self.assertIsNotNone(
+                    call, f"{script.name}: validate_controllers_dest is never called at top level"
+                )
+                purge = line_number_of(text, r"^\s*purge_old_image_and_containers \\$")
+                self.assertIsNotNone(purge, f"{script.name}: purge call not found")
+                build = line_number_of(text, r"^docker build ")
+                self.assertIsNotNone(build, f"{script.name}: docker build not found")
+                self.assertLess(
+                    call,
+                    purge,
+                    f"{script.name}: the destination check (line {call}) must run BEFORE the purge "
+                    f"(line {purge}) -- the purge stops and REMOVES live bot containers.",
+                )
+                self.assertLess(
+                    call,
+                    build,
+                    f"{script.name}: the destination check (line {call}) must run BEFORE the first "
+                    f"docker build (line {build}).",
+                )
+
+    def test_sync_cannot_silently_skip_a_missing_source_or_destination(self):
+        # The warn-and-return-0 guards were the silent-success path itself.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                body = extract_block_function(read_text(script), "sync_controllers")
+                self.assertNotIn(
+                    "skipping controller sync",
+                    body,
+                    f"{script.name}: sync_controllers still has a warn-and-skip path; a build that "
+                    f"syncs nothing must fail, not report success.",
+                )
+                # Exactly one survivor: the explicit --no-controllers-sync opt-out.
+                self.assertEqual(
+                    1,
+                    len(re.findall(r"^\s*return 0$", body, re.M)),
+                    f"{script.name}: sync_controllers must have exactly one non-fatal exit "
+                    f"(the explicit --no-controllers-sync opt-out).",
+                )
+
+
+class TestControllersProvenanceRecorded(unittest.TestCase):
+    """CDX-010 provenance: manifest at the destination, hashes on the image."""
+
+    def test_manifest_is_written_into_the_destination(self):
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = read_text(script)
+                self.assertEqual(
+                    f'CONTROLLERS_MANIFEST_NAME="{MANIFEST_NAME}"',
+                    extract_assignment(text, "CONTROLLERS_MANIFEST_NAME"),
+                )
+                sync = extract_block_function(text, "sync_controllers")
+                # Bound to $dest: a manifest written anywhere else records the
+                # synced set where nothing will ever read it.
+                self.assertIn('local manifest_path="$dest/$CONTROLLERS_MANIFEST_NAME"', sync)
+                self.assertIn(
+                    """printf '%s\\n' "$CONTROLLERS_MANIFEST_BODY" > "$manifest_path\"""",
+                    sync,
+                )
+
+    def test_both_provenance_labels_are_on_the_final_docker_build(self):
+        # Anchored to the label flag AND to the variable that carries the value: a
+        # label whose value is a literal, or a stale/unset var, is not provenance.
+        expected_commit_var = {BOT_BUILD_SCRIPT: "$HB_SHA_FULL", API_BUILD_SCRIPT: "$HBOT_COMMIT_SHA"}
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = read_text(script)
+                # The LAST docker build invocation is the deployed image.
+                final_build = text[text.rindex("docker build $DOCKER_BUILD_FLAGS"):]
+                final_build = final_build[: final_build.index('\n\n')]
+                self.assertIn(
+                    f'--label "nonkyc.hummingbot_commit={expected_commit_var[script]}"',
+                    final_build,
+                    f"{script.name}: the final image must carry the hummingbot commit label",
+                )
+                self.assertIn(
+                    '--label "nonkyc.controllers_manifest_sha256=$CONTROLLERS_MANIFEST_SHA256"',
+                    final_build,
+                    f"{script.name}: the final image must carry the controllers manifest label",
+                )
+
+    def test_manifest_is_computed_before_the_build_that_labels_it(self):
+        # A hash computed after the build could not have been stamped on it; a hash
+        # computed from a re-fetch could describe a different commit than the label.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = read_text(script)
+                compute = line_number_of(text, r"^\s*compute_controllers_manifest \"")
+                self.assertIsNotNone(compute, f"{script.name}: manifest is never computed")
+                final_build = text.rindex("docker build $DOCKER_BUILD_FLAGS")
+                final_build_line = text[:final_build].count("\n") + 1
+                self.assertLess(
+                    compute,
+                    final_build_line,
+                    f"{script.name}: the manifest (line {compute}) must be computed before the "
+                    f"final docker build (line {final_build_line}) that stamps its hash.",
+                )
+
+    def test_api_script_fetches_controllers_once_before_the_build(self):
+        # API-specific: the fetch moved ahead of the build so the labelled tree and
+        # the synced tree are the same checkout. A second fetch afterwards would
+        # re-clone at HEAD and could sync a commit the label does not name.
+        text = read_text(API_BUILD_SCRIPT)
+        fetches = re.findall(r"^\s*fetch_controllers_source$", text, re.M)
+        self.assertEqual(
+            1, len(fetches), "the API script must fetch the controllers source exactly once"
+        )
+        fetch_line = line_number_of(text, r"^\s*fetch_controllers_source$")
+        build_line = text[: text.rindex("docker build $DOCKER_BUILD_FLAGS")].count("\n") + 1
+        sync_line = line_number_of(text, r"^\s*sync_controllers \"\$HBOT_CONTROLLERS_SRC\"$")
+        self.assertLess(fetch_line, build_line, "fetch must precede the build it labels")
+        self.assertLess(build_line, sync_line, "the sync stays post-build")
+        # Order is not reachability. Invert the predicate guarding these calls and
+        # a normal --sync build fetches nothing and hashes nothing, labels the image
+        # "unknown", then dies expanding an unset source AFTER the purge and build --
+        # with every line above still in this exact order. So pin the predicate too:
+        # the calls must sit in the TRUE branch of an equality test on the opt-in.
+        expected = 'if [ "$SYNC_CONTROLLERS" = "1" ]; then'
+        for call in (
+            r"^\s*fetch_controllers_source$",
+            r"^\s*compute_controllers_manifest \"",
+            r"^\s*sync_controllers \"\$HBOT_CONTROLLERS_SRC\"$",
+        ):
+            self.assertEqual(
+                expected,
+                enclosing_if_predicate(text, call),
+                f"the call matching {call!r} must run under {expected!r}; a negated or "
+                f"rewritten predicate silently disables it while every line order holds.",
+            )
+
+
+    def test_bot_main_wires_the_sync_call_verbatim_after_the_build(self):
+        # Every behavioural test below executes sync_controllers() as an EXTRACTED
+        # function, which leaves the one line that invokes it in a real build with
+        # no coverage at all. Delete that line and the bot build still reports
+        # success while the API keeps mounting whatever stale controllers the
+        # destination already held -- CDX-010's exact failure, restored.
+        # The call is pinned verbatim: `:` or a deletion fails the count, and an
+        # env prefix (`SYNC_CONTROLLERS=1 sync_controllers ...`, which would force
+        # destination validation onto an explicit --no-controllers-sync run, after
+        # the purge and build) fails the top-level anchor.
+        text = read_text(BOT_BUILD_SCRIPT)
+        call = r'^sync_controllers "\$SRC_DIR/controllers"$'
+        self.assertEqual(
+            1,
+            len(re.findall(call, text, re.M)),
+            "the bot script must invoke sync_controllers exactly once, unprefixed, at top "
+            "level -- an absent, renamed, or env-prefixed call changes what a build does.",
+        )
+        call_line = line_number_of(text, call)
+        final_build_line = text[: text.rindex("docker build $DOCKER_BUILD_FLAGS")].count("\n") + 1
+        self.assertLess(
+            final_build_line,
+            call_line,
+            "the sync must stay post-build: syncing controllers a build then fails to "
+            "produce would leave the tree ahead of the image.",
+        )
+
+
+def _harness(script_path, functions, preamble="", body=""):
+    """Assemble a runnable script from the build script's OWN function text.
+
+    Only the named functions are extracted -- never the script's Main flow -- so
+    nothing here can clone, purge, or invoke docker. The `docker` poison pill and
+    the assertion in _run_harness enforce that rather than trusting it.
+    """
+    text = read_text(script_path)
+    parts = ["set -uo pipefail", 'docker() { echo "FATAL: extracted block invoked docker" >&2; exit 111; }']
+    for name in ("log", "warn", "die", "ok"):
+        # The REAL helpers: `die` is the unit under test's failure mechanism (it
+        # is what exits 1), so stubbing it would be testing the stub.
+        parts.append(extract_oneline_function(text, name))
+    for name in ("KNOWN_CONTROLLERS_TREE_VPN", "KNOWN_CONTROLLERS_TREE_NO_VPN", "CONTROLLERS_MANIFEST_NAME"):
+        parts.append(extract_assignment(text, name))
+    parts.append(preamble)
+    for name in functions:
+        parts.append(extract_block_function(text, name))
+    parts.append(body)
+    return "\n".join(parts) + "\n"
+
+
+@unittest.skipIf(BASH is None, "no working bash available to execute build-script functions")
+class TestControllersDestValidationBehaviour(unittest.TestCase):
+    """Execute the REAL validate_controllers_dest() text from each build script.
+
+    Greps cannot distinguish a guard that fires from one that is dead: an error
+    message the code never reaches still greps green. So the script's own function
+    text decides the exit code here. Extraction is limited to the function under
+    test -- the Main flow (clone/purge/docker build) is never assembled.
+    """
+
+    def _run(self, script_path, dest=None, sync=1, dest_is_env_unset=False):
+        preamble = f"SYNC_CONTROLLERS={sync}"
+        if dest_is_env_unset:
+            # The real post-arg-parse state when --controllers-dest is omitted.
+            preamble += "\n" + extract_assignment(read_text(script_path), "CONTROLLERS_DEST")
+        else:
+            preamble += f'\nCONTROLLERS_DEST="{dest}"'
+        harness = _harness(
+            script_path, ["validate_controllers_dest"], preamble, "validate_controllers_dest"
+        )
+        self.assertNotIn(
+            "docker build",
+            harness,
+            "harness must never assemble a docker invocation from the build script",
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(harness)
+            path = handle.name
+        try:
+            result = subprocess.run(
+                [BASH, Path(path).as_posix()], capture_output=True, text=True, timeout=60
+            )
+            self.assertNotEqual(111, result.returncode, "extracted block invoked docker")
+            return result
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_unset_destination_fails_the_build(self):
+        # THE finding: this used to be a silent success into the VPN tree.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                result = self._run(script, dest_is_env_unset=True)
+                self.assertNotEqual(
+                    0,
+                    result.returncode,
+                    f"{script.name}: an unset controllers destination must FAIL the build; "
+                    f"stdout={result.stdout!r}",
+                )
+
+    def test_failure_message_names_the_flag_and_both_known_trees(self):
+        # The error has to be actionable: the operator's next keystroke must be in
+        # it. Both trees, because naming only one recreates the default's bias.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                message = self._run(script, dest_is_env_unset=True).stderr
+                self.assertIn("--controllers-dest", message)
+                self.assertIn("--no-controllers-sync", message)
+                self.assertIn(KNOWN_TREE_VPN, message)
+                self.assertIn(KNOWN_TREE_NO_VPN, message)
+
+    def test_nonexistent_destination_fails_the_build(self):
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    missing = Path(tmp) / "no-such-tree" / "controllers"
+                    result = self._run(script, dest=missing.as_posix())
+                    self.assertNotEqual(
+                        0,
+                        result.returncode,
+                        f"{script.name}: a destination that does not exist must fail the build",
+                    )
+                    self.assertIn(missing.as_posix(), result.stderr)
+
+    def test_destination_that_is_a_file_fails_the_build(self):
+        # `-d`, not `-e`: syncing into a regular path would explode mid-copy, after
+        # the purge has already taken the containers down.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    not_a_dir = Path(tmp) / "controllers"
+                    not_a_dir.write_text("i am a file", encoding="utf-8")
+                    self.assertNotEqual(0, self._run(script, dest=not_a_dir.as_posix()).returncode)
+
+    def test_existing_directory_is_accepted(self):
+        # The accept side: the guard must not be a blanket refusal (which would
+        # "pass" every rejection test above while breaking every real build).
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    result = self._run(script, dest=Path(tmp).as_posix())
+                    self.assertEqual(
+                        0, result.returncode, f"{script.name}: a real directory must be accepted"
+                    )
+
+    def test_no_controllers_sync_still_skips_without_a_destination(self):
+        # The documented escape hatch must survive: explicit opt-out, no dest.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                result = self._run(script, sync=0, dest_is_env_unset=True)
+                self.assertEqual(
+                    0,
+                    result.returncode,
+                    f"{script.name}: --no-controllers-sync must remain a valid way to skip",
+                )
+
+
+@unittest.skipIf(BASH is None, "no working bash available to execute build-script functions")
+class TestControllersManifestBehaviour(unittest.TestCase):
+    """Execute the REAL manifest functions against a synthetic controllers tree.
+
+    Every expected value is derived from the CDX-010 spec ("sorted
+    `sha256<2 spaces>relative/path` lines over the synced set") and computed
+    independently in Python -- never captured by running the implementation.
+    """
+
+    FILES = {
+        "zzz_last.py": b"z = 1\n",
+        "aaa_first.py": b"a = 1\n",
+        "market_making/range_inventory_ladder.py": b"class Ladder:\n    pass\n",
+        "market_making/__init__.py": b"",
+    }
+    EXCLUDED = {
+        "__pycache__/aaa_first.cpython-310.pyc": b"compiled",
+        "market_making/__pycache__/cached.py": b"cached = 1\n",
+        "README.md": b"not python\n",
+    }
+
+    def _make_tree(self, root):
+        src = Path(root) / "controllers"
+        for rel, data in {**self.FILES, **self.EXCLUDED}.items():
+            path = src / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        return src
+
+    def _expected_manifest(self):
+        """The manifest the SPEC requires, computed here, not observed."""
+        import hashlib
+
+        lines = [
+            f"{hashlib.sha256(data).hexdigest()}  {rel}"
+            for rel, data in sorted(self.FILES.items())
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _compute(self, script_path, src, out):
+        harness = _harness(
+            script_path,
+            ["controllers_manifest_body", "compute_controllers_manifest"],
+            "",
+            f'compute_controllers_manifest "{src}"\n'
+            f'printf \'%s\\n\' "$CONTROLLERS_MANIFEST_BODY" > "{out}/body.txt"\n'
+            f'printf \'%s\' "$CONTROLLERS_MANIFEST_SHA256" > "{out}/sha.txt"\n',
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(harness)
+            path = handle.name
+        try:
+            result = subprocess.run(
+                [BASH, Path(path).as_posix()], capture_output=True, text=True, timeout=120
+            )
+            self.assertEqual(0, result.returncode, f"manifest computation failed: {result.stderr}")
+            return (
+                (Path(out) / "body.txt").read_text(encoding="utf-8"),
+                (Path(out) / "sha.txt").read_text(encoding="utf-8").strip(),
+            )
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_manifest_matches_the_spec_format_exactly(self):
+        import hashlib
+
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = self._make_tree(tmp)
+                    body, sha = self._compute(script, src.as_posix(), Path(tmp).as_posix())
+
+                    expected = self._expected_manifest()
+                    # Byte-exact: digest, TWO spaces, forward-slash relative path,
+                    # ordered by path. A `sha256sum <path>` implementation emits
+                    # "<hash> *<path>" on a binary-mode host and fails right here.
+                    self.assertEqual(expected, body)
+                    self.assertEqual(hashlib.sha256(expected.encode()).hexdigest(), sha)
+
+    def test_manifest_covers_exactly_the_synced_set(self):
+        # The manifest must describe what sync_controllers copies -- the same find
+        # predicate -- or it attests to files that never reached the destination.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = self._make_tree(tmp)
+                    body, _ = self._compute(script, src.as_posix(), Path(tmp).as_posix())
+                    listed = {line.split("  ", 1)[1] for line in body.strip().splitlines()}
+                    self.assertEqual(set(self.FILES), listed)
+                    for excluded in self.EXCLUDED:
+                        self.assertNotIn(excluded, listed)
+
+    def test_manifest_hash_changes_when_a_controller_changes(self):
+        # Provenance that cannot detect a change is decoration. One byte in one
+        # file must move the label the image is stamped with.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = self._make_tree(tmp)
+                    _, before = self._compute(script, src.as_posix(), Path(tmp).as_posix())
+                    (src / "market_making/range_inventory_ladder.py").write_bytes(
+                        b"class Ladder:\n    pass  # edited\n"
+                    )
+                    _, after = self._compute(script, src.as_posix(), Path(tmp).as_posix())
+                    self.assertNotEqual(before, after)
+
+    def test_manifest_hash_is_stable_across_runs_and_paths(self):
+        # Same content in a different build dir => same hash, or the label is
+        # noise and "did the controllers change?" becomes unanswerable.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
+                    _, first = self._compute(
+                        script, self._make_tree(one).as_posix(), Path(one).as_posix()
+                    )
+                    _, second = self._compute(
+                        script, self._make_tree(two).as_posix(), Path(two).as_posix()
+                    )
+                    self.assertEqual(first, second)
+
+    def test_empty_controllers_tree_fails_rather_than_labelling_a_lie(self):
+        # An empty set hashes to a perfectly valid-looking constant. Stamping that
+        # on an image claims provenance for controllers that were never there.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    empty = Path(tmp) / "controllers"
+                    empty.mkdir()
+                    harness = _harness(
+                        script,
+                        ["controllers_manifest_body", "compute_controllers_manifest"],
+                        "",
+                        f'compute_controllers_manifest "{empty.as_posix()}"',
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        "w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
+                    ) as handle:
+                        handle.write(harness)
+                        path = handle.name
+                    try:
+                        result = subprocess.run(
+                            [BASH, Path(path).as_posix()], capture_output=True, text=True, timeout=60
+                        )
+                        self.assertNotEqual(
+                            0, result.returncode, "an empty controllers tree must fail the build"
+                        )
+                    finally:
+                        Path(path).unlink(missing_ok=True)
+
+
+@unittest.skipIf(BASH is None, "no working bash available to execute build-script functions")
+class TestControllersSyncWritesManifest(unittest.TestCase):
+    """Execute the REAL sync_controllers() against synthetic src/dest trees.
+
+    Proves the manifest reaches the destination with the content the image label
+    attests to -- the property the CDX-010 provenance requirement is actually
+    about. Nothing docker-adjacent is assembled; only the function under test.
+    """
+
+    def _sync(self, script_path, src, dest, sync=1):
+        harness = _harness(
+            script_path,
+            ["controllers_manifest_body", "compute_controllers_manifest", "sync_controllers"],
+            f'SYNC_CONTROLLERS={sync}\nCONTROLLERS_DEST="{dest}"\n'
+            f'CONTROLLERS_MANIFEST_SHA256="unknown"\nCONTROLLERS_MANIFEST_BODY=""',
+            f'sync_controllers "{src}"',
+        )
+        self.assertNotIn("docker build", harness)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(harness)
+            path = handle.name
+        try:
+            result = subprocess.run(
+                [BASH, Path(path).as_posix()], capture_output=True, text=True, timeout=120
+            )
+            self.assertNotEqual(111, result.returncode, "extracted block invoked docker")
+            return result
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_vanished_destination_fails_the_sync_instead_of_being_recreated(self):
+        # validate_controllers_dest() ran long before this point -- before the purge
+        # and the build. If the tree disappears in between (share unmounted, path
+        # renamed), the copy loop's `mkdir -p "$(dirname "$dstf")"` would cheerfully
+        # rebuild it on the container-local disk, copy into that orphan, write a
+        # manifest attesting to it and report success: the silent-wrong-tree
+        # outcome CDX-010 exists to kill, with a real mounted tree left stale.
+        # Grepping the guard's text cannot tell a guard that fires from a dead one,
+        # so execute the real function against a destination that is not there.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    src.mkdir()
+                    (src / "aaa.py").write_bytes(b"a = 1\n")
+                    dest = Path(tmp) / "vanished" / "controllers"
+
+                    result = self._sync(script, src.as_posix(), dest.as_posix())
+
+                    self.assertNotEqual(
+                        0,
+                        result.returncode,
+                        f"{script.name}: a destination that vanished after validation must FAIL "
+                        f"the build; stdout={result.stdout!r}",
+                    )
+                    self.assertFalse(
+                        dest.exists(),
+                        f"{script.name}: the vanished destination must not be recreated -- a "
+                        f"synced orphan tree is worse than a failed build, nothing reads it.",
+                    )
+
+    def test_opt_out_copies_nothing_even_with_a_real_source_present(self):
+        # The escape hatch executed, not grepped: --no-controllers-sync must remain
+        # a genuine skip even when a perfectly syncable source is sitting right
+        # there -- no copy, no manifest, no destination writes.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    src.mkdir()
+                    (src / "aaa.py").write_bytes(b"a = 1\n")
+                    dest = Path(tmp) / "dest"
+                    dest.mkdir()
+
+                    result = self._sync(script, src.as_posix(), dest.as_posix(), sync=0)
+
+                    self.assertEqual(
+                        0, result.returncode, f"{script.name}: opt-out must succeed: {result.stderr}"
+                    )
+                    self.assertEqual(
+                        [],
+                        sorted(p.name for p in dest.iterdir()),
+                        f"{script.name}: --no-controllers-sync must write nothing to the "
+                        f"destination -- not the controllers, not the manifest.",
+                    )
+
+    def test_sync_writes_a_manifest_matching_the_files_it_copied(self):
+        import hashlib
+
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    (src / "market_making").mkdir(parents=True)
+                    top = b"a = 1\n"
+                    nested = b"b = 2\n"
+                    (src / "aaa.py").write_bytes(top)
+                    (src / "market_making/ladder.py").write_bytes(nested)
+                    dest = Path(tmp) / "dest"
+                    dest.mkdir()
+
+                    result = self._sync(script, src.as_posix(), dest.as_posix())
+                    self.assertEqual(0, result.returncode, result.stderr)
+
+                    # The controllers themselves landed...
+                    self.assertEqual(top, (dest / "aaa.py").read_bytes())
+                    self.assertEqual(nested, (dest / "market_making/ladder.py").read_bytes())
+                    # ...and the manifest describes exactly them, per the spec.
+                    # Digests are computed outside the f-string: a `\n` escape inside
+                    # an f-string expression is a literal backslash-n, which would
+                    # hash the wrong bytes and make this assertion a lie.
+                    manifest = (dest / MANIFEST_NAME).read_text(encoding="utf-8")
+                    expected = (
+                        f"{hashlib.sha256(top).hexdigest()}  aaa.py\n"
+                        f"{hashlib.sha256(nested).hexdigest()}  market_making/ladder.py\n"
+                    )
+                    self.assertEqual(expected, manifest)
+
+    def test_manifest_is_written_even_when_no_controller_changed(self):
+        # The no-op path is the common case (rebuild without strategy edits). A
+        # destination that predates this feature must still gain its manifest.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    src.mkdir()
+                    (src / "aaa.py").write_bytes(b"a = 1\n")
+                    dest = Path(tmp) / "dest"
+                    dest.mkdir()
+                    # Destination already byte-identical => changed+added == 0.
+                    (dest / "aaa.py").write_bytes(b"a = 1\n")
+
+                    result = self._sync(script, src.as_posix(), dest.as_posix())
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn("already up to date", result.stdout)
+                    self.assertTrue(
+                        (dest / MANIFEST_NAME).is_file(),
+                        "manifest must be written even when nothing changed",
+                    )
+
+    def test_replaced_manifest_is_backed_up_like_any_other_file(self):
+        # The destination's stated contract is that nothing is ever destroyed.
+        for script in BUILD_SCRIPTS:
+            with self.subTest(script=script.name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    src = Path(tmp) / "src"
+                    src.mkdir()
+                    (src / "aaa.py").write_bytes(b"a = 2\n")
+                    dest = Path(tmp) / "dest"
+                    dest.mkdir()
+                    (dest / "aaa.py").write_bytes(b"a = 1\n")
+                    (dest / MANIFEST_NAME).write_text("stale manifest\n", encoding="utf-8")
+
+                    self.assertEqual(0, self._sync(script, src.as_posix(), dest.as_posix()).returncode)
+
+                    backups = list(dest.glob(f".backup-*/{MANIFEST_NAME}"))
+                    self.assertEqual(
+                        1, len(backups), f"replaced manifest must be backed up; found {backups}"
+                    )
+                    self.assertEqual("stale manifest\n", backups[0].read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
