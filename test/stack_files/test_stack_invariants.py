@@ -10,10 +10,15 @@ and the env vars the patch used to supply are pinned explicitly.
 Pure file-content tests. Nothing here runs, builds, or inspects docker.
 """
 
+import datetime
+import http.server
+import json
 import re
 import shutil
+import ssl
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -30,6 +35,7 @@ SHADOWED_TARGET = "/hummingbot-api/services/docker_service.py"
 
 API_INIT_SERVICE = "hummingbot-api-init"
 API_SERVICE = "hummingbot-api"
+GATEWAY_SERVICE = "gateway"
 
 
 def _resolve_bash():
@@ -478,6 +484,366 @@ class TestProvenanceBlockBehaviour(unittest.TestCase):
                     out = self._run(stack, Path(tmp).as_posix())
                     self.assertIn("[provenance] WARNING", out)
                     self.assertIn("UNVERIFIED", out)
+
+
+def _resolve_node():
+    """Return an absolute path to a working node, or None."""
+    candidates = [shutil.which("node"), r"C:\Program Files\nodejs\node.exe", "/usr/bin/node"]
+    for candidate in candidates:
+        if not candidate or not Path(candidate).exists():
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "-e", "console.log('hbok')"], capture_output=True, text=True, timeout=60
+            )
+        except OSError:
+            continue
+        if probe.returncode == 0 and "hbok" in probe.stdout:
+            return candidate
+    return None
+
+
+NODE = _resolve_node()
+
+
+def gateway_probe_js():
+    """The `node -e` program the gateway healthcheck actually runs."""
+    test = service_of(VPN_STACK, GATEWAY_SERVICE)["healthcheck"]["test"]
+    # ["CMD", "node", "-e", "<program>"]
+    return test[test.index("-e") + 1]
+
+
+class TestGatewayTransportContract(unittest.TestCase):
+    """CDX-009 static locks on the gateway transport contract.
+
+    The API derives gateway_use_ssl SOLELY from the URL scheme
+    (hummingbot-api/services/gateway_client.py:33) and presents no client cert for
+    http://, while docker_service writes gateway_use_ssl=True into every spawned
+    bot's conf_client.yml. Plaintext here is an internal contradiction.
+    """
+
+    def test_vpn_gateway_url_is_https(self):
+        value = env_map(service_of(VPN_STACK, API_SERVICE)).get("GATEWAY_URL")
+        self.assertIsNotNone(value, "vpn stack must define GATEWAY_URL for the API")
+        self.assertTrue(
+            value.lower().startswith("https://"),
+            f"GATEWAY_URL must use the https scheme (the config contract states the Gateway "
+            f"always runs secured/mTLS, and the scheme is what enables the client cert); got {value!r}",
+        )
+
+    def test_vpn_gateway_url_host_matches_a_cert_san(self):
+        # The API verifies the server hostname (hummingbot-api/utils/gateway_certs.py:110
+        # builds the context with ssl.create_default_context -> check_hostname=True) and the
+        # cert set carries DNS SANs only (hummingbot/core/utils/ssl_cert.py:26). An IP
+        # literal here raises SSLCertVerificationError on EVERY gateway call, so an https
+        # URL alone is not sufficient -- the host must be a name in the SAN set.
+        from hummingbot.core.utils.ssl_cert import SAN_DNS
+
+        san_names = {entry.value for entry in SAN_DNS}
+        value = env_map(service_of(VPN_STACK, API_SERVICE)).get("GATEWAY_URL")
+        host = value.split("://", 1)[1].split(":")[0]
+        self.assertIn(
+            host,
+            san_names,
+            f"GATEWAY_URL host {host!r} is not present in the server cert SANs {sorted(san_names)}; "
+            f"hostname verification would reject every gateway call.",
+        )
+
+    def test_no_vpn_gateway_url_is_explicit_and_fails_fast(self):
+        # The no-vpn stack ships no gateway service; leaving GATEWAY_URL unset lets the
+        # API fall back to https://localhost:15888, which points at nothing inside the
+        # API container -- a silent failure. Explicit non-resolving beats silent default.
+        parsed = load_stack(NO_VPN_STACK)
+        self.assertNotIn(
+            GATEWAY_SERVICE,
+            parsed["services"],
+            "premise check: the no-vpn stack is expected to ship no gateway service",
+        )
+        value = env_map(parsed["services"][API_SERVICE]).get("GATEWAY_URL")
+        self.assertIsNotNone(value, "no-vpn stack must set GATEWAY_URL explicitly, not rely on the default")
+        host = value.split("://", 1)[1].split(":")[0]
+        self.assertTrue(
+            host.endswith(".invalid"),
+            f"no-vpn GATEWAY_URL must name a reserved, guaranteed-non-resolving host (RFC 6761 "
+            f"'.invalid') so gateway routes fail fast by design; got {value!r}",
+        )
+        self.assertNotIn(
+            "localhost",
+            host,
+            "no-vpn GATEWAY_URL must not point at localhost -- nothing serves the gateway there",
+        )
+
+
+class TestGatewayHealthcheckIsNotTcpOnly(unittest.TestCase):
+    """The probe must authenticate, not merely observe an open port.
+
+    A TCP-only probe read green whenever something was listening, so a broken TLS
+    transport still looked healthy. These are static locks; the behavioural proof
+    that the probe actually verifies is in TestGatewayProbeBehaviour below.
+    """
+
+    def test_probe_does_not_use_bare_tcp_connect(self):
+        probe = gateway_probe_js()
+        self.assertNotIn("net.createConnection", probe)
+        self.assertNotIn("require('net')", probe)
+
+    def test_probe_presents_client_credentials_and_verifies_server(self):
+        probe = gateway_probe_js()
+        self.assertIn("require('https')", probe)
+        for material in ("ca_cert.pem", "client_cert.pem", "client_key.pem"):
+            with self.subTest(material=material):
+                self.assertIn(material, probe, f"probe must present/trust {material}")
+        self.assertIn("rejectUnauthorized:true", probe.replace(" ", ""))
+        self.assertNotIn("rejectUnauthorized:false", probe.replace(" ", ""))
+
+
+@unittest.skipIf(NODE is None, "no working node available to execute the gateway probe")
+class TestGatewayProbeBehaviour(unittest.TestCase):
+    """Execute the REAL probe text from the stack against a real mTLS server.
+
+    Static greps cannot tell an authenticating probe from TLS-theatre: a probe with
+    `rejectUnauthorized:false` still mentions every cert file by name. So the probe
+    is run for real against servers that differ in exactly one property, and only
+    the stack's own program text decides the exit code. Only the port and the cert
+    directory are rewritten (15888 and /home/gateway/certs cannot exist on a test
+    host); every security-relevant option is the stack's.
+    """
+
+    PASSPHRASE = "probe-test-passphrase"
+
+    # ---- certificate authority helpers (mirrors hummingbot/core/utils/ssl_cert.py) ----
+
+    @staticmethod
+    def _rsa_key():
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    @classmethod
+    def _make_ca(cls, common_name):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.x509.oid import NameOID
+
+        key = cls._rsa_key()
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+        now = datetime.datetime.now(datetime.UTC)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        return key, cert
+
+    @classmethod
+    def _make_leaf(cls, ca_key, ca_cert, common_name, dns_names):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+        key = cls._rsa_key()
+        now = datetime.datetime.now(datetime.UTC)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]),
+                critical=False,
+            )
+        )
+        if dns_names:
+            # DNS SANs only -- deliberately no IP SAN, matching ssl_cert.py:26 (SAN_DNS).
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(n) for n in dns_names]), critical=False
+            )
+        return key, builder.sign(ca_key, hashes.SHA256())
+
+    @staticmethod
+    def _write_pem(directory, name, obj, passphrase=None, is_key=False):
+        from cryptography.hazmat.primitives import serialization
+
+        path = Path(directory) / name
+        if is_key:
+            encryption = (
+                serialization.BestAvailableEncryption(passphrase.encode())
+                if passphrase
+                else serialization.NoEncryption()
+            )
+            data = obj.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=encryption,
+            )
+        else:
+            data = obj.public_bytes(serialization.Encoding.PEM)
+        path.write_bytes(data)
+        return path
+
+    def _build_cert_set(self, tmp, server_signed_by_trusted_ca=True):
+        """Create the /home/gateway/certs equivalent the probe reads."""
+        certs = Path(tmp) / "certs"
+        certs.mkdir()
+        ca_key, ca_cert = self._make_ca("test-ca")
+
+        if server_signed_by_trusted_ca:
+            server_ca_key, server_ca_cert = ca_key, ca_cert
+        else:
+            # A server whose chain the probe's CA does NOT trust (impersonation).
+            server_ca_key, server_ca_cert = self._make_ca("rogue-ca")
+
+        server_key, server_cert = self._make_leaf(
+            server_ca_key, server_ca_cert, "localhost", ["localhost", "gateway"]
+        )
+        client_key, client_cert = self._make_leaf(ca_key, ca_cert, "client", None)
+
+        # ca_cert.pem is the CA the PROBE trusts -- always the good one.
+        self._write_pem(certs, "ca_cert.pem", ca_cert)
+        self._write_pem(certs, "client_cert.pem", client_cert)
+        self._write_pem(certs, "client_key.pem", client_key, passphrase=self.PASSPHRASE, is_key=True)
+
+        server_dir = Path(tmp) / "server"
+        server_dir.mkdir()
+        server_cert_path = self._write_pem(server_dir, "server_cert.pem", server_cert)
+        server_key_path = self._write_pem(server_dir, "server_key.pem", server_key, is_key=True)
+        # The CA the SERVER uses to verify incoming client certs.
+        server_ca_path = self._write_pem(server_dir, "server_ca.pem", ca_cert)
+        return certs, server_cert_path, server_key_path, server_ca_path
+
+    # ---- the server under probe ----
+
+    def _start_server(self, cert, key, ca, status=200, plaintext=False, require_client=True):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                try:
+                    seen.append(self.connection.getpeercert())
+                except (AttributeError, ValueError):
+                    seen.append(None)
+                body = json.dumps({"status": "ok"}).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        if not plaintext:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+            if require_client:
+                context.verify_mode = ssl.CERT_REQUIRED
+                context.load_verify_locations(cafile=str(ca))
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        # addCleanup is LIFO, so these register in reverse of the required order:
+        # shutdown() must stop serve_forever BEFORE the socket is closed, else the
+        # serving thread selects on a dead socket (WinError 10038).
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(server.shutdown)
+        return server.server_port, seen
+
+    def _run_probe(self, port, certs_dir):
+        """Run the stack's own probe text, rewritten only for port + cert dir."""
+        probe = gateway_probe_js()
+        probe, port_subs = re.subn(r"port:15888", f"port:{port}", probe)
+        self.assertEqual(1, port_subs, "probe port not found to rewrite")
+        probe, dir_subs = re.subn(
+            r"'/home/gateway/certs'", f"'{Path(certs_dir).as_posix()}'", probe
+        )
+        self.assertEqual(1, dir_subs, "probe cert directory not found to rewrite")
+
+        import os
+
+        env = dict(os.environ, GATEWAY_PASSPHRASE=self.PASSPHRASE)
+        result = subprocess.run(
+            [NODE, "-e", probe], capture_output=True, text=True, timeout=60, env=env
+        )
+        return result.returncode
+
+    # ---- the experiments ----
+
+    def test_probe_succeeds_against_authenticated_mtls_gateway(self):
+        # Baseline: a correct, mutually-authenticated Gateway must read healthy.
+        # Also proves the probe really presents its client cert (the server demands
+        # one) and that the passphrase-encrypted client key is loadable.
+        with tempfile.TemporaryDirectory() as tmp:
+            certs, cert, key, ca = self._build_cert_set(tmp)
+            port, seen = self._start_server(cert, key, ca)
+            self.assertEqual(0, self._run_probe(port, certs), "probe failed against a healthy mTLS gateway")
+            self.assertTrue(seen, "server never served the probe's request")
+            self.assertIsNotNone(
+                seen[0], "probe did not present a client certificate (mTLS not actually exercised)"
+            )
+            subject = dict(pair for entry in seen[0]["subject"] for pair in entry)
+            self.assertEqual("client", subject.get("commonName"))
+
+    def test_probe_fails_against_untrusted_server_certificate(self):
+        # THE anti-theatre experiment. A probe with rejectUnauthorized:false (or one
+        # that ignores socket.authorized) still connects, still gets 200, and would
+        # PASS here. Only genuine server verification fails this.
+        with tempfile.TemporaryDirectory() as tmp:
+            certs, cert, key, ca = self._build_cert_set(tmp, server_signed_by_trusted_ca=False)
+            port, _ = self._start_server(cert, key, ca)
+            self.assertEqual(
+                1,
+                self._run_probe(port, certs),
+                "probe accepted a server whose certificate is not signed by the trusted CA -- "
+                "it is not verifying the server (TLS-theatre)",
+            )
+
+    def test_probe_fails_against_plaintext_gateway(self):
+        # The exact regression CDX-009 is about: a plaintext port that a TCP-only
+        # probe reported as healthy must now read unhealthy.
+        with tempfile.TemporaryDirectory() as tmp:
+            certs, cert, key, ca = self._build_cert_set(tmp)
+            port, _ = self._start_server(cert, key, ca, plaintext=True)
+            self.assertEqual(
+                1, self._run_probe(port, certs), "probe reported a plaintext gateway as healthy"
+            )
+
+    def test_probe_fails_on_non_2xx_response(self):
+        # Locks the status check: exit 0 only on an authenticated 2xx.
+        with tempfile.TemporaryDirectory() as tmp:
+            certs, cert, key, ca = self._build_cert_set(tmp)
+            port, _ = self._start_server(cert, key, ca, status=503)
+            self.assertEqual(
+                1, self._run_probe(port, certs), "probe reported a 503 gateway as healthy"
+            )
+
+    def test_probe_fails_when_nothing_listens(self):
+        # Connection refused must not read healthy (guards an unconditional exit 0).
+        with tempfile.TemporaryDirectory() as tmp:
+            certs, _cert, _key, _ca = self._build_cert_set(tmp)
+            self.assertEqual(1, self._run_probe(_closed_port(), certs))
+
+
+def _closed_port():
+    """Bind and immediately release a port so nothing is listening on it."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 if __name__ == "__main__":
