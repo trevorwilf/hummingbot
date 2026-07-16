@@ -5,7 +5,7 @@ import os
 import tempfile
 import time
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import Field, field_validator, model_validator
@@ -30,6 +30,117 @@ def _parse_comma_list(value):
     if value is None:
         return []
     return value
+
+
+_DATA_DIR_NAME = "data"
+
+
+def _is_absolute_either_flavor(name: str) -> bool:
+    """True when `name` is absolute under POSIX *or* Windows path semantics.
+
+    Both flavors are consulted because each is blind to the other's absolute forms:
+    `PurePosixPath("C:\\x")` is a single relative component, and
+    `PureWindowsPath("/tmp/x").is_absolute()` is False (rooted but driveless)."""
+    return PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute()
+
+
+def _has_parent_reference(name: str) -> bool:
+    """True when `name` contains a `..` component under either path flavor.
+
+    The Windows flavor is required to see backslash separators: POSIX parses
+    `a\\..\\b` as one opaque component, so a POSIX-only check misses the traversal."""
+    return ".." in PurePosixPath(name).parts or ".." in PureWindowsPath(name).parts
+
+
+def _validate_data_relative_file_name(value: str, field_name: str, allow_absolute: bool) -> Optional[str]:
+    """CONTRACT C1 (CDX-007 / CLA-004) — lexical validation of a controller file name.
+
+    ACCEPT: a str whose stripped value is non-empty and, under BOTH PurePosixPath and
+    PureWindowsPath, is not absolute, has no drive and no root/anchor, contains no `..`
+    component, is not `.`, and whose POSIX normalization stays a strict descendant of
+    `data/` once joined. Empty-after-strip maps to None (unset), which is not fail-open:
+    None selects the default state file name.
+
+    REJECT (fail-closed): absolute POSIX or Windows paths, drive letters, UNC paths, any
+    `..` component, and `.` — unless `allow_absolute` is set, which permits ABSOLUTE paths
+    only and never traversal.
+
+    Purely lexical by contract: no filesystem access at validation time. The runtime
+    containment assertion at the use-sites is the belt-and-braces half."""
+    name = value.strip()
+    if name == "":
+        return None
+
+    # Traversal is rejected unconditionally -- the opt-out permits absolute paths, never `..`.
+    if _has_parent_reference(name):
+        raise ValueError(
+            f"{field_name} must not contain a '..' component (got {value!r}): it would escape the "
+            f"{_DATA_DIR_NAME}/ directory."
+        )
+
+    is_absolute = _is_absolute_either_flavor(name)
+    if allow_absolute and is_absolute:
+        return name
+
+    posix = PurePosixPath(name)
+    windows = PureWindowsPath(name)
+    if is_absolute or posix.root or windows.root or windows.drive:
+        raise ValueError(
+            f"{field_name} must be a relative path inside {_DATA_DIR_NAME}/ (got {value!r}): absolute "
+            f"paths, drive letters and UNC paths are rejected. Set allow_absolute_state_file_name=True "
+            f"to permit an absolute path."
+        )
+    if not posix.parts or not windows.parts:
+        raise ValueError(
+            f"{field_name} must name a file, not a directory reference (got {value!r})."
+        )
+
+    joined = PurePosixPath(_DATA_DIR_NAME).joinpath(posix)
+    if PurePosixPath(_DATA_DIR_NAME) not in joined.parents:
+        raise ValueError(
+            f"{field_name} must normalize to a strict descendant of {_DATA_DIR_NAME}/ (got {value!r})."
+        )
+    return name
+
+
+def _resolve_allowed_root(configured_name: Optional[str], allow_absolute: bool) -> Path:
+    """The directory the composed path must live strictly under: `data/` normally, or the
+    parent of the configured absolute path when the operator opted out."""
+    if allow_absolute and configured_name is not None:
+        stripped = configured_name.strip()
+        if stripped != "" and _is_absolute_either_flavor(stripped):
+            return Path(stripped).parent.resolve()
+    return Path(_DATA_DIR_NAME).resolve()
+
+
+def _assert_path_contained(composed: Path, configured_name: Optional[str], allow_absolute: bool,
+                           field_name: str) -> Path:
+    """Runtime half of CONTRACT C1: resolve `composed` and assert it is a strict descendant
+    of the allowed root, raising rather than proceeding on violation.
+
+    This exists because the lexical validator can be bypassed: configs are mutated at
+    runtime by the is_updatable machinery and can be built with `model_construct`, and
+    `Path("data") / name` silently honours an absolute right operand. Resolving also
+    catches symlink escapes that no lexical check can see."""
+    # Checked independently of the root below: when allow_absolute is set, the root is derived
+    # from configured_name itself, so a traversal planted into configured_name would drag the
+    # root along with it and "contain" itself. C1 permits absolute paths, never traversal.
+    if _has_parent_reference(str(composed)):
+        raise ValueError(
+            f"{field_name} must not contain a '..' component (composed path: {composed}). "
+            f"Refusing to read or write state through a traversing path."
+        )
+    root = _resolve_allowed_root(configured_name, allow_absolute)
+    try:
+        resolved = composed.resolve()
+    except OSError:
+        resolved = composed.absolute()
+    if resolved == root or root not in resolved.parents:
+        raise ValueError(
+            f"{field_name} resolves outside its permitted directory: {resolved} is not contained in "
+            f"{root}. Refusing to read or write state through an escaping path."
+        )
+    return resolved
 
 
 def _safe_decimal(value, field_name: str = "value", default: Optional[str] = None) -> Decimal:
@@ -393,10 +504,22 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # CONTRACT C1 opt-out. Declared BEFORE state_file_name: pydantic v2 validates fields in
+    # declaration order, so the state_file_name validator only sees this in validation_info.data
+    # if it is already validated. If it is missing or itself invalid, the validator reads False
+    # (fail-closed).
+    allow_absolute_state_file_name: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": "Permit an ABSOLUTE state_file_name outside data/? (True/False, default False): ",
+            "prompt_on_new": False,
+            "is_updatable": False,
+        },
+    )
     state_file_name: Optional[str] = Field(
         default=None,
         json_schema_extra={
-            "prompt": "Optional state file name (blank = auto-generated): ",
+            "prompt": "Optional state file name (blank = auto-generated, must be relative to data/): ",
             "prompt_on_new": True,
             "is_updatable": False,
         },
@@ -750,12 +873,23 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             return int(value)
         return value
 
-    @field_validator("state_file_name", "diagnostic_log_file_name", mode="before")
+    @field_validator("state_file_name", "diagnostic_log_file_name", mode="after")
     @classmethod
-    def normalize_state_file_name(cls, value):
-        if value == "":
+    def normalize_state_file_name(cls, value, validation_info: ValidationInfo):
+        """CONTRACT C1 (CDX-007 / CLA-004). Runs in mode="after", so `value` is already
+        Optional[str] and no type coercion can smuggle a non-str past the lexical check.
+
+        The `allow_absolute_state_file_name` opt-out is honoured for the field it names.
+        diagnostic_log_file_name composes an identical `Path("data") / name` at
+        range_inventory_ladder.py:diagnostic_log_path and shares this validator, so it gets
+        the same relative-only rules with no absolute opt-out (fail-closed: C1 defines an
+        opt-out for the state file only, and none is invented here)."""
+        if value is None:
             return None
-        return value
+        allow_absolute = bool(validation_info.data.get("allow_absolute_state_file_name", False))
+        if validation_info.field_name != "state_file_name":
+            allow_absolute = False
+        return _validate_data_relative_file_name(value, validation_info.field_name, allow_absolute)
 
     @field_validator("total_amount_quote")
     @classmethod
@@ -1413,6 +1547,9 @@ class RangeInventoryLadderController(ControllerBase):
         # a once-per-process flag for the <state>.owner contention-marker check.
         self._state_path_abs: Optional[Path] = None
         self._state_owner_checked: bool = False
+        # CONTRACT C1 runtime containment: composed paths already asserted contained, so the
+        # per-access resolve() stays off the hot path. See _assert_contained.
+        self._path_containment_verified: Set[Tuple[str, str, bool]] = set()
 
         # Refresh-wave records (refresh budget fix 1 + deferred-create re-propose fix 4).
         # Per side: None, or a dict with
@@ -1466,10 +1603,31 @@ class RangeInventoryLadderController(ControllerBase):
         self._plan_shave_last_emit: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
 
 
+    def _assert_contained(self, composed: Path, configured_name: Optional[str], allow_absolute: bool,
+                          field_name: str) -> Path:
+        """Memoized wrapper over _assert_path_contained: state_path is read on every save,
+        load and status call, and resolve() is a syscall. The memo key carries the composed
+        path AND the opt-out flag, so a post-validation mutation of either is re-checked
+        rather than served from a stale pass."""
+        cache_key = (field_name, str(composed), allow_absolute)
+        if cache_key in self._path_containment_verified:
+            return composed
+        _assert_path_contained(composed, configured_name, allow_absolute, field_name)
+        self._path_containment_verified.add(cache_key)
+        return composed
+
     @property
     def state_path(self) -> Path:
         file_name = self.config.state_file_name or f"range_inventory_ladder_{self.config.id}.json"
-        return Path("data") / file_name
+        composed = Path("data") / file_name
+        return self._assert_contained(
+            composed,
+            self.config.state_file_name,
+            # `is True` rather than bool(): fail closed on a config that lacks the field or
+            # returns something merely truthy for it. Only a literal True opts out.
+            getattr(self.config, "allow_absolute_state_file_name", False) is True,
+            "state_file_name",
+        )
 
     @property
     def state_path_abs(self) -> Path:
@@ -1495,7 +1653,12 @@ class RangeInventoryLadderController(ControllerBase):
             stamped = f"{stem}_{self._diagnostic_session_stamp}.{ext}"
         else:
             stamped = f"{file_name}_{self._diagnostic_session_stamp}"
-        return Path("data") / stamped
+        composed = Path("data") / stamped
+        # Sibling use-site of state_path: same Path("data") / <name> composition, same escape.
+        # No opt-out here -- C1 defines one for the state file only.
+        return self._assert_contained(
+            composed, self.config.diagnostic_log_file_name, False, "diagnostic_log_file_name",
+        )
 
     @staticmethod
     def _json_safe(value: Any):
