@@ -114,3 +114,4 @@ test_logs/
 /reviews_old/*
 
 /batch_logs/*
+/batch_reviews/*

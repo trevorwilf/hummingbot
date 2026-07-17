@@ -523,6 +523,27 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # Out-of-range market exit. Deliberately NOT part of _runtime_config_signature: it is
+    # read live every cycle, so a hot update takes effect next cycle without forcing a full
+    # cancel-and-rebuild wave.
+    out_of_range_action: str = Field(
+        default="dormant",
+        description=(
+            "What to do when the market moves entirely outside the ladder band. "
+            "'dormant' (default): do nothing (current behavior). 'market_exit': cross the "
+            "spread with a single order to act on the move -- when the confirmed regime is "
+            "above_sell_range, place ONE crossing LIMIT sell for the full available sell "
+            "budget; when below_buy_range, place ONE crossing LIMIT buy for the full "
+            "available buy budget. The limit price is set to the nearest edge rung, which "
+            "acts as a worst-case slippage bound while the order fills at the better current "
+            "price."
+        ),
+        json_schema_extra={
+            "prompt": "Action when price exits the ladder band (dormant / market_exit): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     # CONTRACT C1 opt-out. Declared BEFORE state_file_name: pydantic v2 validates fields in
     # declaration order, so the state_file_name validator only sees this in validation_info.data
     # if it is already validated. If it is missing or itself invalid, the validator reads False
@@ -1084,6 +1105,16 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         if value < 0:
             raise ValueError("regime_dwell_seconds cannot be negative")
         return value
+
+    @field_validator("out_of_range_action")
+    @classmethod
+    def validate_out_of_range_action(cls, value: str):
+        normalized = str(value).strip().lower()
+        if normalized not in ("dormant", "market_exit"):
+            raise ValueError(
+                f"out_of_range_action must be 'dormant' or 'market_exit', got {value!r}"
+            )
+        return normalized
 
     @field_validator("ledger_reconcile_threshold_quote")
     @classmethod
@@ -5057,6 +5088,14 @@ class RangeInventoryLadderController(ControllerBase):
     def _sell_level_id(self, idx: int) -> str:
         return f"sell_{self._price_level_token(self.config.sell_prices[idx])}"
 
+    def _buy_oob_level_id(self) -> str:
+        # Constant id with the side prefix kept so prefix-based logic (recycle bypass,
+        # side detection) treats the exit like any other buy level.
+        return "buy_oob"
+
+    def _sell_oob_level_id(self) -> str:
+        return "sell_oob"
+
     def _can_place_buy_level(self, price: Decimal) -> bool:
         if not self.config.passive_order_placement:
             return True
@@ -6098,6 +6137,77 @@ class RangeInventoryLadderController(ControllerBase):
 
         return actions
 
+    def _create_out_of_range_actions(self) -> List[CreateExecutorAction]:
+        """Opt-in out-of-range market exit (out_of_range_action='market_exit'): when the
+        CONFIRMED price regime sits entirely outside the ladder band, cross the spread with
+        ONE LIMIT order for the full available side budget, priced at the nearest edge rung
+        (the worst-case slippage bound -- the order fills at the better current book price).
+        Returns [] in every non-firing case. Independent of the per-side dirty/refresh state
+        machine: it never touches the dirty flags or _note_side_creates_issued."""
+        if self.config.out_of_range_action != "market_exit":
+            return []
+        # With passive placement off the normal ladder already places crossing LIMIT orders
+        # itself -- running the exit as well would double-spend the same budget.
+        if not self.config.passive_order_placement:
+            return []
+        # The hysteresis-confirmed regime, NOT the raw per-tick one: a momentary wick out of
+        # band must not trigger a full-budget dump.
+        regime = self.processed_data.get("price_regime", "")
+        if regime not in ("above_sell_range", "below_buy_range"):
+            return []
+        side_name = "sell" if regime == "above_sell_range" else "buy"
+        level_id = self._sell_oob_level_id() if side_name == "sell" else self._buy_oob_level_id()
+        # A live exit order blocks a duplicate; a CLOSED exit level carries no cooldown in
+        # event-refresh mode, so a partially-filled exit is free to top up next cycle.
+        if level_id in self.processed_data["blocked_level_ids"]:
+            return []
+        if self._wave_cancels_in_flight(side_name) or self._wave_balance_gate_active(side_name):
+            return []
+        if side_name == "sell":
+            budget = self.processed_data["free_sell_budget_base"]
+            if budget <= Decimal("0"):
+                return []
+            edge_idx = len(self.config.sell_prices) - 1  # highest sell rung = nearest edge
+            action, _ = self._build_sell_executor_action(
+                idx=edge_idx,
+                level_id=level_id,
+                price=self.config.sell_prices[edge_idx],
+                order_base=budget,
+                remaining_base_before=budget,
+                kept_sell_indexes=[edge_idx],
+                passive_execution_strategy=ExecutionStrategy.LIMIT,
+            )
+        else:
+            budget = self.processed_data["free_buy_budget_quote"]
+            if budget <= Decimal("0"):
+                return []
+            edge_idx = len(self.config.buy_prices) - 1  # lowest buy rung = nearest edge
+            action, _ = self._build_buy_executor_action(
+                idx=edge_idx,
+                level_id=level_id,
+                price=self.config.buy_prices[edge_idx],
+                order_quote=budget,
+                remaining_quote_before=budget,
+                kept_buy_indexes=[edge_idx],
+                passive_execution_strategy=ExecutionStrategy.LIMIT,
+            )
+        if action is None:
+            # Sub-minimum budget: the builder's quantization/min-notional guard already
+            # emitted the skip event -- dust cannot be exited.
+            return []
+        self._emit_structured(
+            "range_ladder_out_of_range_exit",
+            side=side_name,
+            regime=regime,
+            amount=str(action.executor_config.amount),
+            limit_price=str(action.executor_config.price),
+            reference_price=str(self.processed_data.get("reference_price", "")),
+            best_bid=str(self.processed_data.get("best_bid", "")),
+            best_ask=str(self.processed_data.get("best_ask", "")),
+            budget=str(budget),
+        )
+        return [action]
+
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         if not self.processed_data:
             return []
@@ -6134,17 +6244,27 @@ class RangeInventoryLadderController(ControllerBase):
         actions.extend(buy_actions)
         actions.extend(sell_actions)
 
+        # Out-of-range market exit: kept in its OWN list so the per-side dirty-flag
+        # bookkeeping below never sees it (it is independent of the refresh state machine),
+        # but folded into the budget invariant checks so the exit stays guarded too.
+        oob_actions = self._create_out_of_range_actions()
+        actions.extend(oob_actions)
+        oob_buys = [a for a in oob_actions if a.executor_config.side == TradeType.BUY]
+        oob_sells = [a for a in oob_actions if a.executor_config.side == TradeType.SELL]
+
         # Safety-net invariant (2026-07-08 addendum): issued creates must fit the budget.
-        if buy_actions:
+        if buy_actions or oob_buys:
             issued_notional = sum(
-                (a.executor_config.amount * a.executor_config.price for a in buy_actions),
+                (a.executor_config.amount * a.executor_config.price
+                 for a in buy_actions + oob_buys),
                 Decimal("0"),
             )
             self._check_plan_budget_invariant(
                 "buy", issued_notional,
                 self.processed_data.get("free_buy_budget_quote", Decimal("0")), "issued_creates")
-        if sell_actions:
-            issued_base = sum((a.executor_config.amount for a in sell_actions), Decimal("0"))
+        if sell_actions or oob_sells:
+            issued_base = sum(
+                (a.executor_config.amount for a in sell_actions + oob_sells), Decimal("0"))
             self._check_plan_budget_invariant(
                 "sell", issued_base,
                 self.processed_data.get("free_sell_budget_base", Decimal("0")), "issued_creates")
@@ -6557,6 +6677,18 @@ class RangeInventoryLadderController(ControllerBase):
         ]
         lines.append(f"Eligible buy prices: {', '.join(eligible_buys) if eligible_buys else 'none'}")
         lines.append(f"Eligible sell prices: {', '.join(eligible_sells) if eligible_sells else 'none'}")
+        if (self.config.out_of_range_action == "market_exit"
+                and p.get("price_regime") in ("above_sell_range", "below_buy_range")):
+            if p["price_regime"] == "above_sell_range":
+                oob_id = self._sell_oob_level_id()
+                sizing = (f"sell {p['free_sell_budget_base']:.6f} {p['base_asset']} "
+                          f"@ limit {self.config.sell_prices[-1]} (crossing)")
+            else:
+                oob_id = self._buy_oob_level_id()
+                sizing = (f"buy {p['free_buy_budget_quote']:.6f} {p['quote_asset']} "
+                          f"@ limit {self.config.buy_prices[-1]} (crossing)")
+            state = "placed (live)" if oob_id in p["blocked_level_ids"] else "armed"
+            lines.append(f"Out-of-range exit: {state} | {sizing}")
         return lines
 
     def get_custom_info(self) -> dict:
@@ -6620,6 +6752,7 @@ class RangeInventoryLadderController(ControllerBase):
             "state_recovery_reason": self._state_recovery_reason or "",
             "state_migrated_from_version": str(self._state_migrated_from_version) if self._state_migrated_from_version is not None else "",
             "price_regime": str(p.get("price_regime", "")),
+            "out_of_range_action": str(self.config.out_of_range_action),
             "config_rebuild_pending": str(self._config_rebuild_pending),
             "market_data_ready": str(p.get("market_data_ready", True)),
             "market_data_error": p.get("market_data_error", ""),
