@@ -544,6 +544,44 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "is_updatable": True,
         },
     )
+    # One-sided / graceful wind-down mode. Deliberately NOT part of _runtime_config_signature:
+    # all three flags are read live every cycle, so a hot update takes effect next cycle
+    # without forcing a full cancel-and-rebuild wave (the cancel_disabled_side_orders cancel
+    # is handled directly in stop_actions_proposal, not via the rebuild path). The price
+    # lists stay fully populated -- the flags gate PLACEMENT and CANCELLATION only, so every
+    # indexer, validator, and regime computation keeps working unchanged. Both sides disabled
+    # at once is permitted: a clean soft-pause that keeps all ledger/fund state intact.
+    enable_buys: bool = Field(
+        default=True,
+        description="When False, the buy side places no new orders. Ladder prices are retained.",
+        json_schema_extra={
+            "prompt": "Enable the buy side? (True/False): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    enable_sells: bool = Field(
+        default=True,
+        description="When False, the sell side places no new orders. Ladder prices are retained.",
+        json_schema_extra={
+            "prompt": "Enable the sell side? (True/False): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    cancel_disabled_side_orders: bool = Field(
+        default=True,
+        description=(
+            "When True, disabling a side also cancels that side's resting orders (bypassing "
+            "cooldown). When False, existing orders on a disabled side are left to fill "
+            "naturally and only NEW placement is frozen."
+        ),
+        json_schema_extra={
+            "prompt": "Cancel resting orders when a side is disabled? (True/False): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     # CONTRACT C1 opt-out. Declared BEFORE state_file_name: pydantic v2 validates fields in
     # declaration order, so the state_file_name validator only sees this in validation_info.data
     # if it is already validated. If it is missing or itself invalid, the validator reads False
@@ -1553,6 +1591,12 @@ class RangeInventoryLadderController(ControllerBase):
         self._sell_dirty_reason: str = ""
         # First fully-processed cycle seeds the global timer and places both ladders.
         self._refresh_timers_initialized: bool = False
+
+        # One-sided / wind-down mode: previous cycle's enable_buys/enable_sells so the
+        # side-disabled / side-reenabled info events fire once per transition, not every
+        # cycle. Seeded True/True so a controller STARTED with a side disabled still emits
+        # the disabled event once on its first cycle.
+        self._prev_side_enabled: Dict[str, bool] = {"buy": True, "sell": True}
 
         # Ledger-funded budgets: per-side latch for the wallet-floor-binding diagnostic so it
         # warns once per binding episode (transition-based), not every cycle.
@@ -2820,9 +2864,46 @@ class RangeInventoryLadderController(ControllerBase):
                 sell_cooldown_armed=self._sell_cooldown_armed,
             )
 
+    def _side_enabled(self, side: str) -> bool:
+        return self.config.enable_buys if side == "buy" else self.config.enable_sells
+
+    def _track_side_enable_transitions(self):
+        """One-sided / wind-down mode observability: emit an info event ONCE when a side
+        transitions enabled<->disabled (the flags are hot-updatable, read live every cycle)."""
+        for side_name, enabled in (("buy", bool(self.config.enable_buys)),
+                                   ("sell", bool(self.config.enable_sells))):
+            if self._prev_side_enabled[side_name] == enabled:
+                continue
+            self._prev_side_enabled[side_name] = enabled
+            if enabled:
+                self.logger().info(
+                    f"{self.config.id}: {side_name} side re-enabled; it rebuilds on the next "
+                    f"refresh trigger from its current budget."
+                )
+                self._emit_structured("range_ladder_side_reenabled", side=side_name)
+            else:
+                cancel_mode = ("resting orders will be cancelled"
+                               if self.config.cancel_disabled_side_orders
+                               else "resting orders are left to fill naturally")
+                self.logger().info(
+                    f"{self.config.id}: {side_name} side disabled (winding down / off); "
+                    f"no new orders will be placed, {cancel_mode}."
+                )
+                self._emit_structured(
+                    "range_ladder_side_disabled",
+                    side=side_name,
+                    cancel_disabled_side_orders=bool(self.config.cancel_disabled_side_orders),
+                )
+
     def _mark_side_dirty(self, side: str, reason: str):
         """Mark a side as needing a refresh. The FIRST reason in a cycle wins for the event
         label (initial/fill reasons fire before cooldown/global, which is the useful ordering)."""
+        if not self._side_enabled(side):
+            # One-sided / wind-down mode: a DISABLED side is never marked dirty, so no
+            # trigger (initial placement, cross-side fill, cooldown lapse, global timer,
+            # watchdogs, reconcile/heal) can schedule a (re)build for it. Existing behavior
+            # is otherwise untouched.
+            return
         if side == "buy":
             if not self._buy_side_dirty:
                 self._buy_dirty_reason = reason
@@ -3846,6 +3927,14 @@ class RangeInventoryLadderController(ControllerBase):
             ("buy", TradeType.BUY, self._buy_side_dirty, self._buy_cooldown_armed),
             ("sell", TradeType.SELL, self._sell_side_dirty, self._sell_cooldown_armed),
         ):
+            if not self._side_enabled(side_name):
+                # One-sided / wind-down mode: a disabled side is deliberately empty/idle --
+                # neither watchdog applies, so skip before any evaluation or WARNING/event
+                # emission and reset the side's watchdog state so nothing is stale when the
+                # side is re-enabled.
+                self._side_empty_since[side_name] = None
+                self._reset_underdeployed_episode(side_name)
+                continue
             side_executors = [e for e in self._order_executors_active_or_shutting_down()
                               if self._executor_side(e) == side]
             wave_present = self._refresh_wave.get(side_name) is not None
@@ -5031,6 +5120,10 @@ class RangeInventoryLadderController(ControllerBase):
         return self._executor_side(executor)
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
+        # One-sided / wind-down mode: fire the once-per-transition side disabled/re-enabled
+        # info events (the flags are hot-updatable and read live everywhere else).
+        self._track_side_enable_transitions()
+
         # v12 Issue 3: reset the side-specific defer flags every cycle so a cycle with no
         # stops never inherits a stale defer from a previous one.
         self._defer_buy_creates_this_cycle = False
@@ -5868,6 +5961,12 @@ class RangeInventoryLadderController(ControllerBase):
         return str(min(elig)) if elig else ""
 
     def _create_buy_actions(self) -> List[CreateExecutorAction]:
+        # One-sided / wind-down mode: a disabled side places NOTHING, unconditionally. This
+        # guard must come first: in LEGACY mode (event_refresh_enabled=False) creates run
+        # every cycle regardless of the dirty flags, so the _mark_side_dirty gate alone
+        # would not cover it.
+        if not self.config.enable_buys:
+            return []
         # v12 Issue 3: a buy stop this cycle defers only buy creates (sell creates proceed).
         if self._defer_buy_creates_this_cycle:
             return []
@@ -6011,6 +6110,9 @@ class RangeInventoryLadderController(ControllerBase):
         return actions
 
     def _create_sell_actions(self) -> List[CreateExecutorAction]:
+        # One-sided / wind-down mode: see _create_buy_actions -- this guard must come first.
+        if not self.config.enable_sells:
+            return []
         # v12 Issue 3: a sell stop this cycle defers only sell creates (buy creates proceed).
         if self._defer_sell_creates_this_cycle:
             return []
@@ -6156,6 +6258,11 @@ class RangeInventoryLadderController(ControllerBase):
         if regime not in ("above_sell_range", "below_buy_range"):
             return []
         side_name = "sell" if regime == "above_sell_range" else "buy"
+        # One-sided / wind-down mode: a disabled side never fires an out-of-range exit
+        # either (enable_sells=False + market_exit = accumulate-only, do nothing on a
+        # spike out the top).
+        if not self._side_enabled(side_name):
+            return []
         level_id = self._sell_oob_level_id() if side_name == "sell" else self._buy_oob_level_id()
         # A live exit order blocks a duplicate; a CLOSED exit level carries no cooldown in
         # event-refresh mode, so a partially-filled exit is free to top up next cycle.
@@ -6343,6 +6450,16 @@ class RangeInventoryLadderController(ControllerBase):
             reason = getattr(self, reason_attr) or "refresh"
             side_name = "buy" if side == TradeType.BUY else "sell"
 
+            if not self._side_enabled(side_name):
+                # One-sided / wind-down mode: the dirty flag was set BEFORE the side was
+                # disabled (_mark_side_dirty drops new ones). Disabling aborts the pending
+                # refresh: never cancel-and-rebuild a disabled side here -- any cancel is
+                # owned by the cancel_disabled_side_orders block in stop_actions_proposal,
+                # and with that flag False the resting orders must be left to ride.
+                setattr(self, dirty_attr, False)
+                setattr(self, reason_attr, "")
+                continue
+
             if reason == "ladder_reconcile":
                 # Heal mode (intended-vs-live reconciliation): NEVER cancel the surviving
                 # orders. Their levels are blocked, so the create path fills only the
@@ -6515,6 +6632,33 @@ class RangeInventoryLadderController(ControllerBase):
                 trading_pair=self.config.trading_pair,
             )
 
+        # One-sided / wind-down mode (cancel_disabled_side_orders=True): stop the resting
+        # orders on a DISABLED side, bypass-marking each level so the cancel starts no
+        # residual cooldown (identical to the hard-pause / session-end / config-rebuild
+        # branches). Unlike those branches this does NOT return: the still-enabled side's
+        # normal refresh/reconcile continues below in the same cycle. With the flag False
+        # the disabled side's resting orders are left to fill naturally and only NEW
+        # placement is frozen (the create-path guards).
+        if self.config.cancel_disabled_side_orders and (
+                not self.config.enable_buys or not self.config.enable_sells):
+            for executor in active_order_executors:
+                side = self._executor_side(executor)
+                if side == TradeType.BUY and not self.config.enable_buys:
+                    side_name = "buy"
+                elif side == TradeType.SELL and not self.config.enable_sells:
+                    side_name = "sell"
+                else:
+                    continue
+                level_id = getattr(executor.config, "level_id", "")
+                self._mark_bypass_cooldown_for_level(level_id)
+                actions.append(StopExecutorAction(controller_id=self.config.id, executor_id=executor.id))
+                self._emit_structured(
+                    "range_ladder_side_disabled_stop",
+                    executor_id=executor.id,
+                    level_id=level_id,
+                    side=side_name,
+                )
+
         # Refresh policy: cancel and recreate resting orders to track current prices/budgets.
         now = self.market_data_provider.time()
 
@@ -6553,6 +6697,15 @@ class RangeInventoryLadderController(ControllerBase):
             refresh_stopped_any = False
             legacy_stopped: Dict[TradeType, List[ExecutorInfo]] = {TradeType.BUY: [], TradeType.SELL: []}
             for executor in active_order_executors:
+                legacy_side = self._executor_side(executor)
+                if ((legacy_side == TradeType.BUY and not self.config.enable_buys)
+                        or (legacy_side == TradeType.SELL and not self.config.enable_sells)):
+                    # One-sided / wind-down mode: an age-refresh cancel on a DISABLED side
+                    # would either duplicate the cancel_disabled_side_orders stop emitted
+                    # above this cycle, or (flag False) kill an order that must be left to
+                    # fill naturally -- the disabled side never rebuilds, so a refresh
+                    # cancel is a silent liquidation either way.
+                    continue
                 age = now - executor.timestamp
                 if age >= self.config.executor_refresh_time:
                     # v12 Issue 2: a refresh cancel must NEVER start a cooldown -- nothing
@@ -6641,6 +6794,17 @@ class RangeInventoryLadderController(ControllerBase):
             f"Diagnostic log: {self.diagnostic_log_path if self.config.diagnostic_log_enabled else 'disabled'}",
             f"Session elapsed: {p.get('session_elapsed_s', Decimal('0')):.3f}s | Max session hours: {self.config.max_session_duration_hours}",
         ]
+        # One-sided / wind-down mode banner, inserted right under the pair header so a
+        # disabled side is impossible to miss.
+        disabled_banners = []
+        resting_mode = ("resting orders are cancelled"
+                        if self.config.cancel_disabled_side_orders
+                        else "resting orders left to fill naturally")
+        if not self.config.enable_buys:
+            disabled_banners.append(f"*** BUY SIDE DISABLED (winding down / off) -- {resting_mode} ***")
+        if not self.config.enable_sells:
+            disabled_banners.append(f"*** SELL SIDE DISABLED (winding down / off) -- {resting_mode} ***")
+        lines[2:2] = disabled_banners
         if not p.get("market_data_ready", True):
             lines.append(f"Market data error: {p.get('market_data_error', '')}")
         if p.get("market_data_hard_pause", False):
@@ -6753,6 +6917,9 @@ class RangeInventoryLadderController(ControllerBase):
             "state_migrated_from_version": str(self._state_migrated_from_version) if self._state_migrated_from_version is not None else "",
             "price_regime": str(p.get("price_regime", "")),
             "out_of_range_action": str(self.config.out_of_range_action),
+            "enable_buys": str(self.config.enable_buys),
+            "enable_sells": str(self.config.enable_sells),
+            "cancel_disabled_side_orders": str(self.config.cancel_disabled_side_orders),
             "config_rebuild_pending": str(self._config_rebuild_pending),
             "market_data_ready": str(p.get("market_data_ready", True)),
             "market_data_error": p.get("market_data_error", ""),
