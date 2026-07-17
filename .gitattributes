@@ -1,0 +1,4 @@
+# Shell scripts must stay LF even on Windows checkouts (core.autocrlf=true),
+# otherwise their shebang becomes "#!/bin/bash\r" and Linux hosts fail with
+# "cannot execute: required file not found".
+*.sh text eol=lf
