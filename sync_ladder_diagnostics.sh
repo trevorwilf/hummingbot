@@ -24,7 +24,8 @@ STACK_ROOTS=(
     "/mnt/sharedrive/apps/hummingbot_us"
 )
 
-DEST_BASE="/mnt/sharedrive/apps/hummingbot/jupyter/notebooks/ladder/diagnostics"
+DEST_BASE="/mnt/sharedrive/apps/hummingbot/jupyter/notebooks/range_ladder/diagnostics"
+mkdir -p -- "$DEST_BASE" || { echo "ERROR: cannot create $DEST_BASE"; exit 1; }
 
 copied=0
 skipped=0

@@ -222,14 +222,10 @@ services:
     command:
       - |
         set -eu
-        [ -f /opt/conda/etc/profile.d/conda.sh ] && . /opt/conda/etc/profile.d/conda.sh && conda activate hummingbot-api 2>/dev/null || true
-        cd /hummingbot-api 2>/dev/null || cd /app 2>/dev/null || { echo "[migrate] app dir not found — skipping"; exit 0; }
-        if [ -f alembic.ini ]; then
-          echo "[migrate] alembic.ini found — running: alembic upgrade head"
-          alembic upgrade head
-          echo "[migrate] Alembic migrations applied."
+        if [ -f /hummingbot-api/scripts/run-migrations.sh ]; then
+          bash /hummingbot-api/scripts/run-migrations.sh
         else
-          echo "[migrate] No alembic.ini in image yet — skipping (scaffold Alembic to enable)."
+          echo "[migrate] scripts/run-migrations.sh not in image yet — skipping (rebuild the image to enable)."
         fi
     restart: "no"
     logging: *default-logging
