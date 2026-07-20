@@ -632,8 +632,11 @@ class TestPMMisterCooldownLedger(IsolatedAsyncioWrapperTestCase):
     def test_analyze_by_level_id_takes_max_of_buffer_and_ledger(self):
         controller = self._make_controller(now=1030.0)
         self._record_level_fill(controller, "buy_0", TradeType.BUY, fill_time=1000.0)
-        # A buffered executor with a NEWER open_order_last_update must win...
+        # A buffered FILLED executor with a NEWER open_order_last_update must win...
+        # (CLA-301, Phase 5: only executors with fills arm the cooldown, so the
+        # buffered reference must carry a fill to count at all.)
         buffered = make_executor_info("buffered", TradeType.BUY, level_id="buy_0",
+                                      filled_amount_quote=Decimal("25"),
                                       timestamp=1010.0)
         buffered.custom_info["open_order_last_update"] = 1020.0
         controller.executors_info = [buffered]

@@ -1,7 +1,7 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Set, Tuple, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
 from controllers._shared.trade_ledger import TradeLedger
@@ -12,6 +12,11 @@ from hummingbot.strategy_v2.executors.order_executor.data_types import Execution
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.utils.common import parse_comma_separated_list, parse_enum_value
+
+# CLA-401: level_id given to the global TP/SL exit OrderExecutor so its custom_info
+# never reports level_id=None. Deliberately NOT of the buy_N/sell_N form: every
+# level parser recognizes only quoting level ids and ignores this sentinel.
+GLOBAL_EXIT_LEVEL_ID = "global_exit"
 
 
 class PMMisterConfig(ControllerConfigBase):
@@ -27,10 +32,14 @@ class PMMisterConfig(ControllerConfigBase):
     target_base_pct: Decimal = Field(default=Decimal("0.5"), json_schema_extra={"is_updatable": True})
     min_base_pct: Decimal = Field(default=Decimal("0.3"), json_schema_extra={"is_updatable": True})
     max_base_pct: Decimal = Field(default=Decimal("0.7"), json_schema_extra={"is_updatable": True})
-    buy_spreads: List[float] = Field(default="0.0005", json_schema_extra={"is_updatable": True})
-    sell_spreads: List[float] = Field(default="0.0005", json_schema_extra={"is_updatable": True})
-    buy_amounts_pct: Union[List[Decimal], None] = Field(default="1", json_schema_extra={"is_updatable": True})
-    sell_amounts_pct: Union[List[Decimal], None] = Field(default="1", json_schema_extra={"is_updatable": True})
+    # CLA-001: pydantic v2 does not run mode="before" validators on omitted
+    # defaults (no validate_default on the base), so string defaults like "0.0005"
+    # would reach the logic unparsed (len("0.0005") == 6 phantom levels). Give the
+    # fields real typed defaults so the value the logic sees is already valid.
+    buy_spreads: List[float] = Field(default_factory=lambda: [0.0005], json_schema_extra={"is_updatable": True})
+    sell_spreads: List[float] = Field(default_factory=lambda: [0.0005], json_schema_extra={"is_updatable": True})
+    buy_amounts_pct: Union[List[Decimal], None] = Field(default_factory=lambda: [Decimal("1")], json_schema_extra={"is_updatable": True})
+    sell_amounts_pct: Union[List[Decimal], None] = Field(default_factory=lambda: [Decimal("1")], json_schema_extra={"is_updatable": True})
     executor_refresh_time: int = Field(default=30, json_schema_extra={"is_updatable": True})
 
     # Enhanced timing parameters
@@ -69,6 +78,49 @@ class PMMisterConfig(ControllerConfigBase):
             return Decimal(v)
         return v
 
+    @staticmethod
+    def _to_finite_decimal(v, field_name: str) -> Decimal:
+        try:
+            d = Decimal(str(v))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError(f"{field_name} must be a number (got {v!r})")
+        if not d.is_finite():
+            raise ValueError(f"{field_name} must be finite (got {v!r})")
+        return d
+
+    @field_validator("portfolio_allocation", "target_base_pct", mode="before")
+    @classmethod
+    def validate_fraction_open_zero(cls, v, validation_info: ValidationInfo):
+        # CLA-003: portfolio_allocation scales the whole book — require finite 0 < v <= 1.
+        # CDX-008: target_base_pct is a division denominator once a position is held —
+        # zero would perma-fail update_processed_data and kill the global SL with it.
+        field_name = validation_info.field_name
+        d = cls._to_finite_decimal(v, field_name)
+        if not (Decimal("0") < d <= Decimal("1")):
+            raise ValueError(f"{field_name} must be in (0, 1] (got {v!r})")
+        return d
+
+    @field_validator("min_base_pct", "max_base_pct", mode="before")
+    @classmethod
+    def validate_fraction_closed(cls, v, validation_info: ValidationInfo):
+        # CDX-008: bounds of the inventory band; ordering vs target is enforced model-wide.
+        field_name = validation_info.field_name
+        d = cls._to_finite_decimal(v, field_name)
+        if not (Decimal("0") <= d <= Decimal("1")):
+            raise ValueError(f"{field_name} must be in [0, 1] (got {v!r})")
+        return d
+
+    @field_validator("min_skew", mode="before")
+    @classmethod
+    def validate_min_skew(cls, v):
+        # CLA-004: min_skew multiplies every order amount; a value > 1 is an unbounded
+        # size multiplier (min_skew=2 doubles every order). The 1.0 default ("skew
+        # disabled") is intentional and unchanged — only the bound is enforced.
+        d = cls._to_finite_decimal(v, "min_skew")
+        if not (Decimal("0") <= d <= Decimal("1")):
+            raise ValueError(f"min_skew must be in [0, 1] (got {v!r})")
+        return d
+
     @field_validator('take_profit_order_type', mode="before")
     @classmethod
     def validate_order_type(cls, v) -> OrderType:
@@ -99,12 +151,42 @@ class PMMisterConfig(ControllerConfigBase):
         if isinstance(parsed, list) and len(parsed) != len(validation_info.data[field_name.replace('amounts_pct', 'spreads')]):
             raise ValueError(
                 f"The number of {field_name} must match the number of {field_name.replace('amounts_pct', 'spreads')}.")
+        if isinstance(parsed, list):
+            # CLA-409: weights feed a sum-normalized division — reject non-finite
+            # and negative elements (the all-zero case is enforced model-wide).
+            for element in parsed:
+                d = cls._to_finite_decimal(element, field_name)
+                if d < 0:
+                    raise ValueError(f"{field_name} elements must be >= 0 (got {element!r})")
         return parsed
 
     @field_validator('position_mode', mode="before")
     @classmethod
     def validate_position_mode(cls, v) -> PositionMode:
         return parse_enum_value(PositionMode, v, "position_mode")
+
+    @model_validator(mode="after")
+    def validate_cross_field_invariants(self):
+        # CDX-008: the inventory band must be ordered around the target; an
+        # inverted band silently disables the position constraints.
+        if not (self.min_base_pct <= self.target_base_pct <= self.max_base_pct):
+            raise ValueError(
+                f"base pct fields must satisfy min_base_pct <= target_base_pct <= max_base_pct "
+                f"(got min={self.min_base_pct}, target={self.target_base_pct}, max={self.max_base_pct})")
+        # CLA-409: all-zero amount weights would zero the normalization denominator
+        # in get_spreads_and_amounts_in_quote and freeze the controller.
+        buy_amounts = self.buy_amounts_pct if isinstance(self.buy_amounts_pct, list) else []
+        sell_amounts = self.sell_amounts_pct if isinstance(self.sell_amounts_pct, list) else []
+        if (buy_amounts or sell_amounts):
+            try:
+                total = sum(Decimal(str(a)) for a in buy_amounts) + sum(Decimal(str(a)) for a in sell_amounts)
+            except (InvalidOperation, ValueError, TypeError):
+                total = None
+            if total is not None and total <= 0:
+                raise ValueError(
+                    "buy_amounts_pct and sell_amounts_pct must not all be zero — "
+                    "the weight normalization divides by their sum.")
+        return self
 
     @field_validator('price_distance_tolerance', 'refresh_tolerance', 'tolerance_scaling', mode="before")
     @classmethod
@@ -168,13 +250,17 @@ class PMMisterConfig(ControllerConfigBase):
         sell_amounts_pct = getattr(self, 'sell_amounts_pct')
 
         total_pct = sum(buy_amounts_pct) + sum(sell_amounts_pct)
-
-        if trade_type == TradeType.BUY:
-            normalized_amounts_pct = [amt_pct / total_pct for amt_pct in buy_amounts_pct]
-        else:
-            normalized_amounts_pct = [amt_pct / total_pct for amt_pct in sell_amounts_pct]
-
+        side_amounts_pct = buy_amounts_pct if trade_type == TradeType.BUY else sell_amounts_pct
         spreads = getattr(self, f'{trade_type.name.lower()}_spreads')
+
+        # CLA-409 runtime guard: validation rejects all-zero weights, but a state
+        # that bypassed pydantic (e.g. direct attribute mutation) must degrade to
+        # zero-sized (skipped) levels, never a division-by-zero that freezes the
+        # controller every tick.
+        if total_pct <= 0:
+            return spreads, [Decimal("0") for _ in side_amounts_pct]
+
+        normalized_amounts_pct = [amt_pct / total_pct for amt_pct in side_amounts_pct]
         return spreads, [amt_pct * self.total_amount_quote * self.portfolio_allocation for amt_pct in normalized_amounts_pct]
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
@@ -230,6 +316,51 @@ class PMMister(ControllerBase):
         TradeLedger.observe_executors is idempotent and never raises.
         """
         self._trade_ledger.observe_executors(self.executors_info, current_time)
+
+    @staticmethod
+    def _normalized_level_id(executor_info) -> str:
+        """CLA-401: custom_info can report the level_id key PRESENT with value
+        None (the global-exit OrderExecutor did exactly that), so
+        `.get("level_id", "")` still yields None and every `.startswith` /
+        `.split` parser raises. Always reduce to a string."""
+        custom_info = getattr(executor_info, "custom_info", None)
+        level_id = custom_info.get("level_id") if isinstance(custom_info, dict) else None
+        return level_id if isinstance(level_id, str) else ""
+
+    @staticmethod
+    def _is_quoting_level_id(level_id) -> bool:
+        """CLA-401: only well-formed quoting level ids (buy_N / sell_N) may reach
+        the level parsers; empties, the global-exit sentinel and any foreign id
+        are ignored instead of raising in the update loop."""
+        if not isinstance(level_id, str) or not level_id:
+            return False
+        parts = level_id.split("_")
+        return len(parts) == 2 and parts[0] in ("buy", "sell") and parts[1].isdigit()
+
+    @staticmethod
+    def _executor_filled_amount(executor_info) -> Decimal:
+        """Best-effort filled quote amount for an executor snapshot (CLA-301).
+
+        Mirrors the trade ledger's fill detection: the public
+        ExecutorInfo.filled_amount_quote plus the custom_info variant some
+        executor types (OrderExecutor POSITION_HOLD) report instead.
+        Non-finite/garbage values collapse to 0.
+        """
+        def to_decimal(value) -> Decimal:
+            try:
+                d = Decimal(str(value))
+                return d if d.is_finite() else Decimal("0")
+            except (InvalidOperation, ValueError, TypeError):
+                return Decimal("0")
+
+        filled = to_decimal(getattr(executor_info, "filled_amount_quote", None))
+        custom_info = getattr(executor_info, "custom_info", None)
+        if isinstance(custom_info, dict):
+            filled = max(filled, to_decimal(custom_info.get("filled_amount_quote")))
+        return filled
+
+    def _executor_has_fill(self, executor_info) -> bool:
+        return self._executor_filled_amount(executor_info) > 0
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
@@ -325,14 +456,20 @@ class PMMister(ControllerBase):
                     position_action=PositionAction.CLOSE,
                     execution_strategy=ExecutionStrategy.MARKET,
                     leverage=self.config.leverage,
+                    # CLA-401: without a level_id the executor's custom_info reports
+                    # the key present-with-None and every level parser in the update
+                    # loop raises. The sentinel is ignored by all parsers.
+                    level_id=GLOBAL_EXIT_LEVEL_ID,
                 )))
         return actions
 
     def should_effectivize_executor(self, executor_info, current_time: int) -> bool:
         """Check if a hanging executor should be effectivized"""
-        level_id = executor_info.custom_info.get("level_id", "")
+        level_id = self._normalized_level_id(executor_info)
+        if not self._is_quoting_level_id(level_id):
+            return False
         fill_time = executor_info.custom_info["open_order_last_update"]
-        if not level_id or not fill_time:
+        if not fill_time:
             return False
 
         trade_type = self.get_trade_type_from_level_id(level_id)
@@ -361,8 +498,8 @@ class PMMister(ControllerBase):
 
     def should_refresh_executor_by_distance(self, executor_info, reference_price: Decimal) -> bool:
         """Check if executor should be refreshed due to price distance deviation"""
-        level_id = executor_info.custom_info.get("level_id", "")
-        if not level_id or not hasattr(executor_info.config, 'entry_price'):
+        level_id = self._normalized_level_id(executor_info)
+        if not self._is_quoting_level_id(level_id) or not hasattr(executor_info.config, 'entry_price'):
             return False
 
         current_order_price = executor_info.config.entry_price
@@ -618,8 +755,15 @@ class PMMister(ControllerBase):
 
         if position_held is not None:
             position_amount = position_held.amount
-            current_base_pct = position_held.amount_quote / self.config.total_amount_quote
-            deviation = (target_position - position_held.amount_quote) / target_position
+            # CDX-008: validators enforce 0 < target_base_pct <= 1, but a state that
+            # bypassed pydantic (direct attribute mutation, hot-reload edge) must not
+            # divide by a zero target — that perma-failed update_processed_data every
+            # tick and killed the global stop-loss while a position was held.
+            total_quote = self.config.total_amount_quote
+            current_base_pct = (position_held.amount_quote / total_quote
+                                if total_quote > 0 else Decimal("0"))
+            deviation = ((target_position - position_held.amount_quote) / target_position
+                         if target_position > 0 else Decimal("0"))
             unrealized_pnl_pct = position_held.unrealized_pnl_quote / position_held.amount_quote if position_held.amount_quote != 0 else Decimal(
                 "0")
             breakeven_price = position_held.breakeven_price
@@ -746,7 +890,13 @@ class PMMister(ControllerBase):
 
     def analyze_all_levels(self) -> List[Dict]:
         """Analyze executors for all levels."""
-        level_ids: Set[str] = {e.custom_info.get("level_id") for e in self.executors_info if "level_id" in e.custom_info}
+        # CLA-401: only well-formed quoting level ids (buy_N / sell_N) may enter the
+        # analysis — a None level_id (global-exit OrderExecutor) or the sentinel
+        # would raise in every downstream parser and brick the update loop.
+        level_ids: Set[str] = {
+            level_id for e in self.executors_info
+            if self._is_quoting_level_id(level_id := self._normalized_level_id(e))
+        }
         # CDX-011 / CLA-305: a level whose executors were all evicted from the
         # bot-wide buffer (or that filled before a restart) would otherwise not
         # be analyzed at all — its cooldown would silently vanish. Include every
@@ -754,7 +904,10 @@ class PMMister(ControllerBase):
         # the per-level cooldown check still runs for it.
         max_cooldown = max(self.config.buy_cooldown_time, self.config.sell_cooldown_time)
         ledger_cutoff = self.market_data_provider.time() - max_cooldown
-        level_ids |= set(self._trade_ledger.level_ids_with_fills_since(ledger_cutoff))
+        level_ids |= {
+            level_id for level_id in self._trade_ledger.level_ids_with_fills_since(ledger_cutoff)
+            if self._is_quoting_level_id(level_id)
+        }
         return [self._analyze_by_level_id(level_id) for level_id in level_ids]
 
     def _analyze_by_level_id(self, level_id: str) -> Dict:
@@ -765,11 +918,17 @@ class PMMister(ControllerBase):
         active_not_trading = [e for e in filtered_executors if e.is_active and not e.is_trading]
         active_trading = [e for e in filtered_executors if e.is_active and e.is_trading]
 
-        # For cooldown calculation, include both active and recently completed executors
+        # For cooldown calculation, include both active and recently completed executors.
+        # CLA-301: the cooldown must arm on FILLS only. A routine refresh CANCEL also
+        # bumps open_order_last_update, and counting it kept re-arming the cooldown
+        # (~60s dark per level per 30s refresh) with zero traded volume. Mirror the
+        # range_inventory_ladder fill-not-cancel pattern: only executors that
+        # actually filled contribute a cooldown reference.
         all_level_executors = [e for e in self.executors_info if e.custom_info.get("level_id") == level_id]
         open_order_last_updates = [
             e.custom_info.get("open_order_last_update") for e in all_level_executors
             if "open_order_last_update" in e.custom_info and e.custom_info["open_order_last_update"] is not None
+            and self._executor_has_fill(e)
         ]
         # CDX-011 / CLA-305: durable floor from the persisted ledger — max() keeps
         # the existing buffer-derived arming (never weaker than before) while the
@@ -1013,9 +1172,9 @@ class PMMister(ControllerBase):
             return False
 
         entry_price = executor_info.config.entry_price
-        level_id = executor_info.custom_info.get("level_id", "")
+        level_id = self._normalized_level_id(executor_info)
 
-        if not level_id:
+        if not self._is_quoting_level_id(level_id):
             return False
 
         is_buy = level_id.startswith("buy")
@@ -1240,15 +1399,20 @@ class PMMister(ControllerBase):
             "sell": {"active": False, "remaining_time": 0, "progress_pct": Decimal("0")}
         }
 
-        # Get latest order timestamps for each trade type
-        buy_executors = [e for e in self.executors_info if e.custom_info.get("level_id", "").startswith("buy")]
-        sell_executors = [e for e in self.executors_info if e.custom_info.get("level_id", "").startswith("sell")]
+        # Get latest order timestamps for each trade type. CLA-401: normalize the
+        # level_id (a present-with-None key would raise on .startswith); the
+        # global-exit sentinel matches neither side and is naturally ignored.
+        buy_executors = [e for e in self.executors_info if self._normalized_level_id(e).startswith("buy")]
+        sell_executors = [e for e in self.executors_info if self._normalized_level_id(e).startswith("sell")]
 
         for trade_type, executors in [("buy", buy_executors), ("sell", sell_executors)]:
-            # Find most recent open order update
+            # Find most recent open order update. CLA-301: fills only — keep the
+            # displayed cooldown consistent with the gate (a refresh cancel must
+            # not show as an armed cooldown).
             latest_updates = [
                 e.custom_info.get("open_order_last_update") for e in executors
                 if "open_order_last_update" in e.custom_info and e.custom_info["open_order_last_update"] is not None
+                and self._executor_has_fill(e)
             ]
 
             # CDX-011 / CLA-305: keep the displayed side cooldown consistent with
@@ -1338,8 +1502,8 @@ class PMMister(ControllerBase):
         effectivization_data["total_hanging"] = len(hanging_executors)
 
         for executor in hanging_executors:
-            level_id = executor.custom_info.get("level_id", "")
-            if not level_id:
+            level_id = self._normalized_level_id(executor)
+            if not self._is_quoting_level_id(level_id):
                 continue
 
             trade_type = self.get_trade_type_from_level_id(level_id)
@@ -1505,11 +1669,12 @@ class PMMister(ControllerBase):
             # Check distance-based refresh condition
             distance_violation = (reference_price > 0 and
                                   self.should_refresh_executor_by_distance(executor, reference_price))
-            # Calculate distance deviation for display
+            # Calculate distance deviation for display. CLA-401: only well-formed
+            # quoting level ids may reach the theoretical-price parser.
             distance_deviation_pct = Decimal("0")
             if reference_price > 0:
-                level_id = executor.custom_info.get("level_id", "")
-                if level_id and hasattr(executor.config, 'entry_price'):
+                level_id = self._normalized_level_id(executor)
+                if self._is_quoting_level_id(level_id) and hasattr(executor.config, 'entry_price'):
                     theoretical_price = self.calculate_theoretical_price(level_id, reference_price)
                     if theoretical_price > 0:
                         distance_deviation_pct = abs(executor.config.entry_price - theoretical_price) / theoretical_price
@@ -1527,11 +1692,14 @@ class PMMister(ControllerBase):
             if distance_violation:
                 refresh_data["distance_violations"] += 1
 
-            level_id = executor.custom_info.get("level_id", "unknown")
-            level = self.get_level_from_level_id(level_id) if level_id != "unknown" else 0
+            # CLA-401: a None level_id used to reach get_level_from_level_id and
+            # raise every tick; non-quoting ids (sentinel/foreign) fall back too.
+            level_id = self._normalized_level_id(executor) or "unknown"
+            is_quoting = self._is_quoting_level_id(level_id)
+            level = self.get_level_from_level_id(level_id) if is_quoting else 0
 
             # Get level-specific refresh tolerance for display
-            level_tolerance = self.config.get_refresh_level_tolerance(level) if level_id != "unknown" else self.config.refresh_tolerance
+            level_tolerance = self.config.get_refresh_level_tolerance(level) if is_quoting else self.config.refresh_tolerance
 
             refresh_data["refresh_candidates"].append({
                 "executor_id": executor.id,
