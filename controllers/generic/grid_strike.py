@@ -8,7 +8,7 @@ from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigB
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
@@ -100,6 +100,11 @@ class GridStrike(ControllerBase):
         self._last_termination_timestamp: Optional[float] = None
         self._consecutive_stopouts: int = 0
         self._last_breaker_warning_timestamp: float = 0.0
+        # CLA-002: signature of the updatable creation-only fields the live
+        # executor was built with; None until a create is issued (or adopted on
+        # recovery, when the creating signature is unknowable).
+        self._active_config_signature: Optional[str] = None
+        self._last_price_warning_timestamp: float = 0.0
         self.initialize_rate_sources()
 
     def initialize_rate_sources(self):
@@ -112,8 +117,35 @@ class GridStrike(ControllerBase):
             if executor.is_active
         ]
 
+    @staticmethod
+    def _is_valid_price(price) -> bool:
+        return isinstance(price, Decimal) and price.is_finite() and price > 0
+
     def is_inside_bounds(self, price: Decimal) -> bool:
+        # CLA-M01 (sibling fix): an empty-book mid arrives as Decimal("NaN") and
+        # NaN Decimal comparisons raise InvalidOperation — treat any invalid price
+        # as out-of-bounds (fail-closed) instead of raising.
+        if not self._is_valid_price(price):
+            return False
         return self.config.start_price <= price <= self.config.end_price
+
+    def _config_signature(self) -> str:
+        """CLA-002: the `is_updatable` fields that only feed GridExecutorConfig at
+        creation. An edit to any of them must stop/reissue the live grid or the
+        update (including the limit_price risk stop) silently never applies."""
+        return str((
+            self.config.start_price,
+            self.config.end_price,
+            self.config.limit_price,
+            self.config.total_amount_quote,
+            self.config.min_spread_between_orders,
+            self.config.min_order_amount_quote,
+            self.config.max_open_orders,
+            self.config.max_orders_per_batch,
+            self.config.order_frequency,
+            self.config.activation_bounds,
+            self.config.keep_position,
+        ))
 
     def _register_terminations(self):
         """GEN-10: fold newly terminated executors into cooldown/breaker state."""
@@ -150,9 +182,33 @@ class GridStrike(ControllerBase):
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         self._register_terminations()
+        active = self.active_executors()
+        if len(active) > 0:
+            current_signature = self._config_signature()
+            if self._active_config_signature is None:
+                # Recovery/restart with a live executor: the creating signature is
+                # unknowable — adopt the current one instead of blind-stopping.
+                self._active_config_signature = current_signature
+            elif current_signature != self._active_config_signature:
+                # CLA-002: an updatable creation-only field changed — stop the live
+                # grid; the normal create path reissues with the new values
+                # (subject to the GEN-10 re-entry cooldown, which stays in force).
+                self._active_config_signature = None
+                return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id)
+                        for executor in active]
+            return []
         mid_price = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-        if len(self.active_executors()) == 0 and self.is_inside_bounds(mid_price) and self._can_create_executor():
+        if not self._is_valid_price(mid_price):
+            now = self.market_data_provider.time()
+            if now - self._last_price_warning_timestamp >= self._WARNING_INTERVAL:
+                self._last_price_warning_timestamp = now
+                self.logger().warning(
+                    f"Mid price unavailable/invalid ({mid_price}) for "
+                    f"{self.config.connector_name}:{self.config.trading_pair} — skipping grid creation this tick.")
+            return []
+        if self.is_inside_bounds(mid_price) and self._can_create_executor():
+            self._active_config_signature = self._config_signature()
             return [CreateExecutorAction(
                 controller_id=self.config.id,
                 executor_config=GridExecutorConfig(

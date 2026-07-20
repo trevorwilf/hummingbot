@@ -94,11 +94,26 @@ class MultiGridStrikeConfig(ControllerConfigBase):
                 f"Sum of enabled grids' amount_quote_pct ({enabled_pct_sum}) exceeds 1")
         return self
 
+    @model_validator(mode="after")
+    def validate_grid_ids_unique(self):
+        # CDX-003/CLA-015: duplicate grid_ids collapse the one-to-one
+        # grid_id -> executor mapping and leave one executor unowned. Reject over
+        # ALL entries, including disabled ones (a disabled duplicate re-enabled
+        # later would collide at runtime).
+        seen = set()
+        for g in self.grids:
+            if g.grid_id in seen:
+                raise ValueError(f"Duplicate grid_id '{g.grid_id}': grid_ids must be unique across all entries")
+            seen.add(g.grid_id)
+        return self
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
 
 class MultiGridStrike(ControllerBase):
+    _WARNING_INTERVAL = 30.0
+
     def __init__(self, config: MultiGridStrikeConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
@@ -108,6 +123,7 @@ class MultiGridStrike(ControllerBase):
         self._grid_param_hashes: Dict[str, str] = {
             g.grid_id: self._grid_param_hash(g) for g in self.config.grids
         }
+        self._last_price_warning_timestamp: float = 0.0
         self.trading_rules = None
         self.initialize_rate_sources()
 
@@ -122,18 +138,30 @@ class MultiGridStrike(ControllerBase):
             for g in self.config.grids
         )))
 
-    @staticmethod
-    def _grid_param_hash(grid: GridConfig) -> str:
-        """GEN-8: hash of the parameters that require re-issuing the grid's executor."""
-        return str((grid.start_price, grid.end_price, grid.limit_price, grid.side, grid.amount_quote_pct))
+    def _shared_param_signature(self) -> tuple:
+        """CDX-M01: creation-only `is_updatable` fields shared by every grid. They
+        feed GridExecutorConfig at creation, so an edit must stop/reissue the live
+        executors or it silently never applies."""
+        return (
+            self.config.total_amount_quote,
+            self.config.min_spread_between_orders,
+            self.config.min_order_amount_quote,
+            self.config.max_open_orders,
+            self.config.max_orders_per_batch,
+            self.config.order_frequency,
+            self.config.activation_bounds,
+            self.config.keep_position,
+        )
 
-    def _has_config_changed(self) -> bool:
-        """Check if configuration has changed"""
-        current_hash = self._get_config_hash()
-        changed = current_hash != self._last_config_hash
-        if changed:
-            self._last_config_hash = current_hash
-        return changed
+    def _grid_param_hash(self, grid: GridConfig) -> str:
+        """GEN-8/CDX-M01: hash of every parameter that requires re-issuing the
+        grid's executor — per-grid geometry plus the shared creation-only fields."""
+        return str((grid.start_price, grid.end_price, grid.limit_price, grid.side,
+                    grid.amount_quote_pct, self._shared_param_signature()))
+
+    @staticmethod
+    def _is_valid_price(price) -> bool:
+        return isinstance(price, Decimal) and price.is_finite() and price > 0
 
     def active_executors(self) -> List[ExecutorInfo]:
         return [
@@ -161,15 +189,74 @@ class MultiGridStrike(ControllerBase):
 
     def is_inside_bounds(self, price: Decimal, grid: GridConfig) -> bool:
         """Check if price is within grid bounds"""
+        # CLA-M01: an empty-book mid arrives as Decimal("NaN") and NaN Decimal
+        # comparisons raise InvalidOperation — treat any invalid price as
+        # out-of-bounds (fail-closed) instead of raising mid-loop.
+        if not self._is_valid_price(price):
+            return False
         return grid.start_price <= price <= grid.end_price
 
+    def _reconcile_executor_ownership(self, stopped_executor_ids: set) -> List[ExecutorAction]:
+        """CDX-003/CLA-015: every active executor must be owned by exactly one
+        configured, enabled grid, and each grid must own at most one executor.
+        Excess executors (transient duplicate creates, mapping collapse, stale
+        state after a missed removed-grid pass) are stopped so nothing trades
+        unowned. Idempotent — derived from live executors_info each tick."""
+        actions: List[ExecutorAction] = []
+        enabled_ids = {g.grid_id for g in self.config.grids if g.enabled}
+        executors_by_grid: Dict[Optional[str], List[ExecutorInfo]] = {}
+        for executor in self.active_executors():
+            level_id = getattr(executor.config, "level_id", None)
+            executors_by_grid.setdefault(level_id, []).append(executor)
+        for grid_id, executors in executors_by_grid.items():
+            if grid_id not in enabled_ids:
+                # Unowned: the grid was removed/disabled (or the executor carries
+                # no level_id) — stop it rather than let it trade unmanaged.
+                for executor in executors:
+                    if executor.id not in stopped_executor_ids:
+                        stopped_executor_ids.add(executor.id)
+                        actions.append(StopExecutorAction(
+                            controller_id=self.config.id, executor_id=executor.id))
+                if grid_id is not None:
+                    self._grid_executor_mapping.pop(grid_id, None)
+                continue
+            if len(executors) > 1:
+                # Duplicate executors for one grid: keep the mapped one (else the
+                # oldest, deterministically) and stop the rest.
+                executors_sorted = sorted(executors, key=lambda e: (e.timestamp, e.id))
+                mapped_id = self._grid_executor_mapping.get(grid_id)
+                keeper = next((e for e in executors_sorted if e.id == mapped_id),
+                              executors_sorted[0])
+                for executor in executors_sorted:
+                    if executor.id != keeper.id and executor.id not in stopped_executor_ids:
+                        stopped_executor_ids.add(executor.id)
+                        actions.append(StopExecutorAction(
+                            controller_id=self.config.id, executor_id=executor.id))
+                self._grid_executor_mapping[grid_id] = keeper.id
+        return actions
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
-        actions = []
         mid_price = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        # CLA-M01: bail out BEFORE any change-detection state is consumed so a bad
+        # tick cannot mark a pending config change as already handled.
+        if not self._is_valid_price(mid_price):
+            now = self.market_data_provider.time()
+            if now - self._last_price_warning_timestamp >= self._WARNING_INTERVAL:
+                self._last_price_warning_timestamp = now
+                self.logger().warning(
+                    f"Mid price unavailable/invalid ({mid_price}) for "
+                    f"{self.config.connector_name}:{self.config.trading_pair} — skipping grid actions this tick.")
+            return []
 
-        # Check for config changes
-        if self._has_config_changed():
+        actions: List[ExecutorAction] = []
+        stopped_executor_ids: set = set()
+        # CLA-M01: change-detection state is committed only after the whole action
+        # list is built — a mid-loop raise leaves the pending change detectable on
+        # the next tick instead of silently consumed.
+        new_config_hash = self._get_config_hash()
+        mapping_removals: List[str] = []
+        if new_config_hash != self._last_config_hash:
             # Handle removed or disabled grids
             current_grid_ids = {g.grid_id for g in self.config.grids if g.enabled}
             for grid_id, executor_id in list(self._grid_executor_mapping.items()):
@@ -177,12 +264,17 @@ class MultiGridStrike(ControllerBase):
                     # GEN-6: only stop executors that are still active — sending a
                     # StopExecutorAction to a terminated executor raises upstream.
                     if self.get_executor_by_grid_id(grid_id) is not None:
+                        stopped_executor_ids.add(executor_id)
                         actions.append(StopExecutorAction(
                             controller_id=self.config.id,
                             executor_id=executor_id
                         ))
-                    del self._grid_executor_mapping[grid_id]
+                    mapping_removals.append(grid_id)
 
+        # CDX-003: stop duplicate/unowned executors before per-grid processing.
+        actions.extend(self._reconcile_executor_ownership(stopped_executor_ids))
+
+        param_hash_updates: Dict[str, str] = {}
         # Process each enabled grid
         for grid in self.config.grids:
             if not grid.enabled:
@@ -196,12 +288,14 @@ class MultiGridStrike(ControllerBase):
             # created while the old one is still winding down.
             current_param_hash = self._grid_param_hash(grid)
             if self._grid_param_hashes.get(grid.grid_id) != current_param_hash:
-                self._grid_param_hashes[grid.grid_id] = current_param_hash
+                param_hash_updates[grid.grid_id] = current_param_hash
                 if executor is not None:
-                    actions.append(StopExecutorAction(
-                        controller_id=self.config.id,
-                        executor_id=executor.id
-                    ))
+                    if executor.id not in stopped_executor_ids:
+                        stopped_executor_ids.add(executor.id)
+                        actions.append(StopExecutorAction(
+                            controller_id=self.config.id,
+                            executor_id=executor.id
+                        ))
                     continue
 
             # Create new executor if none exists and price is in bounds
@@ -231,11 +325,17 @@ class MultiGridStrike(ControllerBase):
                 actions.append(executor_action)
                 # Note: We'll update the mapping after executor is created
 
-            # Update executor mapping if needed
-            if executor is None and len(actions) > 0:
-                # This will be handled in the next cycle after executor is created
-                pass
-
+        # CLA-M01: commit change-detection state only now that the full pass built
+        # its actions without raising.
+        self._last_config_hash = new_config_hash
+        for grid_id in mapping_removals:
+            self._grid_executor_mapping.pop(grid_id, None)
+        self._grid_param_hashes.update(param_hash_updates)
+        configured_ids = {g.grid_id for g in self.config.grids}
+        self._grid_param_hashes = {
+            grid_id: param_hash for grid_id, param_hash in self._grid_param_hashes.items()
+            if grid_id in configured_ids
+        }
         return actions
 
     async def update_processed_data(self):
