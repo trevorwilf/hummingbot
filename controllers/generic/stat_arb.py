@@ -2,9 +2,13 @@ from decimal import Decimal
 from typing import List
 
 import numpy as np
+import pandas as pd
+from pydantic import field_validator, model_validator
+from pydantic_core.core_schema import ValidationInfo
 from sklearn.linear_model import LinearRegression
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, PositionSummary
@@ -37,6 +41,62 @@ class StatArbConfig(ControllerConfigBase):
     pos_hedge_ratio: Decimal = Decimal("1.0")
     leverage: int = 20
     position_mode: PositionMode = PositionMode.HEDGE
+    stop_out_cooldown: int = 300
+
+    @field_validator("pos_hedge_ratio")
+    @classmethod
+    def validate_pos_hedge_ratio(cls, v: Decimal) -> Decimal:
+        # CLA-012: pos_hedge_ratio == -1 crashes __init__ with a division by zero;
+        # non-positive or non-finite ratios produce nonsensical leg allocations.
+        if not v.is_finite() or v <= Decimal("0"):
+            raise ValueError("pos_hedge_ratio must be a finite number greater than zero")
+        return v
+
+    @field_validator("entry_threshold")
+    @classmethod
+    def validate_entry_threshold(cls, v: Decimal) -> Decimal:
+        # CLA-012: a zero/negative threshold turns every z-score reading into an entry.
+        if not v.is_finite() or v <= Decimal("0"):
+            raise ValueError("entry_threshold must be a finite number greater than zero")
+        return v
+
+    @field_validator("tp_global", "sl_global")
+    @classmethod
+    def validate_global_barriers(cls, v: Decimal, info: ValidationInfo) -> Decimal:
+        # CLA-012: sl_global <= 0 fires the global stop at zero PnL (and with the
+        # stop-out latch would keep the controller permanently flat); same for tp_global.
+        if not v.is_finite() or v <= Decimal("0"):
+            raise ValueError(f"{info.field_name} must be a finite number greater than zero")
+        return v
+
+    @field_validator("lookback_period")
+    @classmethod
+    def validate_lookback_period(cls, v: int) -> int:
+        if v < 2:
+            raise ValueError("lookback_period must be at least 2")
+        return v
+
+    @field_validator("stop_out_cooldown")
+    @classmethod
+    def validate_stop_out_cooldown(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("stop_out_cooldown must be non-negative")
+        return v
+
+    @field_validator("interval")
+    @classmethod
+    def validate_interval(cls, v: str) -> str:
+        if v not in CandlesBase.interval_to_seconds:
+            raise ValueError(
+                f"Unsupported interval '{v}'. Must be one of {list(CandlesBase.interval_to_seconds.keys())}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_distinct_pairs(self):
+        if (self.connector_pair_dominant.connector_name == self.connector_pair_hedge.connector_name and
+                self.connector_pair_dominant.trading_pair == self.connector_pair_hedge.trading_pair):
+            raise ValueError("connector_pair_dominant and connector_pair_hedge must be different markets")
+        return self
 
     @property
     def triple_barrier_config(self) -> TripleBarrierConfig:
@@ -71,6 +131,12 @@ class StatArb(ControllerBase):
         self.config = config
         self.theoretical_dominant_quote = self.config.total_amount_quote * (1 / (1 + self.config.pos_hedge_ratio))
         self.theoretical_hedge_quote = self.config.total_amount_quote * (self.config.pos_hedge_ratio / (1 + self.config.pos_hedge_ratio))
+        # Candle interval in seconds — guaranteed resolvable by the interval validator.
+        self._interval_seconds = CandlesBase.interval_to_seconds[self.config.interval]
+        # Stop-out latch (CLA-304): while time < _stop_out_until, entry quoting is gated
+        # so a still-hot z-score cannot re-enter right after a global TP/SL exit.
+        self._stop_out_until: float = 0.0
+        self._last_stop_out_log_ts: float = 0.0
 
         # Initialize processed data dictionary
         self.processed_data = {
@@ -123,7 +189,19 @@ class StatArb(ControllerBase):
         # z-score signal is unavailable (candles outage) — GEN-1.
         pair_pnl_pct = self.processed_data.get("pair_pnl_pct", Decimal("0"))
         if pair_pnl_pct > self.config.tp_global or pair_pnl_pct < -self.config.sl_global:
-            # Close all positions
+            # Global TP/SL breach (CLA-304): latch the stop-out cooldown, cancel every
+            # entry executor so resting maker orders cannot refill while the close is in
+            # flight, then close what is held. The latch re-arms on every breached tick,
+            # so re-entry stays gated for stop_out_cooldown seconds after the LAST
+            # breached observation (never shorter than configured).
+            now = self.market_data_provider.time()
+            self._stop_out_until = now + self.config.stop_out_cooldown
+            if now - self._last_stop_out_log_ts >= 60:
+                self._last_stop_out_log_ts = now
+                self.logger().warning(
+                    f"Global TP/SL breached (pair pnl {pair_pnl_pct:.4%}) — cancelling entry executors, "
+                    f"closing positions and gating re-entry for {self.config.stop_out_cooldown}s.")
+            actions.extend(self.get_entry_executors_to_stop())
             for position in self.positions_held:
                 actions.extend(self.get_executors_to_reduce_position(position))
             return actions
@@ -137,6 +215,25 @@ class StatArb(ControllerBase):
         actions.extend(self.get_executors_to_refresh())
 
         return actions
+
+    def stop_out_cooldown_active(self) -> bool:
+        """True while re-entry is gated after a global TP/SL exit (CLA-304)."""
+        return self.market_data_provider.time() < self._stop_out_until
+
+    def get_entry_executors_to_stop(self) -> List[ExecutorAction]:
+        """
+        Stop every active entry (position) executor on a global TP/SL breach (CLA-304,
+        pmm_mister GEN-4 pattern). In-flight close order executors are excluded — this
+        controller only creates order executors to close positions, and stopping one
+        would cancel the exit itself. keep_position folds partial fills into
+        positions_held so the market close covers them, instead of each executor
+        closing independently.
+        """
+        entry_executors = self.filter_executors(
+            self.executors_info,
+            filter_func=lambda e: e.is_active and e.type == "position_executor")
+        return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id, keep_position=True)
+                for executor in entry_executors]
 
     def get_executors_to_reduce_position_on_opposite_signal(self) -> List[ExecutorAction]:
         if self.processed_data["signal"] == 1:
@@ -181,6 +278,10 @@ class StatArb(ControllerBase):
         Get Order Executor to quote from the dominant and hedge markets.
         """
         actions: List[ExecutorAction] = []
+        if self.stop_out_cooldown_active():
+            # Re-entry gated after a global TP/SL exit (CLA-304): the z-score is usually
+            # still beyond the entry threshold right after a stop-out.
+            return actions
         trade_type_dominant = TradeType.BUY if self.processed_data["signal"] == 1 else TradeType.SELL
         trade_type_hedge = TradeType.SELL if self.processed_data["signal"] == 1 else TradeType.BUY
 
@@ -288,29 +389,37 @@ class StatArb(ControllerBase):
         if z_score is None or not prices_valid:
             # Signal unavailable — fail closed on quoting, keep risk management running
             signal = 0
-            dominant_side, hedge_side = None, None
         elif z_score > entry_threshold:
             # Spread is too high, expect it to revert: long dominant, short hedge
             signal = 1
-            dominant_side, hedge_side = TradeType.BUY, TradeType.SELL
         elif z_score < -entry_threshold:
             # Spread is too low, expect it to revert: short dominant, long hedge
             signal = -1
-            dominant_side, hedge_side = TradeType.SELL, TradeType.BUY
         else:
             # No signal
             signal = 0
-            dominant_side, hedge_side = None, None
 
-        # Get current positions stats by signal
-        positions_dominant = next((position for position in self.positions_held if position.connector_name == self.config.connector_pair_dominant.connector_name and position.trading_pair == self.config.connector_pair_dominant.trading_pair and (position.side == dominant_side or dominant_side is None)), None)
-        positions_hedge = next((position for position in self.positions_held if position.connector_name == self.config.connector_pair_hedge.connector_name and position.trading_pair == self.config.connector_pair_hedge.trading_pair and (position.side == hedge_side or hedge_side is None)), None)
-        # Get position stats
-        position_dominant_quote = positions_dominant.amount_quote if positions_dominant else Decimal("0")
-        position_hedge_quote = positions_hedge.amount_quote if positions_hedge else Decimal("0")
-        position_dominant_pnl_quote = positions_dominant.global_pnl_quote if positions_dominant else Decimal("0")
-        position_hedge_pnl_quote = positions_hedge.global_pnl_quote if positions_hedge else Decimal("0")
-        pair_pnl_pct = (position_dominant_pnl_quote + position_hedge_pnl_quote) / (position_dominant_quote + position_hedge_quote) if (position_dominant_quote + position_hedge_quote) != 0 else Decimal("0")
+        # Aggregate EVERY position summary for each configured pair (CDX-005): in HEDGE
+        # mode both sides coexist while a signal flip is being reduced, and the global
+        # TP/SL must see the losing non-current side. The aggregation is independent of
+        # the signal, so signal == 0 cannot pick a nondeterministic side. PnL is
+        # unrealized only, denominated on gross open exposure — cumulative realized
+        # PnL/fees persist across restarts and would let banked history mask (or force)
+        # an exit on the currently open position.
+        dominant_positions = [
+            position for position in self.positions_held
+            if position.connector_name == self.config.connector_pair_dominant.connector_name and
+            position.trading_pair == self.config.connector_pair_dominant.trading_pair]
+        hedge_positions = [
+            position for position in self.positions_held
+            if position.connector_name == self.config.connector_pair_hedge.connector_name and
+            position.trading_pair == self.config.connector_pair_hedge.trading_pair]
+        position_dominant_quote = sum((abs(position.amount_quote) for position in dominant_positions), Decimal("0"))
+        position_hedge_quote = sum((abs(position.amount_quote) for position in hedge_positions), Decimal("0"))
+        pair_pnl_quote = sum(
+            (position.unrealized_pnl_quote for position in dominant_positions + hedge_positions), Decimal("0"))
+        total_exposure_quote = position_dominant_quote + position_hedge_quote
+        pair_pnl_pct = pair_pnl_quote / total_exposure_quote if total_exposure_quote > Decimal("0") else Decimal("0")
         # Get active executors
         executors_dominant_placed, executors_dominant_filled = self.get_executors_dominant()
         executors_hedge_placed, executors_hedge_filled = self.get_executors_hedge()
@@ -386,6 +495,39 @@ class StatArb(ControllerBase):
             return Decimal("0")
 
     def get_spread_and_z_score(self):
+        # A failure here must degrade to "signal unavailable" — an exception would
+        # propagate into update_processed_data and stall the global TP/SL loop (GEN-1).
+        try:
+            return self._compute_spread_and_z_score()
+        except Exception:
+            self.logger().warning("Spread/z-score computation failed; signal unavailable.", exc_info=True)
+            return None, None
+
+    def _aligned_close_frames(self, dominant_df: pd.DataFrame, hedge_df: pd.DataFrame, now: float) -> pd.DataFrame:
+        """
+        Pair the two candle frames by candle-open timestamp (CDX-004). Only bars that
+        are closed (opened at least one interval before `now`) with finite, positive
+        closes participate; an inner join then drops any timestamp missing from either
+        feed, so a missing/late candle removes that one row instead of shifting every
+        subsequent pair. There is deliberately no positional fallback.
+        """
+        empty = pd.DataFrame(columns=["timestamp", "close_dominant", "close_hedge"])
+        cleaned = []
+        for df in (dominant_df, hedge_df):
+            if "timestamp" not in df.columns or "close" not in df.columns:
+                return empty
+            bars = df[["timestamp", "close"]].copy()
+            bars["timestamp"] = pd.to_numeric(bars["timestamp"], errors="coerce")
+            bars["close"] = pd.to_numeric(bars["close"], errors="coerce")
+            bars = bars.dropna()
+            bars = bars[(bars["close"] > 0) & (bars["timestamp"] + self._interval_seconds <= now)]
+            bars = bars.sort_values("timestamp").drop_duplicates(subset="timestamp", keep="last")
+            cleaned.append(bars)
+        merged = pd.merge(cleaned[0], cleaned[1], on="timestamp", how="inner",
+                          suffixes=("_dominant", "_hedge"))
+        return merged.sort_values("timestamp").reset_index(drop=True)
+
+    def _compute_spread_and_z_score(self):
         # Fetch candle data for both assets
         dominant_df = self.market_data_provider.get_candles_df(
             connector_name=self.config.connector_pair_dominant.connector_name,
@@ -405,24 +547,18 @@ class StatArb(ControllerBase):
             self.logger().warning("Not enough candle data available for statistical analysis")
             return None, None
 
-        # Extract close prices
-        dominant_prices = dominant_df['close'].values
-        hedge_prices = hedge_df['close'].values
-
-        # Ensure we have enough data and both series have the same length
-        min_length = min(len(dominant_prices), len(hedge_prices))
-        if min_length < self.config.lookback_period:
+        # Align by timestamp — never by array position (CDX-004)
+        merged = self._aligned_close_frames(dominant_df, hedge_df, self.market_data_provider.time())
+        if len(merged) < self.config.lookback_period:
             self.logger().warning(
-                f"Not enough data points for analysis. Required: {self.config.lookback_period}, Available: {min_length}")
+                f"Not enough aligned candle data for analysis. "
+                f"Required: {self.config.lookback_period}, Available: {len(merged)}")
             return None, None
 
-        # Use the most recent data points
-        dominant_prices = dominant_prices[-self.config.lookback_period:]
-        hedge_prices = hedge_prices[-self.config.lookback_period:]
-
-        # Convert to numpy arrays
-        dominant_prices_np = np.array(dominant_prices, dtype=float)
-        hedge_prices_np = np.array(hedge_prices, dtype=float)
+        # Use the most recent aligned data points
+        merged = merged.tail(self.config.lookback_period)
+        dominant_prices_np = merged["close_dominant"].to_numpy(dtype=float)
+        hedge_prices_np = merged["close_hedge"].to_numpy(dtype=float)
 
         # Calculate percentage returns
         dominant_pct_change = np.diff(dominant_prices_np) / dominant_prices_np[:-1]
@@ -459,6 +595,9 @@ class StatArb(ControllerBase):
 
         current_spread = spread_pct[-1]
         current_z_score = (current_spread - mean_spread) / std_spread
+        if not (np.isfinite(current_spread) and np.isfinite(current_z_score)):
+            self.logger().warning("Non-finite spread/z-score; signal unavailable.")
+            return None, None
 
         return current_spread, current_z_score
 
@@ -515,6 +654,10 @@ Signal: {self.processed_data['signal']:.2f} | Z-Score: {self.processed_data['z_s
 Alpha : {self.processed_data['alpha']:.2f} | Beta: {self.processed_data['beta']:.2f}
 Pair PnL PCT: {self.processed_data['pair_pnl_pct'] * 100:.2f} %
 """)
+        cooldown_remaining = self._stop_out_until - self.market_data_provider.time()
+        if cooldown_remaining > 0:
+            status_lines.append(
+                f"Stop-out cooldown ACTIVE: re-entry gated for another {cooldown_remaining:.0f}s\n")
         return status_lines
 
     def get_candles_config(self) -> List[CandlesConfig]:

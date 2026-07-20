@@ -170,8 +170,10 @@ class TestStatArbGlobalRiskAndInFlightGuard(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(PositionAction.CLOSE, cfg.position_action)
 
     async def test_short_lookback_returns_none_pair(self):
-        # 10 rows < lookback_period 300 → second early exit
-        df = pd.DataFrame({"close": [100.0 + i for i in range(10)]})
+        # 10 aligned rows < lookback_period 300 → second early exit
+        df = pd.DataFrame({"timestamp": [i * 60.0 for i in range(10)],
+                           "close": [100.0 + i for i in range(10)]})
+        self.market_data_provider.time = MagicMock(return_value=10 * 60.0 + 120.0)
         self.market_data_provider.get_candles_df = MagicMock(return_value=df)
         spread, z_score = self.controller.get_spread_and_z_score()
         self.assertIsNone(spread)
