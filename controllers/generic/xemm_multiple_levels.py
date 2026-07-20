@@ -27,15 +27,19 @@ class XEMMMultipleLevelsConfig(ControllerConfigBase):
     taker_trading_pair: str = Field(
         default="PEPE-USDT",
         json_schema_extra={"prompt": "Enter the taker trading pair: ", "prompt_on_new": True})
+    # CLA-006: the per-level "amount" values are relative WEIGHTS, not absolute order
+    # amounts — each level is sized as (weight / sum_of_side_weights) * (total_amount_quote / 2),
+    # converted to base at the maker mid price. Keep the field names for config
+    # compatibility, but document the weight semantics in the prompts.
     buy_levels_targets_amount: List[List[Decimal]] = Field(
         default="0.003,10-0.006,20-0.009,30",
         json_schema_extra={
-            "prompt": "Enter the buy levels targets with the following structure: (target_profitability1,amount1-target_profitability2,amount2): ",
+            "prompt": "Enter the buy levels with the following structure: (target_profitability1,weight1-target_profitability2,weight2). Weights are RELATIVE — each level gets weight/total_weight of half of total_amount_quote, they are NOT absolute amounts: ",
             "prompt_on_new": True})
     sell_levels_targets_amount: List[List[Decimal]] = Field(
         default="0.003,10-0.006,20-0.009,30",
         json_schema_extra={
-            "prompt": "Enter the sell levels targets with the following structure: (target_profitability1,amount1-target_profitability2,amount2): ",
+            "prompt": "Enter the sell levels with the following structure: (target_profitability1,weight1-target_profitability2,weight2). Weights are RELATIVE — each level gets weight/total_weight of half of total_amount_quote, they are NOT absolute amounts: ",
             "prompt_on_new": True})
     min_profitability: Decimal = Field(
         default=0.003,
@@ -60,8 +64,9 @@ class XEMMMultipleLevelsConfig(ControllerConfigBase):
         GEN-5 / GEN-15: every level must keep a strictly positive profitability floor
         (target_profitability - min_profitability > 0 — the executor hedges with a MARKET
         taker order once profitability decays to that floor, so a floor of 0 realizes
-        slippage as a loss), and level amounts must be positive with a positive sum
-        (the sum is a divisor in determine_executor_actions).
+        slippage as a loss), and level weights must be positive with a positive sum
+        (the sum is a divisor in determine_executor_actions; see CLA-006 — they are
+        relative weights, not absolute amounts).
         """
         for side_name, levels in (("buy", self.buy_levels_targets_amount),
                                   ("sell", self.sell_levels_targets_amount)):
@@ -70,15 +75,15 @@ class XEMMMultipleLevelsConfig(ControllerConfigBase):
             for level in levels:
                 if len(level) != 2:
                     raise ValueError(
-                        f"Each {side_name} level must be (target_profitability, amount), got: {level}")
-                target_profitability, amount = level
+                        f"Each {side_name} level must be (target_profitability, weight), got: {level}")
+                target_profitability, weight = level
                 if target_profitability - self.min_profitability <= Decimal("0"):
                     raise ValueError(
                         f"{side_name} level target_profitability {target_profitability} minus "
                         f"min_profitability {self.min_profitability} must be > 0 — a level with a "
                         f"zero/negative floor hedges via MARKET order at guaranteed slippage loss")
-                if amount <= Decimal("0"):
-                    raise ValueError(f"{side_name} level amounts must be > 0, got: {amount}")
+                if weight <= Decimal("0"):
+                    raise ValueError(f"{side_name} level weights must be > 0, got: {weight}")
         return self
 
     def update_markets(self, markets: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
@@ -99,6 +104,13 @@ class XEMMMultipleLevels(ControllerBase):
         self.sell_levels_targets_amount = config.sell_levels_targets_amount
         super().__init__(config, *args, **kwargs)
         self._gas_token_cache = {}
+        # CLA-303: the executors imbalance is kept CUMULATIVELY in controller state
+        # (fill-derived, counted once per executor id) — re-deriving it each tick from
+        # the archival-coupled executors_info buffer let the guard silently decay as
+        # counted executors were evicted, resuming the halted side.
+        self._counted_executor_ids: Set[str] = set()
+        self._cumulative_filled_buys: int = 0
+        self._cumulative_filled_sells: int = 0
         self._initialize_gas_tokens()
         self.initialize_rate_sources()
 
@@ -169,6 +181,25 @@ class XEMMMultipleLevels(ControllerBase):
     async def update_processed_data(self):
         pass
 
+    def _update_imbalance(self) -> int:
+        """CLA-303: count each done, actually-filled executor exactly once into cumulative
+        per-side counters (the arbitrage_controller GEN-12 pattern). The returned imbalance
+        does not decay when counted executors are evicted from the executors_info buffer."""
+        for executor in self.executors_info:
+            if not executor.is_done or executor.filled_amount_quote == 0:
+                continue
+            if executor.id in self._counted_executor_ids:
+                continue
+            self._counted_executor_ids.add(executor.id)
+            if executor.config.maker_side == TradeType.BUY:
+                self._cumulative_filled_buys += 1
+            else:
+                self._cumulative_filled_sells += 1
+        # Prune ids that already fell out of the buffer — they can never be re-counted
+        current_ids = {e.id for e in self.executors_info}
+        self._counted_executor_ids &= current_ids
+        return self._cumulative_filled_buys - self._cumulative_filled_sells
+
     # Backstop floor for the executor's min_profitability — config validation already
     # guarantees target - min_profitability > 0, this clamp protects hot-updated configs.
     MIN_PROFITABILITY_FLOOR = Decimal("0.0001")
@@ -189,31 +220,23 @@ class XEMMMultipleLevels(ControllerBase):
             executors=self.executors_info,
             filter_func=lambda e: not e.is_done and e.config.maker_side == TradeType.SELL
         )
-        stopped_buy_executors = self.filter_executors(
-            executors=self.executors_info,
-            filter_func=lambda e: e.is_done and e.config.maker_side == TradeType.BUY and e.filled_amount_quote != 0
-        )
-        stopped_sell_executors = self.filter_executors(
-            executors=self.executors_info,
-            filter_func=lambda e: e.is_done and e.config.maker_side == TradeType.SELL and e.filled_amount_quote != 0
-        )
-        imbalance = len(stopped_buy_executors) - len(stopped_sell_executors)
+        imbalance = self._update_imbalance()
 
-        # Calculate total amounts for proportional allocation
-        total_buy_amount = sum(amount for _, amount in self.buy_levels_targets_amount)
-        total_sell_amount = sum(amount for _, amount in self.sell_levels_targets_amount)
+        # CLA-006: level "amounts" are relative weights — sum them for proportional allocation
+        total_buy_weight = sum(weight for _, weight in self.buy_levels_targets_amount)
+        total_sell_weight = sum(weight for _, weight in self.sell_levels_targets_amount)
 
         # Allocate 50% of total_amount_quote to each side
         buy_side_quote = self.config.total_amount_quote * Decimal("0.5")
         sell_side_quote = self.config.total_amount_quote * Decimal("0.5")
 
-        for target_profitability, amount in self.buy_levels_targets_amount:
+        for target_profitability, weight in self.buy_levels_targets_amount:
             # GEN-7: filter (not map to booleans) so each level replenishes independently
             active_buy_executors_target = [e for e in active_buy_executors if e.config.target_profitability == target_profitability]
 
             if len(active_buy_executors_target) == 0 and imbalance < self.config.max_executors_imbalance:
-                # Calculate proportional amount: (level_amount / total_side_amount) * (total_quote * 0.5)
-                proportional_amount_quote = (amount / total_buy_amount) * buy_side_quote
+                # Calculate proportional amount: (level_weight / total_side_weight) * (total_quote * 0.5)
+                proportional_amount_quote = (weight / total_buy_weight) * buy_side_quote
                 min_profitability = max(target_profitability - self.config.min_profitability, self.MIN_PROFITABILITY_FLOOR)
                 max_profitability = target_profitability + self.config.max_profitability
                 config = XEMMExecutorConfig(
@@ -230,12 +253,12 @@ class XEMMMultipleLevels(ControllerBase):
                     max_profitability=max_profitability
                 )
                 executor_actions.append(CreateExecutorAction(executor_config=config, controller_id=self.config.id))
-        for target_profitability, amount in self.sell_levels_targets_amount:
+        for target_profitability, weight in self.sell_levels_targets_amount:
             # GEN-7: filter (not map to booleans) so each level replenishes independently
             active_sell_executors_target = [e for e in active_sell_executors if e.config.target_profitability == target_profitability]
             if len(active_sell_executors_target) == 0 and imbalance > -self.config.max_executors_imbalance:
-                # Calculate proportional amount: (level_amount / total_side_amount) * (total_quote * 0.5)
-                proportional_amount_quote = (amount / total_sell_amount) * sell_side_quote
+                # Calculate proportional amount: (level_weight / total_side_weight) * (total_quote * 0.5)
+                proportional_amount_quote = (weight / total_sell_weight) * sell_side_quote
                 min_profitability = max(target_profitability - self.config.min_profitability, self.MIN_PROFITABILITY_FLOOR)
                 max_profitability = target_profitability + self.config.max_profitability
                 config = XEMMExecutorConfig(
