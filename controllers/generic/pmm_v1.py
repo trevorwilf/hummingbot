@@ -9,11 +9,11 @@ This controller replicates the legacy pure_market_making strategy with:
 - Minimum spread enforcement
 """
 
-from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from hummingbot.core.data_type.common import MarketDict, PriceType, TradeType
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
@@ -53,22 +53,28 @@ class PMMV1Config(ControllerConfigBase):
     # Override inherited total_amount_quote — PMM V1 uses order_amount in base asset
     total_amount_quote: Decimal = Field(default=Decimal("0"), json_schema_extra={"prompt_on_new": False})
 
+    # CLA-013: the amount is denominated in BASE asset — the old default of 1 sized every
+    # level at one whole base unit (1 BTC on the default pair) when the field was omitted.
+    # Default to the prompt's own example (0.01) so an omitted field errs small, never large.
     order_amount: Decimal = Field(
-        default=Decimal("1"),
+        default=Decimal("0.01"),
         json_schema_extra={
             "prompt_on_new": True, "is_updatable": True,
             "prompt": "Enter the order amount in base asset (e.g., 0.01 for BTC):",
         }
     )
+    # CLA-001: defaults bypass mode="before" validators (validate_default is not set on the
+    # base model), so a string default here would reach the logic unparsed — an omitted
+    # field would quote len("0.01")==4 garbage levels. Use real typed list defaults.
     buy_spreads: List[float] = Field(
-        default="0.01",
+        default_factory=lambda: [0.01],
         json_schema_extra={
             "prompt_on_new": True, "is_updatable": True,
             "prompt": "Enter comma-separated buy spreads as decimals (e.g., '0.01,0.02' for 1%, 2%):",
         }
     )
     sell_spreads: List[float] = Field(
-        default="0.01",
+        default_factory=lambda: [0.01],
         json_schema_extra={
             "prompt_on_new": True, "is_updatable": True,
             "prompt": "Enter comma-separated sell spreads as decimals (e.g., '0.01,0.02' for 1%, 2%):",
@@ -147,6 +153,26 @@ class PMMV1Config(ControllerConfigBase):
             return [float(x.strip()) for x in v.split(',')]
         return [float(x) for x in v]
 
+    @field_validator('order_amount')
+    @classmethod
+    def validate_order_amount(cls, v: Decimal) -> Decimal:
+        # CLA-013: reject non-finite / non-positive amounts so a bad value cannot
+        # silently quote zero or garbage.
+        if not v.is_finite() or v <= 0:
+            raise ValueError(f"order_amount must be a finite positive number, got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_price_band(self):
+        # CLA-013: with price_floor >= price_ceiling (both enabled) the band logic
+        # suppresses buys at/above the ceiling AND sells at/below the floor, creating a
+        # silent no-quote band. Reject the geometry at config time.
+        if self.price_ceiling > 0 and self.price_floor > 0 and self.price_floor >= self.price_ceiling:
+            raise ValueError(
+                f"price_floor ({self.price_floor}) must be strictly below price_ceiling "
+                f"({self.price_ceiling}) when both bands are enabled")
+        return self
+
     def get_spreads(self, trade_type: TradeType) -> List[float]:
         """Get spreads for a trade type. Each spread defines one order level."""
         if trade_type == TradeType.BUY:
@@ -172,37 +198,64 @@ class PMMV1(ControllerBase):
 
         # Track when each level can next create orders (for filled_order_delay)
         self._level_next_create_timestamps: Dict[str, float] = {}
-        # Track last seen executor states to detect fills
-        self._last_seen_executors: Dict[str, bool] = {}
+        # CDX-009 / CLA-302: executor ids whose fill outcome has already been resolved.
+        # Fill detection is per-executor-id (terminal-transition based), never re-derived
+        # from level-wide scans of the retained corpse buffer.
+        self._processed_fill_executor_ids: Set[str] = set()
 
     def _detect_filled_executors(self):
-        """Detect executors that were filled (not cancelled)."""
-        # Get current active executor IDs by level
-        current_active_by_level = {}
-        filled_levels = set()
+        """Detect executors that were filled (not cancelled).
 
+        CDX-009 / CLA-302: each executor id is resolved exactly once. The old level-based
+        scan matched ANY retained POSITION_HOLD corpse at a level, so a later clean cancel
+        at a level that had ever filled re-armed filled_order_delay; conversely a real fill
+        surfacing while the executor was SHUTTING_DOWN (is_active excludes SHUTTING_DOWN)
+        slipped past the active->inactive transition and its delay was skipped.
+        """
         for executor in self.executors_info:
-            level_id = executor.custom_info.get("level_id", "")
+            if executor.id in self._processed_fill_executor_ids:
+                continue
+            has_fill = self._executor_has_fill(executor)
+            if executor.is_done:
+                # Terminal: resolve once, arm the delay only on an actual fill.
+                self._processed_fill_executor_ids.add(executor.id)
+                if has_fill:
+                    self._handle_filled_executor(executor)
+            elif executor.status == RunnableStatus.SHUTTING_DOWN and has_fill:
+                # A fill already visible during shutdown must arm the delay NOW —
+                # the level no longer counts as active, so waiting for the terminal
+                # POSITION_HOLD would let the level re-quote inside the delay window.
+                # Zero-fill SHUTTING_DOWN executors are NOT marked processed: a partial
+                # fill can still surface with the cancel confirmation.
+                self._processed_fill_executor_ids.add(executor.id)
+                self._handle_filled_executor(executor)
+        # Prune ids that fell out of the executors_info buffer — they can never
+        # be seen (and thus re-processed) again.
+        current_ids = {e.id for e in self.executors_info}
+        self._processed_fill_executor_ids &= current_ids
 
-            if executor.is_active:
-                current_active_by_level[level_id] = True
-            elif executor.close_type == CloseType.POSITION_HOLD:
-                # POSITION_HOLD means the order was filled
-                filled_levels.add(level_id)
+    def _executor_has_fill(self, executor) -> bool:
+        """True if the executor has traded. POSITION_HOLD is only set with fills for
+        OrderExecutor; its public filled_amount_quote stays 0 on POSITION_HOLD, so the
+        exact fill accounting is read from custom_info."""
+        if executor.close_type == CloseType.POSITION_HOLD:
+            return True
+        try:
+            if executor.filled_amount_quote is not None and executor.filled_amount_quote > 0:
+                return True
+        except (InvalidOperation, TypeError):
+            pass
+        custom_filled = executor.custom_info.get("filled_amount_quote")
+        try:
+            return custom_filled is not None and Decimal(str(custom_filled)) > 0
+        except (InvalidOperation, TypeError, ValueError):
+            return False
 
-        # Check for levels that were active before but aren't now and were filled
-        for level_id, was_active in self._last_seen_executors.items():
-            if (was_active and
-                level_id not in current_active_by_level and
-                    level_id in filled_levels):
-                # This level was active before, not now, and was filled
-                self._handle_filled_executor(level_id)
-
-        # Update last seen state
-        self._last_seen_executors = current_active_by_level.copy()
-
-    def _handle_filled_executor(self, level_id: str):
+    def _handle_filled_executor(self, executor):
         """Set the next create timestamp for a level when its executor is filled."""
+        level_id = executor.custom_info.get("level_id") or ""
+        if not level_id:
+            return
         current_time = self.market_data_provider.time()
         self._level_next_create_timestamps[level_id] = current_time + self.config.filled_order_delay
 
@@ -210,16 +263,22 @@ class PMMV1(ControllerBase):
         self.logger().debug(f"Order on level {level_id} filled. Next order for this level can be created after {self.config.filled_order_delay}s delay.")
 
     def _get_reference_price(self) -> Decimal:
-        """Get reference price (mid price)."""
+        """Get reference price (mid price).
+
+        CDX-012 / CLA-402: the guard must catch Decimal("NaN") too, not only float NaN —
+        a NaN Decimal escaping here raises InvalidOperation at `reference_price > 0`
+        outside any try, freezing the controller with resting orders unrefreshed.
+        """
         try:
             price = self.market_data_provider.get_price_by_type(
                 self.config.connector_name,
                 self.config.trading_pair,
                 PriceType.MidPrice
             )
-            if price is None or (isinstance(price, float) and np.isnan(price)):
+            if price is None:
                 return Decimal("0")
-            return Decimal(str(price))
+            d = Decimal(str(price))
+            return d if d.is_finite() and d > 0 else Decimal("0")
         except Exception:
             return Decimal("0")
 
@@ -565,33 +624,21 @@ class PMMV1(ControllerBase):
                 for executor in executors_past_refresh
             ]
 
-        # Get current order prices and proposal prices
+        # CLA-2b-005: compare each refresh-age executor to the proposal price of its OWN
+        # level (matched sets). The old code compared the refresh-age executors' prices
+        # against ALL configured levels, so any missing level (active-but-young, or one
+        # sitting in filled_order_delay) was a guaranteed length mismatch that refreshed
+        # (churned) every remaining order each cycle.
         buy_proposal_prices = self.processed_data.get("buy_proposal_prices", [])
         sell_proposal_prices = self.processed_data.get("sell_proposal_prices", [])
 
-        # Get current buy/sell order prices
-        current_buy_prices = []
-        current_sell_prices = []
-        for executor in executors_past_refresh:
-            level_id = executor.custom_info.get("level_id", "")
-            order_price = getattr(executor.config, 'price', None)
-            if order_price is None:
-                continue
-            if level_id.startswith("buy"):
-                current_buy_prices.append(order_price)
-            elif level_id.startswith("sell"):
-                current_sell_prices.append(order_price)
-
-        # Check if within tolerance (matching legacy c_is_within_tolerance)
-        buys_within_tolerance = self._is_within_tolerance(
-            current_buy_prices, buy_proposal_prices
-        )
-        sells_within_tolerance = self._is_within_tolerance(
-            current_sell_prices, sell_proposal_prices
+        all_within_tolerance = all(
+            self._executor_within_tolerance(executor, buy_proposal_prices, sell_proposal_prices)
+            for executor in executors_past_refresh
         )
 
         # Log tolerance decisions
-        if buys_within_tolerance and sells_within_tolerance:
+        if all_within_tolerance:
             if executors_past_refresh:
                 executor_level_ids = [e.custom_info.get("level_id", "unknown") for e in executors_past_refresh]
                 self.logger().debug(f"Orders {executor_level_ids} will not be canceled because they are within the order tolerance ({self.config.order_refresh_tolerance_pct:.2%}).")
@@ -600,13 +647,7 @@ class PMMV1(ControllerBase):
         # Log which orders are being refreshed due to tolerance
         if executors_past_refresh:
             executor_level_ids = [e.custom_info.get("level_id", "unknown") for e in executors_past_refresh]
-            tolerance_reason = []
-            if not buys_within_tolerance:
-                tolerance_reason.append("buy orders outside tolerance")
-            if not sells_within_tolerance:
-                tolerance_reason.append("sell orders outside tolerance")
-            reason = " and ".join(tolerance_reason)
-            self.logger().debug(f"Refreshing orders {executor_level_ids} due to {reason} (tolerance: {self.config.order_refresh_tolerance_pct:.2%}).")
+            self.logger().debug(f"Refreshing orders {executor_level_ids} due to orders outside tolerance (tolerance: {self.config.order_refresh_tolerance_pct:.2%}).")
 
         # Otherwise, refresh all executors
         return [
@@ -618,30 +659,29 @@ class PMMV1(ControllerBase):
             for executor in executors_past_refresh
         ]
 
-    def _is_within_tolerance(
-        self, current_prices: List[Decimal], proposal_prices: List[Decimal]
+    def _executor_within_tolerance(
+        self, executor, buy_proposal_prices: List[Decimal], sell_proposal_prices: List[Decimal]
     ) -> bool:
-        """Check if current prices are within tolerance of proposal prices.
+        """Check whether one refresh-age executor's order price is within
+        order_refresh_tolerance_pct of the proposal price for ITS level (CLA-2b-005).
 
-        Matching legacy c_is_within_tolerance behavior.
+        Anything unmatchable (missing price, unknown level) counts as outside
+        tolerance so it gets refreshed rather than silently retained.
         """
-        if len(current_prices) != len(proposal_prices):
+        order_price = getattr(executor.config, 'price', None)
+        if order_price is None or order_price <= 0:
             return False
-
-        if not current_prices:
-            return True
-
-        current_sorted = sorted(current_prices)
-        proposal_sorted = sorted(proposal_prices)
-
-        for current, proposal in zip(current_sorted, proposal_sorted):
-            if current == 0:
-                return False
-            diff_pct = abs(proposal - current) / current
-            if diff_pct > self.config.order_refresh_tolerance_pct:
-                return False
-
-        return True
+        level_id = executor.custom_info.get("level_id") or ""
+        try:
+            trade_type = self.get_trade_type_from_level_id(level_id)
+            level = self.get_level_from_level_id(level_id)
+        except (ValueError, IndexError):
+            return False
+        proposals = buy_proposal_prices if trade_type == TradeType.BUY else sell_proposal_prices
+        if level >= len(proposals):
+            return False
+        diff_pct = abs(proposals[level] - order_price) / order_price
+        return diff_pct <= self.config.order_refresh_tolerance_pct
 
     def _get_executor_config(
         self, level_id: str, price: Decimal, amount: Decimal, trade_type: TradeType
