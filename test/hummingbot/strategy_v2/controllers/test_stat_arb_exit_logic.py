@@ -5,14 +5,21 @@ Covers:
 - CDX-005: hedge-mode pair PnL aggregates EVERY PositionSummary for the configured
   pairs (both sides during a signal flip), unrealized-only, denominated on gross
   |amount_quote| exposure — would fail if only the current/first side were summed.
-- CLA-304: a global TP/SL breach stops all active entry (position) executors while
-  excluding in-flight close order executors, and latches a stop-out cooldown that
-  gates get_executors_to_quote so the still-hot z-score cannot immediately re-enter;
-  the latch expires (no dead strategy) and risk-reducing paths stay live during it.
+  The aggregation tests run under a LIVE nonzero signal (mocked hot z-score), so a
+  regression that filters by the current signal side cannot pass (CDX-R03).
+- CLA-304: a global TP/SL breach stops all active entry (position) executors with
+  keep_position=False (each flattens its own fill — a POSITION_HOLD transfer would
+  race the breach-tick close snapshot, CDX-R01), excludes in-flight close order
+  executors, and latches a stop-out cooldown that gates re-entry. While the latch is
+  active the flatten sweep repeats every tick — a late residual on the CURRENT signal
+  side is still closed — and the latch expires (no dead strategy). stop_out_cooldown
+  must be positive: zero would disable the lockout entirely (CDX-R02).
 - CDX-004: candles are paired by timestamp (inner join), never by array position;
   forming bars, NaN/non-positive closes and duplicate timestamps are cleaned before
   the regression, and misaligned grids yield "signal unavailable" instead of a
-  fabricated spread.
+  fabricated spread. Unequal-length frames are exercised END-TO-END through
+  get_spread_and_z_score so a positional fallback for the unequal branch cannot
+  reappear (CDX-R04).
 - CLA-012: config validators for pos_hedge_ratio (the -1 __init__ crash),
   entry_threshold, tp_global/sl_global, lookback_period, stop_out_cooldown, interval,
   and distinct dominant/hedge markets.
@@ -176,9 +183,12 @@ class TestStatArbConfigValidators(TestCase):
         with self.assertRaises(ValidationError):
             StatArbConfig(**config_kwargs(lookback_period=1))
 
-    def test_stop_out_cooldown_rejects_negative(self):
-        with self.assertRaises(ValidationError):
-            StatArbConfig(**config_kwargs(stop_out_cooldown=-1))
+    def test_stop_out_cooldown_rejects_non_positive(self):
+        # Zero would expire the latch on the breach tick itself — no lockout, and the
+        # cross-tick flatten sweep never runs (CDX-R02).
+        for bad in (0, -1):
+            with self.assertRaises(ValidationError, msg=f"stop_out_cooldown={bad} was accepted"):
+                StatArbConfig(**config_kwargs(stop_out_cooldown=bad))
 
     def test_interval_rejects_unknown_string(self):
         with self.assertRaises(ValidationError):
@@ -192,8 +202,9 @@ class TestStatArbConfigValidators(TestCase):
     def test_valid_config_accepted(self):
         config = StatArbConfig(**config_kwargs(pos_hedge_ratio=Decimal("0.5"),
                                                entry_threshold=Decimal("1.5"),
-                                               stop_out_cooldown=0))
+                                               stop_out_cooldown=60))
         self.assertEqual(Decimal("0.5"), config.pos_hedge_ratio)
+        self.assertEqual(60, config.stop_out_cooldown)
         # defaults construct too
         defaults = StatArbConfig(id="d", total_amount_quote=Decimal("100"))
         self.assertEqual(300, defaults.stop_out_cooldown)
@@ -206,15 +217,26 @@ class TestStatArbHedgeModePnlAggregation(IsolatedAsyncioWrapperTestCase):
         self.config = StatArbConfig(**config_kwargs())
         self.controller, self.market_data_provider = make_controller(self.config)
 
+    def _force_hot_signal(self, direction: int):
+        # Live nonzero signal (CDX-R03): z-score beyond the +/-2.0 entry threshold with
+        # valid prices, so the aggregation is exercised DURING a signal, not only in
+        # the signal-unavailable branch a candles-outage fixture produces.
+        z = 3.0 if direction == 1 else -3.0
+        self.controller.get_spread_and_z_score = MagicMock(return_value=(0.5 * direction, z))
+
     async def test_pair_pnl_aggregates_both_sides_of_hedge_mode(self):
-        # Signal flip in HEDGE mode: winning new side +1, losing old side -20.
-        # Summed unrealized = -19 over gross exposure 200 -> -9.5%.
+        # Signal flip in HEDGE mode while the signal is LIVE (signal=1, current side
+        # BUY): winning current side +1, losing old side -20.
+        # Summed unrealized = -19 over gross exposure 200 -> -9.5%. A regression that
+        # keeps only the current signal side would read +1% here.
+        self._force_hot_signal(1)
         winning_new_side = make_position_summary(DOMINANT, TradeType.BUY, Decimal("1"),
                                                  Decimal("100"), Decimal("1"))
         losing_old_side = make_position_summary(DOMINANT, TradeType.SELL, Decimal("1"),
                                                 Decimal("100"), Decimal("-20"))
         self.controller.positions_held = [winning_new_side, losing_old_side]
         await self.controller.update_processed_data()
+        self.assertEqual(1, self.controller.processed_data["signal"])
         self.assertEqual(Decimal("-0.095"), self.controller.processed_data["pair_pnl_pct"])
         self.assertEqual(Decimal("200"), self.controller.processed_data["position_dominant_quote"])
 
@@ -222,6 +244,26 @@ class TestStatArbHedgeModePnlAggregation(IsolatedAsyncioWrapperTestCase):
         self.controller.positions_held = [losing_old_side, winning_new_side]
         await self.controller.update_processed_data()
         self.assertEqual(Decimal("-0.095"), self.controller.processed_data["pair_pnl_pct"])
+
+        # Same book under the opposite live signal (signal=-1, current side SELL):
+        # a current-side filter would now read -20% instead of the summed -9.5%.
+        self._force_hot_signal(-1)
+        await self.controller.update_processed_data()
+        self.assertEqual(-1, self.controller.processed_data["signal"])
+        self.assertEqual(Decimal("-0.095"), self.controller.processed_data["pair_pnl_pct"])
+
+    async def test_pair_pnl_aggregation_deterministic_under_signal_zero(self):
+        # signal == 0 (candles outage) must not pick a nondeterministic side: both
+        # orderings read the same summed PnL.
+        winning = make_position_summary(DOMINANT, TradeType.BUY, Decimal("1"),
+                                        Decimal("100"), Decimal("1"))
+        losing = make_position_summary(DOMINANT, TradeType.SELL, Decimal("1"),
+                                       Decimal("100"), Decimal("-20"))
+        for book in ([winning, losing], [losing, winning]):
+            self.controller.positions_held = book
+            await self.controller.update_processed_data()
+            self.assertEqual(0, self.controller.processed_data["signal"])
+            self.assertEqual(Decimal("-0.095"), self.controller.processed_data["pair_pnl_pct"])
 
     async def test_pair_pnl_spans_both_configured_pairs(self):
         # dominant +2 on 100 quote; hedge -8 on 0.5*200=100 quote -> -6/200 = -3%
@@ -234,13 +276,16 @@ class TestStatArbHedgeModePnlAggregation(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("100"), self.controller.processed_data["position_hedge_quote"])
 
     async def test_global_sl_fires_on_losing_non_current_side(self):
-        # Only the winning side visible would read +1% (no breach). With the losing
+        # LIVE signal=1 (current side BUY): only the winning current side visible
+        # would read +1% (no breach) and keep quoting the hot signal. With the losing
         # old side included: (-20 + 1)/200 = -9.5% < -5% -> the SL MUST close BOTH.
+        self._force_hot_signal(1)
         self.controller.positions_held = [
             make_position_summary(DOMINANT, TradeType.BUY, Decimal("1"), Decimal("100"), Decimal("1")),
             make_position_summary(DOMINANT, TradeType.SELL, Decimal("1"), Decimal("100"), Decimal("-20")),
         ]
         await self.controller.update_processed_data()
+        self.assertEqual(1, self.controller.processed_data["signal"])
         actions = self.controller.determine_executor_actions()
         creates = [a for a in actions if isinstance(a, CreateExecutorAction)]
         self.assertEqual(2, len(creates))
@@ -319,7 +364,11 @@ class TestStatArbGlobalSlBreachBehavior(IsolatedAsyncioWrapperTestCase):
         creates = [a for a in actions if isinstance(a, CreateExecutorAction)]
         self.assertEqual({"entry-placed", "entry-filled", "entry-hedge"},
                          {a.executor_id for a in stops})
-        self.assertTrue(all(a.keep_position for a in stops))
+        # keep_position=False (CDX-R01): each stopped executor flattens its own fill.
+        # keep_position=True would transfer fills to positions_held only after the
+        # executor is done — after this tick's close was already sized — stranding
+        # the residual.
+        self.assertFalse(any(a.keep_position for a in stops))
         self.assertEqual(1, len(creates))
         self.assertEqual("order_executor", creates[0].executor_config.type)
         self.assertEqual(TradeType.SELL, creates[0].executor_config.side)
@@ -398,6 +447,41 @@ class TestStatArbGlobalSlBreachBehavior(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("order_executor", cfg.type)
         self.assertEqual(TradeType.BUY, cfg.side)
         self.assertEqual(PositionAction.CLOSE, cfg.position_action)
+
+    async def test_late_fill_after_breach_is_flattened_during_cooldown(self):
+        # Two-report race (CDX-R01): tick 1 breaches and stops the entries. A fill
+        # that raced the cancellation materializes in positions_held only on tick 2 —
+        # when the original loss is gone, the residual sits on the CURRENT signal side
+        # with ~zero PnL of its own, and a lingering entry executor is still active.
+        # The latch must flatten both anyway.
+        self._set_time(1000.0)
+        self.controller.positions_held = [self._losing_position()]
+        await self.controller.update_processed_data()
+        self.controller.determine_executor_actions()  # breach tick -> latch until 1300
+
+        residual = make_position_summary(DOMINANT, TradeType.BUY, Decimal("1"),
+                                         Decimal("100"), Decimal("0"))
+        self.controller.positions_held = [residual]
+        self.controller.executors_info = [
+            make_position_executor_info(DOMINANT, TradeType.BUY, executor_id="late-entry",
+                                        is_trading=True),
+        ]
+        self._arm_quote_path(signal=1)  # z-score still hot, pair pnl reads ~0
+        self._set_time(1100.0)
+        actions = self.controller.determine_executor_actions()
+        stops = [a for a in actions if isinstance(a, StopExecutorAction)]
+        creates = [a for a in actions if isinstance(a, CreateExecutorAction)]
+        # The lingering entry executor is stopped, self-flattening...
+        self.assertEqual(["late-entry"], [a.executor_id for a in stops])
+        self.assertFalse(stops[0].keep_position)
+        # ...and the same-signal-side residual is market-closed despite zero PnL and
+        # no breach on this tick. No new entries.
+        self.assertEqual(1, len(creates))
+        cfg = creates[0].executor_config
+        self.assertEqual("order_executor", cfg.type)
+        self.assertEqual(TradeType.SELL, cfg.side)
+        self.assertEqual(PositionAction.CLOSE, cfg.position_action)
+        self.assertEqual(Decimal("1"), cfg.amount)
 
     async def test_relatch_extends_cooldown_from_last_breached_tick(self):
         self._set_time(1000.0)
@@ -502,6 +586,41 @@ class TestStatArbCandleAlignment(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(z_score)
         await self.controller.update_processed_data()
         self.assertEqual(0, self.controller.processed_data["signal"])
+
+    async def test_unequal_length_frames_never_fall_back_to_positional(self):
+        # END-TO-END (CDX-R04): a 60-row dominant frame vs a 55-row hedge frame on a
+        # 30s-skewed grid — zero timestamp intersection, UNEQUAL lengths. Positional
+        # pairing of the tails would happily regress (55 rows >= lookback 50); the
+        # timestamp join must instead report the signal unavailable through the
+        # public path.
+        dom = self._frame(self._grid(60),
+                          [100.0 * (1 + 0.001 * math.sin(i)) for i in range(60)])
+        hedge = self._frame(self._grid(55, offset=30.0),
+                            [50.0 * (1 + 0.001 * math.cos(i / 3)) for i in range(55)])
+        self._set_candles(dom, hedge)
+        self.market_data_provider.time = MagicMock(return_value=3720.0)
+        spread, z_score = self.controller.get_spread_and_z_score()
+        self.assertIsNone(spread)
+        self.assertIsNone(z_score)
+        await self.controller.update_processed_data()
+        self.assertEqual(0, self.controller.processed_data["signal"])
+
+    def test_missing_bar_unequal_lengths_pair_by_timestamp_end_to_end(self):
+        # END-TO-END (CDX-R04): hedge is missing one bar (59 vs 60 rows). The join
+        # drops that single timestamp and the regression still produces a finite
+        # signal from the remaining 59 correctly paired rows (>= lookback 50) —
+        # unequal lengths do not fail closed spuriously.
+        dom = self._frame(self._grid(60),
+                          [100.0 * (1 + 0.001 * math.sin(i)) for i in range(60)])
+        hedge_ts = [i * 60.0 for i in range(60) if i != 30]
+        hedge = self._frame(hedge_ts,
+                            [50.0 * (1 + 0.001 * math.cos(t / 180.0)) for t in hedge_ts])
+        self._set_candles(dom, hedge)
+        self.market_data_provider.time = MagicMock(return_value=3720.0)
+        spread, z_score = self.controller.get_spread_and_z_score()
+        self.assertIsNotNone(spread)
+        self.assertIsNotNone(z_score)
+        self.assertTrue(math.isfinite(float(z_score)))
 
     def test_aligned_clean_frames_produce_finite_signal(self):
         # Fail-closed must not mean permanently dead: a clean aligned pair of feeds

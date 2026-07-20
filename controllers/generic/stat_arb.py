@@ -79,8 +79,11 @@ class StatArbConfig(ControllerConfigBase):
     @field_validator("stop_out_cooldown")
     @classmethod
     def validate_stop_out_cooldown(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError("stop_out_cooldown must be non-negative")
+        # A zero cooldown would expire the stop-out latch on the breach tick itself,
+        # restoring immediate re-entry on the still-hot z-score (the exact CLA-304
+        # exposure) and disabling the cross-tick flatten sweep.
+        if v <= 0:
+            raise ValueError("stop_out_cooldown must be greater than zero")
         return v
 
     @field_validator("interval")
@@ -189,11 +192,10 @@ class StatArb(ControllerBase):
         # z-score signal is unavailable (candles outage) — GEN-1.
         pair_pnl_pct = self.processed_data.get("pair_pnl_pct", Decimal("0"))
         if pair_pnl_pct > self.config.tp_global or pair_pnl_pct < -self.config.sl_global:
-            # Global TP/SL breach (CLA-304): latch the stop-out cooldown, cancel every
-            # entry executor so resting maker orders cannot refill while the close is in
-            # flight, then close what is held. The latch re-arms on every breached tick,
-            # so re-entry stays gated for stop_out_cooldown seconds after the LAST
-            # breached observation (never shorter than configured).
+            # Global TP/SL breach (CLA-304): latch the stop-out cooldown. The latch
+            # re-arms on every breached tick, so re-entry stays gated for
+            # stop_out_cooldown seconds after the LAST breached observation (never
+            # shorter than configured).
             now = self.market_data_provider.time()
             self._stop_out_until = now + self.config.stop_out_cooldown
             if now - self._last_stop_out_log_ts >= 60:
@@ -201,12 +203,22 @@ class StatArb(ControllerBase):
                 self.logger().warning(
                     f"Global TP/SL breached (pair pnl {pair_pnl_pct:.4%}) — cancelling entry executors, "
                     f"closing positions and gating re-entry for {self.config.stop_out_cooldown}s.")
+        if self.stop_out_cooldown_active():
+            # Global-exit flatten is transactional across ticks (CLA-304 hardening): a
+            # fill that raced the breach-tick cancellation, or a POSITION_HOLD transfer
+            # that lands in positions_held only after the breach-tick close was sized,
+            # shows up here on a LATER tick — when the original breach reading may
+            # already be gone and the residual sits on the CURRENT signal side with
+            # ~zero PnL of its own. While the latch is active, keep stopping entry
+            # executors and closing everything held, regardless of signal side, so no
+            # residual leg survives the stop-out. The in-flight close guard inside
+            # get_executors_to_reduce_position keeps this sweep idempotent per tick.
             actions.extend(self.get_entry_executors_to_stop())
             for position in self.positions_held:
                 actions.extend(self.get_executors_to_reduce_position(position))
             return actions
         # Check the signal
-        elif self.processed_data["signal"] != 0:
+        if self.processed_data["signal"] != 0:
             actions.extend(self.get_executors_to_quote())
             actions.extend(self.get_executors_to_reduce_position_on_opposite_signal())
 
@@ -225,14 +237,16 @@ class StatArb(ControllerBase):
         Stop every active entry (position) executor on a global TP/SL breach (CLA-304,
         pmm_mister GEN-4 pattern). In-flight close order executors are excluded — this
         controller only creates order executors to close positions, and stopping one
-        would cancel the exit itself. keep_position folds partial fills into
-        positions_held so the market close covers them, instead of each executor
-        closing independently.
+        would cancel the exit itself. keep_position=False makes each executor cancel
+        its entry and flatten any fill it owns: folding fills into positions_held
+        instead would race the breach-tick close snapshot — the POSITION_HOLD transfer
+        lands only after the executor is done (after the market close was already
+        sized), leaving the residual as unowned inventory on the still-hot side.
         """
         entry_executors = self.filter_executors(
             self.executors_info,
             filter_func=lambda e: e.is_active and e.type == "position_executor")
-        return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id, keep_position=True)
+        return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id, keep_position=False)
                 for executor in entry_executors]
 
     def get_executors_to_reduce_position_on_opposite_signal(self) -> List[ExecutorAction]:
