@@ -115,3 +115,7 @@ test_logs/
 
 /batch_logs/*
 /batch_reviews/*
+HBSTRAT_FINDINGS.md
+hbstrat_fix_batch_prompt.md
+hbstrat_fixes_batch_prompt.md
+run_hbstrat_fix_batch.ps1

@@ -634,6 +634,16 @@ services:
       - /mnt/sharedrive/apps/hummingbot/api/data/bots:/hummingbot-api/bots
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      # This service shares gluetun's network+UTS namespace (network_mode above),
+      # so Docker auto-assigns it gluetun's container id as HOSTNAME. The CLA-M02
+      # bots-path guard (services/docker_service.py:_self_container_id) identifies
+      # its OWN container via HOSTNAME to inspect its mounts; left unset here it
+      # would inspect gluetun's mounts, not find /hummingbot-api/bots, and abort
+      # every deploy with BOTS_PATH_MISCONFIGURED. Pin it to this container's name
+      # (its documented escape hatch) so the guard inspects the right container.
+      # Must equal container_name above. Only needed on the gluetun-namespaced
+      # (VPN) stack; the bridge-networked no-vpn stack gets its own id correctly.
+      - HOSTNAME=hummingbot-api
       - COMPOSE_SERVICE_PREFIX=hummingbot-bot
       - COMPOSE_PROJECT_NAME=hummingbot_stack_1
       - TZ=Europe/Tirane
