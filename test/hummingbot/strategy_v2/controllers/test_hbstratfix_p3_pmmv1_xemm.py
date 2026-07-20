@@ -297,6 +297,13 @@ class TestPMMV1ConfigValidators(IsolatedAsyncioWrapperTestCase):
         config = PMMV1Config(id="t", order_amount=Decimal("0.01"))
         self.assertEqual(Decimal("0.01"), config.order_amount)
 
+    def test_order_amount_omitted_default_errs_small(self):
+        # CDX-R02 (CLA-013): the omitted default must be the prompt's small example
+        # (0.01 base), not one whole base unit — an omitted field errs small, never large.
+        config = PMMV1Config(id="t")
+        self.assertEqual(Decimal("0.01"), config.order_amount)
+        self.assertEqual(Decimal("0.01"), config.order_amount)
+
     def test_cla001_omitted_spreads_default_to_parsed_lists(self):
         # Would-have-caught CLA-001: the old default was the STRING "0.01" (defaults
         # bypass the mode="before" parser), quoting len("0.01")==4 garbage levels.
@@ -493,6 +500,28 @@ class TestXEMMCumulativeImbalance(IsolatedAsyncioWrapperTestCase):
         actions = controller.determine_executor_actions()
         self.assertEqual([], self._buy_creates(actions),
                          "imbalance guard must not decay when counted executors evict")
+        self.assertGreater(len(self._sell_creates(actions)), 0)
+
+    def test_fill_during_unavailable_price_is_counted_before_archival(self):
+        # CDX-R01: an executor that fills while the maker mid is unavailable and is
+        # archived before the price recovers must still be counted. If fill accounting
+        # only ran after the price guard, the imbalance would stay 0 and the halted
+        # buy side would resume once the price came back.
+        controller = self._make_controller()
+        controller.executors_info = [self._make_xemm_executor("b0", TradeType.BUY)]
+        self.market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("NaN"))
+        actions = controller.determine_executor_actions()
+        self.assertEqual([], actions, "no creation while the maker mid is unavailable")
+        self.assertEqual(1, controller._cumulative_filled_buys,
+                         "fill must be recorded even though creation was skipped")
+
+        # Archive the executor while the price is still unavailable, then recover
+        controller.executors_info = []
+        controller.determine_executor_actions()
+        self.market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("2"))
+        actions = controller.determine_executor_actions()
+        self.assertEqual([], self._buy_creates(actions),
+                         "buy side must stay halted after price recovery")
         self.assertGreater(len(self._sell_creates(actions)), 0)
 
     def test_new_fill_after_eviction_rebalances_and_resumes(self):

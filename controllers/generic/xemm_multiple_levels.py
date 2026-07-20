@@ -206,6 +206,10 @@ class XEMMMultipleLevels(ControllerBase):
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         executor_actions = []
+        # CDX-R01: fill accounting runs BEFORE any price-related early return — an executor
+        # that fills and is archived while the maker mid is unavailable must still be counted,
+        # or the imbalance guard under-counts and the halted side resumes after recovery.
+        imbalance = self._update_imbalance()
         mid_price = self.market_data_provider.get_price_by_type(self.config.maker_connector, self.config.maker_trading_pair, PriceType.MidPrice)
         if mid_price is None or not Decimal(str(mid_price)).is_finite() or mid_price <= 0:
             self.logger().warning(
@@ -220,7 +224,6 @@ class XEMMMultipleLevels(ControllerBase):
             executors=self.executors_info,
             filter_func=lambda e: not e.is_done and e.config.maker_side == TradeType.SELL
         )
-        imbalance = self._update_imbalance()
 
         # CLA-006: level "amounts" are relative weights — sum them for proportional allocation
         total_buy_weight = sum(weight for _, weight in self.buy_levels_targets_amount)

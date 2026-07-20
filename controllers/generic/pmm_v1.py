@@ -53,8 +53,11 @@ class PMMV1Config(ControllerConfigBase):
     # Override inherited total_amount_quote — PMM V1 uses order_amount in base asset
     total_amount_quote: Decimal = Field(default=Decimal("0"), json_schema_extra={"prompt_on_new": False})
 
+    # CLA-013: the amount is denominated in BASE asset — the old default of 1 sized every
+    # level at one whole base unit (1 BTC on the default pair) when the field was omitted.
+    # Default to the prompt's own example (0.01) so an omitted field errs small, never large.
     order_amount: Decimal = Field(
-        default=Decimal("1"),
+        default=Decimal("0.01"),
         json_schema_extra={
             "prompt_on_new": True, "is_updatable": True,
             "prompt": "Enter the order amount in base asset (e.g., 0.01 for BTC):",
@@ -153,9 +156,8 @@ class PMMV1Config(ControllerConfigBase):
     @field_validator('order_amount')
     @classmethod
     def validate_order_amount(cls, v: Decimal) -> Decimal:
-        # CLA-013: the order_amount default is denominated in BASE asset (1 BTC on the
-        # default pair) — at minimum reject non-finite / non-positive amounts so a bad
-        # value cannot silently quote zero or garbage.
+        # CLA-013: reject non-finite / non-positive amounts so a bad value cannot
+        # silently quote zero or garbage.
         if not v.is_finite() or v <= 0:
             raise ValueError(f"order_amount must be a finite positive number, got {v}")
         return v
