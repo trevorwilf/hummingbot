@@ -10,14 +10,33 @@ reducing or increasing the short position as needed. This allows safe, controlle
 minimal noise and predictable hedge behavior.
 """
 from decimal import Decimal
-from typing import List
+from typing import Dict, List
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from hummingbot.core.data_type.common import MarketDict, PositionAction, PositionMode, TradeType
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+
+# CDX-007: spot assets that legitimately hedge via a perp on a different (canonical)
+# base symbol. Only strictly unit-equivalent (1 token == 1 canonical unit at all
+# times) wrappers belong here — anything with a unit conversion or an accruing
+# exchange rate would reintroduce the mixed-unit subtraction the validator exists
+# to prevent. CDX-R01: WBETH and WSTETH were removed — they are value-accruing
+# share tokens (1 wstETH/WBETH > 1 ETH and drifting), so a 1:1 hedge is
+# systematically mis-sized. STETH stays: it rebases, keeping 1 stETH == 1 ETH of
+# stake in units. 1000SHIB-style denominated contracts must also never be added.
+WRAPPED_TOKEN_ALIASES: Dict[str, str] = {
+    "WBTC": "BTC",
+    "WETH": "ETH",
+    "STETH": "ETH",
+    "WSOL": "SOL",
+    "WBNB": "BNB",
+    "WMATIC": "MATIC",
+    "WPOL": "POL",
+    "WAVAX": "AVAX",
+}
 
 
 class HedgeAssetConfig(ControllerConfigBase):
@@ -42,11 +61,39 @@ class HedgeAssetConfig(ControllerConfigBase):
     hedge_ratio: Decimal = Field(default=Decimal("0"), ge=0, le=1, json_schema_extra={"is_updatable": True})
     min_notional_size: float = Field(default=10, ge=0)
     cooldown_time: float = Field(default=10.0, ge=0)
+    # CLA-403: cap on a single hedge order, denominated in the hedge pair's quote
+    # asset, applied to BOTH directions. It bounds the blast radius of one
+    # adjustment: a wrong gap can only be chased one capped step per cooldown
+    # window instead of in a single full-size MARKET order (5000 quote per 10s
+    # default cooldown ≈ 30k/min of legitimate re-hedge throughput). CDX-R03: the
+    # cap is ON by default — 0 is an explicit, unsafe legacy opt-out that restores
+    # uncapped full-gap sizing.
+    max_hedge_order_quote: Decimal = Field(default=Decimal("5000"), ge=0, json_schema_extra={"is_updatable": True})
 
     # GEN-13: quote asset of the spot reference pair registered for the hedged asset.
     # Previously hardcoded to USDC — a nonexistent <asset>-USDC market blocks connector
     # readiness for the whole bot. Default preserves prior behavior.
     spot_reference_quote: str = Field(default="USDC")
+
+    @model_validator(mode="after")
+    def validate_asset_matches_hedge_pair(self):
+        # CDX-007: `hedge_position_gap` subtracts the perp position (hedge-pair base
+        # units) from the spot balance (`asset_to_hedge` units) and submits the result
+        # on the hedge pair. If the two assets differ the mixed-unit gap silently
+        # trades the wrong asset (BTC balance + SOL-USDT pair -> sells SOL), so the
+        # pairing is enforced at config time, modulo the wrapped-token allow-list.
+        asset = self.asset_to_hedge.strip().upper()
+        hedge_base = self.hedge_trading_pair.split("-")[0].strip().upper()
+        canonical_asset = WRAPPED_TOKEN_ALIASES.get(asset, asset)
+        if canonical_asset != hedge_base:
+            raise ValueError(
+                f"asset_to_hedge '{self.asset_to_hedge}' does not match the base asset "
+                f"'{hedge_base}' of hedge_trading_pair '{self.hedge_trading_pair}'. "
+                f"The hedge gap is computed in {self.asset_to_hedge} units but orders are "
+                f"placed in {hedge_base} units — this would hedge the wrong asset. "
+                f"Use a hedge pair whose base is {canonical_asset}, or a wrapped alias "
+                f"from the allow-list: {sorted(WRAPPED_TOKEN_ALIASES)}")
+        return self
 
     @property
     def spot_reference_pair(self) -> str:
@@ -59,10 +106,16 @@ class HedgeAssetConfig(ControllerConfigBase):
 
 
 class HedgeAssetController(ControllerBase):
+    _WARNING_INTERVAL = 30.0
+
     def __init__(self, config: HedgeAssetConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
         self.perp_collateral_asset = self.config.hedge_trading_pair.split("-")[1]
+        # CLA-403: rate-limit state for the fail-closed balance-read warnings
+        self._last_suspect_balance_warning_ts: float = 0.0
+        self._last_no_collateral_warning_ts: float = 0.0
+        self._last_invalid_price_warning_ts: float = 0.0
         self.set_leverage_and_position_mode()
 
     def set_leverage_and_position_mode(self):
@@ -110,15 +163,39 @@ class HedgeAssetController(ControllerBase):
                 in_flight -= executor.config.amount
         return in_flight
 
+    @staticmethod
+    def _normalize_balance_read(raw) -> Decimal:
+        """CLA-403: collapse absent/None/non-finite/negative balance reads to 0."""
+        if isinstance(raw, Decimal) and raw.is_finite() and raw > 0:
+            return raw
+        return Decimal("0")
+
     async def update_processed_data(self):
         """
         Compute current spot balance, hedge position size, current hedge ratio, last hedge time, current hedge gap quote
         """
         current_price = self.market_data_provider.get_price_by_type(self.config.hedge_connector_name, self.config.hedge_trading_pair)
-        spot_balance = self.market_data_provider.get_balance(self.config.spot_connector_name, self.config.asset_to_hedge)
-        perp_available_balance = self.market_data_provider.get_available_balance(self.config.hedge_connector_name, self.perp_collateral_asset)
+        spot_balance = self._normalize_balance_read(
+            self.market_data_provider.get_balance(self.config.spot_connector_name, self.config.asset_to_hedge))
+        perp_available_balance = self._normalize_balance_read(
+            self.market_data_provider.get_available_balance(self.config.hedge_connector_name, self.perp_collateral_asset))
         hedge_position_size = self.hedge_position_size
         in_flight_hedge_amount = self.in_flight_hedge_amount
+        # CLA-403: `get_balance` returns 0 for a missing key, so a transient
+        # zero/absent read while a short hedge is held is indistinguishable from a
+        # genuinely flat spot position — but acting on it fires a full-size MARKET
+        # unwind (and a mirror re-hedge when the read recovers). Fail closed: keep
+        # the hedge, warn, and let the next reliable read drive the adjustment.
+        spot_balance_suspect = spot_balance <= 0 and hedge_position_size > 0
+        if spot_balance_suspect:
+            now = self.market_data_provider.time()
+            if now - self._last_suspect_balance_warning_ts >= self._WARNING_INTERVAL:
+                self._last_suspect_balance_warning_ts = now
+                self.logger().warning(
+                    f"Spot balance read for {self.config.asset_to_hedge} on "
+                    f"{self.config.spot_connector_name} is zero/absent while a hedge of "
+                    f"{hedge_position_size} is held. Treating the read as unreliable and "
+                    f"skipping hedge adjustment (no unwind will be placed on this read).")
         # Deduct in-flight hedge orders from the gap (GEN-13)
         hedge_position_gap = spot_balance * self.config.hedge_ratio - hedge_position_size - in_flight_hedge_amount
         hedge_position_gap_quote = hedge_position_gap * current_price
@@ -130,6 +207,7 @@ class HedgeAssetController(ControllerBase):
         self.processed_data.update({
             "current_price": current_price,
             "spot_balance": spot_balance,
+            "spot_balance_suspect": spot_balance_suspect,
             "perp_available_balance": perp_available_balance,
             "hedge_position_size": hedge_position_size,
             "in_flight_hedge_amount": in_flight_hedge_amount,
@@ -141,15 +219,53 @@ class HedgeAssetController(ControllerBase):
         })
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
+        # CLA-403: a zero/absent spot read while a hedge is held is not evidence of a
+        # flat position — the unwind is skipped until the balance read is reliable.
+        if self.processed_data.get("spot_balance_suspect", False):
+            return []
         if self.processed_data["cool_down_time_condition"] and self.processed_data["min_notional_size_condition"]:
             side = TradeType.SELL if self.processed_data["hedge_position_gap"] >= 0 else TradeType.BUY
+            current_price = self.processed_data["current_price"]
+            price_valid = isinstance(current_price, Decimal) and current_price.is_finite() and current_price > 0
+            amount = abs(self.processed_data["hedge_position_gap"])
+            # CLA-403/CDX-R03: cap the per-order hedge step (default on; explicit 0
+            # is the unsafe legacy opt-out). If the price is unusable the cap cannot
+            # be converted to base units — fail closed rather than submit uncapped.
+            if self.config.max_hedge_order_quote > 0:
+                if not price_valid:
+                    now = self.market_data_provider.time()
+                    if now - self._last_invalid_price_warning_ts >= self._WARNING_INTERVAL:
+                        self._last_invalid_price_warning_ts = now
+                        self.logger().warning(
+                            f"Hedge price for {self.config.hedge_trading_pair} is unavailable "
+                            f"({current_price}); the per-order cap cannot be enforced — "
+                            f"skipping hedge adjustment.")
+                    return []
+                amount = min(amount, self.config.max_hedge_order_quote / current_price)
+            if side == TradeType.SELL:
+                # CLA-403: opening/extending the short requires collateral — use the
+                # (previously read-but-unused) perp available balance to bound the
+                # order instead of submitting a MARKET order the margin cannot back.
+                perp_available_balance = self.processed_data["perp_available_balance"]
+                if perp_available_balance <= 0:
+                    now = self.market_data_provider.time()
+                    if now - self._last_no_collateral_warning_ts >= self._WARNING_INTERVAL:
+                        self._last_no_collateral_warning_ts = now
+                        self.logger().warning(
+                            f"No available {self.perp_collateral_asset} collateral read on "
+                            f"{self.config.hedge_connector_name}; skipping hedge SELL of {amount}.")
+                    return []
+                if price_valid:
+                    amount = min(amount, perp_available_balance * self.config.leverage / current_price)
+            if amount <= 0:
+                return []
             order_executor_config = OrderExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.hedge_connector_name,
                 trading_pair=self.config.hedge_trading_pair,
                 side=side,
-                amount=abs(self.processed_data["hedge_position_gap"]),
-                price=self.processed_data["current_price"],
+                amount=amount,
+                price=current_price,
                 leverage=self.config.leverage,
                 position_action=PositionAction.CLOSE if side == TradeType.BUY else PositionAction.OPEN,
                 execution_strategy=ExecutionStrategy.MARKET
