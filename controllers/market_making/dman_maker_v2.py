@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import List, Optional
 
 import pandas_ta as ta  # noqa: F401
@@ -22,12 +22,15 @@ class DManMakerV2Config(MarketMakingControllerConfigBase):
     # DCA configuration
     # NOTE: dca_spreads/dca_amounts are consumed once in the controller's __init__ and
     # are NOT hot-reloadable — YAML edits to them require a controller restart.
+    # CLA-001: typed defaults. The old comma-string defaults bypassed the parse
+    # validators (pydantic v2 does not validate omitted defaults), so an omitted
+    # field reached the controller as a raw string.
     dca_spreads: List[Decimal] = Field(
-        default="0.01,0.02,0.04,0.08",
+        default_factory=lambda: [Decimal("0.01"), Decimal("0.02"), Decimal("0.04"), Decimal("0.08")],
         json_schema_extra={"prompt": "Enter a comma-separated list of spreads for each DCA level "
                                      "(not hot-reloadable, requires restart): ", "prompt_on_new": True})
     dca_amounts: List[Decimal] = Field(
-        default="0.1,0.2,0.4,0.8",
+        default_factory=lambda: [Decimal("0.1"), Decimal("0.2"), Decimal("0.4"), Decimal("0.8")],
         json_schema_extra={"prompt": "Enter a comma-separated list of amounts for each DCA level "
                                      "(not hot-reloadable, requires restart): ", "prompt_on_new": True})
     top_executor_refresh_time: Optional[float] = Field(default=None, json_schema_extra={"is_updatable": True})
@@ -47,31 +50,61 @@ class DManMakerV2Config(MarketMakingControllerConfigBase):
     @field_validator('dca_spreads', mode="before")
     @classmethod
     def parse_dca_spreads(cls, v):
-        if v is None:
-            return []
+        # CDX-010 / CLA-010: '' / None used to parse to [] and quietly produce an
+        # empty ladder; validate nonempty + per-element positive after every parse
+        # form.
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            raise ValueError("dca_spreads must not be empty")
         if isinstance(v, str):
-            if v == "":
-                return []
-            return [float(x.strip()) for x in v.split(',')]
+            try:
+                v = [Decimal(x.strip()) for x in v.split(',')]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_spreads contains a non-numeric entry: {v!r}")
+        if isinstance(v, list):
+            if len(v) == 0:
+                raise ValueError("dca_spreads must not be empty")
+            try:
+                spreads = [Decimal(str(x)) for x in v]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_spreads contains a non-numeric entry: {v!r}")
+            if any(spread <= 0 for spread in spreads):
+                raise ValueError("All DCA spreads must be positive")
+            return spreads
         return v
 
     @field_validator('dca_amounts', mode="before")
     @classmethod
     def parse_and_validate_dca_amounts(cls, v, validation_info):
-        if v is None or v == "":
-            return [1 for _ in validation_info.data['dca_spreads']]
+        # CDX-010 / CLA-010: .get() so a failed dca_spreads surfaces its own error
+        # instead of a masking KeyError here.
+        spreads = validation_info.data.get('dca_spreads')
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            if not spreads:
+                # dca_spreads failed its own validation; let its error surface.
+                return []
+            return [Decimal("1") for _ in spreads]
         if isinstance(v, str):
-            v = [float(x.strip()) for x in v.split(',')]
-        elif isinstance(v, list) and len(v) != len(validation_info.data['dca_spreads']):
-            raise ValueError(
-                f"The number of dca amounts must match the number of {validation_info.data['dca_spreads']}.")
-        if isinstance(v, list) and len(v) > 0:
             try:
-                total = sum(float(x) for x in v)
-            except (TypeError, ValueError):
-                return v  # non-numeric entries are reported by pydantic's own coercion
-            if total <= 0:
-                raise ValueError("The sum of dca_amounts must be positive.")
+                v = [Decimal(x.strip()) for x in v.split(',')]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_amounts contains a non-numeric entry: {v!r}")
+        if isinstance(v, list):
+            try:
+                amounts = [Decimal(str(x)) for x in v]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_amounts contains a non-numeric entry: {v!r}")
+            if len(amounts) == 0:
+                raise ValueError("dca_amounts must not be empty")
+            # CDX-010: length check applied AFTER all parse forms — the old `elif`
+            # skipped it for the common comma-string path, silently zip-truncating
+            # DCA levels in get_executor_config.
+            if spreads is not None and len(amounts) != len(spreads):
+                raise ValueError(
+                    f"The number of dca_amounts ({len(amounts)}) must match the number of "
+                    f"dca_spreads ({len(spreads)}).")
+            if any(amount <= 0 for amount in amounts):
+                raise ValueError("All DCA amounts must be positive")
+            return amounts
         return v
 
 

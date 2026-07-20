@@ -9,9 +9,10 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.candle_freshness import DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, get_freshness_gate
 from controllers._shared.trade_ledger import TradeLedger
 from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
@@ -56,6 +57,13 @@ class MeanReversionBBRSIV1Config(DirectionalTradingControllerConfigBase):
     max_spread_pct: float = Field(default=0.006, ge=0.0)
     max_trades_per_day: int = Field(default=6, ge=0)
 
+    # CDX-001 / CLA-405: interval-relative max age for the newest candle before
+    # the signal is gated to 0. Per-market tunable; sparse pairs legitimately have
+    # old closed bars, so keep this generous. 0 disables (legacy behavior).
+    stale_candle_max_age_intervals: float = Field(
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, gt=0,
+        json_schema_extra={"is_updatable": True})
+
     @field_validator("candles_connector", mode="before")
     @classmethod
     def set_candles_connector(cls, v, validation_info: ValidationInfo):
@@ -70,13 +78,32 @@ class MeanReversionBBRSIV1Config(DirectionalTradingControllerConfigBase):
             return validation_info.data.get("trading_pair")
         return v
 
+    @model_validator(mode="after")
+    def _normalize_omitted_candle_aliases(self):
+        # CLA-001: pydantic v2 does not run mode="before" field validators on
+        # OMITTED fields (the base omits validate_default), so a config that never
+        # mentions candles_connector/candles_trading_pair reached the controller
+        # with the raw None default. Normalize post-construction so the aliases
+        # always hold real values. object.__setattr__ avoids the validate_assignment
+        # re-entry of a plain assignment.
+        if self.candles_connector is None or str(self.candles_connector).strip() == "":
+            object.__setattr__(self, "candles_connector", self.connector_name)
+        if self.candles_trading_pair is None or str(self.candles_trading_pair).strip() == "":
+            object.__setattr__(self, "candles_trading_pair", self.trading_pair)
+        return self
+
     @property
     def required_records(self) -> int:
+        # CLA-2b-004: volume_filter_window must participate in the sizing max.
+        # rolling(...).quantile() emits NaN until the window is full, and the
+        # volume filter treats a NaN threshold as PASS (fail-open) — with too few
+        # records requested, the filter never engaged.
         return max(
             self.bb_length,
             self.trend_ema_length,
             self.rsi_length,
             self.atr_length,
+            self.volume_filter_window,
         ) + 500
 
     @property
@@ -165,6 +192,18 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
         )
 
         if df is None or df.empty:
+            self.processed_data = {"signal": 0, "features": pd.DataFrame()}
+            self._emit_decision_trace(None)
+            return
+
+        # CDX-001 / CLA-405: a frozen-but-full feed keeps replaying its last bar
+        # as a live signal. Gate on interval-relative bar age and fail closed to
+        # signal=0. The bound is generous and per-market configurable so sparse
+        # pairs with legitimately old closed bars are not hard-failed.
+        freshness = get_freshness_gate(self).check(
+            df=df, interval=self.config.interval, now=self.market_data_provider.time(),
+            max_age_intervals=self.config.stale_candle_max_age_intervals)
+        if not freshness.fresh:
             self.processed_data = {"signal": 0, "features": pd.DataFrame()}
             self._emit_decision_trace(None)
             return

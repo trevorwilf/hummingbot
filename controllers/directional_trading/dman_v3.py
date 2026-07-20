@@ -1,11 +1,13 @@
 import math
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import List, Optional, Tuple
 
+import pandas as pd
 import pandas_ta as ta  # noqa: F401
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.candle_freshness import DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, get_freshness_gate
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
@@ -33,21 +35,34 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True})
+    # CLA-014: non-positive indicator periods crash/NaN pandas_ta every tick.
     bb_length: int = Field(
-        default=100,
+        default=100, gt=0,
         json_schema_extra={"prompt": "Enter the Bollinger Bands length: ", "prompt_on_new": True})
-    bb_std: float = Field(default=2.0)
+    bb_std: float = Field(default=2.0, gt=0)
     bb_long_threshold: float = Field(default=0.0)
     bb_short_threshold: float = Field(default=1.0)
+    # CDX-001 / CLA-405: interval-relative max age for the newest candle before the
+    # signal is gated to 0. Per-market tunable; 0 disables (legacy behavior).
+    stale_candle_max_age_intervals: float = Field(
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, gt=0,
+        json_schema_extra={"is_updatable": True})
+    # CLA-001: typed default. The old default was the raw string "0.015,0.005";
+    # pydantic v2 does not run mode="before" validators on omitted fields, so an
+    # omitted trailing_stop reached the executor config unparsed and threw on the
+    # first signal.
     trailing_stop: Optional[TrailingStop] = Field(
-        default="0.015,0.005",
+        default_factory=lambda: TrailingStop(
+            activation_price=Decimal("0.015"), trailing_delta=Decimal("0.005")),
         json_schema_extra={
             "prompt": "Enter the trailing stop parameters (activation_price, trailing_delta) as a comma-separated list: ",
             "prompt_on_new": True,
         }
     )
+    # CLA-001: typed default for the same reason (the old comma-string default
+    # reached len()/iteration unparsed when the field was omitted).
     dca_spreads: List[Decimal] = Field(
-        default="0.001,0.018,0.15,0.25",
+        default_factory=lambda: [Decimal("0.001"), Decimal("0.018"), Decimal("0.15"), Decimal("0.25")],
         json_schema_extra={
             "prompt": "Enter the spreads for each DCA level (comma-separated) if dynamic_spread=True this value "
                       "will multiply BBB/200 (half the BB width fraction), e.g. if the Bollinger Bands width is "
@@ -95,10 +110,22 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
     @field_validator('dca_spreads', mode="before")
     @classmethod
     def validate_spreads(cls, v):
+        # CDX-010 / CLA-010: validate after every parse form — nonempty and
+        # per-element positive, with parse failures surfaced as clean ValueErrors.
         if isinstance(v, str):
-            v = [Decimal(val) for val in v.split(",")]
+            if v.strip() == "":
+                raise ValueError("dca_spreads must not be empty")
+            try:
+                v = [Decimal(val.strip()) for val in v.split(",")]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_spreads contains a non-numeric entry: {v!r}")
         if isinstance(v, list):
-            spreads = [Decimal(str(val)) for val in v]
+            if len(v) == 0:
+                raise ValueError("dca_spreads must not be empty")
+            try:
+                spreads = [Decimal(str(val)) for val in v]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_spreads contains a non-numeric entry: {v!r}")
             if any(spread <= 0 for spread in spreads):
                 raise ValueError("All DCA spreads must be positive")
             return spreads
@@ -107,19 +134,34 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
     @field_validator('dca_amounts_pct', mode="before")
     @classmethod
     def validate_amounts(cls, v, validation_info: ValidationInfo):
+        # CDX-010 / CLA-010: .get() so a failed dca_spreads surfaces its own error
+        # instead of a masking KeyError; per-element positive (the old sum-only
+        # check let individual NEGATIVE weights through -> negative order amounts).
         spreads = validation_info.data.get("dca_spreads")
         if isinstance(v, str):
-            if v == "":
-                return [Decimal('1.0') / len(spreads) for _ in spreads]
-            v = [Decimal(val) for val in v.split(",")]
+            if v.strip() == "":
+                v = None
+            else:
+                try:
+                    v = [Decimal(val.strip()) for val in v.split(",")]
+                except (InvalidOperation, ValueError):
+                    raise ValueError(f"dca_amounts_pct contains a non-numeric entry: {v!r}")
         if v is None:
+            if not spreads:
+                # dca_spreads failed its own validation; let its error surface.
+                return None
             return [Decimal('1.0') / len(spreads) for _ in spreads]
         if isinstance(v, list):
-            amounts = [Decimal(str(val)) for val in v]
+            try:
+                amounts = [Decimal(str(val)) for val in v]
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"dca_amounts_pct contains a non-numeric entry: {v!r}")
+            if len(amounts) == 0:
+                raise ValueError("dca_amounts_pct must not be empty")
             if spreads is not None and len(amounts) != len(spreads):
                 raise ValueError("Amounts and spreads must have the same length")
-            if sum(amounts) <= 0:
-                raise ValueError("Sum of DCA amounts must be positive")
+            if any(amount <= 0 for amount in amounts):
+                raise ValueError("All DCA amounts must be positive")
             return amounts
         return v
 
@@ -168,6 +210,14 @@ class DManV3Controller(DirectionalTradingControllerBase):
                                                       trading_pair=self.config.candles_trading_pair,
                                                       interval=self.config.interval,
                                                       max_records=self.max_records)
+        # CDX-001 / CLA-405: fail closed to signal=0 on stale/absent candles.
+        freshness = get_freshness_gate(self).check(
+            df=df, interval=self.config.interval, now=self.market_data_provider.time(),
+            max_age_intervals=self.config.stale_candle_max_age_intervals)
+        if not freshness.fresh:
+            self.processed_data["signal"] = 0
+            self.processed_data["features"] = df if df is not None else pd.DataFrame()
+            return
         # Add indicators
         df.ta.bbands(length=self.config.bb_length, lower_std=self.config.bb_std, upper_std=self.config.bb_std, append=True)
 
@@ -205,17 +255,20 @@ class DManV3Controller(DirectionalTradingControllerBase):
             return False
         return super().can_create_executor(signal)
 
+    def _dynamic_multiplier(self) -> Decimal:
+        """
+        BBB / 200, i.e. half the BB width expressed as a fraction (BBB is a
+        percentage), floored at config.min_spread_multiplier so a flat window can
+        never collapse spreads, stop-loss or trailing stop to zero.
+        """
+        bb_width = self._latest_bb_width()
+        if bb_width is None or not math.isfinite(bb_width) or bb_width <= 0:
+            return self.config.min_spread_multiplier
+        return max(Decimal(str(bb_width)) / Decimal("200"), self.config.min_spread_multiplier)
+
     def get_spread_multiplier(self) -> Decimal:
-        """
-        Dynamic spread multiplier = BBB / 200, i.e. half the BB width expressed
-        as a fraction (BBB is a percentage), floored at config.min_spread_multiplier
-        so a flat window can never collapse spreads, stop-loss or trailing stop to zero.
-        """
         if self.config.dynamic_order_spread:
-            bb_width = self._latest_bb_width()
-            if bb_width is None or not math.isfinite(bb_width) or bb_width <= 0:
-                return self.config.min_spread_multiplier
-            return max(Decimal(str(bb_width)) / Decimal("200"), self.config.min_spread_multiplier)
+            return self._dynamic_multiplier()
         else:
             return Decimal("1.0")
 
@@ -227,12 +280,16 @@ class DManV3Controller(DirectionalTradingControllerBase):
         else:
             prices = [price * (1 + spread * spread_multiplier) for spread in spread]
         if self.config.dynamic_target:
-            stop_loss = self.config.stop_loss * spread_multiplier if self.config.stop_loss is not None else None
-            take_profit = self.config.take_profit * spread_multiplier if self.config.take_profit is not None else None
+            # CLA-2b-006: use the dynamic multiplier directly. Scaling by
+            # get_spread_multiplier() made dynamic_target a silent no-op
+            # (multiplier fixed at 1) whenever dynamic_order_spread was off.
+            target_multiplier = self._dynamic_multiplier()
+            stop_loss = self.config.stop_loss * target_multiplier if self.config.stop_loss is not None else None
+            take_profit = self.config.take_profit * target_multiplier if self.config.take_profit is not None else None
             if self.config.trailing_stop:
                 trailing_stop = TrailingStop(
-                    activation_price=self.config.trailing_stop.activation_price * spread_multiplier,
-                    trailing_delta=self.config.trailing_stop.trailing_delta * spread_multiplier)
+                    activation_price=self.config.trailing_stop.activation_price * target_multiplier,
+                    trailing_delta=self.config.trailing_stop.trailing_delta * target_multiplier)
             else:
                 trailing_stop = None
         else:

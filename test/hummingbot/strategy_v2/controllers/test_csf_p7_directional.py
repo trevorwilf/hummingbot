@@ -152,6 +152,9 @@ class TestBollinGridSignal(IsolatedAsyncioWrapperTestCase):
             bb_short_threshold=1.0,
         )
         self.market_data_provider = MagicMock(spec=MarketDataProvider)
+        # Freshness gate (CDX-001): "now" must sit just after the newest synthetic
+        # candle (39 * 300 = 11700) or the controller correctly zeroes the signal.
+        self.market_data_provider.time = MagicMock(return_value=11760.0)
         self.controller = BollinGridController(
             config=self.config,
             market_data_provider=self.market_data_provider,

@@ -110,6 +110,9 @@ class TestPMMDynamicControllerFeatures:
         # Mock the market_data_provider
         mock_mdp = MagicMock()
         mock_mdp.get_candles_df.return_value = candles
+        # Freshness gate (CDX-001): "now" must sit just after the newest candle,
+        # otherwise the controller correctly refuses to publish a reference.
+        mock_mdp.time.return_value = 1000000 + n_candles * 60 + 30
 
         controller = PMMDynamicController.__new__(PMMDynamicController)
         controller.config = config

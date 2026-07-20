@@ -9,9 +9,10 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.candle_freshness import DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, get_freshness_gate
 from controllers._shared.trade_ledger import TradeLedger
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
@@ -41,6 +42,14 @@ class EMARegimeHoldV1Config(DirectionalTradingControllerConfigBase):
 
     volume_filter_window: int = Field(default=288, ge=0)
     min_volume_quantile: float = Field(default=0.30, ge=0.0, le=1.0)
+
+    # CDX-001 / CLA-405: interval-relative max age for the newest candle (checked
+    # per feed against its own interval) before the signal is gated to 0.
+    # Per-market tunable; sparse pairs legitimately have old closed bars, so keep
+    # this generous. 0 disables the gate (legacy behavior).
+    stale_candle_max_age_intervals: float = Field(
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, gt=0,
+        json_schema_extra={"is_updatable": True})
 
     hold_mode: str = Field(
         default="reentry",
@@ -73,6 +82,20 @@ class EMARegimeHoldV1Config(DirectionalTradingControllerConfigBase):
         if v is None or (isinstance(v, str) and v.strip() == ""):
             return validation_info.data.get("trading_pair")
         return v
+
+    @model_validator(mode="after")
+    def _normalize_omitted_candle_aliases(self):
+        # CLA-001: pydantic v2 does not run mode="before" field validators on
+        # OMITTED fields (the base omits validate_default), so a config that never
+        # mentions candles_connector/candles_trading_pair reached the controller
+        # with the raw None default. Normalize post-construction so the aliases
+        # always hold real values. object.__setattr__ avoids the validate_assignment
+        # re-entry of a plain assignment.
+        if self.candles_connector is None or str(self.candles_connector).strip() == "":
+            object.__setattr__(self, "candles_connector", self.connector_name)
+        if self.candles_trading_pair is None or str(self.candles_trading_pair).strip() == "":
+            object.__setattr__(self, "candles_trading_pair", self.trading_pair)
+        return self
 
     @property
     def candles_config(self) -> List[CandlesConfig]:
@@ -147,6 +170,23 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
         )
 
         if df_fast is None or df_fast.empty or df_slow is None or df_slow.empty:
+            self.processed_data = {"signal": 0, "features": pd.DataFrame()}
+            self._emit_decision_trace(None)
+            return
+
+        # CDX-001 / CLA-405: a frozen-but-full feed keeps replaying its last bar
+        # as a live signal. Gate BOTH feeds on interval-relative bar age and fail
+        # closed to signal=0. The bound is generous and per-market configurable
+        # so sparse pairs with legitimately old closed bars are not hard-failed.
+        gate = get_freshness_gate(self)
+        now = self.market_data_provider.time()
+        fast_fresh = gate.check(
+            df=df_fast, interval=self.config.signal_interval, now=now,
+            max_age_intervals=self.config.stale_candle_max_age_intervals)
+        slow_fresh = gate.check(
+            df=df_slow, interval=self.config.regime_interval, now=now,
+            max_age_intervals=self.config.stale_candle_max_age_intervals)
+        if not (fast_fresh.fresh and slow_fresh.fresh):
             self.processed_data = {"signal": 0, "features": pd.DataFrame()}
             self._emit_decision_trace(None)
             return
