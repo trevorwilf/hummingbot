@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.trade_ledger import TradeLedger
 from hummingbot.core.data_type.common import MarketDict, OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
@@ -211,6 +212,24 @@ class PMMister(ControllerBase):
         # GEN-4: rate-limit state for the global TP/SL trigger log
         self._last_global_exit_log_timestamp: float = 0.0
         self._warning_interval: float = 30.0
+        # CDX-011 / CLA-305: persisted, controller-owned fill ledger. The
+        # per-level cooldown used to be derived ONLY from executors_info, a
+        # bot-wide archival buffer that a co-deployed churning controller can
+        # evict in minutes and that starts empty on restart — silently dropping
+        # every cooldown. The ledger provides a durable last-fill floor.
+        self._trade_ledger = TradeLedger(
+            ledger_id=f"{config.controller_name}_{config.id}",
+            logger=self.logger(),
+        )
+
+    def _observe_fills(self, current_time: float):
+        """Feed the persisted trade ledger from the current executor snapshot.
+
+        Runs every tick so fills are captured while their executors are still
+        in the buffer (before bot-wide archival eviction can drop them).
+        TradeLedger.observe_executors is idempotent and never raises.
+        """
+        self._trade_ledger.observe_executors(self.executors_info, current_time)
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
@@ -541,6 +560,11 @@ class PMMister(ControllerBase):
         """
         current_time = self.market_data_provider.time()
 
+        # CDX-011 / CLA-305: capture fills into the persisted ledger every tick,
+        # BEFORE any early return below, so fill history is never lost to buffer
+        # eviction just because the price feed had an outage this cycle.
+        self._observe_fills(current_time)
+
         # GEN-3: never fabricate a reference price. On price-unavailable, reuse the
         # previous price only within reference_price_max_age; beyond that (or with no
         # previous price at all) skip the cycle so no ladder is quoted around fiction.
@@ -723,6 +747,14 @@ class PMMister(ControllerBase):
     def analyze_all_levels(self) -> List[Dict]:
         """Analyze executors for all levels."""
         level_ids: Set[str] = {e.custom_info.get("level_id") for e in self.executors_info if "level_id" in e.custom_info}
+        # CDX-011 / CLA-305: a level whose executors were all evicted from the
+        # bot-wide buffer (or that filled before a restart) would otherwise not
+        # be analyzed at all — its cooldown would silently vanish. Include every
+        # ledger-known level that filled within the largest cooldown window so
+        # the per-level cooldown check still runs for it.
+        max_cooldown = max(self.config.buy_cooldown_time, self.config.sell_cooldown_time)
+        ledger_cutoff = self.market_data_provider.time() - max_cooldown
+        level_ids |= set(self._trade_ledger.level_ids_with_fills_since(ledger_cutoff))
         return [self._analyze_by_level_id(level_id) for level_id in level_ids]
 
     def _analyze_by_level_id(self, level_id: str) -> Dict:
@@ -739,6 +771,12 @@ class PMMister(ControllerBase):
             e.custom_info.get("open_order_last_update") for e in all_level_executors
             if "open_order_last_update" in e.custom_info and e.custom_info["open_order_last_update"] is not None
         ]
+        # CDX-011 / CLA-305: durable floor from the persisted ledger — max() keeps
+        # the existing buffer-derived arming (never weaker than before) while the
+        # ledger's last fill for this level survives buffer eviction and restarts.
+        ledger_last_fill = self._trade_ledger.last_fill_timestamp(level_id=level_id)
+        if ledger_last_fill > 0:
+            open_order_last_updates.append(ledger_last_fill)
         latest_open_order_update = max(open_order_last_updates) if open_order_last_updates else None
 
         prices = [e.config.entry_price for e in filtered_executors if hasattr(e.config, 'entry_price')]
@@ -1207,14 +1245,18 @@ class PMMister(ControllerBase):
         sell_executors = [e for e in self.executors_info if e.custom_info.get("level_id", "").startswith("sell")]
 
         for trade_type, executors in [("buy", buy_executors), ("sell", sell_executors)]:
-            if not executors:
-                continue
-
             # Find most recent open order update
             latest_updates = [
                 e.custom_info.get("open_order_last_update") for e in executors
                 if "open_order_last_update" in e.custom_info and e.custom_info["open_order_last_update"] is not None
             ]
+
+            # CDX-011 / CLA-305: keep the displayed side cooldown consistent with
+            # the gate — the persisted ledger's last fill still counts after the
+            # side's executors were evicted from the buffer or the bot restarted.
+            ledger_last_fill = self._trade_ledger.last_fill_timestamp(side=trade_type)
+            if ledger_last_fill > 0:
+                latest_updates.append(ledger_last_fill)
 
             if not latest_updates:
                 continue
