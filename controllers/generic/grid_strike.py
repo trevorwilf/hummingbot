@@ -100,10 +100,9 @@ class GridStrike(ControllerBase):
         self._last_termination_timestamp: Optional[float] = None
         self._consecutive_stopouts: int = 0
         self._last_breaker_warning_timestamp: float = 0.0
-        # CLA-002: signature of the updatable creation-only fields the live
-        # executor was built with; None until a create is issued (or adopted on
-        # recovery, when the creating signature is unknowable).
-        self._active_config_signature: Optional[str] = None
+        # CLA-002: executors we have already asked to stop, so a winding-down
+        # executor is not re-stopped every tick while its config still mismatches.
+        self._stop_requested_ids: Set[str] = set()
         self._last_price_warning_timestamp: float = 0.0
         self.initialize_rate_sources()
 
@@ -129,23 +128,35 @@ class GridStrike(ControllerBase):
             return False
         return self.config.start_price <= price <= self.config.end_price
 
+    # CLA-002: the `is_updatable` fields that only feed GridExecutorConfig at
+    # creation. An edit to any of them must stop/reissue the live grid or the
+    # update (including the limit_price risk stop) silently never applies.
+    _SIGNATURE_FIELDS = (
+        "start_price",
+        "end_price",
+        "limit_price",
+        "total_amount_quote",
+        "min_spread_between_orders",
+        "min_order_amount_quote",
+        "max_open_orders",
+        "max_orders_per_batch",
+        "order_frequency",
+        "activation_bounds",
+        "keep_position",
+    )
+
     def _config_signature(self) -> str:
-        """CLA-002: the `is_updatable` fields that only feed GridExecutorConfig at
-        creation. An edit to any of them must stop/reissue the live grid or the
-        update (including the limit_price risk stop) silently never applies."""
-        return str((
-            self.config.start_price,
-            self.config.end_price,
-            self.config.limit_price,
-            self.config.total_amount_quote,
-            self.config.min_spread_between_orders,
-            self.config.min_order_amount_quote,
-            self.config.max_open_orders,
-            self.config.max_orders_per_batch,
-            self.config.order_frequency,
-            self.config.activation_bounds,
-            self.config.keep_position,
-        ))
+        return str(tuple(getattr(self.config, field) for field in self._SIGNATURE_FIELDS))
+
+    def _executor_signature(self, executor: ExecutorInfo) -> Optional[str]:
+        """CDX-R01: ExecutorInfo carries the original GridExecutorConfig, so the
+        parameters a live executor was actually created with ARE knowable — even
+        across recovery/restart. None (a foreign executor type missing a field)
+        is treated as a mismatch by the caller (fail-closed)."""
+        try:
+            return str(tuple(getattr(executor.config, field) for field in self._SIGNATURE_FIELDS))
+        except AttributeError:
+            return None
 
     def _register_terminations(self):
         """GEN-10: fold newly terminated executors into cooldown/breaker state."""
@@ -184,19 +195,22 @@ class GridStrike(ControllerBase):
         self._register_terminations()
         active = self.active_executors()
         if len(active) > 0:
+            # CLA-002/CDX-R01: compare each live executor's actual creation
+            # parameters (from its own GridExecutorConfig) against the current
+            # config. A mismatch — whether from a hot edit or from recovering an
+            # executor created under an older config — stops the executor so the
+            # create path reissues with the current values (including the
+            # limit_price risk stop), subject to the GEN-10 re-entry cooldown.
             current_signature = self._config_signature()
-            if self._active_config_signature is None:
-                # Recovery/restart with a live executor: the creating signature is
-                # unknowable — adopt the current one instead of blind-stopping.
-                self._active_config_signature = current_signature
-            elif current_signature != self._active_config_signature:
-                # CLA-002: an updatable creation-only field changed — stop the live
-                # grid; the normal create path reissues with the new values
-                # (subject to the GEN-10 re-entry cooldown, which stays in force).
-                self._active_config_signature = None
-                return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id)
-                        for executor in active]
-            return []
+            actions = []
+            for executor in active:
+                if executor.id in self._stop_requested_ids:
+                    continue  # already winding down — do not re-send the stop
+                if self._executor_signature(executor) != current_signature:
+                    self._stop_requested_ids.add(executor.id)
+                    actions.append(StopExecutorAction(
+                        controller_id=self.config.id, executor_id=executor.id))
+            return actions
         mid_price = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
         if not self._is_valid_price(mid_price):
@@ -208,7 +222,6 @@ class GridStrike(ControllerBase):
                     f"{self.config.connector_name}:{self.config.trading_pair} — skipping grid creation this tick.")
             return []
         if self.is_inside_bounds(mid_price) and self._can_create_executor():
-            self._active_config_signature = self._config_signature()
             return [CreateExecutorAction(
                 controller_id=self.config.id,
                 executor_config=GridExecutorConfig(
