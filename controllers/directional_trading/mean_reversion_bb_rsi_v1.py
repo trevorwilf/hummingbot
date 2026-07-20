@@ -12,6 +12,7 @@ import pandas as pd
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.trade_ledger import TradeLedger
 from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -95,6 +96,26 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
         self.config = config
         self.max_records = config.required_records
         super().__init__(config, *args, **kwargs)
+        # CDX-011 / CLA-305: persisted, controller-owned fill ledger. The daily
+        # trade cap counts this ledger (not the transient bot-wide executors_info
+        # buffer, which evicts under co-deployed churn and resets on restart).
+        self._trade_ledger = TradeLedger(
+            ledger_id=f"{config.controller_name}_{config.id}",
+            logger=self.logger(),
+        )
+
+    def _observe_fills(self):
+        """Feed the persisted trade ledger from the current executor snapshot.
+
+        Runs every tick so fills are captured while their executors are still
+        in the buffer (before bot-wide archival eviction can drop them).
+        TradeLedger.observe_executors is idempotent and never raises.
+        """
+        try:
+            now = self.market_data_provider.time()
+        except Exception:
+            return
+        self._trade_ledger.observe_executors(self.executors_info, now)
 
     def get_candles_config(self) -> List[CandlesConfig]:
         return self.config.candles_config
@@ -133,6 +154,9 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
         return True
 
     async def update_processed_data(self):
+        # CDX-011 / CLA-305: capture fills into the persisted ledger every tick,
+        # independent of whether a signal is produced this cycle.
+        self._observe_fills()
         df = self.market_data_provider.get_candles_df(
             connector_name=self.config.candles_connector,
             trading_pair=self.config.candles_trading_pair,
@@ -251,11 +275,13 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
         to timestamp (creation) for executors that are still active.
         Returns 0.0 if no same-side executor is present in executors_info.
 
-        Note: executors_info is a rolling buffer bounded by closed_executors_buffer
-        (default 30 in v2_with_controllers.py). For MR's current config
-        (max_trades_per_day=6, cooldown_time=3600), this buffer is more than
-        sufficient to enforce the 1-hour cooldown. If either of those config
-        values changes materially, this assumption should be re-validated.
+        Note (CDX-011 / CLA-305): executors_info is a bot-wide rolling buffer
+        (closed_executors_buffer, default 30 in v2_with_controllers.py) that a
+        co-deployed churning controller can evict in minutes and that starts
+        empty on restart. It is therefore only ONE input to the cooldown gate:
+        can_create_executor takes the max of this value and the persisted trade
+        ledger's last same-side fill, so the cooldown survives eviction and
+        restarts without weakening the creation-armed component below.
         """
         target_side = TradeType.BUY if signal > 0 else TradeType.SELL
         relevant = [e for e in self.executors_info if e.side == target_side]
@@ -273,8 +299,20 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
             self._log_gate_reason(signal, gate="super", ok=False)
             return False
 
-        last_ts = self._last_same_side_reference_ts(signal)
         now = self.market_data_provider.time()
+        # CDX-011 / CLA-305: make sure any fill visible this tick is recorded
+        # before the gates below read the ledger.
+        self._trade_ledger.observe_executors(self.executors_info, now)
+        target_side = TradeType.BUY if signal > 0 else TradeType.SELL
+
+        # Cooldown: max of the buffer-derived reference (keeps the existing
+        # creation-armed behavior for still-buffered executors — never weaker
+        # than before) and the persisted ledger's last same-side fill (which
+        # survives buffer eviction and bot restarts).
+        last_ts = max(
+            self._last_same_side_reference_ts(signal),
+            self._trade_ledger.last_fill_timestamp(side=target_side),
+        )
         cooldown_ok = (last_ts == 0.0) or (now - last_ts > self.config.cooldown_time)
         if not cooldown_ok:
             self._log_gate_reason(signal, gate="cooldown", ok=False,
@@ -287,11 +325,15 @@ class MeanReversionBBRSIV1(DirectionalTradingControllerBase):
             return False
 
         if self.config.max_trades_per_day and self.config.max_trades_per_day > 0:
+            # CDX-011 / CLA-305: the daily cap counts actually-FILLED trades from
+            # the persisted ledger. The old executors_info count both reset on
+            # restart / co-deployed churn (fail-open) and included never-filled
+            # executors (over-restrictive).
             cutoff = now - 86400
-            recent = [e for e in self.executors_info if getattr(e, "timestamp", 0) >= cutoff]
-            if len(recent) >= self.config.max_trades_per_day:
+            recent_fills = self._trade_ledger.count_fills_since(cutoff)
+            if recent_fills >= self.config.max_trades_per_day:
                 self._log_gate_reason(signal, gate="daily_cap", ok=False,
-                                      count=len(recent), cap=self.config.max_trades_per_day)
+                                      count=recent_fills, cap=self.config.max_trades_per_day)
                 return False
 
         self._log_gate_reason(signal, gate="all", ok=True)

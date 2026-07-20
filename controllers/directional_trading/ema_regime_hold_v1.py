@@ -12,6 +12,7 @@ import pandas as pd
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.trade_ledger import TradeLedger
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -85,6 +86,28 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
     def __init__(self, config: EMARegimeHoldV1Config, *args, **kwargs):
         self.config = config
         super().__init__(config, *args, **kwargs)
+        # CDX-011 / CLA-305: persisted, controller-owned fill ledger. The
+        # same-side cooldown used to be derived ONLY from executors_info, a
+        # bot-wide archival buffer that a co-deployed churning controller can
+        # evict in minutes and that starts empty on restart — silently dropping
+        # the cooldown. The ledger provides a durable last-fill floor.
+        self._trade_ledger = TradeLedger(
+            ledger_id=f"{config.controller_name}_{config.id}",
+            logger=self.logger(),
+        )
+
+    def _observe_fills(self):
+        """Feed the persisted trade ledger from the current executor snapshot.
+
+        Runs every tick so fills are captured while their executors are still
+        in the buffer (before bot-wide archival eviction can drop them).
+        TradeLedger.observe_executors is idempotent and never raises.
+        """
+        try:
+            now = self.market_data_provider.time()
+        except Exception:
+            return
+        self._trade_ledger.observe_executors(self.executors_info, now)
 
     def get_candles_config(self) -> List[CandlesConfig]:
         return self.config.candles_config
@@ -107,6 +130,9 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
         return df
 
     async def update_processed_data(self):
+        # CDX-011 / CLA-305: capture fills into the persisted ledger every tick,
+        # independent of whether a signal is produced this cycle.
+        self._observe_fills()
         df_fast = self.market_data_provider.get_candles_df(
             connector_name=self.config.candles_connector,
             trading_pair=self.config.candles_trading_pair,
@@ -209,9 +235,13 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
         close_timestamp for closed executors and falling back to timestamp
         for still-active ones. Returns 0.0 if no same-side history exists.
 
-        Assumes the closed_executors_buffer (default 30 in v2_with_controllers.py)
-        retains enough history for the configured cooldown. For EMA's regime cadence
-        (typically <1 entry per day), this is effectively guaranteed.
+        Note (CDX-011 / CLA-305): executors_info is a bot-wide rolling buffer
+        (closed_executors_buffer, default 30 in v2_with_controllers.py) that a
+        co-deployed churning controller can evict in minutes and that starts
+        empty on restart. It is therefore only ONE input to the cooldown gate:
+        can_create_executor takes the max of this value and the persisted trade
+        ledger's last same-side fill, so the cooldown survives eviction and
+        restarts without weakening the creation-armed component below.
         """
         target_side = TradeType.BUY if signal > 0 else TradeType.SELL
         relevant = [e for e in self.executors_info if e.side == target_side]
@@ -228,8 +258,19 @@ class EMARegimeHoldV1(DirectionalTradingControllerBase):
         if not super().can_create_executor(signal):
             self._log_gate_reason(signal, gate="super", ok=False)
             return False
-        last_ts = self._last_same_side_reference_ts(signal)
         now = self.market_data_provider.time()
+        # CDX-011 / CLA-305: make sure any fill visible this tick is recorded
+        # before the cooldown below reads the ledger.
+        self._trade_ledger.observe_executors(self.executors_info, now)
+        target_side = TradeType.BUY if signal > 0 else TradeType.SELL
+        # Cooldown: max of the buffer-derived reference (keeps the existing
+        # creation-armed behavior for still-buffered executors — never weaker
+        # than before) and the persisted ledger's last same-side fill (which
+        # survives buffer eviction and bot restarts).
+        last_ts = max(
+            self._last_same_side_reference_ts(signal),
+            self._trade_ledger.last_fill_timestamp(side=target_side),
+        )
         cooldown_ok = (last_ts == 0.0) or (now - last_ts > self.config.cooldown_time)
         if not cooldown_ok:
             self._log_gate_reason(
