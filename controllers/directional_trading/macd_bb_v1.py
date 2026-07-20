@@ -1,9 +1,11 @@
 from typing import List
 
+import pandas as pd
 import pandas_ta as ta  # noqa: F401
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.candle_freshness import DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, get_freshness_gate
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerBase,
@@ -28,21 +30,36 @@ class MACDBBV1ControllerConfig(DirectionalTradingControllerConfigBase):
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True})
+    # CLA-014: non-positive / mis-ordered indicator periods crash or NaN pandas_ta.
     bb_length: int = Field(
-        default=100,
+        default=100, gt=0,
         json_schema_extra={"prompt": "Enter the Bollinger Bands length: ", "prompt_on_new": True})
-    bb_std: float = Field(default=2.0)
+    bb_std: float = Field(default=2.0, gt=0)
     bb_long_threshold: float = Field(default=0.0)
     bb_short_threshold: float = Field(default=1.0)
     macd_fast: int = Field(
-        default=21,
+        default=21, gt=0,
         json_schema_extra={"prompt": "Enter the MACD fast period: ", "prompt_on_new": True})
     macd_slow: int = Field(
-        default=42,
+        default=42, gt=0,
         json_schema_extra={"prompt": "Enter the MACD slow period: ", "prompt_on_new": True})
     macd_signal: int = Field(
-        default=9,
+        default=9, gt=0,
         json_schema_extra={"prompt": "Enter the MACD signal period: ", "prompt_on_new": True})
+    # CDX-001 / CLA-405: interval-relative max age for the newest candle before the
+    # signal is gated to 0. Per-market tunable; 0 disables (legacy behavior).
+    stale_candle_max_age_intervals: float = Field(
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, ge=0,
+        json_schema_extra={"is_updatable": True})
+
+    @model_validator(mode="after")
+    def validate_macd_ordering(self):
+        # CLA-014: some pandas_ta versions silently swap fast/slow instead of
+        # raising, so enforce the ordering at config time.
+        if self.macd_fast >= self.macd_slow:
+            raise ValueError(
+                f"macd_fast ({self.macd_fast}) must be strictly less than macd_slow ({self.macd_slow})")
+        return self
 
     @field_validator("candles_connector", mode="before")
     @classmethod
@@ -71,6 +88,14 @@ class MACDBBV1Controller(DirectionalTradingControllerBase):
                                                       trading_pair=self.config.candles_trading_pair,
                                                       interval=self.config.interval,
                                                       max_records=self.max_records)
+        # CDX-001 / CLA-405: fail closed to signal=0 on stale/absent candles.
+        freshness = get_freshness_gate(self).check(
+            df=df, interval=self.config.interval, now=self.market_data_provider.time(),
+            max_age_intervals=self.config.stale_candle_max_age_intervals)
+        if not freshness.fresh:
+            self.processed_data["signal"] = 0
+            self.processed_data["features"] = df if df is not None else pd.DataFrame()
+            return
         # Add indicators
         df.ta.bbands(length=self.config.bb_length, lower_std=self.config.bb_std, upper_std=self.config.bb_std, append=True)
         df.ta.macd(fast=self.config.macd_fast, slow=self.config.macd_slow, signal=self.config.macd_signal, append=True)

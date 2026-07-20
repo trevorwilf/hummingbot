@@ -219,29 +219,41 @@ class TestPMMDynamicDegenerateIndicators(IsolatedAsyncioWrapperTestCase, LoggerM
         return ctrl
 
     @staticmethod
-    def _flat_candles(close=100.0, rows=60) -> pd.DataFrame:
+    def _timestamps(rows: int):
+        # Newest bar 60s before the mocked clock (1000.0) so the CDX-001
+        # freshness gate sees live data.
+        return [1000.0 - 60.0 * (rows - i) for i in range(rows)]
+
+    @classmethod
+    def _flat_candles(cls, close=100.0, rows=60) -> pd.DataFrame:
         return pd.DataFrame({
+            "timestamp": cls._timestamps(rows),
             "high": [close] * rows,
             "low": [close] * rows,
             "close": [close] * rows,
         })
 
-    @staticmethod
-    def _healthy_candles(rows=60) -> pd.DataFrame:
+    @classmethod
+    def _healthy_candles(cls, rows=60) -> pd.DataFrame:
         closes = [100.0 + (i % 7) - 3 + i * 0.1 for i in range(rows)]
         return pd.DataFrame({
+            "timestamp": cls._timestamps(rows),
             "high": [c * 1.01 for c in closes],
             "low": [c * 0.99 for c in closes],
             "close": closes,
         })
 
-    async def test_flat_closes_fall_back_to_plain_mid_quoting(self):
+    async def test_flat_closes_pause_quoting_without_reference(self):
+        # CLA-016: spreads are in units of volatility; the old fallback of
+        # spread_multiplier=1 turned "1" into a 100% spread while the log claimed
+        # "plain mid quoting". A degenerate NATR must now pause quoting entirely
+        # (no reference published — the MM base treats that as nothing-to-quote).
         ctrl = self._make_pmm(self._flat_candles(close=100.0))
         await ctrl.update_processed_data()
-        self.assertEqual(Decimal("100"), ctrl.processed_data["reference_price"])
-        self.assertEqual(Decimal("1"), ctrl.processed_data["spread_multiplier"])
-        self.assertTrue(ctrl.processed_data["reference_price"].is_finite())
+        self.assertNotIn("reference_price", ctrl.processed_data)
+        self.assertNotIn("spread_multiplier", ctrl.processed_data)
         self.assertTrue(self.is_partially_logged("WARNING", "Degenerate indicators"))
+        self.assertTrue(self.is_partially_logged("WARNING", "pausing quoting"))
 
     async def test_healthy_candles_produce_finite_dynamic_values(self):
         ctrl = self._make_pmm(self._healthy_candles())
