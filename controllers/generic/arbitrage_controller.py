@@ -2,6 +2,7 @@ from decimal import Decimal
 from typing import List, Optional, Set
 
 import pandas as pd
+from pydantic import field_validator
 
 from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.core.data_type.common import MarketDict
@@ -24,6 +25,32 @@ class ArbitrageControllerConfig(ControllerConfigBase):
     rate_connector: str = "binance"
     quote_conversion_asset: str = "USDT"
 
+    @field_validator("min_profitability", mode="before")
+    @classmethod
+    def validate_min_profitability(cls, v):
+        """CLA-007: a negative min_profitability authorizes guaranteed-loss round-trips."""
+        v = Decimal(str(v))
+        if not v.is_finite() or v < 0:
+            raise ValueError("min_profitability must be a finite, non-negative decimal")
+        return v
+
+    @field_validator("delay_between_executors", mode="before")
+    @classmethod
+    def validate_delay_between_executors(cls, v):
+        v = int(v)
+        if v < 0:
+            raise ValueError("delay_between_executors must be >= 0 seconds")
+        return v
+
+    @field_validator("max_executors_imbalance", mode="before")
+    @classmethod
+    def validate_max_executors_imbalance(cls, v):
+        """CLA-007: with 0, abs(imbalance) >= 0 is always true and trading is blocked forever."""
+        v = int(v)
+        if v < 1:
+            raise ValueError("max_executors_imbalance must be >= 1 (0 blocks all trading)")
+        return v
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return [markets.add_or_update(cp.connector_name, cp.trading_pair) for cp in [self.exchange_pair_1, self.exchange_pair_2]][-1]
 
@@ -43,20 +70,24 @@ class ArbitrageController(ControllerBase):
         self._counted_executor_ids: Set[str] = set()
         self.base_asset = self.config.exchange_pair_1.trading_pair.split("-")[0]
         self._gas_token_cache = {}  # Cache for gas tokens by connector
-        self._initialize_gas_tokens()  # Fetch gas tokens during init
-        self.initialize_rate_sources()
+        # CLA-307: gas-token discovery must COMPLETE before rate sources are
+        # registered — otherwise the gas rate pair is silently never registered.
+        # _initialize_gas_tokens() calls initialize_rate_sources() after discovery.
+        self._initialize_gas_tokens()
 
     def initialize_rate_sources(self):
         rates_required = []
         for connector_pair in [self.config.exchange_pair_1, self.config.exchange_pair_2]:
             base, quote = connector_pair.trading_pair.split("-")
 
-            # Add rate source for gas token if it's an AMM connector
+            # Add rate source for gas token if it's an AMM connector.
+            # CLA-407: register the pair create_arbitrage_executor_action actually
+            # queries (base-gas), not gas-quote.
             if connector_pair.is_amm_connector():
                 gas_token = self.get_gas_token(connector_pair.connector_name)
-                if gas_token and gas_token != quote:
+                if gas_token and gas_token != base:
                     rates_required.append(ConnectorPair(connector_name=self.config.rate_connector,
-                                                        trading_pair=f"{gas_token}-{quote}"))
+                                                        trading_pair=f"{base}-{gas_token}"))
 
             # Add rate source for quote conversion asset
             if quote != self.config.quote_conversion_asset:
@@ -70,7 +101,12 @@ class ArbitrageController(ControllerBase):
             self.market_data_provider.initialize_rate_sources(rates_required)
 
     def _initialize_gas_tokens(self):
-        """Initialize gas tokens for AMM connectors during controller initialization."""
+        """Initialize gas tokens for AMM connectors during controller initialization.
+
+        CLA-307: rate sources are registered only AFTER gas-token discovery finishes,
+        so the gas conversion pair is registered with the discovered token instead of
+        racing a fire-and-forget fetch.
+        """
         import asyncio
 
         async def fetch_gas_tokens():
@@ -101,12 +137,17 @@ class ArbitrageController(ControllerBase):
                         except Exception as e:
                             self.logger().error(f"Error getting gas token for {connector_name}: {e}")
 
-        # Run the async function to fetch gas tokens
+        async def fetch_then_register():
+            await fetch_gas_tokens()
+            self.initialize_rate_sources()
+
+        # Run the async function to fetch gas tokens, then register rate sources
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.create_task(fetch_gas_tokens())
+            asyncio.create_task(fetch_then_register())
         else:
             loop.run_until_complete(fetch_gas_tokens())
+            self.initialize_rate_sources()
 
     def get_gas_token(self, connector_name: str) -> Optional[str]:
         """Get the cached gas token for a connector."""
@@ -134,22 +175,39 @@ class ArbitrageController(ControllerBase):
     def create_arbitrage_executor_action(self, buying_exchange_pair: ConnectorPair,
                                          selling_exchange_pair: ConnectorPair):
         try:
+            # CLA-2b-002 / CLA-307: the executor divides the gas cost (denominated in
+            # the gas token) by gas_conversion_price. For an AMM leg the price is
+            # REQUIRED — an absent/NaN/zero value wedges the executor at RUNNING with
+            # zero trades. Apply the same finite/>0 guard as `rate` and skip creation
+            # when it is unavailable (e.g. gas discovery has not completed yet).
             if buying_exchange_pair.is_amm_connector():
-                gas_token = self.get_gas_token(buying_exchange_pair.connector_name)
-                if gas_token:
-                    pair = buying_exchange_pair.trading_pair.split("-")[0] + "-" + gas_token
-                    gas_conversion_price = self.market_data_provider.get_rate(pair)
-                else:
-                    gas_conversion_price = None
+                amm_exchange_pair = buying_exchange_pair
             elif selling_exchange_pair.is_amm_connector():
-                gas_token = self.get_gas_token(selling_exchange_pair.connector_name)
-                if gas_token:
-                    pair = selling_exchange_pair.trading_pair.split("-")[0] + "-" + gas_token
-                    gas_conversion_price = self.market_data_provider.get_rate(pair)
-                else:
-                    gas_conversion_price = None
+                amm_exchange_pair = selling_exchange_pair
             else:
-                gas_conversion_price = None
+                amm_exchange_pair = None
+
+            gas_conversion_price = None
+            if amm_exchange_pair is not None:
+                gas_token = self.get_gas_token(amm_exchange_pair.connector_name)
+                if not gas_token:
+                    self.logger().warning(
+                        f"Gas token for {amm_exchange_pair.connector_name} is not available yet. "
+                        f"Skipping executor creation.")
+                    return None
+                amm_base = amm_exchange_pair.trading_pair.split("-")[0]
+                if gas_token == amm_base:
+                    # gas cost is already denominated in the base asset — rate is exactly 1
+                    gas_conversion_price = Decimal("1")
+                else:
+                    raw_gas_rate = self.market_data_provider.get_rate(f"{amm_base}-{gas_token}")
+                    gas_conversion_price = Decimal(str(raw_gas_rate)) if raw_gas_rate is not None else None
+                    if (gas_conversion_price is None or not gas_conversion_price.is_finite()
+                            or gas_conversion_price <= 0):
+                        self.logger().warning(
+                            f"Cannot get a valid gas conversion rate for {amm_base}-{gas_token} "
+                            f"(got {gas_conversion_price}). Skipping executor creation.")
+                        return None
             rate = self.market_data_provider.get_rate(self.base_asset + "-" + self.config.quote_conversion_asset)
             # GEN-12: `if not rate` let Decimal("NaN") through — require finite and positive
             rate = Decimal(str(rate)) if rate is not None else None

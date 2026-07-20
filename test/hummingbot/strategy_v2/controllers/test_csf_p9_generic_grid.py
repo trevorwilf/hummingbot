@@ -655,6 +655,8 @@ class TestLPRebalancerClosedAmountCapture(IsolatedAsyncioWrapperTestCase):
             actions_queue=AsyncMock(spec=asyncio.Queue),
         )
         controller._pool_price = Decimal("150")
+        # CDX-006: creation now requires a fresh price timestamp (mdp.time() == 1000.0)
+        controller._pool_price_timestamp = 1000.0
         return controller
 
     def _terminated_lp_executor(self, executor_id="lp1", custom_info=None):

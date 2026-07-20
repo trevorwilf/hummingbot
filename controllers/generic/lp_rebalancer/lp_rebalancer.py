@@ -61,6 +61,53 @@ class LPRebalancerConfig(ControllerConfigBase):
     # Connector-specific params (optional)
     strategy_type: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
 
+    # CDX-006 / CLA-408: fail-closed pool-price freshness + create-failure breaker
+    max_pool_price_age_seconds: int = Field(
+        default=60,
+        json_schema_extra={"is_updatable": True},
+        description="Maximum age of the cached pool price before it is treated as unavailable "
+                    "and position creation is skipped (fail-closed)"
+    )
+    create_failure_breaker_count: int = Field(
+        default=3,
+        json_schema_extra={"is_updatable": True},
+        description="Consecutive executors terminating without ever opening a position "
+                    "before new creations are paused (protects against gas/RPC burn)"
+    )
+    create_failure_cooldown_seconds: int = Field(
+        default=300,
+        json_schema_extra={"is_updatable": True},
+        description="How long to pause position creation once the failure breaker trips"
+    )
+
+    @field_validator("position_width_pct", mode="before")
+    @classmethod
+    def validate_position_width_pct(cls, v):
+        """CLA-009: a zero/negative width produces a degenerate or inverted range."""
+        v = Decimal(str(v))
+        if not v.is_finite() or v <= 0:
+            raise ValueError("position_width_pct must be a positive, finite percent (e.g. 0.5 = 0.5%)")
+        return v
+
+    @field_validator("max_pool_price_age_seconds", "create_failure_breaker_count",
+                     "create_failure_cooldown_seconds", mode="before")
+    @classmethod
+    def validate_positive_ints(cls, v, info):
+        v = int(v)
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        return v
+
+    @model_validator(mode="after")
+    def validate_required_fields(self):
+        """CLA-009: trading_pair/pool_address default to "" — an omitted field must not
+        silently reach the controller (model-level so the check also runs on defaults)."""
+        if not self.trading_pair or not self.trading_pair.strip():
+            raise ValueError("trading_pair is required and must be a non-empty string")
+        if not self.pool_address or not self.pool_address.strip():
+            raise ValueError("pool_address is required and must be a non-empty string")
+        return self
+
     @field_validator("sell_price_min", "sell_price_max", "buy_price_min", "buy_price_max", mode="before")
     @classmethod
     def validate_price_limits(cls, v):
@@ -143,7 +190,16 @@ class LPRebalancer(ControllerBase):
         self._pending_balance_update: bool = False
 
         # Cached pool price (updated in update_processed_data)
+        # CDX-006 / CLA-408: the price carries a fetch timestamp; a price that is
+        # stale beyond max_pool_price_age_seconds is treated as unavailable.
         self._pool_price: Optional[Decimal] = None
+        self._pool_price_timestamp: Optional[float] = None
+        self._pool_price_fetch_failures: int = 0
+
+        # CDX-006 breaker: consecutive executors that terminated without ever
+        # opening a position latch a creation cooldown (gas/RPC burn protection)
+        self._consecutive_failed_executors: int = 0
+        self._create_cooldown_until: float = 0.0
 
         # Initialize rate sources
         self.market_data_provider.initialize_rate_sources([
@@ -208,6 +264,15 @@ class LPRebalancer(ControllerBase):
         if executor and not self._current_executor_id:
             self._current_executor_id = executor.id
             self.logger().info(f"Tracking executor: {executor.id}")
+            # CLA-306: the create was actually delivered (the executor is observed) —
+            # only now consume the rebalance intent and the closed-amount clamp, so a
+            # failed create attempt retries with the same side and sizing.
+            self._pending_rebalance = False
+            self._pending_rebalance_side = None
+            self._last_closed_base_amount = None
+            self._last_closed_quote_amount = None
+            self._last_closed_base_fee = None
+            self._last_closed_quote_fee = None
 
         # No active executor - check if we should create one
         if executor is None:
@@ -235,30 +300,54 @@ class LPRebalancer(ControllerBase):
                     self._last_closed_quote_amount = closed_quote
                     self._last_closed_base_fee = closed_base_fee
                     self._last_closed_quote_fee = closed_quote_fee
+                    self._consecutive_failed_executors = 0
                     self.logger().info(
                         f"Captured closed position amounts: base={self._last_closed_base_amount}, "
                         f"quote={self._last_closed_quote_amount}, base_fee={self._last_closed_base_fee}, "
                         f"quote_fee={self._last_closed_quote_fee}"
                     )
-                # All-zero amounts mean the executor never opened a position (e.g.
-                # failed at creation) — keep the previous clamp state so sizing
-                # falls back to the configured total.
+                else:
+                    # All-zero amounts mean the executor never opened a position (e.g.
+                    # failed at creation) — keep the previous clamp state so sizing
+                    # falls back to the configured total.
+                    # CDX-006 breaker: each such termination burned a create attempt
+                    # (gas/RPC); repeated ones latch a creation cooldown.
+                    self._consecutive_failed_executors += 1
+                    if self._consecutive_failed_executors >= self.config.create_failure_breaker_count:
+                        self._create_cooldown_until = (
+                            self.market_data_provider.time() + self.config.create_failure_cooldown_seconds
+                        )
+                        self.logger().warning(
+                            f"{self._consecutive_failed_executors} consecutive executors terminated "
+                            f"without opening a position - pausing creation for "
+                            f"{self.config.create_failure_cooldown_seconds}s"
+                        )
 
             # Clear tracking
             self._current_executor_id = None
 
-            # Determine side for new position
+            # CDX-006 breaker: hold off new creations while the cooldown is latched
+            if self.market_data_provider.time() < self._create_cooldown_until:
+                self.logger().debug(
+                    f"Create-failure breaker active until {self._create_cooldown_until} - "
+                    f"skipping position creation"
+                )
+                return actions
+
+            # Determine side for new position.
+            # CLA-306: read the pending rebalance intent WITHOUT consuming it — a failed
+            # create below must retry with the same side, not fall back to config.side
+            # (doubling down). The intent is consumed only once the created executor is
+            # observed (see the tracking branch above).
             if self._pending_rebalance and self._pending_rebalance_side is not None:
                 side = self._pending_rebalance_side
-                self._pending_rebalance = False
-                self._pending_rebalance_side = None
             else:
                 side = self.config.side
 
             # Create executor config with calculated bounds
             executor_config = self._create_executor_config(side)
             if executor_config is None:
-                self.logger().warning("Skipping position creation - invalid bounds")
+                self.logger().warning("Skipping position creation - invalid bounds or price unavailable")
                 return actions
 
             actions.append(CreateExecutorAction(
@@ -371,10 +460,20 @@ class LPRebalancer(ControllerBase):
 
         Returns None if bounds are invalid.
         """
-        # Use pool price (fetched in update_processed_data every tick)
+        # Use pool price (fetched in update_processed_data every tick).
+        # CDX-006 / CLA-408: a price without a fetch timestamp, or older than
+        # max_pool_price_age_seconds, is treated as unavailable — fail-closed skip
+        # instead of sizing a new position (amounts AND bounds) on a stale price.
         current_price = self._pool_price
-        if current_price is None or current_price == 0:
-            self.logger().warning("No pool price available - waiting for update_processed_data")
+        price_age = None
+        if current_price is not None and self._pool_price_timestamp is not None:
+            price_age = self.market_data_provider.time() - self._pool_price_timestamp
+        if (current_price is None or current_price <= 0 or price_age is None
+                or price_age > self.config.max_pool_price_age_seconds):
+            self.logger().warning(
+                f"Pool price unavailable or stale (price={current_price}, age={price_age}s, "
+                f"max={self.config.max_pool_price_age_seconds}s) - skipping position creation"
+            )
             return None
 
         # Calculate amounts based on side
@@ -475,11 +574,10 @@ class LPRebalancer(ControllerBase):
                         )
                         total = available_as_quote
 
-            # Clear the cached amounts after use
-            self._last_closed_base_amount = None
-            self._last_closed_quote_amount = None
-            self._last_closed_base_fee = None
-            self._last_closed_quote_fee = None
+            # CLA-306: do NOT clear the cached amounts here — this method runs before
+            # _create_executor_config can still return None (invalid bounds). The clamp
+            # is consumed only once the created executor is observed, in
+            # determine_executor_actions, so a failed attempt cannot over-size the next.
 
         if side == 0:  # BOTH
             quote_amt = total / Decimal("2")
@@ -586,9 +684,27 @@ class LPRebalancer(ControllerBase):
             if hasattr(connector, 'get_pool_info_by_address'):
                 pool_info = await connector.get_pool_info_by_address(self.config.pool_address)
                 if pool_info and pool_info.price:
-                    self._pool_price = Decimal(str(pool_info.price))
+                    price = Decimal(str(pool_info.price))
+                    if price.is_finite() and price > 0:
+                        # CDX-006 / CLA-408: stamp the fetch so consumers can age it
+                        self._pool_price = price
+                        self._pool_price_timestamp = self.market_data_provider.time()
+                        self._pool_price_fetch_failures = 0
+                        return
+            self._register_pool_price_failure("empty or invalid pool info")
         except Exception as e:
-            self.logger().debug(f"Could not fetch pool price: {e}")
+            self._register_pool_price_failure(str(e))
+
+    def _register_pool_price_failure(self, reason: str):
+        """CDX-006: a failed fetch keeps the old price but lets it age out; escalate
+        from DEBUG to WARNING once failures persist so the outage is visible."""
+        self._pool_price_fetch_failures += 1
+        if self._pool_price_fetch_failures == 3 or self._pool_price_fetch_failures % 60 == 0:
+            self.logger().warning(
+                f"Pool price fetch failing ({self._pool_price_fetch_failures} consecutive): {reason}"
+            )
+        else:
+            self.logger().debug(f"Could not fetch pool price: {reason}")
 
     def to_format_status(self) -> List[str]:
         """Format status for display."""
