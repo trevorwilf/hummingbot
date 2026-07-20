@@ -22,6 +22,7 @@ Covers:
   (no double-hedge inside the fill-settle window); spot reference pair configurable.
 """
 import asyncio
+import math
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -169,13 +170,38 @@ class TestStatArbGlobalRiskAndInFlightGuard(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("1"), cfg.amount)
         self.assertEqual(PositionAction.CLOSE, cfg.position_action)
 
+    def _distinct_aligned_frames(self, n: int):
+        # Two DISTINCT nondegenerate series on the same timestamp grid, so nothing
+        # (zero spread std, shared frame) can mask the aligned-row threshold check.
+        timestamps = [i * 60.0 for i in range(n)]
+        dom = pd.DataFrame({"timestamp": timestamps,
+                            "close": [100.0 * (1 + 0.001 * math.sin(i)) for i in range(n)]})
+        hedge = pd.DataFrame({"timestamp": timestamps,
+                              "close": [50.0 * (1 + 0.001 * math.cos(i / 3)) for i in range(n)]})
+
+        def by_pair(**kwargs):
+            return dom if kwargs["trading_pair"] == "SOL-USDT" else hedge
+        self.market_data_provider.get_candles_df = MagicMock(side_effect=by_pair)
+        self.market_data_provider.time = MagicMock(return_value=n * 60.0 + 120.0)
+
     async def test_short_lookback_returns_none_pair(self):
-        # 10 rows < lookback_period 300 → second early exit
-        df = pd.DataFrame({"close": [100.0 + i for i in range(10)]})
-        self.market_data_provider.get_candles_df = MagicMock(return_value=df)
+        # lookback_period - 1 = 299 aligned rows < 300 → second early exit at the
+        # exact configured boundary (CDX-R05: a hard-coded lower minimum like 10
+        # would let 11–299 rows through and this test would catch it).
+        self.assertEqual(300, self.config.lookback_period)
+        self._distinct_aligned_frames(self.config.lookback_period - 1)
         spread, z_score = self.controller.get_spread_and_z_score()
         self.assertIsNone(spread)
         self.assertIsNone(z_score)
+
+    async def test_lookback_boundary_exact_rows_produce_signal(self):
+        # Exactly lookback_period aligned rows → the threshold is the configured
+        # value, not a dead strategy: a finite spread/z-score is produced.
+        self._distinct_aligned_frames(self.config.lookback_period)
+        spread, z_score = self.controller.get_spread_and_z_score()
+        self.assertIsNotNone(spread)
+        self.assertIsNotNone(z_score)
+        self.assertTrue(math.isfinite(float(z_score)))
 
     def test_reduce_suppressed_while_close_executor_active(self):
         # Would-have-caught GEN-2: full-size close re-emitted every tick.
