@@ -429,6 +429,27 @@ class TestArbitrageGasGuard(ArbitrageTestBase):
                                                 "ETH-USDT": Decimal("100")})
             self.assertIsNone(action)
 
+    def test_negative_gas_rate_skips_creation(self):
+        # CDX-R01: the guard is finite-AND-POSITIVE, not merely nonzero. A finite
+        # negative divisor would flip the AMM gas cost into a negative transaction
+        # cost and overstate profitability, so Decimal("-1") must also skip.
+        controller = self._make_controller()
+        controller._gas_token_cache["amm_dex"] = "SOL"
+        action = self._create_action(controller, self.AMM_PAIR, self.CEX_PAIR,
+                                     rates={"ETH-SOL": Decimal("-1"),
+                                            "ETH-USDT": Decimal("100")})
+        self.assertIsNone(action)
+
+    def test_infinite_gas_rate_skips_creation(self):
+        # CDX-R01: positive infinity is > 0 yet non-finite — pins the full
+        # finite-and-positive contract from the other side.
+        controller = self._make_controller()
+        controller._gas_token_cache["amm_dex"] = "SOL"
+        action = self._create_action(controller, self.AMM_PAIR, self.CEX_PAIR,
+                                     rates={"ETH-SOL": Decimal("Infinity"),
+                                            "ETH-USDT": Decimal("100")})
+        self.assertIsNone(action)
+
     def test_selling_side_amm_gas_rate_also_guarded(self):
         controller = self._make_controller()
         controller._gas_token_cache["amm_dex"] = "SOL"
