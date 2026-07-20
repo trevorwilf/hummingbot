@@ -21,6 +21,7 @@
 # a WARNING -- the ledger keeps accumulating in memory for the life of the
 # process exactly as if persistence did not exist.
 
+import hashlib
 import json
 import logging
 import math
@@ -55,7 +56,22 @@ def _sanitize_ledger_id(ledger_id: str) -> str:
     cleaned = cleaned.lstrip(".")
     if not cleaned:
         cleaned = "default"
-    return cleaned[:100]
+    return cleaned[:60]
+
+
+def _ledger_file_name(ledger_id: str) -> str:
+    """Collision-resistant file name for an arbitrary controller id.
+
+    The sanitized fragment is human-readable but many-to-one (character
+    replacement + truncation): distinct legal ids like 'ctl/a' and 'ctl:a'
+    both sanitize to 'ctl_a', and with a sanitized-only name the second
+    controller would silently overwrite the first controller's cap history.
+    A digest of the FULL untruncated id is appended so distinct ids never
+    share a file.
+    """
+    readable = _sanitize_ledger_id(ledger_id)
+    digest = hashlib.sha256(str(ledger_id).encode("utf-8")).hexdigest()[:12]
+    return f"trade_ledger_{readable}_{digest}.json"
 
 
 def _as_float(value) -> float:
@@ -100,7 +116,7 @@ class TradeLedger:
                  logger: Optional[logging.Logger] = None):
         self._ledger_id = str(ledger_id)
         self._base_dir = Path(base_dir) if base_dir is not None else DEFAULT_LEDGER_DIR
-        self._path = self._base_dir / f"trade_ledger_{_sanitize_ledger_id(self._ledger_id)}.json"
+        self._path = self._base_dir / _ledger_file_name(self._ledger_id)
         self._retention_seconds = float(retention_seconds)
         self._logger = logger if logger is not None else logging.getLogger(__name__)
         # executor_id -> {"executor_id", "timestamp", "side", "level_id", "amount_quote"}

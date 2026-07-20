@@ -30,6 +30,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from controllers._shared.trade_ledger import TradeLedger
+from controllers.directional_trading.ema_regime_hold_v1 import EMARegimeHoldV1, EMARegimeHoldV1Config
 from controllers.directional_trading.mean_reversion_bb_rsi_v1 import MeanReversionBBRSIV1, MeanReversionBBRSIV1Config
 from controllers.generic.pmm_mister import PMMister, PMMisterConfig
 from hummingbot.core.data_type.common import TradeType
@@ -159,10 +160,41 @@ class TestTradeLedgerUnit(unittest.TestCase):
         self.assertEqual(5000.0, reborn.last_fill_timestamp(level_id="buy_0"))
         self.assertEqual(["buy_0"], reborn.level_ids_with_fills_since(0.0))
 
-    def test_atomic_write_leaves_no_tmp_files_and_valid_json(self):
+    def test_atomic_write_publishes_via_fsync_then_replace(self):
+        # CDX-R03: a plain overwrite also leaves valid JSON and no .tmp file, so
+        # asserting only the final state cannot catch a non-atomic regression.
+        # Assert the WRITE PROTOCOL: the payload is fsync'd and then published
+        # with a single os.replace of the tmp file onto the ledger path.
+        from controllers._shared import trade_ledger as tl_module
+        protocol_calls = []
+        real_fsync = tl_module.os.fsync
+        real_replace = tl_module.os.replace
+
+        def spy_fsync(fd):
+            protocol_calls.append(("fsync",))
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            protocol_calls.append(("replace", str(src), str(dst)))
+            return real_replace(src, dst)
+
         ledger = self._ledger(ledger_id="atomic")
-        ledger.observe_executors(
-            [_StubExecutor("e-1", filled_amount_quote=Decimal("1"))], now=1.0)
+        with patch.object(tl_module.os, "fsync", side_effect=spy_fsync), \
+                patch.object(tl_module.os, "replace", side_effect=spy_replace):
+            ledger.observe_executors(
+                [_StubExecutor("e-1", filled_amount_quote=Decimal("1"))], now=1.0)
+
+        replace_calls = [c for c in protocol_calls if c[0] == "replace"]
+        self.assertEqual(1, len(replace_calls),
+                         f"expected exactly one atomic publish, got {protocol_calls}")
+        _, src, dst = replace_calls[0]
+        self.assertTrue(src.endswith(".tmp"), f"replace source must be the tmp file: {src}")
+        self.assertEqual(str(ledger.path), dst)
+        # The file fsync must happen BEFORE the publish (torn-file protection).
+        replace_index = protocol_calls.index(replace_calls[0])
+        self.assertIn(("fsync",), protocol_calls[:replace_index],
+                      f"no fsync before the publish: {protocol_calls}")
+        # Final state still holds: no leftover tmp files, valid published JSON.
         leftovers = list(self.base_dir.glob("*.tmp"))
         self.assertEqual([], leftovers)
         payload = json.loads(ledger.path.read_text(encoding="utf-8"))
@@ -188,7 +220,8 @@ class TestTradeLedgerUnit(unittest.TestCase):
         self.assertGreaterEqual(ledger.io_failure_count, 1)
 
     def test_corrupt_file_degrades_to_empty_with_warning_and_quarantine(self):
-        path = self.base_dir / "trade_ledger_corrupt-1.json"
+        path = self._ledger(ledger_id="corrupt-1").path
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not valid json", encoding="utf-8")
         with self.assertLogs(self.logger, level="WARNING"):
             ledger = TradeLedger(ledger_id="corrupt-1", base_dir=self.base_dir, logger=self.logger)
@@ -197,7 +230,10 @@ class TestTradeLedgerUnit(unittest.TestCase):
         self.assertTrue(Path(f"{path}.corrupt").exists())
 
     def test_foreign_ledger_id_is_not_adopted_and_not_quarantined(self):
-        path = self.base_dir / "trade_ledger_mine.json"
+        # A copied/restored file carrying another controller's ledger_id under
+        # our exact file name must not be adopted (and must not be destroyed).
+        path = self._ledger(ledger_id="mine").path
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
             "schema_version": 1,
             "ledger_id": "somebody-else",
@@ -209,6 +245,31 @@ class TestTradeLedgerUnit(unittest.TestCase):
         self.assertEqual(0, ledger.count_fills_since(0.0))
         # The foreign file is left in place (it may be someone's live ledger).
         self.assertTrue(path.exists())
+
+    def test_distinct_ids_with_colliding_sanitizations_do_not_share_history(self):
+        # CDX-R02: 'ctl/a' and 'ctl:a' both sanitize to 'ctl_a'. With a lossy
+        # sanitized-only file name they alias to ONE path: the second ledger
+        # overwrites the first controller's file, and the reborn first
+        # controller then sees a foreign ledger_id and silently restarts with
+        # zero cap/cooldown history. Distinct ids must never share a file.
+        first = self._ledger(ledger_id="ctl/a")
+        first.observe_executors(
+            [_StubExecutor("e-a", filled_amount_quote=Decimal("5"),
+                           custom_info={"side": TradeType.BUY})], now=1000.0)
+        second = self._ledger(ledger_id="ctl:a")
+        second.observe_executors(
+            [_StubExecutor("e-b", filled_amount_quote=Decimal("7"),
+                           custom_info={"side": TradeType.SELL})], now=2000.0)
+        self.assertNotEqual(first.path, second.path)
+
+        # Simulated restart of the first controller: its history must survive
+        # the second controller's writes.
+        reborn = self._ledger(ledger_id="ctl/a")
+        self.assertEqual(1, reborn.count_fills_since(0.0))
+        self.assertEqual(1000.0, reborn.last_fill_timestamp())
+        # And the second controller's own restart sees its own record.
+        reborn_second = self._ledger(ledger_id="ctl:a")
+        self.assertEqual(2000.0, reborn_second.last_fill_timestamp())
 
     def test_nan_and_garbage_amounts_are_not_recorded(self):
         ledger = self._ledger()
@@ -252,11 +313,14 @@ class TestTradeLedgerUnit(unittest.TestCase):
 
     def test_default_dir_and_file_name_sanitization(self):
         # No base_dir: composes under the module default (patched per-test by
-        # conftest; Path("data") in production).
+        # conftest; Path("data") in production). File name = readable sanitized
+        # fragment + digest of the FULL id (CDX-R02 collision resistance).
+        import hashlib
         from controllers._shared import trade_ledger as tl_module
         ledger = TradeLedger(ledger_id="a/b:c d", logger=self.logger)
         self.assertEqual(tl_module.DEFAULT_LEDGER_DIR, ledger.path.parent)
-        self.assertEqual("trade_ledger_a_b_c_d.json", ledger.path.name)
+        expected_digest = hashlib.sha256("a/b:c d".encode("utf-8")).hexdigest()[:12]
+        self.assertEqual(f"trade_ledger_a_b_c_d_{expected_digest}.json", ledger.path.name)
 
 
 class TestMeanReversionTradeCapLedger(IsolatedAsyncioWrapperTestCase):
@@ -396,6 +460,88 @@ class TestMeanReversionTradeCapLedger(IsolatedAsyncioWrapperTestCase):
                                filled_amount_quote=Decimal("25"),
                                timestamp=self.NOW - 10)
         ]
+        controller.market_data_provider.get_candles_df = MagicMock(return_value=None)
+        await controller.update_processed_data()
+        self.assertEqual(1, controller._trade_ledger.count_fills_since(0.0))
+        self.assertEqual(self.NOW, controller._trade_ledger.last_fill_timestamp())
+
+
+class TestEMARegimeHoldCooldownLedger(IsolatedAsyncioWrapperTestCase):
+    """CDX-011 / CLA-305 wiring in ema_regime_hold_v1 (review CDX-R01).
+
+    The EMA same-side cooldown was derived exclusively from the transient
+    bot-wide executors_info buffer: a restart (or co-deployed churn eviction)
+    reset last_ts to 0.0 and immediately permitted a same-side re-entry while
+    the cooldown should still be active.
+    """
+
+    NOW = 100000.0
+
+    def _make_config(self, **overrides):
+        kwargs = dict(
+            id="ema-ledger-test",
+            connector_name="nonkyc",
+            trading_pair="XMR-USDT",
+            candles_connector="nonkyc",
+            candles_trading_pair="XMR-USDT",
+            cooldown_time=3600,
+        )
+        kwargs.update(overrides)
+        return EMARegimeHoldV1Config(**kwargs)
+
+    def _make_controller(self, config=None):
+        config = config or self._make_config()
+        market_data_provider = MagicMock(spec=MarketDataProvider)
+        market_data_provider.time = MagicMock(return_value=self.NOW)
+        return EMARegimeHoldV1(
+            config=config,
+            market_data_provider=market_data_provider,
+            actions_queue=AsyncMock(spec=asyncio.Queue),
+        )
+
+    def _seed_fill(self, controller, fill_time, side=TradeType.BUY):
+        executor = make_executor_info(f"ema-fill-{side.name}", side,
+                                      filled_amount_quote=Decimal("25"),
+                                      timestamp=fill_time, close_timestamp=fill_time,
+                                      status=RunnableStatus.TERMINATED)
+        controller._trade_ledger.observe_executors([executor], now=fill_time)
+
+    def _can_create(self, controller, signal=1):
+        with patch.object(DirectionalTradingControllerBase, "can_create_executor", return_value=True):
+            return controller.can_create_executor(signal)
+
+    def test_cooldown_survives_buffer_eviction(self):
+        controller = self._make_controller()
+        # Fill 60s ago, cooldown 3600s — but the buffer has evicted it.
+        self._seed_fill(controller, fill_time=self.NOW - 60.0)
+        controller.executors_info = []
+        self.assertFalse(self._can_create(controller))
+
+    def test_cooldown_survives_restart_and_releases_after_expiry(self):
+        config = self._make_config(id="ema-restart-test")
+        first_life = self._make_controller(config)
+        fill_time = self.NOW - 60.0
+        self._seed_fill(first_life, fill_time=fill_time)
+
+        # Restart: fresh controller instance, empty executors_info buffer.
+        # Only the persisted ledger can know about the pre-restart fill.
+        second_life = self._make_controller(config)
+        second_life.executors_info = []
+        self.assertFalse(self._can_create(second_life))
+
+        # Not over-restrictive: once the cooldown elapses the gate opens.
+        second_life.market_data_provider.time = MagicMock(return_value=fill_time + 3601.0)
+        self.assertTrue(self._can_create(second_life))
+
+    async def test_update_processed_data_observes_fills(self):
+        controller = self._make_controller()
+        controller.executors_info = [
+            make_executor_info("ema-live-fill", TradeType.BUY,
+                               filled_amount_quote=Decimal("25"),
+                               timestamp=self.NOW - 10)
+        ]
+        # Candle outage: update_processed_data early-returns, but the fill must
+        # still have been observed into the ledger first.
         controller.market_data_provider.get_candles_df = MagicMock(return_value=None)
         await controller.update_processed_data()
         self.assertEqual(1, controller._trade_ledger.count_fills_since(0.0))
