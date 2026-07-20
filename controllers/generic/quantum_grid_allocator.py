@@ -11,6 +11,7 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
@@ -20,7 +21,9 @@ class QGAConfig(ControllerConfigBase):
     # Portfolio allocation zones
     long_only_threshold: Decimal = Field(default=Decimal("0.2"), json_schema_extra={"is_updatable": True})
     short_only_threshold: Decimal = Field(default=Decimal("0.2"), json_schema_extra={"is_updatable": True})
-    hedge_ratio: Decimal = Field(default=Decimal("2"), json_schema_extra={"is_updatable": True})
+    # CLA-011: the dead `hedge_ratio` field was removed — nothing ever read it and a
+    # configured value silently did nothing. BaseClientModel forbids extra fields, so
+    # a mode="before" hook drops the key from legacy configs to keep them loadable.
 
     # Grid allocation multipliers
     base_grid_value_pct: Decimal = Field(default=Decimal("0.08"), json_schema_extra={"is_updatable": True})
@@ -70,15 +73,39 @@ class QGAConfig(ControllerConfigBase):
     interval: str = "1s"
     dynamic_grid_range: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     show_terminated_details: bool = False
+    # CLA-308 (enhancement, DEFAULT OFF): optional consecutive-stop-out breaker.
+    # 0 disables it entirely — recentering behavior is byte-for-byte unchanged.
+    # When set to N > 0, after N consecutive stop-outs on a pair (grid terminated by
+    # a limit-price breach: CloseType.STOP_LOSS, or POSITION_HOLD since QGA grids run
+    # keep_position=True) no new grid is created for that pair until
+    # stop_out_breaker_cooldown seconds have passed since the last stop-out.
+    stop_out_breaker_count: int = Field(default=0, ge=0, json_schema_extra={"is_updatable": True})
+    stop_out_breaker_cooldown: float = Field(default=300.0, ge=0, json_schema_extra={"is_updatable": True})
 
     @property
     def quote_asset_allocation(self) -> Decimal:
         """Calculate the implicit quote asset (USDT) allocation"""
         return Decimal("1") - sum(self.portfolio_allocation.values())
 
+    @model_validator(mode="before")
+    @classmethod
+    def drop_removed_hedge_ratio(cls, values):
+        # CLA-011: silently-dead field removed; legacy configs still carry it and
+        # extra="forbid" would otherwise fail them at load time.
+        if isinstance(values, dict) and "hedge_ratio" in values:
+            values = dict(values)
+            values.pop("hedge_ratio")
+        return values
+
     @field_validator("portfolio_allocation")
     @classmethod
     def validate_allocation(cls, v):
+        # CLA-011: every allocation must be a positive finite fraction — a zero or
+        # negative allocation makes the theoretical value 0 and silently disables the
+        # deviation math for that asset; NaN would poison the totals.
+        for asset, allocation in v.items():
+            if not allocation.is_finite() or allocation <= 0:
+                raise ValueError(f"Allocation for {asset} must be a positive finite number, got {allocation}")
         total = sum(v.values())
         if total >= Decimal("1"):
             raise ValueError(f"Total allocation {total} exceeds or equals 100%. Must leave room for USDT allocation.")
@@ -117,6 +144,18 @@ class QuantumGridAllocator(ControllerBase):
         self.metrics = {}
         # GEN-9: rate-limit state for the invalid-geometry warning
         self._last_invalid_geometry_warning_timestamp: float = 0.0
+        # CLA-411: assets whose balance has been observed nonzero at least once. A
+        # later zero/absent read for such an asset is treated as a transient bad read
+        # (fail-closed skip), while a genuinely-flat cold start stays tradeable.
+        self._assets_seen_nonzero: Set[str] = set()
+        self._suspect_balance_assets: Set[str] = set()
+        self._last_suspect_balance_warning_timestamp: float = 0.0
+        # CLA-308: consecutive-stop-out breaker state (tracked even while the breaker
+        # is disabled so hot-enabling it has history; it gates nothing at default 0).
+        self._stopout_streaks: Dict[str, int] = {}
+        self._last_stopout_timestamps: Dict[str, float] = {}
+        self._counted_terminal_grid_ids: Set[str] = set()
+        self._last_breaker_warning_timestamp: float = 0.0
         # Track unfavorable grid IDs
         self.unfavorable_grid_ids = set()
         # Track held positions from unfavorable grids
@@ -166,6 +205,24 @@ class QuantumGridAllocator(ControllerBase):
                 "bb_width": bb_width
             }
 
+    def _read_balance(self, asset: str, suspect_assets: Set[str]) -> Decimal:
+        """
+        CLA-411: fail-closed balance read. `get_balance` returns 0 for a missing key,
+        so a transient zero/absent read is indistinguishable from a flat position —
+        but acting on it makes deviation=-1 and spawns a real BUY grid (and a mirror
+        SELL grid when the read recovers). A zero read for an asset previously seen
+        nonzero, or any non-Decimal/non-finite/negative read, marks the asset suspect;
+        a zero read on a never-funded asset is a legitimate cold start.
+        """
+        raw = self.market_data_provider.get_balance(self.config.connector_name, asset)
+        valid = isinstance(raw, Decimal) and raw.is_finite() and raw >= 0
+        balance = raw if valid else Decimal("0")
+        if balance > 0:
+            self._assets_seen_nonzero.add(asset)
+        elif not valid or asset in self._assets_seen_nonzero:
+            suspect_assets.add(asset)
+        return balance
+
     def update_portfolio_metrics(self):
         """
         Calculate theoretical vs actual portfolio allocations
@@ -177,7 +234,8 @@ class QuantumGridAllocator(ControllerBase):
         }
 
         # Get real balances and calculate total portfolio value
-        quote_balance = self.market_data_provider.get_balance(self.config.connector_name, self.config.quote_asset)
+        suspect_assets: Set[str] = set()
+        quote_balance = self._read_balance(self.config.quote_asset, suspect_assets)
         total_value_quote = quote_balance
 
         # Calculate actual allocations including positions
@@ -185,7 +243,7 @@ class QuantumGridAllocator(ControllerBase):
             trading_pair = f"{asset}-{self.config.quote_asset}"
             price = self.get_mid_price(trading_pair)
             # Get balance and add any position from active grid
-            balance = self.market_data_provider.get_balance(self.config.connector_name, asset)
+            balance = self._read_balance(asset, suspect_assets)
             value = balance * price
             total_value_quote += value
             metrics["actual"][asset] = value
@@ -200,6 +258,17 @@ class QuantumGridAllocator(ControllerBase):
         metrics["difference"][self.config.quote_asset] = quote_balance - metrics["theoretical"][self.config.quote_asset]
         metrics["total_portfolio_value"] = total_value_quote
         self.metrics = metrics
+        # CLA-411: any suspect read skews total_value_quote and therefore EVERY
+        # asset's theoretical allocation, so the whole tick is treated as unreliable.
+        self._suspect_balance_assets = suspect_assets
+        if suspect_assets:
+            now = self.market_data_provider.time()
+            if now - self._last_suspect_balance_warning_timestamp >= self._WARNING_INTERVAL:
+                self._last_suspect_balance_warning_timestamp = now
+                self.logger().warning(
+                    f"Zero/absent balance read for previously-funded asset(s) "
+                    f"{sorted(suspect_assets)} on {self.config.connector_name}. Treating the "
+                    f"read as transient/unreliable and skipping grid creation this tick.")
 
     def get_active_grids_by_asset(self) -> Dict[str, List[ExecutorInfo]]:
         """Group active grids by asset using filter_executors"""
@@ -305,9 +374,60 @@ class QuantumGridAllocator(ControllerBase):
     def sl_multiplier(self):
         return 1 - self.config.tp_sl_ratio
 
+    def _register_grid_terminations(self):
+        """
+        CLA-308: fold newly-terminated grid executors into the per-pair stop-out
+        streaks. Ids are counted once and accumulated in a cumulative set so buffer
+        archival cannot decay the streak. A limit-price breach terminates as
+        CloseType.STOP_LOSS, or as POSITION_HOLD because QGA grids run
+        keep_position=True (grid_executor maps the breach to POSITION_HOLD then; an
+        operator early-stop maps there too, which errs on the fail-closed side when
+        the breaker is enabled). TAKE_PROFIT/COMPLETED closes reset the streak;
+        FAILED/INSUFFICIENT_BALANCE are not market outcomes and change nothing.
+        """
+        now = self.market_data_provider.time()
+        for executor in self.executors_info:
+            if executor.is_active or executor.type != "grid_executor":
+                continue
+            if executor.id in self._counted_terminal_grid_ids:
+                continue
+            self._counted_terminal_grid_ids.add(executor.id)
+            trading_pair = executor.config.trading_pair
+            if executor.close_type in (CloseType.STOP_LOSS, CloseType.POSITION_HOLD):
+                self._stopout_streaks[trading_pair] = self._stopout_streaks.get(trading_pair, 0) + 1
+                self._last_stopout_timestamps[trading_pair] = executor.close_timestamp or now
+            elif executor.close_type in (CloseType.TAKE_PROFIT, CloseType.COMPLETED):
+                self._stopout_streaks[trading_pair] = 0
+
+    def _stop_out_breaker_tripped(self, trading_pair: str) -> bool:
+        """CLA-308: True while the (opt-in) breaker blocks new grids for the pair."""
+        limit = self.config.stop_out_breaker_count
+        if limit <= 0:
+            return False  # default: breaker disabled, behavior unchanged
+        if self._stopout_streaks.get(trading_pair, 0) < limit:
+            return False
+        now = self.market_data_provider.time()
+        last_stopout = self._last_stopout_timestamps.get(trading_pair, 0.0)
+        if now - last_stopout < self.config.stop_out_breaker_cooldown:
+            if now - self._last_breaker_warning_timestamp >= self._WARNING_INTERVAL:
+                self._last_breaker_warning_timestamp = now
+                self.logger().warning(
+                    f"Stop-out breaker tripped for {trading_pair}: "
+                    f"{self._stopout_streaks.get(trading_pair, 0)} consecutive stop-outs "
+                    f"(limit {limit}). Pausing grid creation until "
+                    f"{self.config.stop_out_breaker_cooldown}s after the last stop-out.")
+            return True
+        # Cooldown served — reset the streak and allow grids again.
+        self._stopout_streaks[trading_pair] = 0
+        return False
+
     def determine_executor_actions(self) -> List[Union[CreateExecutorAction, StopExecutorAction]]:
         actions = []
         self.update_portfolio_metrics()
+        self._register_grid_terminations()
+        if self._suspect_balance_assets:
+            # CLA-411: unreliable balance read this tick — fail closed, create nothing.
+            return actions
         active_grids_by_asset = self.get_active_grids_by_asset()
         for asset in self.config.portfolio_allocation:
             if asset == self.config.quote_asset:
@@ -316,6 +436,8 @@ class QuantumGridAllocator(ControllerBase):
             # Check if there are any active grids for this asset
             if asset in active_grids_by_asset:
                 self.logger().debug(f"Skipping {trading_pair} - Active grid exists")
+                continue
+            if self._stop_out_breaker_tripped(trading_pair):
                 continue
             theoretical = self.metrics["theoretical"][asset]
             difference = self.metrics["difference"][asset]
