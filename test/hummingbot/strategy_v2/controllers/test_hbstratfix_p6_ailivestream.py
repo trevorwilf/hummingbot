@@ -88,6 +88,21 @@ class TestAbsentTargetPctIsNeutral(AILivestreamBarrierTestBase):
         self.assertEqual(TRAILING_ACTIVATION, barriers.trailing_stop.activation_price)
         self.assertEqual(TRAILING_DELTA, barriers.trailing_stop.trailing_delta)
 
+    def test_absent_target_pct_neutral_under_non_default_band(self):
+        # CDX-R02 regression guard: with a non-default band whose floor is
+        # below 1 (the only kind the validator now accepts), an absent
+        # target_pct must still leave the barriers EXACTLY unchanged — the
+        # floor may never lift the neutral result above the configured values.
+        controller = self._make_controller(
+            min_volatility_factor=0.5, max_volatility_factor=3.0)
+        controller._handle_ml_signal({"probabilities": LONG_PAYLOAD_PROBS}, "topic")
+        self.assertEqual(1, controller.processed_data["signal"])
+        barriers = self._barriers(controller)
+        self.assertEqual(STOP_LOSS, barriers.stop_loss)
+        self.assertEqual(TAKE_PROFIT, barriers.take_profit)
+        self.assertEqual(TRAILING_ACTIVATION, barriers.trailing_stop.activation_price)
+        self.assertEqual(TRAILING_DELTA, barriers.trailing_stop.trailing_delta)
+
     def test_neutral_factor_constant_is_one(self):
         # The neutral multiplier is 1, not the old 0.01 default.
         self.assertEqual(1.0, NEUTRAL_VOLATILITY_FACTOR)
@@ -229,6 +244,10 @@ class TestMalformedPayloadZeroesSignal(AILivestreamBarrierTestBase):
         {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": "2.0"},
         {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": True},
         {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": None},
+        # Oversized JSON integers: float() raises OverflowError past ~1e308,
+        # which must not escape validation (CDX-R01).
+        {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": 10 ** 400},
+        {"probabilities": [0.1, 0.2, 10 ** 400]},
     ]
 
     def test_each_malformed_payload_zeroes_signal_without_raising(self):
@@ -246,6 +265,28 @@ class TestMalformedPayloadZeroesSignal(AILivestreamBarrierTestBase):
         controller.processed_data["signal"] = 1
         controller._handle_ml_signal({"probabilities": LONG_PAYLOAD_PROBS, "target_pct": 0}, "topic")
         self.assertEqual([], controller.create_actions_proposal())
+
+    def test_oversized_target_pct_zeroes_previously_armed_signal(self):
+        # CDX-R01 reproduction: arm a valid long signal, then send a payload
+        # whose target_pct is a JSON integer too large for float(). The old
+        # code raised OverflowError inside validation, so the reject-and-zero
+        # branch never ran and the stale armed signal stayed live.
+        controller = self._make_controller()
+        controller._handle_ml_signal(
+            {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": 2.0}, "topic")
+        self.assertEqual(1, controller.processed_data["signal"])  # precondition: armed
+        controller._handle_ml_signal(
+            {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": 10 ** 400}, "topic")
+        self.assertEqual(0, controller.processed_data["signal"])
+
+    def test_oversized_probability_zeroes_previously_armed_signal(self):
+        # Same CDX-R01 mechanism via the probability path.
+        controller = self._make_controller()
+        controller._handle_ml_signal(
+            {"probabilities": LONG_PAYLOAD_PROBS, "target_pct": 2.0}, "topic")
+        self.assertEqual(1, controller.processed_data["signal"])
+        controller._handle_ml_signal({"probabilities": [0.1, 0.2, 10 ** 400]}, "topic")
+        self.assertEqual(0, controller.processed_data["signal"])
 
     def test_valid_payload_after_rejection_recovers(self):
         # A reject must not wedge the controller: the next valid payload works.
@@ -284,6 +325,22 @@ class TestVolatilityBandConfigValidation(AILivestreamBarrierTestBase):
     def test_infinite_max_factor_rejected(self):
         with self.assertRaises(ValidationError):
             AILivestreamControllerConfig(**self._config_params(max_volatility_factor=float("inf")))
+
+    def test_min_factor_above_one_rejected(self):
+        # CDX-R02: min_volatility_factor doubles as the barrier floor factor.
+        # A lower bound above 1 would make the floor RAISE the neutral
+        # (absent-target_pct) barriers — e.g. min=2.0 turns a 0.03 stop into
+        # 0.06 — so it must be rejected at config time.
+        with self.assertRaises(ValidationError):
+            AILivestreamControllerConfig(**self._config_params(
+                min_volatility_factor=2.0, max_volatility_factor=10.0))
+
+    def test_min_factor_of_exactly_one_accepted(self):
+        # Boundary: min=1 means "no shrink allowed", which never raises the
+        # neutral barriers. Must remain a valid configuration.
+        config = AILivestreamControllerConfig(**self._config_params(
+            min_volatility_factor=1.0, max_volatility_factor=10.0))
+        self.assertEqual(1.0, config.min_volatility_factor)
 
     def test_max_below_min_rejected(self):
         with self.assertRaises(ValidationError):

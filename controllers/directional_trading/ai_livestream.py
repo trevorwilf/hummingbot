@@ -33,7 +33,9 @@ class AILivestreamControllerConfig(DirectionalTradingControllerConfigBase):
     # publish to it), so a payload factor outside this band is rejected outright
     # rather than clamped into a live order. The band also floors the scaled
     # barriers: no accepted payload can shrink stop-loss/take-profit below
-    # configured_barrier * min_volatility_factor.
+    # configured_barrier * min_volatility_factor. min_volatility_factor must not
+    # exceed 1 — the floor may only ever lower barriers back up toward the
+    # configured values, never raise the neutral (factor-1) result above them.
     min_volatility_factor: float = Field(default=0.1, json_schema_extra={"is_updatable": True})
     max_volatility_factor: float = Field(default=10.0, json_schema_extra={"is_updatable": True})
 
@@ -41,8 +43,10 @@ class AILivestreamControllerConfig(DirectionalTradingControllerConfigBase):
     def validate_volatility_band(self):
         lo = self.min_volatility_factor
         hi = self.max_volatility_factor
-        if not (isinstance(lo, (int, float)) and math.isfinite(lo) and lo > 0):
-            raise ValueError(f"min_volatility_factor must be finite and > 0, got {lo!r}")
+        if not (isinstance(lo, (int, float)) and math.isfinite(lo) and 0 < lo <= 1):
+            raise ValueError(
+                f"min_volatility_factor must be finite and in (0, 1] (it doubles as the barrier "
+                f"floor factor, which must never widen neutral barriers), got {lo!r}")
         if not (isinstance(hi, (int, float)) and math.isfinite(hi) and hi >= lo):
             raise ValueError(
                 f"max_volatility_factor must be finite and >= min_volatility_factor ({lo}), got {hi!r}")
@@ -83,6 +87,23 @@ class AILivestreamController(DirectionalTradingControllerBase):
             self.logger().error(f"Failed to initialize ML signal listener: {str(e)}")
             self._ml_signal_listener = None
 
+    @staticmethod
+    def _as_finite_float(raw) -> Optional[float]:
+        """
+        Total conversion of an untrusted numeric value: returns a finite float
+        or None. Never raises — a JSON integer can be arbitrarily large and
+        `float()` raises OverflowError past ~1e308.
+        """
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        try:
+            value = float(raw)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
     def _validated_volatility_factor(self, raw) -> Optional[float]:
         """
         Validate an externally-supplied barrier multiplier. Returns the factor
@@ -90,10 +111,8 @@ class AILivestreamController(DirectionalTradingControllerBase):
         configured [min_volatility_factor, max_volatility_factor] band, else
         None.
         """
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            return None
-        value = float(raw)
-        if not math.isfinite(value) or value <= 0.0:
+        value = self._as_finite_float(raw)
+        if value is None or value <= 0.0:
             return None
         if not (self.config.min_volatility_factor <= value <= self.config.max_volatility_factor):
             return None
@@ -112,9 +131,8 @@ class AILivestreamController(DirectionalTradingControllerBase):
         if not isinstance(probabilities, (list, tuple)) or len(probabilities) != 3:
             return False
         for p in probabilities:
-            if isinstance(p, bool) or not isinstance(p, (int, float)):
-                return False
-            if not math.isfinite(float(p)) or not (0.0 <= float(p) <= 1.0):
+            value = self._as_finite_float(p)
+            if value is None or not (0.0 <= value <= 1.0):
                 return False
         if "target_pct" in payload and self._validated_volatility_factor(payload["target_pct"]) is None:
             return False
@@ -126,7 +144,16 @@ class AILivestreamController(DirectionalTradingControllerBase):
         A malformed or out-of-band payload zeroes the signal (fail closed)
         instead of being clamped into a live order.
         """
-        if not self._is_valid_ml_payload(signal):
+        try:
+            payload_ok = self._is_valid_ml_payload(signal)
+        except Exception as e:
+            # Defense in depth: validation of untrusted input must itself be
+            # total. Any escape here would leave a previously armed signal
+            # live (the MQTT dispatcher only logs callback exceptions).
+            payload_ok = False
+            self.logger().warning(
+                f"ML payload validation raised {e!r}; treating payload as invalid.")
+        if not payload_ok:
             self.processed_data["signal"] = 0
             self.logger().warning(
                 f"Rejected invalid ML payload on unauthenticated topic {topic}; "
