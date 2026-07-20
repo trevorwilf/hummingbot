@@ -5,16 +5,22 @@ hbstrat_fix Phase 7 tests — hedge_asset.py + quantum_grid_allocator.py
 Covers:
 - CDX-007: config-time validator that `asset_to_hedge` matches the base of
   `hedge_trading_pair` (wrapped-token allow-list) — a mismatch would submit a
-  mixed-unit gap on the wrong asset.
+  mixed-unit gap on the wrong asset. CDX-R01: the allow-list holds only strictly
+  unit-equivalent wrappers — value-accruing share tokens (wstETH, WBETH) are
+  rejected.
 - CLA-403 (transient-zero trigger treated as real per human decision): a
   zero/absent spot balance read while a hedge is held must NOT fire a full-size
   MARKET unwind — skip and warn. Per-order hedge step cap
-  (`max_hedge_order_quote`, 0 = legacy uncapped) and the perp available-balance
-  collateral cap on SELL sizing.
-- CLA-411 (same decision): a zero/absent base-balance read for a
-  previously-funded asset must NOT produce deviation=-1 and a live BUY grid —
-  skip and warn. A never-funded asset (genuine cold start) stays tradeable.
-- CLA-011: dead `hedge_ratio` removed from QGAConfig; allocations validated
+  (`max_hedge_order_quote`) is ON by default (CDX-R03; explicit 0 is the unsafe
+  legacy opt-out) and fails closed when the price is unusable; perp
+  available-balance collateral cap bounds SELL sizing.
+- CLA-411 (same decision): a zero/absent base-balance read must NOT produce
+  deviation=-1 and a live BUY grid — skip and warn. CDX-R02: a first-observation
+  zero is also suspect (restart history is process-local) and is trusted only
+  after persisting for `zero_balance_confirmation_seconds`, so an all-quote cold
+  start still bootstraps after the window.
+- CLA-011: dead `hedge_ratio` removed from QGAConfig; a legacy config carrying
+  it is rejected with a migration error (CDX-R04); allocations validated
   positive and finite.
 - CLA-308 (enhancement, DEFAULT OFF): opt-in consecutive-stop-out breaker —
   inert at the default 0, bounds same-tick respawn when enabled.
@@ -128,6 +134,19 @@ class TestHedgeAssetPairValidator(IsolatedAsyncioWrapperTestCase):
         with self.assertRaisesRegex(ValidationError, "does not match the base asset"):
             self._config(asset_to_hedge="WBTC", hedge_trading_pair="SOL-USDT")
 
+    def test_share_token_aliases_rejected(self):
+        # CDX-R01: wstETH/WBETH are value-accruing share tokens (1 token != 1 ETH,
+        # and drifting) — a symbol-level alias would reintroduce the mixed-unit
+        # mis-sized hedge the validator exists to prevent.
+        for asset in ("WSTETH", "WBETH"):
+            with self.assertRaisesRegex(ValidationError, "does not match the base asset"):
+                self._config(asset_to_hedge=asset, hedge_trading_pair="ETH-USDT")
+
+    def test_rebasing_unit_pegged_alias_accepted(self):
+        # stETH rebases: 1 stETH == 1 ETH of stake at all times (unit-equivalent).
+        config = self._config(asset_to_hedge="STETH", hedge_trading_pair="ETH-USDT")
+        self.assertEqual("STETH", config.asset_to_hedge)
+
     def test_case_insensitive_match(self):
         config = self._config(asset_to_hedge="sol")
         self.assertEqual("sol", config.asset_to_hedge)
@@ -221,13 +240,55 @@ class TestHedgeAssetZeroBalanceGuard(HedgeAssetControllerTestBase):
 class TestHedgeAssetOrderCaps(HedgeAssetControllerTestBase):
     """CLA-403 — per-order step cap and perp collateral cap."""
 
-    async def test_cap_disabled_by_default(self):
+    def test_cap_enabled_by_default(self):
+        # CDX-R03: the per-order cap must be ON in a normal configuration.
+        self.make_controller()
+        self.assertEqual(Decimal("5000"), self.config.max_hedge_order_quote)
+
+    async def test_gap_below_default_cap_not_reduced(self):
+        # gap = 10 SOL @ 100 → 1000 quote, under the 5000 default cap.
         self.make_controller()
         await self.controller.update_processed_data()
         actions = self.controller.determine_executor_actions()
         self.assertEqual(1, len(actions))
         self.assertEqual(TradeType.SELL, actions[0].executor_config.side)
         self.assertEqual(Decimal("10"), actions[0].executor_config.amount)
+
+    async def test_default_cap_bounds_single_order(self):
+        # CDX-R03: a huge gap is chased in capped steps, never one full-size
+        # MARKET order. gap = 100 SOL @ 100 → 10000 quote; default 5000 → 50 SOL.
+        self.make_controller()
+        self.market_data_provider.get_balance = MagicMock(return_value=Decimal("100"))
+        await self.controller.update_processed_data()
+        actions = self.controller.determine_executor_actions()
+        self.assertEqual(1, len(actions))
+        self.assertEqual(Decimal("50"), actions[0].executor_config.amount)
+
+    async def test_explicit_zero_disables_cap(self):
+        # Unsafe legacy opt-out: an explicit 0 restores full-gap sizing.
+        self.make_controller(max_hedge_order_quote=Decimal("0"))
+        self.market_data_provider.get_balance = MagicMock(return_value=Decimal("100"))
+        await self.controller.update_processed_data()
+        actions = self.controller.determine_executor_actions()
+        self.assertEqual(1, len(actions))
+        self.assertEqual(Decimal("100"), actions[0].executor_config.amount)
+
+    def test_cap_with_unusable_price_fails_closed(self):
+        # CDX-R03: if the price is unusable the cap cannot be converted to base
+        # units — skip and warn rather than submit an uncapped MARKET order.
+        self.make_controller()
+        self.controller.processed_data = {
+            "spot_balance_suspect": False,
+            "cool_down_time_condition": True,
+            "min_notional_size_condition": True,
+            "hedge_position_gap": Decimal("10"),
+            "current_price": Decimal("NaN"),
+            "perp_available_balance": Decimal("1000"),
+        }
+        with patch.object(HedgeAssetController, "logger") as logger_mock:
+            actions = self.controller.determine_executor_actions()
+        self.assertEqual([], actions)
+        self.assertTrue(logger_mock.return_value.warning.called)
 
     async def test_max_hedge_order_quote_caps_amount(self):
         # gap = 10 SOL @ 100 → 1000 quote; cap 500 quote → 5 SOL per order.
@@ -280,9 +341,11 @@ class TestQGAConfigCLA011(IsolatedAsyncioWrapperTestCase):
         config = QGAConfig(id="test-qga")
         self.assertFalse(hasattr(config, "hedge_ratio"))
 
-    def test_legacy_config_with_hedge_ratio_still_loads(self):
-        config = QGAConfig(id="test-qga", hedge_ratio=Decimal("2"))
-        self.assertFalse(hasattr(config, "hedge_ratio"))
+    def test_legacy_config_with_hedge_ratio_rejected_with_migration_error(self):
+        # CDX-R04: the removed knob must fail loudly with a migration hint, not
+        # be silently discarded (which would perpetuate the original no-op).
+        with self.assertRaisesRegex(ValidationError, "hedge_ratio.*was removed"):
+            QGAConfig(id="test-qga", hedge_ratio=Decimal("2"))
 
     def test_zero_allocation_rejected(self):
         with self.assertRaisesRegex(ValidationError, "positive finite"):
@@ -333,16 +396,63 @@ class QGAControllerTestBase(IsolatedAsyncioWrapperTestCase):
 class TestQGAZeroBalanceGuard(QGAControllerTestBase):
     """CLA-411 — transient zero base-balance read must not spawn a grid."""
 
-    def test_cold_start_zero_balance_allows_grid(self):
-        # Regression guard: a never-funded asset is a genuine cold start (all-quote
-        # portfolio) and MUST still bootstrap a BUY grid.
+    def test_cold_start_first_zero_read_is_suspect(self):
+        # CDX-R02: the in-process nonzero history does not survive a restart, so a
+        # first-observation zero (exactly what a transient post-restart read looks
+        # like) must fail closed — no BUY grid from a single unconfirmed read.
         self.make_controller()
         self.balances["SOL"] = Decimal("0")
+        with patch.object(QuantumGridAllocator, "logger") as logger_mock:
+            actions = self.controller.determine_executor_actions()
+        self.assertEqual([], actions)
+        self.assertIn("SOL", self.controller._suspect_balance_assets)
+        self.assertTrue(logger_mock.return_value.warning.called)
+
+    def test_cold_start_zero_confirmed_after_window_allows_grid(self):
+        # Regression guard: a genuinely flat all-quote start must still bootstrap —
+        # the zero becomes trusted once it persists for the confirmation window.
+        self.make_controller()
+        self.balances["SOL"] = Decimal("0")
+        self.assertEqual([], self.controller.determine_executor_actions())
+        self.current_time = 1060.0  # default window (60s) served
         actions = self.controller.determine_executor_actions()
         self.assertEqual(1, len(actions))
         self.assertIsInstance(actions[0], CreateExecutorAction)
         self.assertEqual(TradeType.BUY, actions[0].executor_config.side)
         self.assertEqual("SOL-USDT", actions[0].executor_config.trading_pair)
+
+    def test_seen_nonzero_zero_stays_suspect_beyond_window(self):
+        # Once funded in-process, a zero read is suspect regardless of how long it
+        # persists — the confirmation window applies only to never-funded assets.
+        self.make_controller()
+        self.controller.determine_executor_actions()  # funded tick: SOL=10
+        self.balances["SOL"] = Decimal("0")
+        self.current_time = 1200.0  # far beyond the 60s window
+        self.assertEqual([], self.controller.determine_executor_actions())
+        self.assertIn("SOL", self.controller._suspect_balance_assets)
+
+    def test_invalid_read_restarts_zero_confirmation(self):
+        # An invalid read says nothing about flatness — it must restart the
+        # confirmation window rather than count toward trusting the zero.
+        self.make_controller()
+        self.balances["SOL"] = Decimal("0")
+        self.assertEqual([], self.controller.determine_executor_actions())  # window starts @1000
+        self.current_time = 1030.0
+        self.balances["SOL"] = Decimal("NaN")
+        self.assertEqual([], self.controller.determine_executor_actions())  # invalid: restart
+        self.current_time = 1120.0
+        self.balances["SOL"] = Decimal("0")
+        # 120s after the first zero, but the window restarted at 1120 — still suspect.
+        self.assertEqual([], self.controller.determine_executor_actions())
+        self.assertIn("SOL", self.controller._suspect_balance_assets)
+
+    def test_zero_confirmation_optout_restores_immediate_bootstrap(self):
+        # Explicit unsafe opt-out: window 0 trusts a first-read zero immediately.
+        self.make_controller(zero_balance_confirmation_seconds=0.0)
+        self.balances["SOL"] = Decimal("0")
+        actions = self.controller.determine_executor_actions()
+        self.assertEqual(1, len(actions))
+        self.assertEqual(TradeType.BUY, actions[0].executor_config.side)
 
     def test_transient_zero_after_nonzero_blocks_creation(self):
         # Would-have-caught CLA-411: without the guard the zero read makes

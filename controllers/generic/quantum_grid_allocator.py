@@ -22,8 +22,9 @@ class QGAConfig(ControllerConfigBase):
     long_only_threshold: Decimal = Field(default=Decimal("0.2"), json_schema_extra={"is_updatable": True})
     short_only_threshold: Decimal = Field(default=Decimal("0.2"), json_schema_extra={"is_updatable": True})
     # CLA-011: the dead `hedge_ratio` field was removed — nothing ever read it and a
-    # configured value silently did nothing. BaseClientModel forbids extra fields, so
-    # a mode="before" hook drops the key from legacy configs to keep them loadable.
+    # configured value silently did nothing. CDX-R04: a config still carrying it is
+    # rejected with a targeted migration error rather than silently discarded — an
+    # operator tuning the knob deserves an error, not a continued no-op.
 
     # Grid allocation multipliers
     base_grid_value_pct: Decimal = Field(default=Decimal("0.08"), json_schema_extra={"is_updatable": True})
@@ -81,6 +82,13 @@ class QGAConfig(ControllerConfigBase):
     # stop_out_breaker_cooldown seconds have passed since the last stop-out.
     stop_out_breaker_count: int = Field(default=0, ge=0, json_schema_extra={"is_updatable": True})
     stop_out_breaker_cooldown: float = Field(default=300.0, ge=0, json_schema_extra={"is_updatable": True})
+    # CLA-411/CDX-R02: a zero read for an asset never yet seen nonzero (cold start
+    # OR the first ticks after a restart — the in-process nonzero history does not
+    # survive a restart) is trusted only after it has persisted this many seconds.
+    # A transient post-restart zero recovers within a tick or two and never gets
+    # trusted; a genuinely flat all-quote start bootstraps after the window.
+    # 0 trusts first-read zeros immediately (unsafe legacy opt-out).
+    zero_balance_confirmation_seconds: float = Field(default=60.0, ge=0, json_schema_extra={"is_updatable": True})
 
     @property
     def quote_asset_allocation(self) -> Decimal:
@@ -89,12 +97,13 @@ class QGAConfig(ControllerConfigBase):
 
     @model_validator(mode="before")
     @classmethod
-    def drop_removed_hedge_ratio(cls, values):
-        # CLA-011: silently-dead field removed; legacy configs still carry it and
-        # extra="forbid" would otherwise fail them at load time.
+    def reject_removed_hedge_ratio(cls, values):
+        # CLA-011/CDX-R04: fail loudly with a migration hint (clearer than the
+        # generic extra_forbidden error the base class would raise).
         if isinstance(values, dict) and "hedge_ratio" in values:
-            values = dict(values)
-            values.pop("hedge_ratio")
+            raise ValueError(
+                "QGA config field 'hedge_ratio' was removed — it was never read and had "
+                "no effect on behavior. Delete it from the controller config.")
         return values
 
     @field_validator("portfolio_allocation")
@@ -148,6 +157,10 @@ class QuantumGridAllocator(ControllerBase):
         # later zero/absent read for such an asset is treated as a transient bad read
         # (fail-closed skip), while a genuinely-flat cold start stays tradeable.
         self._assets_seen_nonzero: Set[str] = set()
+        # CDX-R02: first timestamp a valid zero was read for a never-seen-nonzero
+        # asset — a zero must persist for zero_balance_confirmation_seconds before
+        # it is trusted as a genuine flat position.
+        self._zero_reads_since: Dict[str, float] = {}
         self._suspect_balance_assets: Set[str] = set()
         self._last_suspect_balance_warning_timestamp: float = 0.0
         # CLA-308: consecutive-stop-out breaker state (tracked even while the breaker
@@ -211,16 +224,28 @@ class QuantumGridAllocator(ControllerBase):
         so a transient zero/absent read is indistinguishable from a flat position —
         but acting on it makes deviation=-1 and spawns a real BUY grid (and a mirror
         SELL grid when the read recovers). A zero read for an asset previously seen
-        nonzero, or any non-Decimal/non-finite/negative read, marks the asset suspect;
-        a zero read on a never-funded asset is a legitimate cold start.
+        nonzero, or any non-Decimal/non-finite/negative read, marks the asset suspect.
+        CDX-R02: the in-process nonzero history does not survive a restart, so a
+        first-observation zero is ALSO suspect until it has persisted for
+        zero_balance_confirmation_seconds — only a stable zero is trusted as a
+        genuine cold-start flat position.
         """
         raw = self.market_data_provider.get_balance(self.config.connector_name, asset)
         valid = isinstance(raw, Decimal) and raw.is_finite() and raw >= 0
         balance = raw if valid else Decimal("0")
         if balance > 0:
             self._assets_seen_nonzero.add(asset)
+            self._zero_reads_since.pop(asset, None)
         elif not valid or asset in self._assets_seen_nonzero:
             suspect_assets.add(asset)
+            # An invalid read says nothing about flatness — restart the confirmation
+            # window so it cannot count toward trusting a later zero.
+            self._zero_reads_since.pop(asset, None)
+        else:
+            now = self.market_data_provider.time()
+            first_zero = self._zero_reads_since.setdefault(asset, now)
+            if now - first_zero < self.config.zero_balance_confirmation_seconds:
+                suspect_assets.add(asset)
         return balance
 
     def update_portfolio_metrics(self):
@@ -266,7 +291,7 @@ class QuantumGridAllocator(ControllerBase):
             if now - self._last_suspect_balance_warning_timestamp >= self._WARNING_INTERVAL:
                 self._last_suspect_balance_warning_timestamp = now
                 self.logger().warning(
-                    f"Zero/absent balance read for previously-funded asset(s) "
+                    f"Zero/absent or unconfirmed balance read for asset(s) "
                     f"{sorted(suspect_assets)} on {self.config.connector_name}. Treating the "
                     f"read as transient/unreliable and skipping grid creation this tick.")
 

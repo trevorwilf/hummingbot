@@ -20,15 +20,17 @@ from hummingbot.strategy_v2.executors.order_executor.data_types import Execution
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 
 # CDX-007: spot assets that legitimately hedge via a perp on a different (canonical)
-# base symbol. Only 1:1-redeemable wrappers belong here — anything with a unit
-# conversion (e.g. 1000SHIB) would reintroduce the mixed-unit subtraction the
-# validator exists to prevent.
+# base symbol. Only strictly unit-equivalent (1 token == 1 canonical unit at all
+# times) wrappers belong here — anything with a unit conversion or an accruing
+# exchange rate would reintroduce the mixed-unit subtraction the validator exists
+# to prevent. CDX-R01: WBETH and WSTETH were removed — they are value-accruing
+# share tokens (1 wstETH/WBETH > 1 ETH and drifting), so a 1:1 hedge is
+# systematically mis-sized. STETH stays: it rebases, keeping 1 stETH == 1 ETH of
+# stake in units. 1000SHIB-style denominated contracts must also never be added.
 WRAPPED_TOKEN_ALIASES: Dict[str, str] = {
     "WBTC": "BTC",
     "WETH": "ETH",
-    "WBETH": "ETH",
     "STETH": "ETH",
-    "WSTETH": "ETH",
     "WSOL": "SOL",
     "WBNB": "BNB",
     "WMATIC": "MATIC",
@@ -59,11 +61,14 @@ class HedgeAssetConfig(ControllerConfigBase):
     hedge_ratio: Decimal = Field(default=Decimal("0"), ge=0, le=1, json_schema_extra={"is_updatable": True})
     min_notional_size: float = Field(default=10, ge=0)
     cooldown_time: float = Field(default=10.0, ge=0)
-    # CLA-403: optional cap on a single hedge order, denominated in the hedge pair's
-    # quote asset. 0 disables the cap (legacy sizing). Any positive value bounds the
-    # blast radius of one adjustment: a wrong gap can then only be chased one capped
-    # step per cooldown window instead of in a single full-size MARKET order.
-    max_hedge_order_quote: Decimal = Field(default=Decimal("0"), ge=0, json_schema_extra={"is_updatable": True})
+    # CLA-403: cap on a single hedge order, denominated in the hedge pair's quote
+    # asset, applied to BOTH directions. It bounds the blast radius of one
+    # adjustment: a wrong gap can only be chased one capped step per cooldown
+    # window instead of in a single full-size MARKET order (5000 quote per 10s
+    # default cooldown ≈ 30k/min of legitimate re-hedge throughput). CDX-R03: the
+    # cap is ON by default — 0 is an explicit, unsafe legacy opt-out that restores
+    # uncapped full-gap sizing.
+    max_hedge_order_quote: Decimal = Field(default=Decimal("5000"), ge=0, json_schema_extra={"is_updatable": True})
 
     # GEN-13: quote asset of the spot reference pair registered for the hedged asset.
     # Previously hardcoded to USDC — a nonexistent <asset>-USDC market blocks connector
@@ -110,6 +115,7 @@ class HedgeAssetController(ControllerBase):
         # CLA-403: rate-limit state for the fail-closed balance-read warnings
         self._last_suspect_balance_warning_ts: float = 0.0
         self._last_no_collateral_warning_ts: float = 0.0
+        self._last_invalid_price_warning_ts: float = 0.0
         self.set_leverage_and_position_mode()
 
     def set_leverage_and_position_mode(self):
@@ -222,8 +228,19 @@ class HedgeAssetController(ControllerBase):
             current_price = self.processed_data["current_price"]
             price_valid = isinstance(current_price, Decimal) and current_price.is_finite() and current_price > 0
             amount = abs(self.processed_data["hedge_position_gap"])
-            # CLA-403: cap the per-order hedge step (0 = disabled)
-            if self.config.max_hedge_order_quote > 0 and price_valid:
+            # CLA-403/CDX-R03: cap the per-order hedge step (default on; explicit 0
+            # is the unsafe legacy opt-out). If the price is unusable the cap cannot
+            # be converted to base units — fail closed rather than submit uncapped.
+            if self.config.max_hedge_order_quote > 0:
+                if not price_valid:
+                    now = self.market_data_provider.time()
+                    if now - self._last_invalid_price_warning_ts >= self._WARNING_INTERVAL:
+                        self._last_invalid_price_warning_ts = now
+                        self.logger().warning(
+                            f"Hedge price for {self.config.hedge_trading_pair} is unavailable "
+                            f"({current_price}); the per-order cap cannot be enforced — "
+                            f"skipping hedge adjustment.")
+                    return []
                 amount = min(amount, self.config.max_hedge_order_quote / current_price)
             if side == TradeType.SELL:
                 # CLA-403: opening/extending the short requires collateral — use the
