@@ -41,7 +41,7 @@ class BollingerV1ControllerConfig(DirectionalTradingControllerConfigBase):
     # signal is gated to 0. Per-market tunable; sparse pairs legitimately have old
     # closed bars, so keep this generous. 0 disables the gate (legacy behavior).
     stale_candle_max_age_intervals: float = Field(
-        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, ge=0,
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, gt=0,
         json_schema_extra={"is_updatable": True})
 
     @field_validator("candles_connector", mode="before")

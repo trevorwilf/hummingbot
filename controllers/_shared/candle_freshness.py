@@ -14,8 +14,10 @@
 # closed bars -- the newest available bar on a low-volume market can be many
 # intervals old while the feed itself is healthy (the `_drop_incomplete_last_bar`
 # case). The bound is therefore interval-relative, generous by default, and a
-# per-controller (hence per-market) config field; `<= 0` disables the gate
-# entirely, restoring the legacy behavior byte-for-byte.
+# per-controller (hence per-market) config field. Sparse markets are handled by
+# WIDENING the bound, never by disabling the gate: a non-positive/non-finite
+# bound and an unparseable interval both FAIL CLOSED (adjudicated CDX-R01) --
+# this is a live-money risk control and must not have a fail-open bypass.
 
 import math
 import re
@@ -89,17 +91,22 @@ class CandleFreshnessGate:
 
     def _check(self, df, interval, now, max_age_intervals) -> FreshnessResult:
         try:
-            bound_intervals = float(max_age_intervals)
-        except (TypeError, ValueError):
-            bound_intervals = 0.0
-        if bound_intervals <= 0.0 or not math.isfinite(bound_intervals):
-            # Explicitly disabled: legacy (length-only) behavior, no gating.
-            return FreshnessResult(True, "disabled", None, None)
-
-        try:
             now_f = float(now)
         except (TypeError, ValueError):
             now_f = float("nan")
+
+        try:
+            bound_intervals = float(max_age_intervals)
+        except (TypeError, ValueError):
+            bound_intervals = float("nan")
+        if not math.isfinite(bound_intervals) or bound_intervals <= 0.0:
+            # FAIL CLOSED (CDX-R01): a bound that cannot gate must not let a
+            # stale feed keep trading. The config layer rejects <= 0 (gt=0);
+            # this covers programmatic construction and non-finite values.
+            result = FreshnessResult(False, "invalid_bound", None, None)
+            self._warn_stale(interval, now_f if math.isfinite(now_f) else 0.0, result)
+            return result
+
         if not math.isfinite(now_f):
             result = FreshnessResult(False, "clock_unavailable", None, None)
             self._warn_stale(interval, 0.0, result)
@@ -121,12 +128,13 @@ class CandleFreshnessGate:
 
         interval_seconds = interval_to_seconds(interval)
         if interval_seconds is None or interval_seconds <= 0:
-            # Cannot compute an interval-relative age. All hummingbot-supported
-            # intervals parse; warn once per unknown value and do not gate
-            # (gating forever on an operator typo would permanently zero the
-            # strategy with no stale data actually present).
+            # FAIL CLOSED (CDX-R01): an interval we cannot parse means an age
+            # bound we cannot compute. Every CandlesBase-supported interval
+            # parses, and the framework rejects unsupported intervals at feed
+            # construction (candles_base.py:60-64), so this cannot brick a
+            # legitimate live deployment.
             self._warn_unknown_interval(interval)
-            return FreshnessResult(True, "unknown_interval", None, None)
+            return FreshnessResult(False, "unknown_interval", None, None)
 
         max_age_seconds = bound_intervals * interval_seconds
         age_seconds = now_f - last_ts
@@ -165,7 +173,8 @@ class CandleFreshnessGate:
             self._unknown_interval_warned.add(key)
             self._logger.warning(
                 f"Candle freshness gate{f' [{self._context}]' if self._context else ''}: "
-                f"cannot parse interval {interval!r}; freshness gating is DISABLED for this feed.")
+                f"cannot parse interval {interval!r}; failing CLOSED -- candles for this feed "
+                f"are treated as stale (signal zeroed / data unavailable) until the interval is fixed.")
         except Exception:  # pragma: no cover
             pass
 

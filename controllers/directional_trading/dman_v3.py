@@ -45,7 +45,7 @@ class DManV3ControllerConfig(DirectionalTradingControllerConfigBase):
     # CDX-001 / CLA-405: interval-relative max age for the newest candle before the
     # signal is gated to 0. Per-market tunable; 0 disables (legacy behavior).
     stale_candle_max_age_intervals: float = Field(
-        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, ge=0,
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, gt=0,
         json_schema_extra={"is_updatable": True})
     # CLA-001: typed default. The old default was the raw string "0.015,0.005";
     # pydantic v2 does not run mode="before" validators on omitted fields, so an

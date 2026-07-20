@@ -63,7 +63,7 @@ class PMMDynamicControllerConfig(MarketMakingControllerConfigBase):
     # the controller stops publishing a reference price (nothing is quoted while
     # data is stale). Per-market tunable; 0 disables (legacy behavior).
     stale_candle_max_age_intervals: float = Field(
-        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, ge=0,
+        default=DEFAULT_STALE_CANDLE_MAX_AGE_INTERVALS, gt=0,
         json_schema_extra={"is_updatable": True})
 
     @field_validator("candles_connector", mode="before")

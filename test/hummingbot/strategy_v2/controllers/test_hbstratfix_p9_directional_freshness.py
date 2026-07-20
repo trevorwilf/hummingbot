@@ -113,12 +113,21 @@ class TestCandleFreshnessGateUnit(IsolatedAsyncioWrapperTestCase):
         ten_intervals_later = 10000.0 + 10 * 14400.0
         self.assertTrue(gate.check(df, "4h", ten_intervals_later, 48.0).fresh)
 
-    def test_zero_bound_disables_gate(self):
-        gate = CandleFreshnessGate()
-        ancient = make_candles([100.0] * 5, last_ts=0.0)
-        result = gate.check(ancient, "5m", 1e12, 0)
-        self.assertTrue(result.fresh)
-        self.assertEqual("disabled", result.reason)
+    def test_non_positive_or_non_finite_bound_fails_closed(self):
+        # Adjudicated CDX-R01: the gate is a live-money risk control -- a bound
+        # that cannot gate (0, negative, inf, nan, unparseable) must FAIL
+        # CLOSED, never silently restore the legacy length-only behavior.
+        # Sparse markets widen the bound; nothing disables the gate.
+        logger = MagicMock()
+        gate = CandleFreshnessGate(logger=logger)
+        now = 10000.0
+        # Brand-new bar: if the check fails it is the bound handling, not age.
+        fresh_df = make_candles([100.0] * 5, last_ts=now)
+        for bad_bound in (0, -1.0, float("inf"), float("nan"), None):
+            result = gate.check(fresh_df, "5m", now, bad_bound)
+            self.assertFalse(result.fresh, f"bound={bad_bound!r} must fail closed")
+            self.assertEqual("invalid_bound", result.reason)
+        self.assertGreaterEqual(logger.warning.call_count, 1)
 
     def test_empty_or_missing_data_is_stale(self):
         gate = CandleFreshnessGate()
@@ -129,15 +138,20 @@ class TestCandleFreshnessGateUnit(IsolatedAsyncioWrapperTestCase):
         bad_ts = pd.DataFrame({"timestamp": ["x", "y"], "close": [1.0, 2.0]})
         self.assertFalse(gate.check(bad_ts, "5m", 1000.0, 48.0).fresh)
 
-    def test_unknown_interval_does_not_brick(self):
-        # An unparseable interval cannot be gated interval-relatively; the gate
-        # must not permanently zero the strategy over an operator typo.
+    def test_unknown_interval_fails_closed(self):
+        # Adjudicated CDX-R01: an unparseable interval means an uncomputable
+        # age bound -- fail closed. This cannot brick a legitimate deployment:
+        # CandlesBase rejects unsupported intervals at feed construction, so a
+        # live feed's interval always parses.
         logger = MagicMock()
         gate = CandleFreshnessGate(logger=logger)
-        df = make_candles([100.0] * 5, last_ts=0.0)
+        df = make_candles([100.0] * 5, last_ts=1e12)  # newest possible bar
         result = gate.check(df, "weird", 1e12, 48.0)
-        self.assertTrue(result.fresh)
+        self.assertFalse(result.fresh)
         self.assertEqual("unknown_interval", result.reason)
+        logger.warning.assert_called_once()
+        # Warn once per unknown value, not every tick.
+        gate.check(df, "weird", 1e12 + 1.0, 48.0)
         logger.warning.assert_called_once()
 
     def test_stale_warning_is_rate_limited(self):
@@ -537,6 +551,27 @@ class TestIndicatorPeriodValidators(IsolatedAsyncioWrapperTestCase):
                     SuperTrendConfig, PMMDynamicControllerConfig):
             cls(**_base_kwargs())
 
+    def test_all_configs_reject_non_positive_stale_bound(self):
+        # Adjudicated CDX-R01: stale_candle_max_age_intervals is gt=0 in every
+        # wired config -- the freshness gate cannot be disabled from config.
+        # Sparse markets widen the bound instead of bypassing the control.
+        cases = [
+            (BollingerV1ControllerConfig, {}),
+            (BollingerV2ControllerConfig, {}),
+            (BollinGridControllerConfig, {}),
+            (MACDBBV1ControllerConfig, {}),
+            (SuperTrendConfig, {}),
+            (PMMDynamicControllerConfig, {}),
+            (DManV3ControllerConfig, {"dynamic_order_spread": False, "dynamic_target": False}),
+            (EMARegimeHoldV1Config, {}),
+            (MeanReversionBBRSIV1Config, {}),
+        ]
+        for cls, extra in cases:
+            for bad_bound in (0, -1.0):
+                with self.assertRaises(ValidationError,
+                                       msg=f"{cls.__name__} must reject bound={bad_bound}"):
+                    cls(**_base_kwargs(stale_candle_max_age_intervals=bad_bound, **extra))
+
 
 class TestMeanReversionRequiredRecords(IsolatedAsyncioWrapperTestCase):
     """CLA-2b-004: volume_filter_window participates in history sizing."""
@@ -675,6 +710,20 @@ class TestDCAValidation(IsolatedAsyncioWrapperTestCase):
     def test_dman_maker_rejects_negative_amount(self):
         with self.assertRaises(ValidationError):
             DManMakerV2Config(**_base_kwargs(dca_spreads="0.01,0.02", dca_amounts="1,-1"))
+
+    def test_dman_maker_rejects_non_positive_spread(self):
+        # Adjudicated CDX-R03: a negative spread inverts the maker price (a
+        # nominal BUY level prices ABOVE the reference -> marketable order);
+        # a zero spread collapses the level onto the reference. Cover the
+        # comma-string path (the common YAML form) and the list path.
+        with self.assertRaises(ValidationError):
+            DManMakerV2Config(**_base_kwargs(dca_spreads="0.01,-0.02", dca_amounts="1,1"))
+        with self.assertRaises(ValidationError):
+            DManMakerV2Config(**_base_kwargs(dca_spreads="0,0.02", dca_amounts="1,1"))
+        with self.assertRaises(ValidationError):
+            DManMakerV2Config(**_base_kwargs(
+                dca_spreads=[Decimal("0.01"), Decimal("-0.02")],
+                dca_amounts=[Decimal("1"), Decimal("1")]))
 
     def test_dman_maker_empty_amounts_yield_equal_weights(self):
         config = DManMakerV2Config(**_base_kwargs(dca_spreads="0.01,0.02", dca_amounts=""))
