@@ -724,12 +724,16 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     # instantly while the wallet snapshot lags one balance poll (up to ~120s on connectors
     # without push balances, e.g. Kraken). Treat that window like balance settling so the
     # over-claim re-anchor/warnings and the wallet-floor warning do not false-positive.
+    # hbpurse P3 (F21/A4): default raised 90 -> 150 so the grace exceeds the code's own
+    # documented ~120s poll lag. Kraken is poll-only (A4), so its false over-claim window
+    # lived here; a deployed yml that PINS 90 keeps 90 (an explicit value overrides this
+    # default -- no auto-change to existing deployments).
     fill_settle_grace_seconds: int = Field(
-        default=90,
+        default=150,
         json_schema_extra={
             "prompt": (
                 "Grace period (seconds) after a booked fill during which ledger/wallet "
-                "over-claim checks are deferred (default 90): "
+                "over-claim checks are deferred (default 150): "
             ),
             "prompt_on_new": False,
             "is_updatable": True,
@@ -859,6 +863,23 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             "prompt": (
                 "Re-seed generation counter -- bump this integer to re-arm a one-shot re-seed "
                 "with reseed_fund_from_wallet_once left True (default 0): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    # hbpurse P3 (F19): claim-plausibility floor for the one-shot re-seed. A re-seed claims from
+    # the CURRENT wallet; if the connector is mid-reconnect or a poll is stale the wallet reads
+    # low/zero and the claim would rebaseline the fund to that transient. Refuse (DEFER, token NOT
+    # consumed) when the computed seed_value_quote is zero or below this fraction of the target,
+    # so a stale read cannot silently shrink the managed fund. Fail-closed: the deferral warns and
+    # the operator re-arms (bump reseed_generation) or lowers this floor once the wallet is sane.
+    reseed_min_claim_fraction: Decimal = Field(
+        default=Decimal("0.5"),
+        json_schema_extra={
+            "prompt": (
+                "Minimum fraction of the re-seed target the wallet claim must reach before the "
+                "one-shot re-seed applies (default 0.5): "
             ),
             "prompt_on_new": False,
             "is_updatable": True,
@@ -1041,6 +1062,15 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     def validate_min_order_quote(cls, value: Decimal):
         if not value.is_finite() or value <= Decimal("0"):
             raise ValueError("min_order_quote must be a finite value greater than zero")
+        return value
+
+    @field_validator("reseed_min_claim_fraction")
+    @classmethod
+    def validate_reseed_min_claim_fraction(cls, value: Decimal):
+        # A fraction of the target: finite and within [0, 1]. 0 disables the plausibility floor
+        # (any positive claim applies); >1 would make every claim implausible (a permanent defer).
+        if not value.is_finite() or value < Decimal("0") or value > Decimal("1"):
+            raise ValueError("reseed_min_claim_fraction must be a finite value in [0, 1]")
         return value
 
     @field_validator("executor_refresh_time")
@@ -1645,9 +1675,13 @@ class RangeInventoryLadderController(ControllerBase):
         # (quote withheld so the exchange's notional + fee hold fits the budget).
         self._last_buy_fee_headroom_quote: Decimal = Decimal("0")
 
-        # Re-seed deferral latch: the "deferred while orders rest" warning/event fires once
-        # per reseed token, not per cycle.
+        # Re-seed deferral latches: each "deferred" warning/event fires once per reseed token,
+        # not per cycle. hbpurse P3 (F19) adds the freshness and plausibility deferral reasons;
+        # they are tracked SEPARATELY from the active-orders latch so a later reason still warns
+        # on the same token (a shared latch would swallow the second warning).
         self._reseed_deferred_warned_token: Optional[str] = None
+        self._reseed_deferred_unsettled_token: Optional[str] = None
+        self._reseed_deferred_implausible_token: Optional[str] = None
 
         # Ledger-understatement diagnostic (the inverse of the over-claim): timestamp the
         # wallet-over-ledger surplus first exceeded the threshold, plus its own warning
@@ -2306,6 +2340,15 @@ class RangeInventoryLadderController(ControllerBase):
             parsed = _safe_decimal(validated.get(offset_key), f"state field '{offset_key}'", default="0")
             if parsed < Decimal("0"):
                 raise ValueError(f"State field '{offset_key}' must be non-negative")
+        # hbpurse P3 (F11): the optional init-time hold keys follow the SAME discipline -- MISSING is
+        # fine (a pre-P3 state file loads), a PRESENT corrupt/negative value quarantines. Do NOT
+        # materialize defaults (a clean file must round-trip byte-identically).
+        for hold_key in ("init_unavailable_quote", "init_unavailable_base"):
+            if validated.get(hold_key) is None:
+                continue
+            parsed = _safe_decimal(validated.get(hold_key), f"state field '{hold_key}'", default="0")
+            if parsed < Decimal("0"):
+                raise ValueError(f"State field '{hold_key}' must be non-negative")
         # CDX-R03: an offset timestamp is a CREATION time -- never negative, never in the future. A
         # far-future ts makes `now - ts` negative, so the expiry test `(now - ts) >= expiry` never
         # fires and the credit becomes IMMORTAL, absorbing genuine future debits and over-stating
@@ -2632,6 +2675,17 @@ class RangeInventoryLadderController(ControllerBase):
         self._initialization_blocked_reason = None
         self._initialization_blocked_logged = False
 
+        # hbpurse P3 (F11 / A6): do NOT flip allow_initialize_with_unavailable_wallet_funds. When
+        # init proceeds WITH unavailable (exchange-held) wallet funds, persist the held amounts as
+        # OPTIONAL v10 state keys and emit an event, so a later hold-release is classifiable
+        # (P4's opening epoch records them) instead of being mis-read as a deposit that inflates
+        # the fund. Reaching here with holds present implies allow_...=true (the block above already
+        # refused init otherwise), but the flag is checked explicitly so the intent is self-evident.
+        record_init_holds = bool(self.config.allow_initialize_with_unavailable_wallet_funds) and (
+            unavailable_quote_balance > self.INITIALIZATION_UNAVAILABLE_BALANCE_TOLERANCE
+            or unavailable_base_balance > self.INITIALIZATION_UNAVAILABLE_BALANCE_TOLERANCE
+        )
+
         # Seed claim (one-time, first init only). The base sleeve is carved OUT of
         # total_amount_quote -- it is a SUBSET, not additive (see _compute_seed_claim).
         (managed_quote_claim, claimed_base_amount, base_seed_value,
@@ -2666,6 +2720,12 @@ class RangeInventoryLadderController(ControllerBase):
             "seed_value_quote": str(seed_value_quote),
             "tracked_fill_executor_ids": [],
         }
+        # hbpurse P3 (F11): persist the init-time exchange-held amounts as OPTIONAL v10 keys so the
+        # later hold-release is classifiable. Absent when there are no material holds (a clean init
+        # round-trips byte-identically -- the keys are never materialized to defaults).
+        if record_init_holds:
+            initial_state["init_unavailable_quote"] = str(unavailable_quote_balance)
+            initial_state["init_unavailable_base"] = str(unavailable_base_balance)
         # hbpurse P2 (CDX-M01 / CDX-R01): first-init CREATES every authoritative money field, so it
         # obeys the SAME commit-before-adopt discipline as booking/reseed/re-anchor. Build the
         # initial state as a CANDIDATE and adopt it into self._state ONLY after a durable save. If
@@ -2724,6 +2784,23 @@ class RangeInventoryLadderController(ControllerBase):
             schema_version=str(self.STATE_SCHEMA_VERSION),
             seed_value_quote=str(seed_value_quote),
         )
+
+        # hbpurse P3 (F11): init proceeded with material exchange-held (unavailable) wallet funds.
+        # Emit the recorded holds so the later release is classifiable and never mis-read as a
+        # deposit. The config default is UNCHANGED (A6) -- this only observes and records.
+        if record_init_holds:
+            self._emit_structured(
+                "range_ladder_init_unavailable_holds_recorded",
+                connector=self.config.connector_name,
+                trading_pair=self.config.trading_pair,
+                init_unavailable_quote=str(unavailable_quote_balance),
+                init_unavailable_base=str(unavailable_base_balance),
+                available_quote=str(available_quote_balance),
+                total_quote=str(total_quote_balance),
+                available_base=str(available_base_balance),
+                total_base=str(total_base_balance),
+                tolerance=str(self.INITIALIZATION_UNAVAILABLE_BALANCE_TOLERANCE),
+            )
 
         # Diagnostics: surface a side that starts essentially unfunded so that
         # "no buys" / "no sells" is never a silent mystery. A side is unfunded when
@@ -2828,21 +2905,33 @@ class RangeInventoryLadderController(ControllerBase):
         except (ValueError, TypeError, InvalidOperation):
             return None
 
-    def _order_fee_breakdown(self, order, info: Dict, quote_asset: str, base_asset: str, exec_quote: Decimal):
+    def _order_fee_breakdown(self, order, info: Dict, quote_asset: str, base_asset: str,
+                             exec_quote: Decimal, order_price: Decimal = Decimal("0")):
         """Cumulative fee for an order, source-robust. Returns (fee_in_quote, alt_fees) where
-        alt_fees maps any NON-quote fee asset -> cumulative amount (recorded for visibility but
-        NOT folded into the two-asset ledger -- see the alternateFeeAsset edge case).
+        alt_fees maps any NON-quote fee asset -> cumulative NATIVE amount (recorded for visibility).
 
-        Preference: per-fill TradeUpdate fee tokens (NonKYC: quote-denominated flat fees) ->
+        Preference: per-fill TradeUpdate fee tokens (NonKYC: quote-denominated flat fees; a
+        base-denominated fee is valued at order_price and folded in -- hbpurse P3/F6) ->
         connector cumulative_fee_paid(quote) -> property-style cumulative fee ->
-        custom_info.cum_fees_quote -> fee_rate fallback (NOT 0; NonKYC orders carry no fee).
+        custom_info.cum_fees_quote -> fee_rate percent estimate.
+
+        hbpurse P3 (F6): when an order HAS fills but no recognized quote/base fee is present, the
+        fee is UNKNOWN (fee_in_quote stays None) so the fallback chain -- ending in the fee_rate
+        percent estimate -- runs. The prior code pinned fee_in_quote=0 the moment order_fills was
+        non-empty, which blocked every fallback and understated fees (earnings overstated). Live
+        NonKYC carries a flat QUOTE fee on every fill, so recognized_fee>0 there and this path is
+        byte-identical; the estimate fires only when a recognized quote/base fee is genuinely
+        absent (base-only or third-asset-only fees, or a fee not yet reported for the fill).
         """
         alt_fees: Dict[str, Decimal] = {}
         fee_in_quote: Optional[Decimal] = None
+        quote_fee_from_fills = Decimal("0")
+        base_fee_native = Decimal("0")
+        saw_fills = False
 
         order_fills = getattr(order, "order_fills", None) if order is not None else None
         if isinstance(order_fills, dict) and order_fills:
-            fee_in_quote = Decimal("0")
+            saw_fills = True
             for trade_update in order_fills.values():
                 fee_obj = getattr(trade_update, "fee", None)
                 flat_fees = getattr(fee_obj, "flat_fees", None) or []
@@ -2852,11 +2941,27 @@ class RangeInventoryLadderController(ControllerBase):
                     if amount <= Decimal("0"):
                         continue
                     if token == quote_asset:
-                        fee_in_quote += amount
+                        quote_fee_from_fills += amount
                     else:
-                        # Fee charged in the base asset or a third asset: it must NOT be
-                        # subtracted from owned_quote. Record it for visibility only.
+                        # Non-quote fee: record the NATIVE amount for visibility. A base-asset fee
+                        # is additionally valued into quote (below) and IS a recognized cost; a
+                        # third asset cannot be valued from this pair, so it stays alt_fees-only.
                         alt_fees[str(token)] = alt_fees.get(str(token), Decimal("0")) + amount
+                        if token == base_asset:
+                            base_fee_native += amount
+
+        # hbpurse P3 (F6): a base-denominated fee is a real cost -- value it at the order price and
+        # fold it into the recognized quote fee (alt_fees keeps the native amount informational).
+        base_fee_in_quote = Decimal("0")
+        if base_fee_native > Decimal("0") and order_price > Decimal("0"):
+            base_fee_in_quote = base_fee_native * order_price
+
+        recognized_fee = quote_fee_from_fills + base_fee_in_quote
+        if saw_fills and recognized_fee > Decimal("0"):
+            # Fills carried a usable (quote and/or base-valued) fee -> authoritative; no fallback.
+            fee_in_quote = recognized_fee
+        # else: no fills, OR fills with NO recognized quote/base fee -> leave fee_in_quote None so
+        # the fallback chain below (ending in the fee_rate percent estimate) runs.
 
         if fee_in_quote is None and order is not None:
             method = getattr(order, "cumulative_fee_paid", None)
@@ -2915,7 +3020,9 @@ class RangeInventoryLadderController(ControllerBase):
             exec_quote = exec_base * order_price
         exec_quote = max(Decimal("0"), exec_quote)
 
-        exec_fees, alt_fees = self._order_fee_breakdown(order, info, quote_asset, base_asset, exec_quote)
+        exec_fees, alt_fees = self._order_fee_breakdown(
+            order, info, quote_asset, base_asset, exec_quote, order_price
+        )
         return exec_base, exec_quote, exec_fees, alt_fees
 
     # (amount state key, creation-timestamp state key) per asset -- quote first, base second.
@@ -3124,8 +3231,11 @@ class RangeInventoryLadderController(ControllerBase):
             d_quote = max(Decimal("0"), exec_quote - booked_quote)
             d_fees = max(Decimal("0"), exec_fees - booked_fees)
 
-            if d_base <= Decimal("0") and d_quote <= Decimal("0"):
+            if d_base <= Decimal("0") and d_quote <= Decimal("0") and d_fees <= Decimal("0"):
                 continue  # nothing new for this order
+            # hbpurse P3 (F6): a fee-only delta (d_fees>0, d_base==d_quote==0) reaches here and
+            # BOOKS the fee debit below instead of early-continuing -- a late-reported fee on an
+            # already-booked fill must still reduce the fund.
 
             offset_quote_consumed = Decimal("0")
             offset_base_consumed = Decimal("0")
@@ -3152,8 +3262,36 @@ class RangeInventoryLadderController(ControllerBase):
             else:
                 continue  # unknown side -- do not book
 
+            # hbpurse P3 (F20): surface a non-dust clamp truncation in LEGACY budgeting
+            # (ledger_funded_budgets=False), where owned_* is NOT the budget source, so a
+            # max(0, ...) here can silently swallow a reserve/deposit spend that drove owned_*
+            # negative (deposit-as-profit). Behavior is UNCHANGED (still clamp to zero); only a
+            # diagnostic event is added, and only in legacy mode -- the live default
+            # ledger_funded_budgets=True never emits it. Dust threshold is min_order_quote (a
+            # truncation below the minimum tradeable notional is accounting noise, not absorption).
+            pre_clamp_quote = owned_quote
+            pre_clamp_base = owned_base
             owned_quote = max(Decimal("0"), owned_quote)
             owned_base = max(Decimal("0"), owned_base)
+            if not self.config.ledger_funded_budgets:
+                dust_quote = max(Decimal("0"), self.config.min_order_quote)
+                exec_price = self._d(getattr(executor.config, "price", "0") or "0")
+                truncated_quote = (owned_quote - pre_clamp_quote) if pre_clamp_quote < Decimal("0") else Decimal("0")
+                truncated_base = (owned_base - pre_clamp_base) if pre_clamp_base < Decimal("0") else Decimal("0")
+                truncated_base_value = truncated_base * exec_price if exec_price > Decimal("0") else Decimal("0")
+                if truncated_quote > dust_quote or truncated_base_value > dust_quote:
+                    self._emit_structured(
+                        "range_ladder_legacy_clamp_truncation",
+                        executor_id=eid,
+                        side=(side.name if side is not None else ""),
+                        pre_clamp_owned_quote=str(pre_clamp_quote),
+                        pre_clamp_owned_base=str(pre_clamp_base),
+                        truncated_quote=str(truncated_quote),
+                        truncated_base=str(truncated_base),
+                        truncated_base_value_quote=str(truncated_base_value),
+                        reference_price=str(exec_price),
+                        min_order_quote=str(dust_quote),
+                    )
             progress[eid] = {"base": str(exec_base), "quote": str(exec_quote), "fees": str(exec_fees)}
             changed = True
 
@@ -3423,6 +3561,31 @@ class RangeInventoryLadderController(ControllerBase):
                 )
             return
 
+        # hbpurse P3 (F19): claim only from a FRESH wallet snapshot. Defer (token NOT consumed)
+        # while the connector is still warming up, while a post-fill/post-reconnect balance sync
+        # is in flight, or within the settle-grace window of a booked fill -- in any of those the
+        # cached wallet can read transiently low and the claim would rebaseline the fund to that
+        # transient. This runs BEFORE booking each cycle, so _within_fill_settle_grace reflects a
+        # PRIOR cycle's fill.
+        now = self.market_data_provider.time()
+        if (not self._connector_ready()) or self._is_balance_settling() or self._within_fill_settle_grace(now):
+            if self._reseed_deferred_unsettled_token != reseed_token:
+                self._reseed_deferred_unsettled_token = reseed_token
+                self.logger().warning(
+                    f"{self.config.id}: re-seed (token={reseed_token}) deferred: the wallet "
+                    "snapshot is not settled (connector warming up, a balance sync is in flight, "
+                    "or a fill just booked). The re-seed applies automatically on the first cycle "
+                    "with a fresh wallet; the token is NOT consumed."
+                )
+                self._emit_structured(
+                    "range_ladder_reseed_deferred_unsettled",
+                    reseed_token=reseed_token,
+                    connector_ready=self._connector_ready(),
+                    balance_settling=self._is_balance_settling(),
+                    within_fill_settle_grace=self._within_fill_settle_grace(now),
+                )
+            return
+
         base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
         total_quote_balance = self._safe_get_balance(quote_asset)
         total_base_balance = self._safe_get_balance(base_asset)
@@ -3436,6 +3599,34 @@ class RangeInventoryLadderController(ControllerBase):
             available_base_balance=available_base_balance,
             target_quote=target_quote,
         )
+
+        # hbpurse P3 (F19): plausibility floor. A zero or implausibly-small claim means the wallet
+        # read is not trustworthy (stale/zero balances, mid-reconnect) -- rebaselining owned_* to it
+        # would shrink the managed fund on a transient. DEFER (token NOT consumed) so the re-seed
+        # retries when the wallet is sane; the operator path out is to fix the balances, lower
+        # reseed_min_claim_fraction, or re-arm with a fresh reseed_generation.
+        min_claim_fraction = max(Decimal("0"), self._d(self.config.reseed_min_claim_fraction, "0.5"))
+        min_claim_quote = target_quote * min_claim_fraction
+        if seed_value_quote <= Decimal("0") or seed_value_quote < min_claim_quote:
+            if self._reseed_deferred_implausible_token != reseed_token:
+                self._reseed_deferred_implausible_token = reseed_token
+                self.logger().warning(
+                    f"{self.config.id}: re-seed (token={reseed_token}) deferred: the wallet claim "
+                    f"seed_value_quote={seed_value_quote} is zero or below "
+                    f"{min_claim_fraction} x target_quote={target_quote} (floor {min_claim_quote}). "
+                    "The token is NOT consumed; fix the wallet balances, lower "
+                    "reseed_min_claim_fraction, or bump reseed_generation to re-arm."
+                )
+                self._emit_structured(
+                    "range_ladder_reseed_deferred_implausible_claim",
+                    reseed_token=reseed_token,
+                    seed_value_quote=str(seed_value_quote),
+                    target_quote=str(target_quote),
+                    min_claim_fraction=str(min_claim_fraction),
+                    min_claim_quote=str(min_claim_quote),
+                    claim_source=claim_source,
+                )
+            return
 
         old_owned_quote = self._d(self._state.get("owned_quote"), "0")
         old_owned_base = self._d(self._state.get("owned_base"), "0")
@@ -4690,6 +4881,19 @@ class RangeInventoryLadderController(ControllerBase):
             return getattr(connector, "is_balance_settling", False) is True
         except Exception:
             return False
+
+    def _connector_ready(self) -> bool:
+        """hbpurse P3 (F19): True unless the connector EXPLICITLY reports not-ready. A re-seed
+        claims from the live wallet, so a connector still warming up (books/balances not yet
+        synced) must not seed the fund from a transient read. Fail-closed: an unreachable
+        connector reads NOT ready (defer). A connector that does not expose ``.ready`` (or a test
+        MagicMock, whose auto-attribute is never the literal ``False``) reads ready -- the
+        plausibility floor (reseed_min_claim_fraction) remains the substantive guard there."""
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+        except Exception:
+            return False
+        return getattr(connector, "ready", True) is not False
 
     def _external_order_holds(self) -> Tuple[Decimal, Decimal]:
         """LOG-2' (CSF-V1 Phase 5): (quote_hold, base_hold) locked in untracked (manual /

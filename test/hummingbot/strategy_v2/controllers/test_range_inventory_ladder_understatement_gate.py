@@ -62,18 +62,18 @@ class TestUnderstatementGrowthGate(_GateHarness):
         self.assertEqual(D("11.18"), ctrl._understatement_baseline)
 
         # Phase 2: a fill books, then the surplus grows by +2.0 (a missed-fill pattern).
-        # The evaluation cycle runs past the 90s fill-settle grace, which defers all
-        # ledger/wallet checks right after a booked fill.
+        # The evaluation cycle runs past the 150s fill-settle grace (hbpurse P3/F21), which
+        # defers all ledger/wallet checks right after a booked fill.
         t_fill = 1000.0 + 100 * 60.0
         ctrl._last_fill_booked_ts = t_fill
         balances["USDT"] = (D("113.18"), D("113.18"))
-        self._cycle(ctrl, mdp, t_fill + 120.0)
+        self._cycle(ctrl, mdp, t_fill + 180.0)
         self.assertEqual(2, len(catcher.records))
         self.assertEqual(D("13.18"), ctrl._understatement_baseline)
 
         # Phase 3: flat at the new level for 100 more cycles -> silence.
         for i in range(100):
-            self._cycle(ctrl, mdp, t_fill + 180.0 + i * 60.0)
+            self._cycle(ctrl, mdp, t_fill + 240.0 + i * 60.0)
         self.assertEqual(2, len(catcher.records))
 
         # The warnings map 1:1 onto warn_kind-carrying events.
@@ -128,7 +128,8 @@ class TestUnderstatementGrowthGate(_GateHarness):
         self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 60.0)
         self.assertEqual(1, len(catcher.records))
         balances["USDT"] = (D("117.18"), D("117.18"))      # +6.0 > 5
-        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 120.0)
+        # hbpurse P3 (F21): grace is now 150s; evaluate past it (fill was at PERSIST_S+30).
+        self._cycle(ctrl, mdp, 1000.0 + PERSIST_S + 200.0)
         self.assertEqual(2, len(catcher.records))
 
     def test_flat_surplus_keeps_reduced_cadence_jsonl_visibility(self):
