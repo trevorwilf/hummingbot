@@ -190,6 +190,9 @@ class TestPostRefreshSettle(unittest.TestCase):
         controller._market_data_hard_pause = False
         controller._session_expired = False
         controller._accounting_degraded = False  # hbpurse P2: healthy ledger (not IO-degraded)
+        controller._purse_degraded = False       # hbpurse P4: healthy purse journal
+        controller._purse_degraded_reason = ""
+        controller._purse = MagicMock(loaded=True)  # hbpurse P4 (CDX-R01): journal adopted
         controller._state_io_failures = 0
         controller._config_rebuild_pending = False
         controller._refresh_quiet_until = 2_000.0  # future

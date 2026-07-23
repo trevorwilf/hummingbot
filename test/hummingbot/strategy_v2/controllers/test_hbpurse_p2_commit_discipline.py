@@ -209,7 +209,11 @@ class TestBookingCommitDiscipline(_Harness):
 
     def test_booking_save_failure_leaves_inmemory_prior_then_retries_once(self):
         ctrl, mdp, _ = self._buy_fill_ctrl()
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # hbpurse P4 (CDX-R04): "the writer is down for cycle 1" now means TWO failed writes --
+        # #1 the booking commit, #2 the end-of-cycle purse-marker backstop retry (which must
+        # keep retrying while degraded, so it also attempts and also fails). Cycle 2's booking
+        # retry is write #3; the bridge marker piggybacks on that successful commit.
+        self._install_flaky_writer(ctrl, fail_on_calls={1, 2})
 
         # Cycle 1: the booking save fails. In-memory ledger MUST stay at its PRIOR value.
         self._cycle(ctrl, mdp, 1000.0)
@@ -219,8 +223,8 @@ class TestBookingCommitDiscipline(_Harness):
         self.assertEqual(ctrl._state.get("booked_fill_progress", {}), {})
         self.assertFalse(self._state_path.exists())
         self.assertTrue(ctrl._accounting_degraded)
-        self.assertEqual(ctrl._state_io_failures, 1)
-        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_commit_failed")))
+        self.assertEqual(ctrl._state_io_failures, 2)   # booking commit + marker backstop retry
+        self.assertEqual(2, len(self._emit_events(ctrl, "range_ladder_state_commit_failed")))
         # The unpersisted fill must NOT drive the refresh machine (existing orders untouched):
         # the per-cycle booked-fill flags are rolled back on a failed commit.
         self.assertFalse(ctrl._booked_buy_fill_this_cycle)
@@ -234,7 +238,7 @@ class TestBookingCommitDiscipline(_Harness):
         self.assertEqual(D(self._persisted()["owned_base"]), D("0.1"))
         # Recovered: degraded cleared, exactly one recovery event, failure count did not grow.
         self.assertFalse(ctrl._accounting_degraded)
-        self.assertEqual(ctrl._state_io_failures, 1)
+        self.assertEqual(ctrl._state_io_failures, 2)
         self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_accounting_degraded_cleared")))
 
     def test_failed_booking_does_not_dirty_opposite_side(self):
@@ -252,7 +256,8 @@ class TestBookingCommitDiscipline(_Harness):
         )]
         ctrl._refresh_timers_initialized = True   # past the initial-placement dirtying
         ctrl._last_global_refresh_ts = 1000.0
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # CDX-R04: writer down for the whole cycle = booking commit (#1) AND marker retry (#2).
+        self._install_flaky_writer(ctrl, fail_on_calls={1, 2})
 
         self._cycle(ctrl, mdp, 1000.0)   # booking save fails
         self.assertTrue(ctrl._accounting_degraded)
@@ -263,7 +268,8 @@ class TestBookingCommitDiscipline(_Harness):
         # After recovery the fill must not be booked a SECOND time on a later idle cycle: the
         # persisted progress baseline makes d_base/d_quote zero, so owned_* stay at 70/0.1.
         ctrl, mdp, _ = self._buy_fill_ctrl()
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # CDX-R04: writer down for the whole cycle = booking commit (#1) AND marker retry (#2).
+        self._install_flaky_writer(ctrl, fail_on_calls={1, 2})
         self._cycle(ctrl, mdp, 1000.0)   # fail
         # CDX-R05 discriminator: the FAILED cycle must NOT have advanced the in-memory ledger, and
         # nothing may be on disk. Reverting _commit_state to mutate-then-save (self._state =
@@ -297,7 +303,8 @@ class TestReseedCommitDiscipline(_Harness):
 
     def test_reseed_save_failure_does_not_consume_token(self):
         ctrl, mdp, _ = self._reseed_ctrl()
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # CDX-R04: writer down for the whole cycle = reseed commit (#1) AND marker retry (#2).
+        self._install_flaky_writer(ctrl, fail_on_calls={1, 2})
 
         # Cycle 1: reseed save fails -> token NOT consumed, owned_* NOT rebaselined.
         self._cycle(ctrl, mdp, 1000.0)
@@ -325,7 +332,12 @@ class TestReanchorCommitDiscipline(_Harness):
         ctrl = self._build(mdp, ledger_overclaim_reanchor_seconds=10)
         self._init_state(ctrl, owned_quote=600, owned_base=0, seed_value=600,
                          reserve_quote="400")
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # hbpurse P4: the first cycle is quiet (the over-claim grace is only arming), so the
+        # one-time purse-bootstrap `purse_initialized` marker commits at end-of-cycle as state
+        # write #1. The re-anchor commit under test is therefore write #2 now. The
+        # discriminating assertions are unchanged: the FAILED re-anchor save must leave owned_*
+        # at their prior values, append no reanchor_events, and emit no reanchored event.
+        self._install_flaky_writer(ctrl, fail_on_calls={2})
 
         self._cycle(ctrl, mdp, 1000.0)   # over-claim observed, grace arms (no save)
         self._cycle(ctrl, mdp, 1020.0)   # 20s > 10s grace -> cut attempt, save FAILS
@@ -382,7 +394,8 @@ class TestAccountingDegradedGate(_Harness):
         ctrl.executors_info = [_filling_executor(
             "buy_300", TradeType.BUY, 300, "late-buy", filled_base="0.1", filled_quote="30",
         )]
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # CDX-R04: writer down for the whole cycle = booking commit (#1) AND marker retry (#2).
+        self._install_flaky_writer(ctrl, fail_on_calls={1, 2})
 
         self._cycle(ctrl, mdp, 1000.0)     # booking save fails -> degraded
         self.assertTrue(ctrl._accounting_degraded)
