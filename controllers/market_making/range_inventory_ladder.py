@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from pydantic import Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from controllers._shared.purse_ledger import PurseError, PurseLedger, purse_path_for_state
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
 from hummingbot.logger.structured_event_logger import get_structured_logger
@@ -886,6 +887,47 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
 
+    # hbpurse P4 (F1 / A6): operator-declared PURSE OPENING BASIS, consumed ONLY by the one-shot
+    # purse-journal bootstrap. When purse_opening_contributed_quote is set, the bootstrap opening
+    # epoch records the declared contributed/earned figures with
+    # opening_basis_quality="reconstructed"; when unset, the bootstrap records the CURRENT equity
+    # as contributed (earned 0) with opening_basis_quality="current_equity_only" -- pre-purse
+    # history must never be fabricated. Edits AFTER the bootstrap are ignored with a warning
+    # (the journal is the permanent record). Defaults reproduce current behavior for every
+    # deployed yml (no field -> current_equity_only bootstrap).
+    purse_opening_contributed_quote: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Operator-declared inception 'contributed' figure (quote) recorded by the one-shot "
+            "purse bootstrap with opening_basis_quality='reconstructed'. Blank = record current "
+            "equity as contributed (opening_basis_quality='current_equity_only')."
+        ),
+        json_schema_extra={
+            "prompt": "Declared inception contributed quote for the purse bootstrap (blank = current equity): ",
+            "prompt_on_new": False,
+        },
+    )
+    purse_opening_earned_quote: Optional[Decimal] = Field(
+        default=None,
+        description=(
+            "Operator-declared inception 'earned to date' figure (quote, may be negative) for "
+            "the purse bootstrap. Only honored together with purse_opening_contributed_quote; "
+            "blank defaults to 0."
+        ),
+        json_schema_extra={
+            "prompt": "Declared inception earned quote for the purse bootstrap (blank = 0): ",
+            "prompt_on_new": False,
+        },
+    )
+    purse_opening_note: Optional[str] = Field(
+        default=None,
+        description="Free-form operator note recorded on the purse bootstrap opening epoch.",
+        json_schema_extra={
+            "prompt": "Optional note for the purse bootstrap opening epoch: ",
+            "prompt_on_new": False,
+        },
+    )
+
     @field_validator("buy_prices", "sell_prices", mode="before")
     @classmethod
     def parse_price_lists(cls, value, validation_info: ValidationInfo):
@@ -942,6 +984,37 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             if value == "":
                 return None
         return _safe_decimal(value, "reseed_fund_target_quote")
+
+    @field_validator("purse_opening_contributed_quote", "purse_opening_earned_quote", mode="before")
+    @classmethod
+    def parse_optional_purse_opening_decimals(cls, value, validation_info: ValidationInfo):
+        # Blank / unset -> None (undeclared -> current_equity_only bootstrap).
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+        return _safe_decimal(value, validation_info.field_name)
+
+    @field_validator("purse_opening_contributed_quote")
+    @classmethod
+    def validate_purse_opening_contributed_quote(cls, value):
+        # Contributed is a sum of money put in -- never negative. (Earned may be negative.)
+        if value is not None and value < Decimal("0"):
+            raise ValueError("purse_opening_contributed_quote cannot be negative")
+        return value
+
+    @field_validator("purse_opening_note", mode="before")
+    @classmethod
+    def parse_optional_purse_opening_note(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+        return str(value)
 
     @field_validator("understatement_growth_threshold_quote", mode="before")
     @classmethod
@@ -1565,6 +1638,24 @@ class RangeInventoryLadderController(ControllerBase):
         self._accounting_degraded: bool = False
         self._state_io_failures: int = 0
 
+        # hbpurse P4: the append-only purse journal (contract v1). The journal is adopted or
+        # bootstrapped by _ensure_purse each cycle; ANY load/save failure fails CLOSED via
+        # _purse_degraded (its own flag -- a successful STATE commit must not clear a purse
+        # failure), which suppresses new-order proposals exactly like _accounting_degraded.
+        # While the journal is un-adoptable, booked rollup deltas and re-anchor records are
+        # RETAINED in the pending buffers below and drained on recovery (contract: the pending
+        # journal delta is retained in memory and retried every cycle; a crash in that window
+        # is surfaced later by checkpoint reconciliation as drift, never fabricated away).
+        self._purse: Optional[PurseLedger] = None
+        self._purse_degraded: bool = False
+        self._purse_degraded_reason: str = ""
+        self._purse_degraded_logged: bool = False
+        self._purse_pending_records: List[tuple] = []
+        self._purse_pending_rollup: Optional[Dict[str, Any]] = None
+        self._purse_declaration_ignored_warned: bool = False
+        self._purse_last_ref_price: Decimal = Decimal("0")
+        self._reseed_deferred_purse_token: Optional[str] = None
+
         self._config_rebuild_pending: bool = False
         self._config_rebuild_reason: str = ""
         self._pending_runtime_config_signature: Optional[tuple] = None
@@ -1790,6 +1881,14 @@ class RangeInventoryLadderController(ControllerBase):
             except OSError:
                 self._state_path_abs = self.state_path.absolute()
         return self._state_path_abs
+
+    @property
+    def purse_path(self) -> Path:
+        """hbpurse P4 (contract v1): the purse journal lives NEXT TO the state file --
+        `<state_stem>.purse.json` -- so it inherits state_path's containment assertion and
+        survives the state-file quarantine rename untouched (F2/F3: the quarantine only ever
+        moves state_path itself)."""
+        return purse_path_for_state(self.state_path)
 
     @property
     def diagnostic_log_path(self) -> Path:
@@ -2367,6 +2466,17 @@ class RangeInventoryLadderController(ControllerBase):
                     f"State field '{offset_ts_key}' {parsed_ts} is unreasonably far in the future"
                 )
 
+        # hbpurse P4: the OPTIONAL v10 bridge marker `purse_initialized` (no schema bump).
+        # MISSING is a valid absence (pre-purse file loads untouched); a PRESENT value must be a
+        # strict bool -- anything else is corruption and trips the quarantine like the money
+        # fields (the marker gates the fail-closed missing-purse abort, so a mangled value must
+        # never load as accidentally-truthy or -falsy).
+        if "purse_initialized" in validated and not isinstance(validated.get("purse_initialized"), bool):
+            raise ValueError(
+                f"State field 'purse_initialized' must be a boolean, got "
+                f"{validated.get('purse_initialized')!r}"
+            )
+
         validated["schema_version"] = self.STATE_SCHEMA_VERSION
         if schema_version != self.STATE_SCHEMA_VERSION:
             validated["migrated_from_schema_version"] = schema_version
@@ -2517,6 +2627,13 @@ class RangeInventoryLadderController(ControllerBase):
         commit clears accounting_degraded. Returns True on a durable commit, False otherwise."""
         candidate = dict(self._state)
         candidate.update(mutations)
+        # hbpurse P4: once the purse journal is durably on disk, the bridge marker
+        # `purse_initialized: true` rides EVERY state commit until it lands (piggyback -- no
+        # extra write). _purse_marker_due() is False until the journal content is clean on
+        # disk, so a crash can never leave a marker pointing at a journal that was never
+        # written (which would trip the fail-closed missing-purse abort forever).
+        if self._purse_marker_due() and "purse_initialized" not in candidate:
+            candidate["purse_initialized"] = True
         try:
             self._write_state_to_disk(candidate)
         except Exception as exc:
@@ -2552,6 +2669,454 @@ class RangeInventoryLadderController(ControllerBase):
             )
         return True
 
+    # ------------------------------------------------------------------ #
+    # hbpurse P4 -- purse journal wiring (contract v1)
+    # ------------------------------------------------------------------ #
+
+    def _purse_marker_due(self) -> bool:
+        """True when the OPTIONAL v10 bridge marker `purse_initialized: true` should be
+        committed: the journal content is durably ON DISK (loaded and not dirty) and the
+        initialized state does not carry the marker yet. Gating on `not dirty` is load-bearing:
+        a marker committed ahead of the journal bytes would, after a crash, trip the
+        fail-closed missing-purse abort against a journal that never existed."""
+        purse = self._purse
+        return (
+            purse is not None
+            and purse.loaded
+            and not purse.dirty
+            and bool(self._state.get("initialized"))
+            and self._state.get("purse_initialized") is not True
+        )
+
+    def _finalize_purse_marker(self) -> None:
+        """End-of-cycle backstop for the bridge marker: normally it piggybacks on the next
+        money commit (no extra write); on a quiet cycle with a due marker, commit it directly.
+        Skipped while degraded -- a degraded cycle must not spend writes on the marker (the
+        piggyback lands it with the first recovered commit)."""
+        if self._accounting_degraded or self._purse_degraded:
+            return
+        if self._purse_marker_due():
+            self._commit_state({"purse_initialized": True}, reason="purse_bootstrap_marker")
+
+    @staticmethod
+    def _note_init_stamp(note) -> Optional[str]:
+        """Extract the `init_ts=<initialized_timestamp>` stamp every opening-epoch note starts
+        with. The stamp ties an opening epoch to ONE state incarnation, which is what makes the
+        bootstrap idempotent across a crash between the purse save and the marker commit
+        (matching stamp -> just re-arm the marker; mismatch -> a genuinely new incarnation ->
+        append a re-init epoch)."""
+        if not isinstance(note, str) or not note.startswith("init_ts="):
+            return None
+        return note.split(";", 1)[0][len("init_ts="):].strip()
+
+    def _build_opening_epoch_fields(self, *, reference_price: Decimal, contributed: Decimal,
+                                    earned: Decimal, quality: str, predecessor: Optional[str],
+                                    note_suffix: Optional[str]) -> Dict[str, Any]:
+        """Contract v1 `opening_epoch` fields from the CURRENT state and wallet. The
+        unavailable_* fields prefer the P3 init-hold keys (the holds recorded AT init, F11);
+        a pre-P3 state falls back to the current wallet total-minus-available."""
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        total_quote = self._safe_get_balance(quote_asset)
+        total_base = self._safe_get_balance(base_asset)
+        available_quote = self._safe_get_available_balance(quote_asset)
+        available_base = self._safe_get_available_balance(base_asset)
+        if self._state.get("init_unavailable_quote") is not None or \
+                self._state.get("init_unavailable_base") is not None:
+            unavailable_quote = self._d(self._state.get("init_unavailable_quote"), "0")
+            unavailable_base = self._d(self._state.get("init_unavailable_base"), "0")
+        else:
+            unavailable_quote = max(Decimal("0"), total_quote - available_quote)
+            unavailable_base = max(Decimal("0"), total_base - available_base)
+        note = f"init_ts={self._state.get('initialized_timestamp')}"
+        if note_suffix:
+            note = f"{note}; {note_suffix}"
+        return {
+            "owned_quote": str(self._d(self._state.get("owned_quote"), "0")),
+            "owned_base": str(self._d(self._state.get("owned_base"), "0")),
+            "seed_value_quote": str(self._d(self._state.get("seed_value_quote"), "0")),
+            "reference_price": str(reference_price),
+            "wallet_quote_total": str(total_quote),
+            "wallet_base_total": str(total_base),
+            "unavailable_quote": str(unavailable_quote),
+            "unavailable_base": str(unavailable_base),
+            "contributed_opening_quote": str(contributed),
+            "earned_opening_quote": str(earned),
+            "opening_basis_quality": quality,
+            "predecessor": predecessor,
+            "note": note,
+        }
+
+    def _bootstrap_purse(self, reference_price: Decimal) -> None:
+        """One-shot migration bootstrap: no journal exists and the state does not claim one --
+        create the journal with an opening epoch from the current state/wallet. The operator
+        declarations (purse_opening_*) are consumed HERE and only here."""
+        purse = self._purse
+        owned_quote = self._d(self._state.get("owned_quote"), "0")
+        owned_base = self._d(self._state.get("owned_base"), "0")
+        equity = owned_quote + owned_base * reference_price
+        declared = self.config.purse_opening_contributed_quote is not None
+        if declared:
+            contributed = Decimal(self.config.purse_opening_contributed_quote)
+            earned = (
+                Decimal(self.config.purse_opening_earned_quote)
+                if self.config.purse_opening_earned_quote is not None else Decimal("0")
+            )
+            quality = "reconstructed"
+        else:
+            if (self.config.purse_opening_earned_quote is not None
+                    and not self._purse_declaration_ignored_warned):
+                # An earned figure without the contributed anchor is not a usable basis.
+                self._purse_declaration_ignored_warned = True
+                self.logger().warning(
+                    f"{self.config.id}: purse_opening_earned_quote is set without "
+                    "purse_opening_contributed_quote; the declaration is IGNORED and the "
+                    "bootstrap records current equity (current_equity_only)."
+                )
+                self._emit_structured(
+                    "range_ladder_purse_opening_declaration_incomplete",
+                    purse_opening_earned_quote=str(self.config.purse_opening_earned_quote),
+                )
+            contributed = equity
+            earned = Decimal("0")
+            quality = "current_equity_only"
+        # F16: an init that followed a quarantine records the recovery reason as predecessor.
+        predecessor = self._state_recovery_reason or None
+        purse.create()
+        fields = self._build_opening_epoch_fields(
+            reference_price=reference_price,
+            contributed=contributed,
+            earned=earned,
+            quality=quality,
+            predecessor=predecessor,
+            note_suffix=self.config.purse_opening_note,
+        )
+        fields["epoch_id"] = purse.next_epoch_id()
+        record = purse.append("opening_epoch", fields, ts=self.market_data_provider.time())
+        self.logger().info(
+            f"{self.config.id}: purse journal bootstrapped at {self.purse_path} -- epoch "
+            f"{record['epoch_id']}, basis={quality}, contributed={contributed}, earned={earned}"
+            + (f", predecessor={predecessor}" if predecessor else "")
+        )
+        self._emit_structured(
+            "range_ladder_purse_bootstrapped",
+            purse_file=str(self.purse_path),
+            epoch_id=record["epoch_id"],
+            opening_basis_quality=quality,
+            contributed_opening_quote=str(contributed),
+            earned_opening_quote=str(earned),
+            predecessor=predecessor or "",
+            declared=str(declared),
+        )
+
+    def _on_purse_adopted(self, reference_price: Decimal, marker: bool) -> None:
+        """An existing journal was loaded. Warn (once) if opening declarations are set -- they
+        are consumed only by the bootstrap. When the state lost its marker, decide between the
+        crashed-marker retry (same incarnation -> no new record) and the quarantine/redeploy
+        re-init (new incarnation -> append a re-init opening epoch; history accumulates,
+        never resets -- F2/F16)."""
+        if (self.config.purse_opening_contributed_quote is not None
+                and not self._purse_declaration_ignored_warned):
+            self._purse_declaration_ignored_warned = True
+            self.logger().warning(
+                f"{self.config.id}: purse opening declarations are set but the purse journal "
+                f"already exists; they are consumed at bootstrap only and are IGNORED now."
+            )
+            self._emit_structured(
+                "range_ladder_purse_opening_declaration_ignored",
+                purse_file=str(self.purse_path),
+                purse_opening_contributed_quote=str(self.config.purse_opening_contributed_quote),
+            )
+        if marker:
+            return
+        latest = self._purse.latest_opening_epoch()
+        stamp = self._note_init_stamp(latest.get("note") if latest else None)
+        state_ts = self._state.get("initialized_timestamp")
+        same_incarnation = False
+        if stamp is not None and state_ts is not None:
+            try:
+                same_incarnation = (
+                    _safe_decimal(stamp, "purse note init_ts")
+                    == _safe_decimal(state_ts, "initialized_timestamp")
+                )
+            except ValueError:
+                same_incarnation = False
+        if same_incarnation:
+            # The journal already reflects THIS state incarnation; only the marker commit was
+            # lost. _purse_marker_due re-arms it (piggyback / end-of-cycle) -- appending another
+            # opening epoch here would duplicate history.
+            return
+        predecessor = self._state_recovery_reason or "state_reinitialized"
+        fields = self._build_opening_epoch_fields(
+            reference_price=reference_price,
+            contributed=Decimal("0"),
+            earned=Decimal("0"),
+            quality="current_equity_only",
+            predecessor=predecessor,
+            note_suffix=f"reinitialized_after={predecessor}",
+        )
+        fields["epoch_id"] = self._purse.next_epoch_id()
+        record = self._purse.append("opening_epoch", fields, ts=self.market_data_provider.time())
+        self.logger().warning(
+            f"{self.config.id}: state was re-initialized ({predecessor}) while the purse "
+            f"journal survived; appended re-init epoch {record['epoch_id']} -- inception "
+            "history accumulates, it is never reset."
+        )
+        self._emit_structured(
+            "range_ladder_purse_epoch_appended",
+            kind="opening_epoch",
+            epoch_id=record["epoch_id"],
+            predecessor=predecessor,
+            purse_file=str(self.purse_path),
+        )
+
+    def _ensure_purse(self, reference_price: Decimal) -> None:
+        """Per-cycle purse maintenance: adopt or bootstrap the journal once, drain any pending
+        deltas buffered during a degraded window, flush unsaved content, and clear/raise the
+        purse-degraded flag. Exception-safe: every failure degrades (fail closed -- new orders
+        halt via create_actions_proposal) instead of raising into the control loop."""
+        try:
+            if self._purse is None:
+                self._purse = PurseLedger(
+                    self.purse_path,
+                    controller_id=self.config.id,
+                    controller_name=self.config.controller_name,
+                    trading_pair=self.config.trading_pair,
+                    logger=self.logger(),
+                )
+            purse = self._purse
+            if not purse.loaded:
+                marker = self._state.get("purse_initialized") is True
+                if purse.file_exists():
+                    try:
+                        purse.load()
+                    except PurseError as exc:
+                        self._set_purse_degraded("purse_load_failed", str(exc))
+                        return
+                    self._on_purse_adopted(reference_price, marker)
+                elif marker:
+                    # POST-BOOTSTRAP MISSING (contract): the state says a journal exists but
+                    # the file is gone. NEVER silently re-bootstrap -- that would fabricate a
+                    # fresh history over the permanent record. Halt new orders and keep
+                    # checking every cycle until the operator restores the journal.
+                    self._set_purse_degraded(
+                        "purse_missing_post_bootstrap",
+                        f"state has purse_initialized=true but {self.purse_path} is absent",
+                    )
+                    return
+                else:
+                    if not self._connector_ready():
+                        # Defer the one-shot bootstrap until the connector can serve honest
+                        # wallet totals for the opening epoch. Not degraded -- just not yet.
+                        return
+                    self._bootstrap_purse(reference_price)
+            # Deltas booked while the journal was un-adoptable drain now, before the flush.
+            self._drain_purse_pending()
+            if purse.dirty:
+                self._purse_try_save()
+            elif self._purse_degraded:
+                # Loaded and clean with nothing pending -> a prior failure fully recovered.
+                self._clear_purse_degraded()
+        except Exception as exc:
+            # Fail closed, never crash the cycle: whatever went wrong, the journal cannot be
+            # trusted to be current, so suppress new orders until a clean pass.
+            self.logger().exception(f"{self.config.id}: purse journal maintenance failed")
+            self._set_purse_degraded("purse_internal_error", str(exc))
+
+    def _drain_purse_pending(self) -> None:
+        """Apply records/rollup deltas buffered while the journal was un-adoptable. An entry is
+        popped only AFTER it applied cleanly, so a failure retains it for the next cycle."""
+        purse = self._purse
+        if purse is None or not purse.loaded:
+            return
+        while self._purse_pending_records:
+            self._purse_apply_entry(self._purse_pending_records[0])
+            self._purse_pending_records.pop(0)
+        if self._purse_pending_rollup is not None:
+            pending = self._purse_pending_rollup
+            purse.update_fills_rollup(
+                epoch_id=purse.current_epoch_id(),
+                d_base=pending["d_base"],
+                d_quote=pending["d_quote"],
+                d_fees=pending["d_fees"],
+                fills=pending["fills"],
+                ts=self.market_data_provider.time(),
+            )
+            self._purse_pending_rollup = None
+
+    def _purse_apply_entry(self, entry) -> None:
+        """Append one buffered/live record, resolving epoch ids AT APPEND TIME (an epoch-opening
+        record takes the next seq's id; others default to the current epoch)."""
+        kind, fields, opens_epoch = entry
+        purse = self._purse
+        fields = dict(fields)
+        if opens_epoch:
+            if kind == "reseed_epoch" and "prev_epoch_id" not in fields:
+                fields["prev_epoch_id"] = purse.current_epoch_id()
+            fields["epoch_id"] = purse.next_epoch_id()
+        elif "epoch_id" not in fields:
+            fields["epoch_id"] = purse.current_epoch_id() or ""
+        purse.append(kind, fields, ts=self.market_data_provider.time())
+
+    def _purse_append_record(self, kind: str, fields: Dict[str, Any], *,
+                             opens_epoch: bool = False) -> None:
+        """Guarded journal append + save from the money sites (reseed epoch, re-anchor).
+        Un-adoptable journal -> the record is BUFFERED (retained in memory, drained on
+        recovery); append/save failures degrade. Never raises into the control loop."""
+        entry = (kind, dict(fields), opens_epoch)
+        purse = self._purse
+        if purse is None or not purse.loaded:
+            self._purse_pending_records.append(entry)
+            self.logger().warning(
+                f"{self.config.id}: purse journal unavailable; buffered a {kind} record "
+                f"({len(self._purse_pending_records)} pending) for replay on recovery."
+            )
+            return
+        try:
+            self._purse_apply_entry(entry)
+        except PurseError as exc:
+            # A record one of our own sites built failed validation -- a coding bug, but money
+            # discipline still applies: keep it pending is wrong (it will never validate), so
+            # record the loss loudly and degrade.
+            self.logger().error(
+                f"{self.config.id}: purse {kind} record failed validation and was NOT "
+                f"journaled: {exc}",
+                exc_info=True,
+            )
+            self._set_purse_degraded("purse_append_failed", str(exc))
+            return
+        self._purse_try_save()
+
+    def _purse_update_rollup(self, *, d_base: Decimal, d_quote: Decimal, d_fees: Decimal,
+                             fills: int) -> None:
+        """Guarded fills_rollup update + save, called AFTER the booking state commit succeeded
+        (save ordering: state first, then purse). Un-adoptable journal -> the delta accumulates
+        in the pending buffer (contract: retained in memory, retried every cycle)."""
+        purse = self._purse
+        now = self.market_data_provider.time()
+        if purse is None or not purse.loaded:
+            pending = self._purse_pending_rollup or {
+                "d_base": Decimal("0"), "d_quote": Decimal("0"),
+                "d_fees": Decimal("0"), "fills": 0,
+            }
+            pending["d_base"] += d_base
+            pending["d_quote"] += d_quote
+            pending["d_fees"] += d_fees
+            pending["fills"] += int(fills)
+            self._purse_pending_rollup = pending
+            self.logger().warning(
+                f"{self.config.id}: purse journal unavailable; booked-fill rollup delta "
+                f"buffered for replay on recovery (d_base={d_base} d_quote={d_quote} "
+                f"d_fees={d_fees})."
+            )
+            return
+        try:
+            purse.update_fills_rollup(
+                epoch_id=purse.current_epoch_id(),
+                d_base=d_base, d_quote=d_quote, d_fees=d_fees, fills=int(fills), ts=now,
+            )
+        except PurseError as exc:
+            self.logger().error(
+                f"{self.config.id}: purse fills_rollup update failed: {exc}", exc_info=True,
+            )
+            self._set_purse_degraded("purse_rollup_failed", str(exc))
+            return
+        self._purse_try_save()
+
+    def _purse_try_save(self) -> bool:
+        """Persist the journal; on failure degrade (the in-memory document IS the pending
+        delta and is retried every cycle by _ensure_purse)."""
+        try:
+            self._purse.save()
+        except PurseError as exc:
+            self._set_purse_degraded("purse_save_failed", str(exc))
+            return False
+        if self._purse_degraded:
+            self._clear_purse_degraded()
+        return True
+
+    def _set_purse_degraded(self, reason: str, error: str) -> None:
+        self._purse_degraded = True
+        self._purse_degraded_reason = reason
+        if not self._purse_degraded_logged:
+            self._purse_degraded_logged = True
+            self.logger().error(
+                f"{self.config.id}: PURSE JOURNAL DEGRADED ({reason}): {error}. New-order "
+                "proposals are suppressed (existing orders untouched) until the journal "
+                "recovers; pending deltas are retained in memory and retried every cycle."
+            )
+            self._emit_structured(
+                "range_ladder_purse_degraded",
+                reason=reason,
+                error=str(error),
+                purse_file=str(self.purse_path),
+                purse_io_failures=self._purse.io_failures if self._purse is not None else 0,
+                pending_records=len(self._purse_pending_records),
+                pending_rollup=self._purse_pending_rollup is not None,
+            )
+
+    def _clear_purse_degraded(self) -> None:
+        if not self._purse_degraded:
+            return
+        self._purse_degraded = False
+        reason = self._purse_degraded_reason
+        self._purse_degraded_reason = ""
+        self._purse_degraded_logged = False
+        self.logger().info(
+            f"{self.config.id}: purse journal recovered (was: {reason}); new-order proposals "
+            "resume."
+        )
+        self._emit_structured(
+            "range_ladder_purse_recovered",
+            was_reason=reason,
+            purse_io_failures=self._purse.io_failures if self._purse is not None else 0,
+        )
+
+    def _purse_status_block(self, reference_price: Optional[Decimal] = None) -> Dict[str, Any]:
+        """The `purse` reporting block (F13/F9/F1): inception metrics per the contract
+        formulas plus epoch markers, exposed through processed_data/custom_info/status so
+        `controller_performance_snapshots` become retroactively segmentable."""
+        purse = self._purse
+        ready = purse is not None and purse.loaded
+        if reference_price is not None and reference_price > Decimal("0"):
+            self._purse_last_ref_price = reference_price
+        ref = self._purse_last_ref_price
+        zero = Decimal("0")
+        metrics = {
+            "contributed": zero, "withdrawn": zero, "earned_realized": zero,
+            "earned_total": zero, "unrealized": zero, "drift": zero, "equity_quote": zero,
+        }
+        if ready:
+            try:
+                metrics = purse.derived_metrics(
+                    reference_price=ref,
+                    owned_quote=self._d(self._state.get("owned_quote"), "0"),
+                    owned_base=self._d(self._state.get("owned_base"), "0"),
+                )
+            except Exception as exc:
+                self.logger().warning(
+                    f"{self.config.id}: purse derived-metrics computation failed ({exc}); "
+                    "reporting zeros this cycle."
+                )
+        return {
+            "purse_ready": ready,
+            "purse_initialized": self._state.get("purse_initialized") is True,
+            "purse_path": str(self.purse_path),
+            "accounting_degraded": bool(self._accounting_degraded or self._purse_degraded),
+            "purse_degraded": self._purse_degraded,
+            "purse_degraded_reason": self._purse_degraded_reason,
+            "purse_io_failures": purse.io_failures if purse is not None else 0,
+            "purse_pending_writes": (
+                bool(purse is not None and purse.dirty)
+                or bool(self._purse_pending_records)
+                or self._purse_pending_rollup is not None
+            ),
+            "epoch_id": (purse.current_epoch_id() if ready else None) or "",
+            "opening_basis_quality": (purse.opening_basis_quality() if ready else None) or "",
+            "reanchor_count": purse.reanchor_count() if ready else 0,
+            "last_reseed_token": self._state.get("last_reseed_token") or "",
+            "reseed_generation": int(self.config.reseed_generation),
+            **metrics,
+        }
 
     def _compute_seed_claim(self, *, reference_price: Decimal, available_quote_balance: Decimal,
                             available_base_balance: Decimal, target_quote: Decimal):
@@ -3216,6 +3781,18 @@ class RangeInventoryLadderController(ControllerBase):
         changed = False
         current_ids = set()
 
+        # hbpurse P4: per-cycle signed fill deltas for the purse journal's per-epoch
+        # fills_rollup -- "the same signed deltas" the booking derives: BUY base +d_base /
+        # quote -(d_quote + d_fees); SELL base -d_base / quote +(d_quote - d_fees). These are
+        # the fills' ECONOMIC flows (received-spent, fees netted), deliberately PRE-offset:
+        # an offset credit only marks that a re-anchor already debited owned_* for this fill,
+        # and that cut is journaled by its own reanchor record -- folding the offset in here
+        # would erase the fill's real spend from the realized-flow history.
+        purse_base_delta = Decimal("0")
+        purse_quote_delta = Decimal("0")
+        purse_fees_delta = Decimal("0")
+        purse_fills = 0
+
         for executor in self.executors_info:
             level_id = getattr(executor.config, "level_id", None)
             if level_id is None:
@@ -3265,6 +3842,10 @@ class RangeInventoryLadderController(ControllerBase):
                 owned_base += d_base
                 owned_quote -= quote_debit
                 self._booked_buy_fill_this_cycle = True
+                purse_base_delta += d_base
+                purse_quote_delta -= d_quote + d_fees
+                purse_fees_delta += d_fees
+                purse_fills += 1
             elif side == TradeType.SELL:
                 base_debit = d_base
                 offset_base_consumed = min(base_debit, offset_base)
@@ -3275,6 +3856,10 @@ class RangeInventoryLadderController(ControllerBase):
                 owned_base -= base_debit
                 owned_quote += (d_quote - d_fees)
                 self._booked_sell_fill_this_cycle = True
+                purse_base_delta -= d_base
+                purse_quote_delta += d_quote - d_fees
+                purse_fees_delta += d_fees
+                purse_fills += 1
             else:
                 continue  # unknown side -- do not book
 
@@ -3361,6 +3946,18 @@ class RangeInventoryLadderController(ControllerBase):
             if reseed_priming:
                 self._reseed_just_applied = False
             if changed:
+                # hbpurse P4 (contract save ordering): the STATE committed first; only now does
+                # the purse journal take the same signed deltas into the current epoch's
+                # fills_rollup. A purse failure here retains the delta in memory (degraded,
+                # retried every cycle); a crash in that window is surfaced later by checkpoint
+                # reconciliation as drift -- never re-derived, never fabricated (the progress
+                # baseline advanced with the state, so the deltas cannot be recomputed).
+                self._purse_update_rollup(
+                    d_base=purse_base_delta,
+                    d_quote=purse_quote_delta,
+                    d_fees=purse_fees_delta,
+                    fills=purse_fills,
+                )
                 # v15: arm the fill-settle grace window — the wallet snapshot will lag this fill
                 # by up to one balance poll, so over-claim checks defer until it re-syncs.
                 self._last_fill_booked_ts = self.market_data_provider.time()
@@ -3554,6 +4151,28 @@ class RangeInventoryLadderController(ControllerBase):
         if self._state.get("last_reseed_token") == reseed_token:
             return  # this exact re-seed already applied -> idempotent no-op
 
+        # hbpurse P4: a re-seed OPENS a new accounting epoch and must be journaled in the same
+        # cycle with the old values captured. While the purse journal is KNOWN un-adoptable
+        # (an instance exists but load failed / missing post-bootstrap) the epoch boundary
+        # would be lost to the permanent record -- DEFER (token NOT consumed), warn once per
+        # token; the re-seed applies on the first cycle with a healthy journal. A purse of
+        # None means the purse machinery has not engaged (in a live cycle _ensure_purse always
+        # runs first); then the reseed proceeds and its epoch record rides the pending buffer.
+        if self._purse is not None and not self._purse.loaded:
+            if self._reseed_deferred_purse_token != reseed_token:
+                self._reseed_deferred_purse_token = reseed_token
+                self.logger().warning(
+                    f"{self.config.id}: re-seed (token={reseed_token}) deferred: the purse "
+                    "journal is unavailable, so the reseed epoch could not be recorded. The "
+                    "token is NOT consumed; the re-seed applies once the journal recovers."
+                )
+                self._emit_structured(
+                    "range_ladder_reseed_deferred_purse_unavailable",
+                    reseed_token=reseed_token,
+                    purse_degraded_reason=self._purse_degraded_reason,
+                )
+            return
+
         # The re-seed claims from AVAILABLE balances only, so funds held in this controller's
         # own resting orders would be excluded from the new seed; when those orders later cancel
         # the money returns to the wallet, but a cancel is not a fill, so the ledger never
@@ -3685,6 +4304,25 @@ class RangeInventoryLadderController(ControllerBase):
         # Next booking pass re-baselines open orders to their current cumulative WITHOUT booking,
         # so already-realized fills (already reflected in the re-seeded wallet) are not re-booked.
         self._reseed_just_applied = True
+
+        # hbpurse P4: journal the reseed epoch in the SAME cycle, old values captured before the
+        # overwrite became observable (state committed first per the save-ordering contract; the
+        # journal record follows immediately). The record opens the new epoch -- subsequent
+        # fills roll up under its epoch_id.
+        self._purse_append_record(
+            "reseed_epoch",
+            {
+                "token": reseed_token,
+                "old_owned_quote": str(old_owned_quote),
+                "old_owned_base": str(old_owned_base),
+                "old_seed_value_quote": str(old_seed_value),
+                "new_owned_quote": str(managed_quote_claim),
+                "new_owned_base": str(claimed_base_amount),
+                "new_seed_value_quote": str(seed_value_quote),
+                "reference_price": str(reference_price),
+            },
+            opens_epoch=True,
+        )
 
         self.logger().warning(
             f"{self.config.id}: managed fund RE-SEEDED from wallet (token={reseed_token}, "
@@ -5095,6 +5733,12 @@ class RangeInventoryLadderController(ControllerBase):
             self._emit_diagnostic_heartbeat_if_due()
             return
 
+        # hbpurse P4: purse-journal maintenance runs FIRST among the money steps -- it adopts or
+        # bootstraps the journal (one-shot), drains any pending deltas from a degraded window,
+        # and retries unsaved content -- so the reseed/booking/re-anchor sites below always see
+        # an adopted journal on a healthy cycle. Exception-safe; failures degrade (fail closed).
+        self._ensure_purse(reference_price)
+
         # v13: fill booking moved DOWN to after the balance reads (so the re-seed and the
         # booked owned_* both feed managed_* the same cycle). See the booking call below.
 
@@ -5317,6 +5961,32 @@ class RangeInventoryLadderController(ControllerBase):
                             reserve_base_balance=str(reserve_base_balance),
                             overclaim_quote=str(reanchor_overclaim_quote),
                             grace_seconds=self.config.ledger_overclaim_reanchor_seconds,
+                        )
+                        # hbpurse P4: journal the re-anchor (state committed first). A cut
+                        # larger than dust (min_order_quote, valued at the reference price) is
+                        # an "undeclared_outflow" awaiting operator classification; smaller
+                        # cuts are "drift". Either way the loss is SURFACED in the permanent
+                        # record, never silently absorbed.
+                        reanchor_cut_value = (
+                            max(Decimal("0"), owned_quote - new_owned_quote)
+                            + max(Decimal("0"), owned_base - new_owned_base) * reference_price
+                        )
+                        reanchor_dust = max(Decimal("0"), self.config.min_order_quote)
+                        self._purse_append_record(
+                            "reanchor",
+                            {
+                                "old_owned_quote": str(owned_quote),
+                                "old_owned_base": str(owned_base),
+                                "new_owned_quote": str(new_owned_quote),
+                                "new_owned_base": str(new_owned_base),
+                                "overclaim_quote": str(reanchor_overclaim_quote),
+                                "classification": (
+                                    "undeclared_outflow"
+                                    if reanchor_cut_value > reanchor_dust else "drift"
+                                ),
+                                "wallet_quote_total": str(total_quote_balance),
+                                "wallet_base_total": str(total_base_balance),
+                            },
                         )
                         owned_quote, owned_base = new_owned_quote, new_owned_base
                         self._overclaim_since = None
@@ -5684,7 +6354,12 @@ class RangeInventoryLadderController(ControllerBase):
             self._last_price_regime = raw_regime
         price_regime = self._last_price_regime
 
+        # hbpurse P4 (F13/F9/F1): inception purse metrics + epoch markers, computed AFTER the
+        # booking/re-anchor sites so this cycle's records are reflected.
+        purse_block = self._purse_status_block(reference_price)
+
         self.processed_data = {
+            "purse": purse_block,
             "reference_price": reference_price,
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -5802,6 +6477,10 @@ class RangeInventoryLadderController(ControllerBase):
         # Zero-level deadlock watchdog (fix 3): runs AFTER processed_data is assembled so the
         # plan/budget checks see THIS cycle's effective budgets.
         self._run_empty_side_watchdog(now)
+
+        # hbpurse P4: end-of-cycle backstop for the `purse_initialized` bridge marker (normally
+        # it piggybacks on the first money commit; a quiet cycle commits it here).
+        self._finalize_purse_marker()
 
         self._emit_diagnostic_heartbeat_if_due()
 
@@ -7028,13 +7707,17 @@ class RangeInventoryLadderController(ControllerBase):
         if self._market_data_hard_pause or self._session_expired:
             return []
 
-        # hbpurse P2 (CDX-M01): fail closed while the ledger is accounting-degraded (a state
-        # commit failed and the in-memory ledger could not be persisted). Propose NO new orders
-        # until the next successful save clears it; EXISTING resting orders are left untouched.
-        if self._accounting_degraded:
+        # hbpurse P2 (CDX-M01) + P4 (purse contract): fail closed while accounting is degraded
+        # -- a STATE commit failed (in-memory ledger unpersisted) OR the PURSE journal failed
+        # to load/save (permanent record not current). Propose NO new orders until the next
+        # successful save clears it; EXISTING resting orders are left untouched. The event
+        # keeps its P2 name and keys; the purse keys are additive.
+        if self._accounting_degraded or self._purse_degraded:
             self._emit_structured(
                 "range_ladder_create_blocked_accounting_degraded",
                 state_io_failures=self._state_io_failures,
+                purse_degraded=self._purse_degraded,
+                purse_degraded_reason=self._purse_degraded_reason,
             )
             return []
 
@@ -7459,6 +8142,9 @@ class RangeInventoryLadderController(ControllerBase):
             return ["Controller not ready."]
         p = self.processed_data
         blocked = sorted(list(p["blocked_level_ids"]))
+        # hbpurse P4: the purse block rides processed_data on healthy cycles; degraded/
+        # unavailable paths fall back to a live read so the status never KeyErrors.
+        pb = p.get("purse") or self._purse_status_block()
         lines = [
             "Strategy: fixed range inventory ladder",
             f"Pair: {self.config.connector_name} {self.config.trading_pair}",
@@ -7500,8 +8186,18 @@ class RangeInventoryLadderController(ControllerBase):
             f"{p['inventory_unrealized_pnl_quote']:.6f} / {p['inventory_global_pnl_quote']:.6f} {p['quote_asset']}",
             f"Inventory fees: {p['inventory_cum_fees_quote']:.6f} {p['quote_asset']} | "
             f"Net base held: {p['inventory_net_base_amount']:.6f} {p['base_asset']}",
-            f"Fund growth since init: {p['fund_growth_quote']:.6f} {p['quote_asset']} | "
+            # hbpurse P4 (F9): the old "since init" label implied inception; this figure is
+            # epoch-relative and mark-to-market (rebaselined by reseed/re-init). Inception
+            # accounting lives in the purse lines below.
+            f"Fund growth since epoch (MTM): {p['fund_growth_quote']:.6f} {p['quote_asset']} | "
             f"Reconciliation gap: {p['reconciliation_gap_quote']:.6f} {p['quote_asset']}",
+            f"Purse (inception): contributed {pb['contributed']:.6f} / withdrawn {pb['withdrawn']:.6f} "
+            f"{p['quote_asset']} | earned {pb['earned_total']:.6f} "
+            f"(realized {pb['earned_realized']:.6f} / unrealized {pb['unrealized']:.6f}) | "
+            f"drift {pb['drift']:.6f}",
+            f"Purse epoch: {pb['epoch_id'] or 'n/a'} ({pb['opening_basis_quality'] or 'n/a'}) | "
+            f"reanchors: {pb['reanchor_count']} | degraded: {pb['accounting_degraded']} | "
+            f"journal: {pb['purse_path']}",
             f"Reserved wallet balances: {p['reserve_quote_balance']:.6f} {p['quote_asset']} / {p['reserve_base_balance']:.6f} {p['base_asset']}",
             f"State file: {self.state_path} | Schema: {self.STATE_SCHEMA_VERSION}",
             f"Diagnostic log: {self.diagnostic_log_path if self.config.diagnostic_log_enabled else 'disabled'}",
@@ -7623,15 +8319,24 @@ class RangeInventoryLadderController(ControllerBase):
             "inventory_abs_notional_quote": str(p["inventory_abs_notional_quote"]),
             "initial_fund_value_quote": str(p["initial_fund_value_quote"]),
             "fund_growth_quote": str(p["fund_growth_quote"]),
+            # hbpurse P4 (F9): clarified alias for fund_growth_quote -- the figure is EPOCH-
+            # relative and mark-to-market, not inception realized earned (that lives in the
+            # purse block). The old key keeps its key and value byte-identically.
+            "fund_growth_since_epoch_mtm": str(p["fund_growth_quote"]),
             "reconciliation_gap_quote": str(p["reconciliation_gap_quote"]),
             "state_file": str(self.state_path),
             "state_schema_version": str(self.STATE_SCHEMA_VERSION),
             "state_recovery_reason": self._state_recovery_reason or "",
             "state_migrated_from_version": str(self._state_migrated_from_version) if self._state_migrated_from_version is not None else "",
-            # hbpurse P2 (CDX-M01): fail-closed accounting health. accounting_degraded=True means a
-            # state commit failed and NEW orders are suppressed until the next durable save.
-            "accounting_degraded": str(self._accounting_degraded),
+            # hbpurse P2 (CDX-M01) + P4: fail-closed accounting health. True means a state
+            # commit failed OR the purse journal is degraded; NEW orders are suppressed until
+            # the next durable save (the create gate blocks on exactly this disjunction).
+            "accounting_degraded": str(self._accounting_degraded or self._purse_degraded),
             "state_io_failures": self._state_io_failures,
+            # hbpurse P4 (F13/F1): the inception purse block -- contributed / withdrawn /
+            # earned / drift per the contract formulas, plus the epoch markers that make
+            # controller_performance_snapshots retroactively segmentable.
+            "purse": self._json_safe(p.get("purse") or self._purse_status_block()),
             "price_regime": str(p.get("price_regime", "")),
             "out_of_range_action": str(self.config.out_of_range_action),
             "enable_buys": str(self.config.enable_buys),

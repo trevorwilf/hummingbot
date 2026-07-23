@@ -325,7 +325,12 @@ class TestReanchorCommitDiscipline(_Harness):
         ctrl = self._build(mdp, ledger_overclaim_reanchor_seconds=10)
         self._init_state(ctrl, owned_quote=600, owned_base=0, seed_value=600,
                          reserve_quote="400")
-        self._install_flaky_writer(ctrl, fail_on_calls={1})
+        # hbpurse P4: the first cycle is quiet (the over-claim grace is only arming), so the
+        # one-time purse-bootstrap `purse_initialized` marker commits at end-of-cycle as state
+        # write #1. The re-anchor commit under test is therefore write #2 now. The
+        # discriminating assertions are unchanged: the FAILED re-anchor save must leave owned_*
+        # at their prior values, append no reanchor_events, and emit no reanchored event.
+        self._install_flaky_writer(ctrl, fail_on_calls={2})
 
         self._cycle(ctrl, mdp, 1000.0)   # over-claim observed, grace arms (no save)
         self._cycle(ctrl, mdp, 1020.0)   # 20s > 10s grace -> cut attempt, save FAILS
