@@ -261,18 +261,21 @@ class TestIssue1LedgerReanchor(_Harness):
         self.assertEqual(D(ctrl._state["owned_quote"]), D(0))
         self.assertEqual(D(ctrl._state["owned_base"]), D(0))
 
-    def test_reanchor_respects_reserve_floor(self):
-        # total quote 100, reserve 70 -> wallet-derived = 30; owned 50 over-claims the
-        # managed portion. After grace, owned re-anchors to 30 (not to total 100).
+    def test_reanchor_cut_ignores_stale_reserve(self):
+        # hbpurse P1 (F4/CLA-M01): the cut uses the SAME baseline as the trigger -- the
+        # TOTAL wallet. reserve_* is stale by construction (written only at init/reseed)
+        # and is arithmetic-inert in the mutating path: total quote 100, stale reserve 70,
+        # owned 130 -> re-anchor lands at 100 (wallet truth), NOT at 30 (total - reserve,
+        # the pre-P1 collapse arithmetic).
         balances = {"XMR": (D(0), D(0)), "USDT": (D(100), D(100))}
         mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
         ctrl = self._build(mdp, ledger_overclaim_reanchor_seconds=10)
-        # owned_quote 130 actually exceeds TOTAL 100 -> genuine over-claim trigger.
+        # owned_quote 130 exceeds TOTAL 100 -> genuine over-claim trigger.
         self._init_state(ctrl, owned_quote=130, owned_base=0, seed_value=130,
                          reserve_quote="70")
         self._cycle(ctrl, mdp, 1000.0)
         self._cycle(ctrl, mdp, 1020.0)
-        self.assertEqual(D(ctrl._state["owned_quote"]), D(30))  # 100 total - 70 reserve
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(100))  # wallet total, reserve inert
 
 
 # ============================================================ Issue 2: refresh bypass

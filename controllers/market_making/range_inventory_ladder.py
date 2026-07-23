@@ -747,6 +747,22 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
 
+    # hbpurse P1 (F5): a re-anchor can cut owned_* for a fill the wallet already reflects;
+    # the cut amounts become offset credits the booking loop consumes instead of debiting
+    # owned_* a second time when the late fill books. Credits expire after this many seconds
+    # so a stale credit cannot absorb genuine future debits.
+    reanchor_offset_expiry_seconds: int = Field(
+        default=600,
+        json_schema_extra={
+            "prompt": (
+                "Seconds a re-anchor offset credit stays consumable by late-booking fills "
+                "before it expires (default 600): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
     # Understatement growth gate (2026-07-12): once a sustained wallet-over-ledger surplus has
     # been warned about ONCE (the baseline), re-warn only when the surplus GROWS beyond the
     # baseline by more than this many quote units AND a fill has been booked since -- a stable
@@ -938,6 +954,7 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         "recycle_max_latency_seconds",
         "ledger_overclaim_reanchor_seconds",
         "fill_settle_grace_seconds",
+        "reanchor_offset_expiry_seconds",
         "regime_dwell_seconds",
         "reseed_generation",
         mode="before",
@@ -1135,6 +1152,13 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
     def validate_fill_settle_grace_seconds(cls, value: int):
         if value < 0:
             raise ValueError("fill_settle_grace_seconds cannot be negative")
+        return value
+
+    @field_validator("reanchor_offset_expiry_seconds")
+    @classmethod
+    def validate_reanchor_offset_expiry_seconds(cls, value: int):
+        if value < 0:
+            raise ValueError("reanchor_offset_expiry_seconds cannot be negative")
         return value
 
     @field_validator("regime_dwell_seconds")
@@ -1471,6 +1495,10 @@ class RangeInventoryLadderController(ControllerBase):
     # the warning had already fired. Warn only when the over-claim persists longer than
     # this OR across two consecutive evaluations.
     OVERCLAIM_WARNING_GRACE_SECONDS = 10.0
+    # hbpurse P1 (CLA-M02): newest re-anchor events kept in the OPTIONAL state list
+    # `reanchor_events` (state file, not the purse journal -- the P4 journal has no cap).
+    # The cumulative cut counters are never capped, so the total is always reconstructable.
+    REANCHOR_EVENTS_MAX = 50
     # Watchdog fire/skip loop fix rule 4 (2026-07-12): how long after the forced balance
     # refresh request the under-deployment condition must STILL hold before the re-center
     # actually fires (gives the async REST refresh a moment to land in the cached balances).
@@ -2665,6 +2693,117 @@ class RangeInventoryLadderController(ControllerBase):
         exec_fees, alt_fees = self._order_fee_breakdown(order, info, quote_asset, base_asset, exec_quote)
         return exec_base, exec_quote, exec_fees, alt_fees
 
+    # (amount state key, creation-timestamp state key) per asset -- quote first, base second.
+    REANCHOR_OFFSET_KEYS = (
+        ("reanchor_offset_quote", "reanchor_offset_quote_ts"),
+        ("reanchor_offset_base", "reanchor_offset_base_ts"),
+    )
+
+    def _load_reanchor_offsets(self, now: float) -> Tuple[Decimal, Decimal, bool]:
+        """hbpurse P1 (F5): current re-anchor offset credits, honoring PER-ASSET expiry.
+
+        Each credit ages from its OWN creation timestamp (CDX-R01): a later re-anchor on
+        the other asset -- or a later cut merged into this asset's surviving credit -- must
+        never rejuvenate an old credit's expiry clock.
+
+        Returns (offset_quote, offset_base, cleared) where cleared=True means a non-zero
+        stored credit was expired (older than reanchor_offset_expiry_seconds) or unreadable
+        and now reads as zero -- the caller persists the cleared zeros on its next save.
+        Zero is the fail-closed direction: an offset only ever REDUCES a debit, so dropping
+        a doubtful credit means the debit applies in full and equity is never fabricated.
+        """
+        expiry = Decimal(self.config.reanchor_offset_expiry_seconds)
+        now_d = None  # converted lazily: with no live credit the clock is never read
+        loaded = []
+        cleared = False
+        for amount_key, ts_key in self.REANCHOR_OFFSET_KEYS:
+            try:
+                amount = max(Decimal("0"), _safe_decimal(
+                    self._state.get(amount_key), amount_key, default="0"))
+            except ValueError:
+                loaded.append(Decimal("0"))
+                cleared = True
+                continue
+            if amount <= Decimal("0"):
+                loaded.append(Decimal("0"))
+                continue
+            try:
+                offset_ts = _safe_decimal(self._state.get(ts_key), ts_key)
+            except ValueError:
+                # Unknown age -> treat as stale rather than immortal.
+                loaded.append(Decimal("0"))
+                cleared = True
+                continue
+            if now_d is None:
+                now_d = Decimal(str(now))
+            if (now_d - offset_ts) >= expiry:
+                loaded.append(Decimal("0"))
+                cleared = True
+                continue
+            loaded.append(amount)
+        return loaded[0], loaded[1], cleared
+
+    def _record_reanchor_cut(self, *, now: float, old_owned_quote: Decimal, old_owned_base: Decimal,
+                             new_owned_quote: Decimal, new_owned_base: Decimal,
+                             overclaim_quote: Decimal, wallet_quote_total: Decimal,
+                             wallet_base_total: Decimal) -> None:
+        """hbpurse P1 (CLA-M02 + F5): persist re-anchor visibility and offset credits into
+        self._state. The caller saves (single mutation set, so P2's commit discipline can
+        wrap the whole re-anchor in one candidate later).
+
+        CLA-M02: the total-wallet trigger inherently nets external flows (a deposit plus an
+        equal withdrawal is invisible to it), so every cut is appended to the OPTIONAL state
+        list `reanchor_events` (newest REANCHOR_EVENTS_MAX kept) with wallet totals, plus
+        uncapped cumulative cut counters -- the netting is at least VISIBLE until
+        declared-flow accounting lands (P5; P4 journals from this same site).
+
+        F5: the per-asset cut amounts become offset credits. The booking loop consumes them
+        BEFORE debiting owned_* again, so a fill the wallet already reflected (and this
+        re-anchor already deducted) cannot double-debit when it books late.
+        """
+        cut_quote = max(Decimal("0"), old_owned_quote - new_owned_quote)
+        cut_base = max(Decimal("0"), old_owned_base - new_owned_base)
+
+        events_raw = self._state.get("reanchor_events")
+        events = list(events_raw) if isinstance(events_raw, list) else []
+        events.append({
+            "ts": float(now),
+            "old_owned_quote": str(old_owned_quote),
+            "old_owned_base": str(old_owned_base),
+            "new_owned_quote": str(new_owned_quote),
+            "new_owned_base": str(new_owned_base),
+            "overclaim_quote": str(overclaim_quote),
+            "wallet_quote_total": str(wallet_quote_total),
+            "wallet_base_total": str(wallet_base_total),
+        })
+        self._state["reanchor_events"] = events[-self.REANCHOR_EVENTS_MAX:]
+
+        for key, cut in (("reanchor_cut_quote_cum", cut_quote), ("reanchor_cut_base_cum", cut_base)):
+            try:
+                prior = max(Decimal("0"), _safe_decimal(self._state.get(key), key, default="0"))
+            except ValueError:
+                # A corrupt diagnostic counter must not abort the re-anchor itself (the
+                # safety action); restart the cumulative from this cut and say so.
+                self.logger().warning(
+                    f"{self.config.id}: resetting unreadable {key}={self._state.get(key)!r} to 0"
+                )
+                prior = Decimal("0")
+            self._state[key] = str(prior + cut)
+
+        prior_offset_quote, prior_offset_base, _cleared = self._load_reanchor_offsets(now)
+        for cut, prior, (amount_key, ts_key) in (
+                (cut_quote, prior_offset_quote, self.REANCHOR_OFFSET_KEYS[0]),
+                (cut_base, prior_offset_base, self.REANCHOR_OFFSET_KEYS[1])):
+            self._state[amount_key] = str(prior + cut)
+            if prior > Decimal("0"):
+                # CDX-R01: a cut merged into a surviving credit keeps the credit's ORIGINAL
+                # timestamp (fail closed: the merged-in portion may expire early, but a later
+                # re-anchor can never rejuvenate a stale credit); the other asset's clock is
+                # per-asset state and is not touched at all.
+                continue
+            if cut > Decimal("0"):
+                self._state[ts_key] = float(now)
+
     def _book_fills_from_orders(self):
         """v13 Part A: robust per-order incremental fill booking.
 
@@ -2686,6 +2825,24 @@ class RangeInventoryLadderController(ControllerBase):
         owned_base = self._d(self._state.get("owned_base"), "0")
         progress_raw = self._state.get("booked_fill_progress")
         progress: Dict[str, Dict[str, str]] = dict(progress_raw) if isinstance(progress_raw, dict) else {}
+
+        # hbpurse P1 (F5): re-anchor offset credits. A re-anchor may already have deducted
+        # the money a late-booking fill is about to debit (the wallet reflected the fill
+        # before booking observed it); the matching offset absorbs that debit exactly once.
+        # Only DEBITS are offset (BUY's owned_quote debit, SELL's owned_base debit) --
+        # credits always book in full. Expired/unreadable credits read as zero (fail
+        # closed) and the cleared zeros persist on this cycle's save.
+        now_ts = self.market_data_provider.time()
+        offset_quote, offset_base, offset_dirty = self._load_reanchor_offsets(now_ts)
+        if offset_dirty:
+            self._emit_structured(
+                "range_ladder_reanchor_offset_expired",
+                offset_quote=str(self._state.get("reanchor_offset_quote")),
+                offset_base=str(self._state.get("reanchor_offset_base")),
+                offset_quote_ts=str(self._state.get("reanchor_offset_quote_ts")),
+                offset_base_ts=str(self._state.get("reanchor_offset_base_ts")),
+                expiry_seconds=self.config.reanchor_offset_expiry_seconds,
+            )
 
         # Reset the per-cycle booked-fill side flags (drive the recycle windows).
         self._booked_buy_fill_this_cycle = False
@@ -2734,12 +2891,26 @@ class RangeInventoryLadderController(ControllerBase):
             if d_base <= Decimal("0") and d_quote <= Decimal("0"):
                 continue  # nothing new for this order
 
+            offset_quote_consumed = Decimal("0")
+            offset_base_consumed = Decimal("0")
             if side == TradeType.BUY:
+                quote_debit = d_quote + d_fees
+                offset_quote_consumed = min(quote_debit, offset_quote)
+                if offset_quote_consumed > Decimal("0"):
+                    offset_quote -= offset_quote_consumed
+                    quote_debit -= offset_quote_consumed
+                    offset_dirty = True
                 owned_base += d_base
-                owned_quote -= (d_quote + d_fees)
+                owned_quote -= quote_debit
                 self._booked_buy_fill_this_cycle = True
             elif side == TradeType.SELL:
-                owned_base -= d_base
+                base_debit = d_base
+                offset_base_consumed = min(base_debit, offset_base)
+                if offset_base_consumed > Decimal("0"):
+                    offset_base -= offset_base_consumed
+                    base_debit -= offset_base_consumed
+                    offset_dirty = True
+                owned_base -= base_debit
                 owned_quote += (d_quote - d_fees)
                 self._booked_sell_fill_this_cycle = True
             else:
@@ -2760,6 +2931,8 @@ class RangeInventoryLadderController(ControllerBase):
                 d_fees=str(d_fees),
                 owned_quote=str(owned_quote),
                 owned_base=str(owned_base),
+                offset_quote_consumed=str(offset_quote_consumed),
+                offset_base_consumed=str(offset_base_consumed),
                 alt_fees={k: str(v) for k, v in alt_fees.items()},
             )
 
@@ -2774,10 +2947,12 @@ class RangeInventoryLadderController(ControllerBase):
             # by up to one balance poll, so over-claim checks defer until it re-syncs.
             self._last_fill_booked_ts = self.market_data_provider.time()
 
-        if changed or pruned_ids or reseed_priming:
+        if changed or pruned_ids or reseed_priming or offset_dirty:
             self._state["owned_quote"] = str(owned_quote)
             self._state["owned_base"] = str(owned_base)
             self._state["booked_fill_progress"] = progress
+            self._state["reanchor_offset_quote"] = str(offset_quote)
+            self._state["reanchor_offset_base"] = str(offset_base)
             self._save_state()
             if changed:
                 self.logger().info(
@@ -3023,6 +3198,12 @@ class RangeInventoryLadderController(ControllerBase):
         self._state["seed_value_quote"] = str(seed_value_quote)
         self._state["booked_fill_progress"] = {}
         self._state["tracked_fill_executor_ids"] = []
+        # hbpurse P1 (F5): the re-seed re-baselines owned_* from the live wallet and re-primes
+        # every open order's cumulative baseline, so an outstanding re-anchor offset credit no
+        # longer corresponds to a pending late fill. Leaving it live would let it absorb a
+        # genuine post-reseed debit (fabricated equity) -- clear it with the re-baseline.
+        self._state["reanchor_offset_quote"] = "0"
+        self._state["reanchor_offset_base"] = "0"
         self._state["last_reseed_token"] = reseed_token
         self._save_state()
 
@@ -4587,8 +4768,13 @@ class RangeInventoryLadderController(ControllerBase):
         # is legitimate under the self-balance model (idle reserve, deposits, un-booked
         # proceeds) and stays a no-op. The booking loop's downward math is untouched -- this
         # is the safety net for fills that loop misses.
-        reanchor_wallet_derived_quote = max(Decimal("0"), total_quote_balance - reserve_quote_balance)
-        reanchor_wallet_derived_base = max(Decimal("0"), total_base_balance - reserve_base_balance)
+        # hbpurse P1 (F4/CLA-M01): trigger and cut share the SAME baseline -- the TOTAL
+        # wallet, per asset. reserve_* is stale by construction (written only at init and
+        # reseed; nothing updates it on a deposit/withdrawal) and is arithmetic-inert in
+        # every path that mutates owned_*: it stays persisted and reported for diagnostics
+        # only. The old cut clamped to total - reserve, so a withdrawn reserve plus a small
+        # over-claim collapsed the fund by the entire stale reserve (600->170 instead of
+        # 600->570). The warn-only diagnostics below keep their existing formulas.
         reanchor_quote_overclaim = max(Decimal("0"), owned_quote - total_quote_balance)
         reanchor_base_overclaim = max(Decimal("0"), owned_base - total_base_balance)
         reanchor_overclaim_quote = reanchor_quote_overclaim + reanchor_base_overclaim * reference_price
@@ -4600,8 +4786,10 @@ class RangeInventoryLadderController(ControllerBase):
             if self._overclaim_since is None:
                 self._overclaim_since = now
             elif (now - self._overclaim_since) >= self.config.ledger_overclaim_reanchor_seconds:
-                new_owned_quote = max(Decimal("0"), min(owned_quote, reanchor_wallet_derived_quote))
-                new_owned_base = max(Decimal("0"), min(owned_base, reanchor_wallet_derived_base))
+                # Per-asset cut to wallet truth: each side is clamped only by its OWN total,
+                # so a quote-side over-claim can never drag owned_base below its own bound.
+                new_owned_quote = max(Decimal("0"), min(owned_quote, total_quote_balance))
+                new_owned_base = max(Decimal("0"), min(owned_base, total_base_balance))
                 if new_owned_quote < owned_quote or new_owned_base < owned_base:
                     self.logger().warning(
                         f"{self.config.id}: re-anchoring over-claimed ledger to wallet. "
@@ -4611,10 +4799,26 @@ class RangeInventoryLadderController(ControllerBase):
                         "range_ladder_ledger_reanchored",
                         old_owned_quote=str(owned_quote), new_owned_quote=str(new_owned_quote),
                         old_owned_base=str(owned_base), new_owned_base=str(new_owned_base),
-                        wallet_derived_quote=str(reanchor_wallet_derived_quote),
-                        wallet_derived_base=str(reanchor_wallet_derived_base),
+                        # Existing keys keep their keys; they now report the cut baseline,
+                        # which P1 made the total wallet (no reserve subtraction).
+                        wallet_derived_quote=str(total_quote_balance),
+                        wallet_derived_base=str(total_base_balance),
+                        wallet_quote_total=str(total_quote_balance),
+                        wallet_base_total=str(total_base_balance),
+                        cut_quote=str(owned_quote - new_owned_quote),
+                        cut_base=str(owned_base - new_owned_base),
+                        reserve_quote_balance=str(reserve_quote_balance),
+                        reserve_base_balance=str(reserve_base_balance),
                         overclaim_quote=str(reanchor_overclaim_quote),
                         grace_seconds=self.config.ledger_overclaim_reanchor_seconds,
+                    )
+                    self._record_reanchor_cut(
+                        now=now,
+                        old_owned_quote=owned_quote, old_owned_base=owned_base,
+                        new_owned_quote=new_owned_quote, new_owned_base=new_owned_base,
+                        overclaim_quote=reanchor_overclaim_quote,
+                        wallet_quote_total=total_quote_balance,
+                        wallet_base_total=total_base_balance,
                     )
                     owned_quote, owned_base = new_owned_quote, new_owned_base
                     self._state["owned_quote"] = str(owned_quote)
