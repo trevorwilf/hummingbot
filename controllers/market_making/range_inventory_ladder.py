@@ -1525,6 +1525,15 @@ class RangeInventoryLadderController(ControllerBase):
         self._state_recovery_backup_path: Optional[Path] = None
         self._state_migrated_from_version: Optional[int] = None
 
+        # hbpurse P2 (CDX-M01): commit-before-advance discipline. A money-state mutation is
+        # applied to a CANDIDATE copy, durably saved, and only adopted (self._state = candidate)
+        # ON SUCCESS. A failed save leaves the in-memory ledger UNCHANGED (so the next cycle
+        # recomputes the SAME deltas and retries -> booking/reseed/re-anchor are retry-idempotent),
+        # counts a state_io_failure, and raises accounting_degraded so NO new orders are proposed
+        # until the next successful save clears it. Existing resting orders are never touched.
+        self._accounting_degraded: bool = False
+        self._state_io_failures: int = 0
+
         self._config_rebuild_pending: bool = False
         self._config_rebuild_reason: str = ""
         self._pending_runtime_config_signature: Optional[tuple] = None
@@ -2054,8 +2063,25 @@ class RangeInventoryLadderController(ControllerBase):
             )
         try:
             os.replace(self.state_path, backup_path)
-        except OSError:
-            pass
+        except OSError as move_error:
+            # hbpurse P2 (A2 carry-along): the backup MOVE failed (e.g. a Windows file lock).
+            # Do NOT swallow it and do NOT delete/truncate the original file -- the rejected file
+            # is left in place so nothing is silently lost, and the failure is LOUDLY recorded so
+            # the re-init that follows is never a silent data loss. (The original bare `except
+            # OSError: pass` hid exactly this.)
+            self.logger().error(
+                f"{self.config.id}: FAILED to move rejected state file {self.state_path} to "
+                f"{backup_path}: {move_error}. Leaving the original file in place and re-initializing "
+                f"from wallet balances; the original ledger is NOT deleted or truncated here.",
+                exc_info=True,
+            )
+            self._emit_structured(
+                "range_ladder_state_backup_failed",
+                state_file=str(self.state_path),
+                backup_file=str(backup_path),
+                reason=reason,
+                error=str(move_error),
+            )
 
     @staticmethod
     def _d(value, default: str = "0") -> Decimal:
@@ -2191,6 +2217,65 @@ class RangeInventoryLadderController(ControllerBase):
         if not isinstance(validated.get("tracked_fill_executor_ids"), list):
             validated["tracked_fill_executor_ids"] = []
 
+        # hbpurse P2 (CLA-M03): validate booked_fill_progress with the SAME discipline as the
+        # monetary fields. It is an OPTIONAL v10 key, so missing/None -> {}. But a value that
+        # loads clean yet is unbookable (a non-dict payload, a non-string key, or a base/quote/
+        # fees that is non-numeric / non-finite / negative) would raise EVERY booking cycle into
+        # the blanket except -- booking silently dies while trading continues, and the poison
+        # rides copy-forward to the next deploy. Refuse it here (quarantine) instead.
+        progress_raw = validated.get("booked_fill_progress")
+        if progress_raw is None:
+            # Missing/None is a valid absence -> treated as {} by the booking read (the existing
+            # `isinstance(progress_raw, dict)` guard). Leave the state UNTOUCHED (do NOT materialize
+            # the key) so a pre-progress v10 file round-trips byte-identically -- the existing
+            # test_v10_state_without_progress_loads_and_books_forward regression pins this.
+            pass
+        elif not isinstance(progress_raw, dict):
+            raise ValueError("State field 'booked_fill_progress' must be a JSON object")
+        else:
+            for entry_key, entry_val in progress_raw.items():
+                if not isinstance(entry_key, str):
+                    raise ValueError(
+                        f"State 'booked_fill_progress' key {entry_key!r} must be a string"
+                    )
+                if not isinstance(entry_val, dict):
+                    raise ValueError(
+                        f"State 'booked_fill_progress[{entry_key}]' entry must be a JSON object"
+                    )
+                for money_key in ("base", "quote", "fees"):
+                    # default="0" mirrors the booking read (self._d(entry.get(k), "0")): a MISSING
+                    # sub-key is fine (defaults to 0), a PRESENT non-numeric/non-finite one raises.
+                    parsed = _safe_decimal(
+                        entry_val.get(money_key),
+                        f"booked_fill_progress[{entry_key}].{money_key}",
+                        default="0",
+                    )
+                    if parsed < Decimal("0"):
+                        raise ValueError(
+                            f"State 'booked_fill_progress[{entry_key}].{money_key}' must be non-negative"
+                        )
+            # A valid progress map is left UNTOUCHED (loads byte-identically).
+
+        # hbpurse P2 (CLA-M03): validate the P1 (F5/CLA-M02) optional keys too. MISSING keys are
+        # fine -- a pre-P1 state file must still load, and each use-site applies its own default.
+        # A PRESENT but corrupt value trips the quarantine (same discipline as the money fields).
+        if "reanchor_events" in validated and validated.get("reanchor_events") is not None \
+                and not isinstance(validated.get("reanchor_events"), list):
+            raise ValueError("State field 'reanchor_events' must be a list")
+        for offset_key in (
+            "reanchor_offset_quote", "reanchor_offset_base",
+            "reanchor_cut_quote_cum", "reanchor_cut_base_cum",
+        ):
+            if validated.get(offset_key) is None:
+                continue
+            parsed = _safe_decimal(validated.get(offset_key), f"state field '{offset_key}'", default="0")
+            if parsed < Decimal("0"):
+                raise ValueError(f"State field '{offset_key}' must be non-negative")
+        for offset_ts_key in ("reanchor_offset_quote_ts", "reanchor_offset_base_ts"):
+            if validated.get(offset_ts_key) is None:
+                continue
+            _safe_decimal(validated.get(offset_ts_key), f"state field '{offset_ts_key}'")
+
         validated["schema_version"] = self.STATE_SCHEMA_VERSION
         if schema_version != self.STATE_SCHEMA_VERSION:
             validated["migrated_from_schema_version"] = schema_version
@@ -2286,13 +2371,17 @@ class RangeInventoryLadderController(ControllerBase):
         except Exception:
             pass
 
-    def _save_state(self):
+    def _write_state_to_disk(self, state: Dict) -> None:
+        """Atomically persist the GIVEN state dict (temp file + flush + fsync + os.replace, plus
+        a best-effort parent-dir fsync). Raises on any IO failure so the caller decides how to
+        react. It operates on the PASSED dict -- not self._state -- so _commit_state can persist a
+        CANDIDATE state BEFORE it becomes self._state (the CDX-M01 commit discipline)."""
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_state_owner_marker()
         fd, tmp_path = tempfile.mkstemp(dir=str(self.state_path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self._state, f, indent=2, sort_keys=True)
+                json.dump(state, f, indent=2, sort_keys=True)
                 # Flush + fsync BEFORE the atomic replace: without it, a host power loss can
                 # leave a torn/zero-length state file, and the quarantine path would then
                 # re-initialize from the current wallet -- silently resetting seed_value_quote
@@ -2317,6 +2406,60 @@ class RangeInventoryLadderController(ControllerBase):
             except FileNotFoundError:
                 pass
             raise
+
+    def _save_state(self):
+        """Persist the CURRENT in-memory state. Used by the NON-money save sites (first-init and
+        schema migration) where there is no prior committed state to preserve. The money sites
+        (booking, reseed, re-anchor) go through _commit_state for the CDX-M01 commit discipline."""
+        self._write_state_to_disk(self._state)
+
+    def _commit_state(self, mutations: Dict[str, Any], *, reason: str) -> bool:
+        """hbpurse P2 (CDX-M01): advance in-memory money state ONLY after a durable save.
+
+        Build a CANDIDATE (a shallow copy of self._state with `mutations` applied; every mutation
+        VALUE is a freshly-built object, so the copy never aliases a nested dict the caller still
+        mutates), persist the candidate via the atomic writer, and ONLY on success adopt it
+        (self._state = candidate). On failure self._state is UNCHANGED -- the next cycle recomputes
+        the SAME deltas and retries naturally (retry-idempotent booking/reseed/re-anchor);
+        state_io_failures increments, accounting_degraded is raised (new-order proposals suppressed
+        while degraded, EXISTING orders untouched), and a structured event is emitted. A successful
+        commit clears accounting_degraded. Returns True on a durable commit, False otherwise."""
+        candidate = dict(self._state)
+        candidate.update(mutations)
+        try:
+            self._write_state_to_disk(candidate)
+        except Exception as exc:
+            self._state_io_failures += 1
+            self._accounting_degraded = True
+            self.logger().error(
+                f"{self.config.id}: state commit FAILED ({reason}); the in-memory ledger is left "
+                f"UNCHANGED and new orders are suppressed until the next durable save "
+                f"(state_io_failures={self._state_io_failures}): {exc}",
+                exc_info=True,
+            )
+            self._emit_structured(
+                "range_ladder_state_commit_failed",
+                reason=reason,
+                error=str(exc),
+                state_io_failures=self._state_io_failures,
+                accounting_degraded=True,
+                state_file=str(self.state_path),
+            )
+            return False
+        self._state = candidate
+        if self._accounting_degraded:
+            self._accounting_degraded = False
+            self.logger().info(
+                f"{self.config.id}: state commit recovered ({reason}); accounting_degraded cleared "
+                f"and new-order proposals resume (state_io_failures={self._state_io_failures})."
+            )
+            self._emit_structured(
+                "range_ladder_accounting_degraded_cleared",
+                reason=reason,
+                state_io_failures=self._state_io_failures,
+                state_file=str(self.state_path),
+            )
+        return True
 
 
     def _compute_seed_claim(self, *, reference_price: Decimal, available_quote_balance: Decimal,
@@ -2373,14 +2516,37 @@ class RangeInventoryLadderController(ControllerBase):
             return True
 
         base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
-        total_quote_balance = Decimal(self.market_data_provider.get_balance(self.config.connector_name, quote_asset))
-        total_base_balance = Decimal(self.market_data_provider.get_balance(self.config.connector_name, base_asset))
-        available_quote_balance = Decimal(
-            self.market_data_provider.get_available_balance(self.config.connector_name, quote_asset)
-        )
-        available_base_balance = Decimal(
-            self.market_data_provider.get_available_balance(self.config.connector_name, base_asset)
-        )
+        # hbpurse P2 (F10): parse the four wallet reads with the safe Decimal helper instead of
+        # raw Decimal(...). This kills the float-dust hazard (Decimal(str(x)) is exact) AND fails
+        # CLOSED on a non-finite / unparseable balance (NaN, Infinity, garbage): rather than
+        # seeding the reconcile-critical baseline from a bogus value (or crashing the cycle on a
+        # TypeError), REFUSE init this cycle, write no state, and retry next cycle once the read is
+        # sane.
+        try:
+            total_quote_balance = self._d(self.market_data_provider.get_balance(self.config.connector_name, quote_asset))
+            total_base_balance = self._d(self.market_data_provider.get_balance(self.config.connector_name, base_asset))
+            available_quote_balance = self._d(
+                self.market_data_provider.get_available_balance(self.config.connector_name, quote_asset)
+            )
+            available_base_balance = self._d(
+                self.market_data_provider.get_available_balance(self.config.connector_name, base_asset)
+            )
+        except (ValueError, InvalidOperation, TypeError) as balance_error:
+            self._initialization_blocked_reason = "unparseable_wallet_balance_at_init"
+            if not self._initialization_blocked_logged:
+                self._initialization_blocked_logged = True
+                self.logger().error(
+                    f"{self.config.id}: refusing first-time initialization -- a wallet balance read "
+                    f"was non-finite or unparseable ({balance_error}). No state is written; the "
+                    "controller will retry next cycle once the balances are sane."
+                )
+                self._emit_structured(
+                    "range_ladder_initialization_blocked_bad_balance",
+                    connector=self.config.connector_name,
+                    trading_pair=self.config.trading_pair,
+                    error=str(balance_error),
+                )
+            return False
 
         unavailable_quote_balance = max(Decimal("0"), total_quote_balance - available_quote_balance)
         unavailable_base_balance = max(Decimal("0"), total_base_balance - available_base_balance)
@@ -2743,26 +2909,28 @@ class RangeInventoryLadderController(ControllerBase):
             loaded.append(amount)
         return loaded[0], loaded[1], cleared
 
-    def _record_reanchor_cut(self, *, now: float, old_owned_quote: Decimal, old_owned_base: Decimal,
-                             new_owned_quote: Decimal, new_owned_base: Decimal,
-                             overclaim_quote: Decimal, wallet_quote_total: Decimal,
-                             wallet_base_total: Decimal) -> None:
-        """hbpurse P1 (CLA-M02 + F5): persist re-anchor visibility and offset credits into
-        self._state. The caller saves (single mutation set, so P2's commit discipline can
-        wrap the whole re-anchor in one candidate later).
+    def _build_reanchor_mutations(self, *, now: float, old_owned_quote: Decimal, old_owned_base: Decimal,
+                                  new_owned_quote: Decimal, new_owned_base: Decimal,
+                                  overclaim_quote: Decimal, wallet_quote_total: Decimal,
+                                  wallet_base_total: Decimal) -> Dict[str, Any]:
+        """hbpurse P1 (CLA-M02 + F5), P2 (CDX-M01): compute the re-anchor visibility + offset-credit
+        state deltas as a MUTATION SET, reading self._state read-only (never writing it). The caller
+        merges owned_* and commits everything in ONE candidate via _commit_state -- so a failed save
+        leaves ALL of this metadata, and owned_*, at their prior values (no partial re-anchor).
 
-        CLA-M02: the total-wallet trigger inherently nets external flows (a deposit plus an
-        equal withdrawal is invisible to it), so every cut is appended to the OPTIONAL state
-        list `reanchor_events` (newest REANCHOR_EVENTS_MAX kept) with wallet totals, plus
-        uncapped cumulative cut counters -- the netting is at least VISIBLE until
-        declared-flow accounting lands (P5; P4 journals from this same site).
+        CLA-M02: the total-wallet trigger inherently nets external flows (a deposit plus an equal
+        withdrawal is invisible to it), so every cut is appended to the OPTIONAL state list
+        `reanchor_events` (newest REANCHOR_EVENTS_MAX kept) with wallet totals, plus uncapped
+        cumulative cut counters -- the netting is at least VISIBLE until declared-flow accounting
+        lands (P5; P4 journals from this same site).
 
-        F5: the per-asset cut amounts become offset credits. The booking loop consumes them
-        BEFORE debiting owned_* again, so a fill the wallet already reflected (and this
-        re-anchor already deducted) cannot double-debit when it books late.
+        F5: the per-asset cut amounts become offset credits. The booking loop consumes them BEFORE
+        debiting owned_* again, so a fill the wallet already reflected (and this re-anchor already
+        deducted) cannot double-debit when it books late.
         """
         cut_quote = max(Decimal("0"), old_owned_quote - new_owned_quote)
         cut_base = max(Decimal("0"), old_owned_base - new_owned_base)
+        mutations: Dict[str, Any] = {}
 
         events_raw = self._state.get("reanchor_events")
         events = list(events_raw) if isinstance(events_raw, list) else []
@@ -2776,7 +2944,7 @@ class RangeInventoryLadderController(ControllerBase):
             "wallet_quote_total": str(wallet_quote_total),
             "wallet_base_total": str(wallet_base_total),
         })
-        self._state["reanchor_events"] = events[-self.REANCHOR_EVENTS_MAX:]
+        mutations["reanchor_events"] = events[-self.REANCHOR_EVENTS_MAX:]
 
         for key, cut in (("reanchor_cut_quote_cum", cut_quote), ("reanchor_cut_base_cum", cut_base)):
             try:
@@ -2788,13 +2956,13 @@ class RangeInventoryLadderController(ControllerBase):
                     f"{self.config.id}: resetting unreadable {key}={self._state.get(key)!r} to 0"
                 )
                 prior = Decimal("0")
-            self._state[key] = str(prior + cut)
+            mutations[key] = str(prior + cut)
 
         prior_offset_quote, prior_offset_base, _cleared = self._load_reanchor_offsets(now)
         for cut, prior, (amount_key, ts_key) in (
                 (cut_quote, prior_offset_quote, self.REANCHOR_OFFSET_KEYS[0]),
                 (cut_base, prior_offset_base, self.REANCHOR_OFFSET_KEYS[1])):
-            self._state[amount_key] = str(prior + cut)
+            mutations[amount_key] = str(prior + cut)
             if prior > Decimal("0"):
                 # CDX-R01: a cut merged into a surviving credit keeps the credit's ORIGINAL
                 # timestamp (fail closed: the merged-in portion may expire early, but a later
@@ -2802,7 +2970,8 @@ class RangeInventoryLadderController(ControllerBase):
                 # per-asset state and is not touched at all.
                 continue
             if cut > Decimal("0"):
-                self._state[ts_key] = float(now)
+                mutations[ts_key] = float(now)
+        return mutations
 
     def _book_fills_from_orders(self):
         """v13 Part A: robust per-order incremental fill booking.
@@ -2852,7 +3021,9 @@ class RangeInventoryLadderController(ControllerBase):
         # booking, so already-realized fills (already reflected in the re-seeded wallet) are not
         # retroactively re-booked. Subsequent cycles book normally from that baseline.
         reseed_priming = self._reseed_just_applied
-        self._reseed_just_applied = False
+        # hbpurse P2 (CDX-M01): _reseed_just_applied is cleared ONLY alongside a SUCCESSFUL commit
+        # below -- if the priming save fails, we re-prime next cycle instead of double-booking the
+        # already-realized fills the re-seed's wallet already reflects.
 
         changed = False
         current_ids = set()
@@ -2942,19 +3113,38 @@ class RangeInventoryLadderController(ControllerBase):
         for eid in pruned_ids:
             del progress[eid]
 
-        if changed:
-            # v15: arm the fill-settle grace window — the wallet snapshot will lag this fill
-            # by up to one balance poll, so over-claim checks defer until it re-syncs.
-            self._last_fill_booked_ts = self.market_data_provider.time()
-
         if changed or pruned_ids or reseed_priming or offset_dirty:
-            self._state["owned_quote"] = str(owned_quote)
-            self._state["owned_base"] = str(owned_base)
-            self._state["booked_fill_progress"] = progress
-            self._state["reanchor_offset_quote"] = str(offset_quote)
-            self._state["reanchor_offset_base"] = str(offset_base)
-            self._save_state()
+            # hbpurse P2 (CDX-M01): commit the booked ledger to disk BEFORE advancing the
+            # in-memory owned_*/progress/offsets. `owned_quote`, `owned_base` and `progress` are
+            # LOCALS up to here -- self._state still holds the PRIOR values -- so a failed save
+            # leaves the ledger untouched and the next cycle recomputes the SAME deltas and
+            # re-books this fill exactly once.
+            committed = self._commit_state(
+                {
+                    "owned_quote": str(owned_quote),
+                    "owned_base": str(owned_base),
+                    "booked_fill_progress": progress,
+                    "reanchor_offset_quote": str(offset_quote),
+                    "reanchor_offset_base": str(offset_base),
+                },
+                reason="fill_booking",
+            )
+            if not committed:
+                # Degraded: owned_*/progress/offsets and _reseed_just_applied stay at their prior
+                # values, and we do NOT arm the settle-grace on an unpersisted book. Also roll back
+                # the per-cycle booked-fill flags so the refresh machine cannot cancel/rebuild
+                # EXISTING orders on a fill that did not durably book (existing orders untouched
+                # while degraded). Retry next cycle.
+                self._booked_buy_fill_this_cycle = False
+                self._booked_sell_fill_this_cycle = False
+                return
+            # The baseline (priming) or the booked deltas are now durable.
+            if reseed_priming:
+                self._reseed_just_applied = False
             if changed:
+                # v15: arm the fill-settle grace window — the wallet snapshot will lag this fill
+                # by up to one balance poll, so over-claim checks defer until it re-syncs.
+                self._last_fill_booked_ts = self.market_data_provider.time()
                 self.logger().info(
                     f"{self.config.id}: ledger updated from fills. "
                     f"owned_quote={owned_quote} owned_base={owned_base}"
@@ -3188,24 +3378,37 @@ class RangeInventoryLadderController(ControllerBase):
 
         # Recompute owned_*/seed_value/initial_*/reserve_* from the current wallet; clear the
         # fills bookkeeping so the new baseline books forward cleanly. Never wipe unrelated state.
-        self._state["reserve_quote_balance"] = str(max(Decimal("0"), total_quote_balance - managed_quote_claim))
-        self._state["reserve_base_balance"] = str(max(Decimal("0"), total_base_balance - claimed_base_amount))
-        self._state["initial_managed_quote"] = str(managed_quote_claim)
-        self._state["initial_claimed_base_amount"] = str(claimed_base_amount)
-        self._state["initial_reference_price"] = str(reference_price)
-        self._state["owned_quote"] = str(managed_quote_claim)
-        self._state["owned_base"] = str(claimed_base_amount)
-        self._state["seed_value_quote"] = str(seed_value_quote)
-        self._state["booked_fill_progress"] = {}
-        self._state["tracked_fill_executor_ids"] = []
-        # hbpurse P1 (F5): the re-seed re-baselines owned_* from the live wallet and re-primes
-        # every open order's cumulative baseline, so an outstanding re-anchor offset credit no
-        # longer corresponds to a pending late fill. Leaving it live would let it absorb a
-        # genuine post-reseed debit (fabricated equity) -- clear it with the re-baseline.
-        self._state["reanchor_offset_quote"] = "0"
-        self._state["reanchor_offset_base"] = "0"
-        self._state["last_reseed_token"] = reseed_token
-        self._save_state()
+        reserve_quote = str(max(Decimal("0"), total_quote_balance - managed_quote_claim))
+        reserve_base = str(max(Decimal("0"), total_base_balance - claimed_base_amount))
+        # hbpurse P2 (CDX-M01): the reseed token is consumed ONLY inside the committed candidate.
+        # If the save fails, self._state is UNCHANGED -- the token is NOT consumed and owned_* is
+        # NOT rebaselined -- so the reseed retries and applies next cycle exactly once (and
+        # _reseed_just_applied is set only after the successful commit, as it always has been).
+        committed = self._commit_state(
+            {
+                "reserve_quote_balance": reserve_quote,
+                "reserve_base_balance": reserve_base,
+                "initial_managed_quote": str(managed_quote_claim),
+                "initial_claimed_base_amount": str(claimed_base_amount),
+                "initial_reference_price": str(reference_price),
+                "owned_quote": str(managed_quote_claim),
+                "owned_base": str(claimed_base_amount),
+                "seed_value_quote": str(seed_value_quote),
+                "booked_fill_progress": {},
+                "tracked_fill_executor_ids": [],
+                # hbpurse P1 (F5): the re-seed re-baselines owned_* from the live wallet and
+                # re-primes every open order's cumulative baseline, so an outstanding re-anchor
+                # offset credit no longer corresponds to a pending late fill. Leaving it live would
+                # let it absorb a genuine post-reseed debit (fabricated equity) -- clear it with
+                # the re-baseline.
+                "reanchor_offset_quote": "0",
+                "reanchor_offset_base": "0",
+                "last_reseed_token": reseed_token,
+            },
+            reason="reseed",
+        )
+        if not committed:
+            return  # save failed -> token NOT consumed; the reseed retries next cycle.
 
         # Next booking pass re-baselines open orders to their current cumulative WITHOUT booking,
         # so already-realized fills (already reflected in the re-seeded wallet) are not re-booked.
@@ -4791,28 +4994,14 @@ class RangeInventoryLadderController(ControllerBase):
                 new_owned_quote = max(Decimal("0"), min(owned_quote, total_quote_balance))
                 new_owned_base = max(Decimal("0"), min(owned_base, total_base_balance))
                 if new_owned_quote < owned_quote or new_owned_base < owned_base:
-                    self.logger().warning(
-                        f"{self.config.id}: re-anchoring over-claimed ledger to wallet. "
-                        f"owned_quote {owned_quote}->{new_owned_quote} owned_base {owned_base}->{new_owned_base}"
-                    )
-                    self._emit_structured(
-                        "range_ladder_ledger_reanchored",
-                        old_owned_quote=str(owned_quote), new_owned_quote=str(new_owned_quote),
-                        old_owned_base=str(owned_base), new_owned_base=str(new_owned_base),
-                        # Existing keys keep their keys; they now report the cut baseline,
-                        # which P1 made the total wallet (no reserve subtraction).
-                        wallet_derived_quote=str(total_quote_balance),
-                        wallet_derived_base=str(total_base_balance),
-                        wallet_quote_total=str(total_quote_balance),
-                        wallet_base_total=str(total_base_balance),
-                        cut_quote=str(owned_quote - new_owned_quote),
-                        cut_base=str(owned_base - new_owned_base),
-                        reserve_quote_balance=str(reserve_quote_balance),
-                        reserve_base_balance=str(reserve_base_balance),
-                        overclaim_quote=str(reanchor_overclaim_quote),
-                        grace_seconds=self.config.ledger_overclaim_reanchor_seconds,
-                    )
-                    self._record_reanchor_cut(
+                    # hbpurse P2 (CDX-M01): persist owned_* AND the re-anchor visibility/offset
+                    # metadata in ONE committed candidate. Build the metadata mutation set read-only,
+                    # merge owned_*, and commit. Only on a DURABLE save do we adopt the cut (reassign
+                    # owned_*, announce it, clear the grace timer). If the save fails, owned_* stay at
+                    # their OLD values, NO reanchored event is emitted (nothing durably happened), and
+                    # _overclaim_since is left ARMED so the next cycle (grace already elapsed) retries
+                    # the cut promptly.
+                    mutations = self._build_reanchor_mutations(
                         now=now,
                         old_owned_quote=owned_quote, old_owned_base=owned_base,
                         new_owned_quote=new_owned_quote, new_owned_base=new_owned_base,
@@ -4820,11 +5009,36 @@ class RangeInventoryLadderController(ControllerBase):
                         wallet_quote_total=total_quote_balance,
                         wallet_base_total=total_base_balance,
                     )
-                    owned_quote, owned_base = new_owned_quote, new_owned_base
-                    self._state["owned_quote"] = str(owned_quote)
-                    self._state["owned_base"] = str(owned_base)
-                    self._save_state()
-                self._overclaim_since = None
+                    mutations["owned_quote"] = str(new_owned_quote)
+                    mutations["owned_base"] = str(new_owned_base)
+                    if self._commit_state(mutations, reason="reanchor"):
+                        self.logger().warning(
+                            f"{self.config.id}: re-anchoring over-claimed ledger to wallet. "
+                            f"owned_quote {owned_quote}->{new_owned_quote} owned_base {owned_base}->{new_owned_base}"
+                        )
+                        self._emit_structured(
+                            "range_ladder_ledger_reanchored",
+                            old_owned_quote=str(owned_quote), new_owned_quote=str(new_owned_quote),
+                            old_owned_base=str(owned_base), new_owned_base=str(new_owned_base),
+                            # Existing keys keep their keys; they now report the cut baseline,
+                            # which P1 made the total wallet (no reserve subtraction).
+                            wallet_derived_quote=str(total_quote_balance),
+                            wallet_derived_base=str(total_base_balance),
+                            wallet_quote_total=str(total_quote_balance),
+                            wallet_base_total=str(total_base_balance),
+                            cut_quote=str(owned_quote - new_owned_quote),
+                            cut_base=str(owned_base - new_owned_base),
+                            reserve_quote_balance=str(reserve_quote_balance),
+                            reserve_base_balance=str(reserve_base_balance),
+                            overclaim_quote=str(reanchor_overclaim_quote),
+                            grace_seconds=self.config.ledger_overclaim_reanchor_seconds,
+                        )
+                        owned_quote, owned_base = new_owned_quote, new_owned_base
+                        self._overclaim_since = None
+                    # else: commit failed -> leave _overclaim_since armed for a prompt retry.
+                else:
+                    # No actual cut (both sides already at/under wallet) -> clear the grace timer.
+                    self._overclaim_since = None
         else:
             self._overclaim_since = None
 
@@ -6529,6 +6743,16 @@ class RangeInventoryLadderController(ControllerBase):
         if self._market_data_hard_pause or self._session_expired:
             return []
 
+        # hbpurse P2 (CDX-M01): fail closed while the ledger is accounting-degraded (a state
+        # commit failed and the in-memory ledger could not be persisted). Propose NO new orders
+        # until the next successful save clears it; EXISTING resting orders are left untouched.
+        if self._accounting_degraded:
+            self._emit_structured(
+                "range_ladder_create_blocked_accounting_degraded",
+                state_io_failures=self._state_io_failures,
+            )
+            return []
+
         if self._config_rebuild_pending and self._active_order_executors():
             self._emit_structured(
                 "range_ladder_rebuild_waiting_for_cancels",
@@ -7119,6 +7343,10 @@ class RangeInventoryLadderController(ControllerBase):
             "state_schema_version": str(self.STATE_SCHEMA_VERSION),
             "state_recovery_reason": self._state_recovery_reason or "",
             "state_migrated_from_version": str(self._state_migrated_from_version) if self._state_migrated_from_version is not None else "",
+            # hbpurse P2 (CDX-M01): fail-closed accounting health. accounting_degraded=True means a
+            # state commit failed and NEW orders are suppressed until the next durable save.
+            "accounting_degraded": str(self._accounting_degraded),
+            "state_io_failures": self._state_io_failures,
             "price_regime": str(p.get("price_regime", "")),
             "out_of_range_action": str(self.config.out_of_range_action),
             "enable_buys": str(self.config.enable_buys),

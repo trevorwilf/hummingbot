@@ -189,6 +189,8 @@ class TestPostRefreshSettle(unittest.TestCase):
         }
         controller._market_data_hard_pause = False
         controller._session_expired = False
+        controller._accounting_degraded = False  # hbpurse P2: healthy ledger (not IO-degraded)
+        controller._state_io_failures = 0
         controller._config_rebuild_pending = False
         controller._refresh_quiet_until = 2_000.0  # future
         mdp = MagicMock()
