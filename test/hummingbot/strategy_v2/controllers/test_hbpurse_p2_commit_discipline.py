@@ -265,10 +265,22 @@ class TestBookingCommitDiscipline(_Harness):
         ctrl, mdp, _ = self._buy_fill_ctrl()
         self._install_flaky_writer(ctrl, fail_on_calls={1})
         self._cycle(ctrl, mdp, 1000.0)   # fail
+        # CDX-R05 discriminator: the FAILED cycle must NOT have advanced the in-memory ledger, and
+        # nothing may be on disk. Reverting _commit_state to mutate-then-save (self._state =
+        # candidate BEFORE the write) leaves owned_quote at 70 here -> this test FAILS, so it can no
+        # longer pass under the exact mutation it claims to catch.
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(100))
+        self.assertEqual(D(ctrl._state["owned_base"]), D(0))
+        self.assertEqual(ctrl._state.get("booked_fill_progress", {}), {})
+        self.assertFalse(self._state_path.exists())
         self._cycle(ctrl, mdp, 1001.0)   # book once
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(70))
+        self.assertEqual(D(ctrl._state["owned_base"]), D("0.1"))
         self._cycle(ctrl, mdp, 1002.0)   # idle: nothing new to book
         self.assertEqual(D(ctrl._state["owned_quote"]), D(70))
         self.assertEqual(D(ctrl._state["owned_base"]), D("0.1"))
+        self.assertEqual(D(self._persisted()["owned_quote"]), D(70))
+        self.assertEqual(D(self._persisted()["owned_base"]), D("0.1"))
 
 
 # ==================================================== CDX-M01: reseed commit discipline
@@ -461,7 +473,15 @@ class TestLoadValidation(_Harness):
         ctrl._load_state()
         self.assertEqual([], self._emit_events(ctrl, "range_ladder_state_rejected"))
         self.assertTrue(ctrl._state.get("initialized"))
-        self.assertEqual(ctrl._state["booked_fill_progress"]["exec1"]["base"], "0.5")
+        # CDX-R06 discriminator: a VALID progress map must load byte-for-byte UNTOUCHED -- EVERY
+        # sub-key (base AND quote AND fees), not just base. A validation pass that rewrites any
+        # entry value (e.g. entry_val["fees"] = "999") is now caught by the full-mapping equality;
+        # the old base-only assertion missed a corrupted quote/fee baseline, which would suppress
+        # future fee deltas via the monotonic guard and over-state the fund.
+        self.assertEqual(
+            ctrl._state["booked_fill_progress"],
+            {"exec1": {"base": "0.5", "quote": "150", "fees": "0.1"}},
+        )
 
     def test_missing_progress_loads_and_is_treated_as_empty(self):
         # Missing/None progress must NOT quarantine and must behave as {} (the booking read
@@ -531,6 +551,69 @@ class TestLoadValidation(_Harness):
         self.assertEqual({}, ctrl._state)
         self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_rejected")))
 
+    # ------ CDX-R03: malformed reanchor_events elements + future/negative offset timestamps ------
+
+    def test_malformed_reanchor_event_element_quarantines(self):
+        # CDX-R03: a reanchor_events LIST is not enough -- a malformed ELEMENT (a bare string) must
+        # quarantine, else it loads clean and later crashes the reporting/journal read that iterates
+        # events. The old `isinstance(..., list)`-only check accepted this.
+        self._write_state(self._valid_state(reanchor_events=["not-an-event"]))
+        ctrl = self._fresh_ctrl()
+        ctrl._load_state()
+        self.assertEqual({}, ctrl._state)
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_rejected")))
+
+    def test_nonfinite_reanchor_event_amount_quarantines(self):
+        # A well-shaped event dict with a NON-FINITE numeric (NaN) must also quarantine.
+        self._write_state(self._valid_state(reanchor_events=[
+            {"ts": 1000.0, "old_owned_quote": "NaN", "new_owned_quote": "0",
+             "old_owned_base": "0", "new_owned_base": "0", "overclaim_quote": "0",
+             "wallet_quote_total": "0", "wallet_base_total": "0"}]))
+        ctrl = self._fresh_ctrl()
+        ctrl._load_state()
+        self.assertEqual({}, ctrl._state)
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_rejected")))
+
+    def test_valid_reanchor_event_element_loads(self):
+        # Regression: a well-formed event list (the shape _build_reanchor_mutations writes) must
+        # still load clean.
+        self._write_state(self._valid_state(reanchor_events=[
+            {"ts": 1000.0, "old_owned_quote": "600", "new_owned_quote": "570",
+             "old_owned_base": "0", "new_owned_base": "0", "overclaim_quote": "30",
+             "wallet_quote_total": "570", "wallet_base_total": "0"}]))
+        ctrl = self._fresh_ctrl()
+        ctrl._load_state()
+        self.assertEqual([], self._emit_events(ctrl, "range_ladder_state_rejected"))
+        self.assertTrue(ctrl._state.get("initialized"))
+
+    def test_future_dated_offset_ts_quarantines(self):
+        # CDX-R03: a far-future offset creation timestamp makes `now - ts` negative, so the expiry
+        # test never fires and the credit becomes IMMORTAL -- it could absorb a genuine future debit
+        # and OVER-STATE owned_*. Refuse it on load (harness mdp.time() == 1000).
+        self._write_state(self._valid_state(
+            reanchor_offset_quote="30", reanchor_offset_quote_ts="9999999999"))
+        ctrl = self._fresh_ctrl()
+        ctrl._load_state()
+        self.assertEqual({}, ctrl._state)
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_rejected")))
+
+    def test_negative_offset_ts_quarantines(self):
+        self._write_state(self._valid_state(
+            reanchor_offset_base="5", reanchor_offset_base_ts="-1"))
+        ctrl = self._fresh_ctrl()
+        ctrl._load_state()
+        self.assertEqual({}, ctrl._state)
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_rejected")))
+
+    def test_present_valid_offset_ts_loads(self):
+        # Regression: a plausible (past, non-negative) offset ts must still load.
+        self._write_state(self._valid_state(
+            reanchor_offset_quote="30", reanchor_offset_quote_ts="990"))
+        ctrl = self._fresh_ctrl()
+        ctrl._load_state()
+        self.assertEqual([], self._emit_events(ctrl, "range_ladder_state_rejected"))
+        self.assertTrue(ctrl._state.get("initialized"))
+
 
 # ==================================================== F10: init Decimal hygiene
 
@@ -569,29 +652,116 @@ class TestInitDecimalHygiene(_Harness):
         )
 
 
+# ================================================ CDX-R01: first-init commit discipline
+
+class TestInitCommitDiscipline(_Harness):
+
+    def test_init_write_failure_refuses_then_retries(self):
+        # CDX-R01: first-init CREATES every authoritative money field, so a failed initial save must
+        # NOT leave initialized=True in memory with nothing on disk (which would trade from a
+        # non-durable ledger and silently re-seed on restart). Instead: refuse, degrade, retry.
+        balances = {"XMR": (D("1"), D("1")), "USDT": (D("200"), D("200"))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        ctrl._state = {}
+        ctrl._state_loaded = True
+        self._install_flaky_writer(ctrl, fail_on_calls={1})
+
+        # Cycle 1: the initial state save fails -> init REFUSED, in-memory state NOT advanced to
+        # initialized, nothing on disk, degraded raised, failure counted, commit-fail event emitted.
+        # Reverting first-init to mutate-then-save (assign self._state before the write) leaves
+        # initialized=True in memory here -> this test FAILS.
+        self.assertFalse(ctrl._ensure_initialized(Decimal("300")))
+        self.assertEqual({}, ctrl._state)
+        self.assertNotIn("initialized", ctrl._state)
+        self.assertFalse(self._state_path.exists())
+        self.assertTrue(ctrl._accounting_degraded)
+        self.assertEqual(ctrl._state_io_failures, 1)
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_state_commit_failed")))
+
+        # Cycle 2: the writer works -> init applies and persists exactly once, degraded clears.
+        self.assertTrue(ctrl._ensure_initialized(Decimal("300")))
+        self.assertTrue(ctrl._state.get("initialized"))
+        self.assertTrue(self._state_path.exists())
+        self.assertTrue(self._persisted().get("initialized"))
+        self.assertFalse(ctrl._accounting_degraded)
+        self.assertEqual(ctrl._state_io_failures, 1)
+
+
+# =============================== CDX-R03: offset expiry defense-in-depth at consumption
+
+class TestOffsetExpiryDefenseInDepth(_Harness):
+
+    def test_load_reanchor_offsets_drops_future_ts(self):
+        # CDX-R03 defense-in-depth: even if a future-stamped credit reaches the consumption site
+        # (bypassing load validation), _load_reanchor_offsets must read it as ZERO (stale), never as
+        # a live immortal credit. Without the future-age guard, `(now - ts) >= expiry` is false for a
+        # future ts and the credit would survive.
+        mdp = _make_mdp(balances={"XMR": (D(0), D(0)), "USDT": (D(0), D(0))},
+                        mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        self._init_state(ctrl, owned_quote=100, owned_base=0, seed_value=100,
+                         reanchor_offset_quote="30",
+                         reanchor_offset_quote_ts=str(1000 + 10 * 86400))
+        offset_quote, offset_base, cleared = ctrl._load_reanchor_offsets(1000.0)
+        self.assertEqual(offset_quote, Decimal("0"))
+        self.assertTrue(cleared)
+
+    def test_load_reanchor_offsets_keeps_fresh_ts(self):
+        # Regression: a fresh (recent, past) credit is preserved.
+        mdp = _make_mdp(balances={"XMR": (D(0), D(0)), "USDT": (D(0), D(0))},
+                        mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp, reanchor_offset_expiry_seconds=600)
+        self._init_state(ctrl, owned_quote=100, owned_base=0, seed_value=100,
+                         reanchor_offset_quote="30", reanchor_offset_quote_ts="990")
+        offset_quote, offset_base, cleared = ctrl._load_reanchor_offsets(1000.0)
+        self.assertEqual(offset_quote, Decimal("30"))
+        self.assertFalse(cleared)
+
+
 # ==================================================== A2: quarantine backup-move failure
 
 class TestQuarantineBackupFailure(_Harness):
 
     def test_backup_move_failure_emits_event_and_keeps_original(self):
         # A corrupt file triggers quarantine; the backup os.replace fails (e.g. a Windows lock).
-        # The failure must be LOUDLY recorded and the original file must NOT be lost.
+        # The failure must be LOUDLY recorded AND the rejected bytes must survive the
+        # re-initialization that FOLLOWS (which os.replace()s a fresh state onto state_path).
+        rejected_bytes = "{ this is not valid json "
         with self._state_path.open("w", encoding="utf-8") as f:
-            f.write("{ this is not valid json ")
-        ctrl = self._build(_make_mdp(balances={"XMR": (D(0), D(0)), "USDT": (D(0), D(0))},
+            f.write(rejected_bytes)
+        ctrl = self._build(_make_mdp(balances={"XMR": (D(1), D(1)), "USDT": (D(200), D(200))},
                                      mid=300, bid=299, ask=301))
 
         def failing_replace(src, dst):
             raise OSError("backup move blocked by a file lock")
 
+        # Only the quarantine MOVE (os.replace) fails; the best-effort shutil.copy2 preserve and
+        # the later re-init atomic write are real IO in the tmp dir.
         with patch.object(ril.os, "replace", side_effect=failing_replace):
             ctrl._load_state()
 
         self.assertEqual({}, ctrl._state)                 # re-init will follow
-        self.assertTrue(self._state_path.exists())        # original NOT deleted/lost
+        self.assertTrue(self._state_path.exists())        # original NOT deleted/lost yet
+        backup_path = ctrl._state_recovery_backup_path
+        self.assertIsNotNone(backup_path)
         events = self._emit_events(ctrl, "range_ladder_state_backup_failed")
         self.assertEqual(1, len(events))
         self.assertIn("backup move blocked", events[0].kwargs["error"])
+        # A2 + CDX-R04: the rejected bytes are PRESERVED at the backup path (copy fallback), so the
+        # recovery init below cannot destroy the only copy.
+        self.assertEqual("True", events[0].kwargs["preserved_backup"])
+        self.assertEqual(Path(backup_path).read_text(encoding="utf-8"), rejected_bytes)
+
+        # CDX-R07 discriminator: drive the recovery initialization, which os.replace()s a fresh
+        # state onto state_path. The rejected ledger must STILL be recoverable at the backup path
+        # afterward (dropping the copy-preserve loses it here), while state_path now holds the fresh
+        # initialized state -- NOT the rejected bytes.
+        self.assertTrue(ctrl._ensure_initialized(Decimal("300")))
+        self.assertTrue(ctrl._state.get("initialized"))
+        self.assertEqual(Path(backup_path).read_text(encoding="utf-8"), rejected_bytes)
+        self.assertNotEqual(self._state_path.read_text(encoding="utf-8"), rejected_bytes)
+        self.assertTrue(self._persisted().get("initialized"))
 
     def test_backup_move_success_still_moves_file(self):
         # Regression guard: when the move succeeds the original is relocated to the backup path.

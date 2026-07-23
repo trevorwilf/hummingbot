@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import time
 from decimal import Decimal, InvalidOperation
@@ -2064,15 +2065,33 @@ class RangeInventoryLadderController(ControllerBase):
         try:
             os.replace(self.state_path, backup_path)
         except OSError as move_error:
-            # hbpurse P2 (A2 carry-along): the backup MOVE failed (e.g. a Windows file lock).
-            # Do NOT swallow it and do NOT delete/truncate the original file -- the rejected file
-            # is left in place so nothing is silently lost, and the failure is LOUDLY recorded so
-            # the re-init that follows is never a silent data loss. (The original bare `except
-            # OSError: pass` hid exactly this.)
+            # hbpurse P2 (A2 carry-along + CDX-R04): the backup MOVE failed (e.g. a Windows file
+            # lock). Do NOT swallow it. The quarantine is followed by a re-initialization that
+            # os.replace()s a FRESH state onto state_path -- which would DESTROY the only copy of
+            # the rejected ledger. So first make a BEST-EFFORT COPY of the rejected bytes to the
+            # backup path (copy2 does not use os.replace, so it survives a rename-only lock). If
+            # even the copy fails, leave the original in place and record the loss loudly -- and
+            # note that re-init's own save is now commit-disciplined (CDX-R01), so a still-locked
+            # path fails closed rather than silently overwriting the rejected ledger.
+            preserved = False
+            try:
+                shutil.copy2(self.state_path, backup_path)
+                preserved = True
+            except OSError as copy_error:
+                self.logger().error(
+                    f"{self.config.id}: could ALSO not copy rejected state file {self.state_path} "
+                    f"to {backup_path}: {copy_error}. The rejected ledger may be overwritten by the "
+                    f"recovery initialization only if that write succeeds despite this failure.",
+                    exc_info=True,
+                )
             self.logger().error(
                 f"{self.config.id}: FAILED to move rejected state file {self.state_path} to "
-                f"{backup_path}: {move_error}. Leaving the original file in place and re-initializing "
-                f"from wallet balances; the original ledger is NOT deleted or truncated here.",
+                f"{backup_path}: {move_error}. "
+                + (f"Preserved a recoverable copy of the rejected ledger at {backup_path}; "
+                   if preserved else "Could NOT preserve a backup copy; ")
+                + "the original is left in place and re-initialization is commit-disciplined so it "
+                "cannot silently overwrite a still-locked ledger; the ledger is NOT deleted or "
+                "truncated here.",
                 exc_info=True,
             )
             self._emit_structured(
@@ -2081,6 +2100,7 @@ class RangeInventoryLadderController(ControllerBase):
                 backup_file=str(backup_path),
                 reason=reason,
                 error=str(move_error),
+                preserved_backup=str(preserved),
             )
 
     @staticmethod
@@ -2257,11 +2277,26 @@ class RangeInventoryLadderController(ControllerBase):
             # A valid progress map is left UNTOUCHED (loads byte-identically).
 
         # hbpurse P2 (CLA-M03): validate the P1 (F5/CLA-M02) optional keys too. MISSING keys are
-        # fine -- a pre-P1 state file must still load, and each use-site applies its own default.
-        # A PRESENT but corrupt value trips the quarantine (same discipline as the money fields).
-        if "reanchor_events" in validated and validated.get("reanchor_events") is not None \
-                and not isinstance(validated.get("reanchor_events"), list):
-            raise ValueError("State field 'reanchor_events' must be a list")
+        # fine -- a pre-P1 state file must still load, and each use-site applies its own default
+        # (backward compat is pinned by test_pre_p1_state_without_reanchor_keys_loads; materializing
+        # defaults here would break that byte-round-trip). A PRESENT but corrupt value trips the
+        # quarantine (same discipline as the money fields).
+        events_raw = validated.get("reanchor_events")
+        if events_raw is not None:
+            if not isinstance(events_raw, list):
+                raise ValueError("State field 'reanchor_events' must be a list")
+            # CDX-R03: a list is not enough -- each ELEMENT must be a well-formed event dict with
+            # FINITE numeric fields. A malformed element (a bare string, a NaN amount) would ride
+            # the load clean and later crash the reporting/journal read that iterates these events.
+            for idx, event in enumerate(events_raw):
+                if not isinstance(event, dict):
+                    raise ValueError(f"State 'reanchor_events[{idx}]' must be a JSON object")
+                for num_key in (
+                    "ts", "old_owned_quote", "old_owned_base", "new_owned_quote",
+                    "new_owned_base", "overclaim_quote", "wallet_quote_total", "wallet_base_total",
+                ):
+                    if num_key in event:
+                        _safe_decimal(event.get(num_key), f"reanchor_events[{idx}].{num_key}")
         for offset_key in (
             "reanchor_offset_quote", "reanchor_offset_base",
             "reanchor_cut_quote_cum", "reanchor_cut_base_cum",
@@ -2271,10 +2306,23 @@ class RangeInventoryLadderController(ControllerBase):
             parsed = _safe_decimal(validated.get(offset_key), f"state field '{offset_key}'", default="0")
             if parsed < Decimal("0"):
                 raise ValueError(f"State field '{offset_key}' must be non-negative")
+        # CDX-R03: an offset timestamp is a CREATION time -- never negative, never in the future. A
+        # far-future ts makes `now - ts` negative, so the expiry test `(now - ts) >= expiry` never
+        # fires and the credit becomes IMMORTAL, absorbing genuine future debits and over-stating
+        # owned_*. Bound it to the same skew window as initialized_timestamp (fail closed: a corrupt
+        # clock is quarantined at load; _load_reanchor_offsets also drops a future ts at consumption
+        # as defense in depth).
+        offsets_now_ts = Decimal(str(self.market_data_provider.time()))
         for offset_ts_key in ("reanchor_offset_quote_ts", "reanchor_offset_base_ts"):
             if validated.get(offset_ts_key) is None:
                 continue
-            _safe_decimal(validated.get(offset_ts_key), f"state field '{offset_ts_key}'")
+            parsed_ts = _safe_decimal(validated.get(offset_ts_key), f"state field '{offset_ts_key}'")
+            if parsed_ts < Decimal("0"):
+                raise ValueError(f"State field '{offset_ts_key}' must be non-negative")
+            if parsed_ts > (offsets_now_ts + self.STATE_MAX_FUTURE_SKEW_SECONDS):
+                raise ValueError(
+                    f"State field '{offset_ts_key}' {parsed_ts} is unreasonably far in the future"
+                )
 
         validated["schema_version"] = self.STATE_SCHEMA_VERSION
         if schema_version != self.STATE_SCHEMA_VERSION:
@@ -2594,7 +2642,7 @@ class RangeInventoryLadderController(ControllerBase):
             target_quote=Decimal(self.config.total_amount_quote),
         )
 
-        self._state = {
+        initial_state = {
             "schema_version": self.STATE_SCHEMA_VERSION,
             "controller_name": self.config.controller_name,
             "controller_type": self.config.controller_type,
@@ -2618,7 +2666,18 @@ class RangeInventoryLadderController(ControllerBase):
             "seed_value_quote": str(seed_value_quote),
             "tracked_fill_executor_ids": [],
         }
-        self._save_state()
+        # hbpurse P2 (CDX-M01 / CDX-R01): first-init CREATES every authoritative money field, so it
+        # obeys the SAME commit-before-adopt discipline as booking/reseed/re-anchor. Build the
+        # initial state as a CANDIDATE and adopt it into self._state ONLY after a durable save. If
+        # the save fails, self._state is left at its prior (uninitialized {}) value -- the
+        # `initialized` fast-path at the top stays false so the NEXT cycle retries a fresh init
+        # instead of trading from an in-memory-only ledger with nothing on disk (which a restart
+        # would silently re-seed from the then-current wallet -- a hidden accounting-epoch reset).
+        # _commit_state raises accounting_degraded (new orders suppressed), increments
+        # state_io_failures and emits the commit-failure event on failure.
+        if not self._commit_state(initial_state, reason="first_init"):
+            self._initialization_blocked_reason = "state_commit_failed_at_init"
+            return False
 
         if self._state_recovery_reason:
             self.logger().warning(
@@ -2902,7 +2961,13 @@ class RangeInventoryLadderController(ControllerBase):
                 continue
             if now_d is None:
                 now_d = Decimal(str(now))
-            if (now_d - offset_ts) >= expiry:
+            age = now_d - offset_ts
+            # CDX-R03 defense-in-depth: a credit stamped in the FUTURE (age negative beyond the skew
+            # window) can never be a real creation time -- treat it as stale rather than immortal (a
+            # negative age would otherwise defeat the `age >= expiry` expiry test and let the credit
+            # absorb genuine future debits). Load validation already quarantines such a ts; this is
+            # the belt-and-suspenders at the consumption site.
+            if age >= expiry or age < -self.STATE_MAX_FUTURE_SKEW_SECONDS:
                 loaded.append(Decimal("0"))
                 cleared = True
                 continue
