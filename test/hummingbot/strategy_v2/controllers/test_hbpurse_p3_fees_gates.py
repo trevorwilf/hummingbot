@@ -202,12 +202,23 @@ class TestF6FeeCorrectness(_Harness):
 
     def test_fills_present_zero_quote_fee_falls_through_to_percent_estimate(self):
         """Fills present but NO recognized fee -> percent estimate (fee_rate * exec_quote).
-        MUTATION that this catches: restoring the pre-fix line that pins fee_in_quote=Decimal("0")
-        the moment order_fills is non-empty (which blocks every fallback) -> fee 0, owned 268."""
+
+        PRODUCTION-SHAPED (CDX-R02): the in-flight order exposes cumulative_fee_paid(token) that
+        returns Decimal("0") -- the REAL InFlightOrder returns a zero accumulator, never None -- AND
+        the executor custom_info carries cum_fees_quote=0 (OrderExecutor.get_custom_info ALWAYS
+        publishes it). Both zero-valued cumulative surfaces must be treated as UNKNOWN and fall
+        through to the percent estimate; if either were accepted as authoritative the fee books 0.
+        MUTATION this catches: reverting the positive-only guard on the cumulative_fee_paid path
+        (`if paid_quote is not None and paid_quote > Decimal("0")` -> `if paid_quote is not None`),
+        OR on the custom_info path (`if cust_fee > Decimal("0")` -> unconditional) -> fee 0,
+        owned 268 (not 267.936)."""
         in_flight = {"OID": _fake_order(executed_base="0.1", executed_quote="32",
-                                        order_fills={"t1": _trade_update([])})}  # fills, no fee token
+                                        order_fills={"t1": _trade_update([])},  # fills, no fee token
+                                        fee_paid_quote="0")}  # real order: cumulative_fee_paid -> 0
         ctrl = self._ctrl(in_flight=in_flight, fee_rate="0.002", owned_quote="300", owned_base="0")
-        ctrl.executors_info = [_cust_exec("buy_321", TradeType.BUY, "321", "B1", order_id="OID")]
+        # fees="0": mirror OrderExecutor.get_custom_info always publishing cum_fees_quote (0 default).
+        ctrl.executors_info = [_cust_exec("buy_321", TradeType.BUY, "321", "B1",
+                                          order_id="OID", fees="0")]
         ctrl._book_fills_from_orders()
         # Spec: fee = fee_rate * exec_quote = 0.002 * 32 = 0.064.
         self.assertEqual(D(ctrl._state["owned_quote"]), D("300") - D("32") - D("0.064"))
@@ -245,15 +256,26 @@ class TestF6FeeCorrectness(_Harness):
         self.assertEqual(D(ctrl._state["owned_base"]), D("0.1"))  # base unchanged by the fee delta
 
     def test_flat_quote_fee_books_byte_identically(self):
-        """Regression guard: the live NonKYC path (a flat QUOTE fee on the fill) is unchanged.
-        MUTATION: forcing the fall-through even when recognized_fee>0 (e.g. `if False:` on the
-        recognized branch) -> fee goes to the 0 percent estimate, owned 268 (not 267.5)."""
+        """Regression guard: the live NonKYC path (a flat QUOTE fee on the fill) is authoritative
+        and does NOT get the percent estimate added on top.
+
+        Runs with the live default fee_rate=0.002 (CDX-R03) so the test distinguishes "actual fee
+        only" (0.5) from "actual fee PLUS percentage" (0.5 + 0.002*32 = 0.564). A recognized quote
+        fee wins outright; the percent estimate must never double-count it.
+        MUTATIONS this catches: (a) forcing the fall-through when recognized_fee>0 (`if False:` on
+        the recognized branch) -> fee 0.064, owned 267.936; (b) adding the percent estimate to the
+        recognized fee (`recognized_fee + exec_quote*fee_rate`) -> fee 0.564, owned 267.436 -- both
+        differ from the pinned 267.5."""
         in_flight = {"OID": _fake_order(executed_base="0.1", executed_quote="32",
                                         order_fills={"t1": _trade_update([_flat_fee("USDT", "0.5")])})}
-        ctrl = self._ctrl(in_flight=in_flight, owned_quote="300", owned_base="0")
+        ctrl = self._ctrl(in_flight=in_flight, fee_rate="0.002", owned_quote="300", owned_base="0")
         ctrl.executors_info = [_cust_exec("buy_321", TradeType.BUY, "321", "B1", order_id="OID")]
         ctrl._book_fills_from_orders()
+        # Spec: ONLY the actual flat fee 0.5 is debited; the 0.002*32=0.064 percent estimate is
+        # NOT added on top (the recognized fee is authoritative). owned = 300 - 32 - 0.5 = 267.5.
         self.assertEqual(D(ctrl._state["owned_quote"]), D("300") - D("32") - D("0.5"))
+        ev = self._events(ctrl, "range_ladder_fill_booked")[0]
+        self.assertEqual(D(ev.kwargs["d_fees"]), D("0.5"))
 
 
 # ============================================================ F19: reseed freshness + plausibility
@@ -319,6 +341,42 @@ class TestF19ReseedGates(_Harness):
         self.assertEqual(D(ctrl._state["owned_quote"]), D("193"))
         self.assertNotIn("last_reseed_token", ctrl._state)
         self.assertEqual(1, len(self._events(ctrl, "range_ladder_reseed_deferred_unsettled")))
+
+    def test_connector_not_ready_defers_freshness_without_consuming_token(self):
+        """A connector still warming up (ready=False) defers the re-seed (fresh-wallet gate), token
+        NOT consumed -- a warm-up/reconnect snapshot must never rebaseline the fund. The claim here
+        is PLAUSIBLE (300 >= 150 floor) so ONLY the connector-ready term can be blocking it.
+        MUTATION (CDX-R04): deleting `not self._connector_ready()` from the freshness gate -> the
+        re-seed applies against the 300 claim, owned 300, token consumed -- this test fails."""
+        ctrl, mdp = self._armed_ctrl({"XMR": (D(0), D(0)), "USDT": (D(300), D(300))})
+        mdp.get_connector.return_value.ready = False   # connector EXPLICITLY not ready
+        ctrl._maybe_reseed_fund(Decimal("335"))
+        self.assertEqual(D(ctrl._state["owned_quote"]), D("193"))          # NOT re-seeded
+        self.assertNotIn("last_reseed_token", ctrl._state)                 # token NOT consumed
+        self.assertEqual(self._events(ctrl, "range_ladder_fund_reseeded"), [])
+        deferred = self._events(ctrl, "range_ladder_reseed_deferred_unsettled")
+        self.assertEqual(1, len(deferred))
+        self.assertIs(deferred[0].kwargs["connector_ready"], False)        # gate attributes the defer
+
+    def test_zero_claim_with_floor_disabled_still_refuses(self):
+        """The unconditional `seed_value_quote <= 0` refusal holds EVEN when the fractional floor is
+        disabled (reseed_min_claim_fraction=0). A zero wallet snapshot must never rebaseline the
+        fund to zero -- the escape hatch lowers the floor, it does NOT remove the zero guard. This
+        is the only state where the explicit zero clause differs from the fractional comparison.
+        MUTATION (CDX-R05): dropping the `seed_value_quote <= Decimal("0")` clause (leaving only
+        `< min_claim_quote`, which with a 0 floor is `< 0` -> never true for a 0 claim) -> the 0
+        claim applies, owned/seed collapse to 0 and the token is consumed -- this test fails."""
+        ctrl, mdp = self._armed_ctrl({"XMR": (D(0), D(0)), "USDT": (D(0), D(0))},
+                                     reseed_min_claim_fraction=Decimal("0"))
+        ctrl._maybe_reseed_fund(Decimal("335"))
+        self.assertEqual(D(ctrl._state["owned_quote"]), D("193"))          # NOT collapsed to 0
+        self.assertEqual(D(ctrl._state["owned_base"]), D("0"))
+        self.assertNotIn("last_reseed_token", ctrl._state)                 # token NOT consumed
+        self.assertEqual(self._events(ctrl, "range_ladder_fund_reseeded"), [])
+        deferred = self._events(ctrl, "range_ladder_reseed_deferred_implausible_claim")
+        self.assertEqual(1, len(deferred))
+        self.assertEqual(D(deferred[0].kwargs["seed_value_quote"]), D("0"))
+        self.assertEqual(D(deferred[0].kwargs["min_claim_quote"]), D("0"))  # floor disabled, zero still caught
 
 
 # ============================================================ F21: grace default
@@ -399,6 +457,22 @@ class TestF11InitUnavailableHolds(_Harness):
         self.assertEqual(D(ctrl._state["init_unavailable_quote"]), D("100"))
         self.assertEqual(D(ctrl._state["init_unavailable_base"]), D("0"))
         self.assertEqual(1, len(self._events(ctrl, "range_ladder_init_unavailable_holds_recorded")))
+
+    def test_init_with_base_side_holds_persists_base_amount(self):
+        """A base-side (XMR) exchange hold is recorded INDEPENDENTLY of the quote hold.
+        XMR total 1 / available 0.4 -> unavailable base 0.6; USDT fully available -> quote hold 0.
+        MUTATION (CDX-R06): pinning initial_state['init_unavailable_base']='0' (or reusing the quote
+        value) -> the base hold is lost, so P4's opening epoch mis-classifies the later release as
+        unexplained equity/deposit growth. This test pins base=0.6, quote=0."""
+        mdp = _make_mdp(balances={"XMR": (D(1), D("0.4")), "USDT": (D(300), D(300))})
+        ctrl = self._build(mdp, allow_initialize_with_unavailable_wallet_funds=True)
+        self.assertTrue(ctrl._ensure_initialized(Decimal("335")))
+        self.assertEqual(D(ctrl._state["init_unavailable_base"]), D("0.6"))
+        self.assertEqual(D(ctrl._state["init_unavailable_quote"]), D("0"))   # quote fully available
+        ev = self._events(ctrl, "range_ladder_init_unavailable_holds_recorded")
+        self.assertEqual(1, len(ev))
+        self.assertEqual(D(ev[0].kwargs["init_unavailable_base"]), D("0.6"))
+        self.assertEqual(D(ev[0].kwargs["init_unavailable_quote"]), D("0"))
 
     def test_init_without_holds_omits_keys(self):
         """A clean init (fully available wallet) never materializes the hold keys."""

@@ -2963,29 +2963,45 @@ class RangeInventoryLadderController(ControllerBase):
         # else: no fills, OR fills with NO recognized quote/base fee -> leave fee_in_quote None so
         # the fallback chain below (ending in the fee_rate percent estimate) runs.
 
+        # hbpurse P3 (F6 / CDX-R01): the cumulative-fee fallbacks are authoritative ONLY when they
+        # report a STRICTLY POSITIVE fee. A zero-valued cumulative reading is NOT proof of a
+        # zero-fee fill: the real InFlightOrder.cumulative_fee_paid initializes its accumulator to
+        # Decimal("0") and returns it whenever it cannot derive a fee (no fills, an unconvertible
+        # third-asset fee, a fee not yet reported, or an internal error), and
+        # OrderExecutor.get_custom_info ALWAYS publishes cum_fees_quote (Decimal("0") by default).
+        # Accepting either zero as authoritative would defeat F6's percent-estimate fallback on the
+        # exact real-object path F6 was written to fix (fills present, no recognized quote/base
+        # fee). So a zero cumulative reading falls THROUGH to the percent estimate; a legitimately
+        # zero-fee deployment sets fee_rate=0 and the estimate is 0 anyway. Live NonKYC is
+        # unaffected -- recognized_fee>0 there sets fee_in_quote above and these fallbacks are
+        # skipped.
         if fee_in_quote is None and order is not None:
             method = getattr(order, "cumulative_fee_paid", None)
             if callable(method):
                 try:
                     paid = method(quote_asset)
-                    if paid is not None:
-                        fee_in_quote = max(Decimal("0"), self._d(paid, "0"))
                 except Exception:
-                    fee_in_quote = None
+                    paid = None
+                paid_quote = self._d(paid, "0") if paid is not None else None
+                if paid_quote is not None and paid_quote > Decimal("0"):
+                    fee_in_quote = paid_quote
 
         if fee_in_quote is None:
             for attr in ("cumulative_fee_in_quote", "cum_fees_quote"):
                 val = self._safe_order_decimal(order, attr)
-                if val is not None:
-                    fee_in_quote = max(Decimal("0"), val)
+                if val is not None and val > Decimal("0"):
+                    fee_in_quote = val
                     break
 
         if fee_in_quote is None and info.get("cum_fees_quote") is not None:
-            fee_in_quote = max(Decimal("0"), self._d(info.get("cum_fees_quote"), "0"))
+            cust_fee = self._d(info.get("cum_fees_quote"), "0")
+            if cust_fee > Decimal("0"):
+                fee_in_quote = cust_fee
 
         if fee_in_quote is None:
-            # Fallback: NonKYC orders carry no fee field; derive from the configured rate so a
-            # silent 0 never slowly overstates the fund.
+            # Fallback: no fills carried a recognized fee and no cumulative source reported a
+            # positive fee; derive from the configured rate so a silent 0 never slowly overstates
+            # the fund.
             fee_in_quote = max(Decimal("0"), exec_quote * Decimal(self.config.fee_rate))
 
         return fee_in_quote, alt_fees
