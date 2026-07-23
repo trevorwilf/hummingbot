@@ -28,6 +28,26 @@ The discriminating assertions (named for the reviewer's TEST INTEGRITY AUDIT):
 - Bootstrap idempotency: test_marker_crash_retry asserts exactly ONE opening_epoch after a
   crashed marker commit + restart. Removing the note init_ts stamp match appends a duplicate
   epoch -> FAILS.
+
+Adjudication additions (CDX-R01..R07, each verified by running the named mutation):
+- R01 pending-gate: test_bootstrap_pending_connector_not_ready_blocks_creates FAILS if the
+  purse-pending create gate reverts to only `if self._accounting_degraded or
+  self._purse_degraded:` (verified: [] != [CreateExecutorAction...]).
+- R02 strict reads: test_bootstrap_wallet_read_failure_defers... FAILS if any opening wallet
+  read reverts to the zero-swallowing _safe_get_balance (verified on the quote-total line).
+- R03 start-empty: test_empty_journal_rejected FAILS if the first-record check reverts to
+  `if records and ...` (verified: PurseIntegrityError not raised).
+- R04 marker retry: test_marker_transient_failure_recovers_same_process FAILS if the backstop
+  guard reverts to skip on _accounting_degraded (verified: KeyError purse_initialized).
+- R05 rollup strictness: TestRollupUpdateStrictness FAILS (14 subtests) under the original
+  unvalidated in-place update body (verified: NaN/Infinity accepted silently).
+- R06 contract seq: test_seq_gap_accepted_per_contract FAILS if contiguity is re-imposed
+  (verified with seq != prev+1); the old test_seq_gap_rejected enforced contiguity BEYOND the
+  pinned "1-based, strictly increasing" contract and was replaced.
+- R07 value compat: the compat test compares EVERY pre-P4 key against the pre-P4 build's
+  output (captured at merge-base ad5eceee for this exact scenario); breaking any single value
+  (verified with reference_price -> "BROKEN") now FAILS where the old key-presence check
+  stayed green.
 """
 import asyncio
 import json
@@ -559,6 +579,70 @@ class TestFailClosed(_Harness):
         self.assertFalse(self._purse_path.exists())
         self.assertTrue(ctrl2._purse_degraded)
 
+    def test_bootstrap_pending_connector_not_ready_blocks_creates(self):
+        # CDX-R01: an initialized, FUNDED controller whose purse has not bootstrapped yet
+        # (connector explicitly ready=False) must not propose orders from cached balances.
+        # The deferral is fail-closed: not degraded, just not yet journaled -- and un-journaled
+        # means no new orders.
+        balances = self._sell_ladder_balances()
+        mdp = _make_mdp(balances=balances, mid=335, bid=334.9, ask=335.1)
+        mdp.get_connector.return_value.ready = False   # the literal False: EXPLICITLY not ready
+        ctrl = self._build(mdp)
+        self._init_state(ctrl, owned_quote=0, owned_base=1, seed_value=170)
+        self._cycle(ctrl, mdp, 1000.0)
+
+        self.assertFalse(self._purse_path.exists(), "bootstrap must defer, not journal blind")
+        self.assertFalse(ctrl._purse_degraded)         # deferral, not degradation
+        self.assertEqual([], ctrl.create_actions_proposal())
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_create_blocked_purse_pending")))
+
+        # Connector comes up -> the one-shot bootstrap lands and creates open again.
+        mdp.get_connector.return_value.ready = True
+        self._cycle(ctrl, mdp, 1001.0)
+        self.assertTrue(self._purse_path.exists())
+        self.assertTrue(ctrl.create_actions_proposal(), "creates must resume once journaled")
+
+    def test_bootstrap_wallet_read_failure_defers_and_never_journals_zeros(self):
+        # CDX-R02: a failed wallet read during the one-shot bootstrap must DEFER the opening
+        # epoch -- never let the _safe_* zero-fallback fabricate a permanent observation.
+        # Each of the four opening wallet reads is exercised independently.
+        cases = [("get_balance", "USDT"), ("get_balance", "XMR"),
+                 ("get_available_balance", "USDT"), ("get_available_balance", "XMR")]
+        for method, broken_asset in cases:
+            with self.subTest(method=method, asset=broken_asset):
+                balances = {"XMR": (D(1), D(1)), "USDT": (D(500), D(500))}
+                mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+                idx = 1 if method == "get_available_balance" else 0
+
+                def broken_reader(c, a, *, _broken=broken_asset, _idx=idx):
+                    if a == _broken:
+                        raise OSError("simulated wallet read failure")
+                    return balances[a][_idx]
+
+                getattr(mdp, method).side_effect = broken_reader
+                ctrl = self._build(mdp)
+                self._init_state(ctrl, owned_quote=400, owned_base=0, seed_value=400)
+                self._cycle(ctrl, mdp, 1000.0)
+
+                self.assertFalse(self._purse_path.exists(),
+                                 "a failed read must never bootstrap a zeroed opening epoch")
+                self.assertFalse(ctrl._purse_degraded)
+                self.assertEqual([], ctrl.create_actions_proposal())
+                self.assertEqual(
+                    1, len(self._emit_events(ctrl, "range_ladder_purse_wallet_unreadable"))
+                )
+
+        # Reads recover -> the bootstrap lands with the REAL wallet observations, and the
+        # deferral was zero-residue (no half-created journal to collide with).
+        balances = {"XMR": (D(1), D(1)), "USDT": (D(500), D(500))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        self._init_state(ctrl, owned_quote=400, owned_base=0, seed_value=400)
+        self._cycle(ctrl, mdp, 2000.0)
+        rec = self._persisted_purse()["records"][0]
+        self.assertEqual(D("500"), D(rec["wallet_quote_total"]))
+        self.assertEqual(D("1"), D(rec["wallet_base_total"]))
+
     def test_corrupt_purse_degrades_and_defers_reseed_until_recovery(self):
         with self._purse_path.open("w", encoding="utf-8") as f:
             f.write("{ corrupt purse bytes ")
@@ -676,10 +760,41 @@ class TestMarkerCrashRetry(_Harness):
         self.assertIs(True, self._persisted_state()["purse_initialized"])
         self.assertEqual([], self._emit_events(ctrl2, "range_ladder_purse_epoch_appended"))
 
+    def test_marker_transient_failure_recovers_same_process(self):
+        # CDX-R04: the purse bootstrap saves, but the FIRST marker state-commit fails. On a
+        # QUIET controller that failed marker write is the only commit there is, so the
+        # end-of-cycle backstop must keep retrying it WHILE accounting_degraded is set --
+        # a guard that skips on the very flag the failure raised would deadlock the
+        # degradation until restart.
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(500), D(500))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        with self._state_path.open("w", encoding="utf-8") as f:
+            json.dump(_valid_state("ctrl-hbpurse-p4", owned_quote="400", owned_base="0",
+                                   seed_value="400", init_ts="1000"), f)
+        ctrl = self._build(mdp)
+        ctrl._write_state_to_disk = lambda state: (_ for _ in ()).throw(OSError("simulated"))
+        self._cycle(ctrl, mdp, 1000.0)
+        self.assertTrue(self._purse_path.exists())     # the journal itself is durable
+        self.assertNotIn("purse_initialized", self._persisted_state())
+        self.assertTrue(ctrl._accounting_degraded)     # the marker commit failed
+        self.assertEqual([], ctrl.create_actions_proposal())
+
+        # The writer recovers -- same process, no restart, and NO money mutation for the
+        # marker to piggyback on. The backstop retry alone must land it and clear the flag.
+        del ctrl._write_state_to_disk
+        self._cycle(ctrl, mdp, 1001.0)
+        self.assertIs(True, self._persisted_state()["purse_initialized"])
+        self.assertFalse(ctrl._accounting_degraded)
+        self.assertEqual(
+            1, len(self._emit_events(ctrl, "range_ladder_accounting_degraded_cleared"))
+        )
+        self.assertEqual(1, len([r for r in self._persisted_purse()["records"]
+                                 if r["kind"] == "opening_epoch"]))
+
 
 # ==================================================== PurseLedger validation unit tests
 
-class TestPurseLedgerValidation(unittest.TestCase):
+class _LedgerUnitHarness(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -718,6 +833,19 @@ class TestPurseLedgerValidation(unittest.TestCase):
         with self._path.open("w", encoding="utf-8") as f:
             json.dump(doc, f)
 
+    @staticmethod
+    def _reseed(seq=2, epoch="epoch-2"):
+        return {
+            "seq": seq, "ts": 1001.0, "kind": "reseed_epoch", "epoch_id": epoch,
+            "prev_epoch_id": "epoch-1", "token": "1:800",
+            "old_owned_quote": "100", "old_owned_base": "0", "old_seed_value_quote": "100",
+            "new_owned_quote": "80", "new_owned_base": "0", "new_seed_value_quote": "80",
+            "reference_price": "300",
+        }
+
+
+class TestPurseLedgerValidation(_LedgerUnitHarness):
+
     def test_valid_document_loads(self):
         self._write(self._doc())
         ledger = self._ledger()
@@ -746,14 +874,93 @@ class TestPurseLedgerValidation(unittest.TestCase):
         with self.assertRaises(PurseIntegrityError):
             self._ledger().load()
 
-    def test_seq_gap_rejected(self):
-        # Append-only implies contiguous seq; a gap means records were lost/edited.
+    def test_seq_gap_accepted_per_contract(self):
+        # CDX-R06: the PINNED contract says seq is "1-based, strictly increasing" and the
+        # top-level sequence is "highest record seq" -- NOT contiguous. A 1,3 journal is
+        # contract-valid and MUST load (the sibling API validates against the same text; the
+        # engine must not accept a narrower format than the contract defines).
+        doc = self._doc()
+        doc["records"].append(self._opening(seq=3, epoch="epoch-3"))
+        doc["sequence"] = 3
+        self._write(doc)
+        ledger = self._ledger()
+        ledger.load()
+        self.assertTrue(ledger.loaded)
+        self.assertEqual("epoch-3", ledger.current_epoch_id())
+        # Appends continue from the highest seq, not the record count.
+        self.assertEqual("epoch-4", ledger.next_epoch_id())
+
+    def test_first_seq_must_be_one_rejected(self):
+        # "1-based" pins the FIRST record to seq 1; starting higher means the opening was lost.
+        bad = self._doc(records=[self._opening(seq=2)], sequence=2)
+        self._write(bad)
+        with self.assertRaises(PurseIntegrityError):
+            self._ledger().load()
+
+    def test_seq_decreasing_rejected(self):
         bad = self._doc()
         bad["records"].append(self._opening(seq=3, epoch="epoch-3"))
+        bad["records"].append(self._opening(seq=2, epoch="epoch-2"))
         bad["sequence"] = 3
         self._write(bad)
         with self.assertRaises(PurseIntegrityError):
             self._ledger().load()
+
+    def test_sequence_must_match_highest_seq_rejected(self):
+        bad = self._doc(sequence=2)   # records' highest seq is 1
+        self._write(bad)
+        with self.assertRaises(PurseIntegrityError):
+            self._ledger().load()
+
+    def test_empty_journal_rejected(self):
+        # CDX-R03: an on-disk journal with records: [] is the forbidden start-empty fallback.
+        # Only create() may hold a transiently empty document, and only in memory.
+        self._write(self._doc(records=[], sequence=0))
+        with self.assertRaises(PurseIntegrityError):
+            self._ledger().load()
+
+    def test_opening_missing_predecessor_key_rejected(self):
+        # CDX-R03: contract-required fields must be PRESENT; predecessor may be null but
+        # never absent.
+        opening = self._opening()
+        del opening["predecessor"]
+        self._write(self._doc(records=[opening]))
+        with self.assertRaises(PurseIntegrityError):
+            self._ledger().load()
+
+    def test_opening_missing_note_key_rejected(self):
+        opening = self._opening()
+        del opening["note"]
+        self._write(self._doc(records=[opening]))
+        with self.assertRaises(PurseIntegrityError):
+            self._ledger().load()
+
+    def test_opening_null_note_accepted(self):
+        opening = self._opening()
+        opening["note"] = None
+        self._write(self._doc(records=[opening]))
+        ledger = self._ledger()
+        ledger.load()
+        self.assertTrue(ledger.loaded)
+
+    def test_reseed_missing_prev_epoch_id_key_rejected(self):
+        reseed = self._reseed()
+        del reseed["prev_epoch_id"]
+        doc = self._doc()
+        doc["records"].append(reseed)
+        doc["sequence"] = 2
+        self._write(doc)
+        with self.assertRaises(PurseIntegrityError):
+            self._ledger().load()
+
+    def test_valid_reseed_record_accepted(self):
+        doc = self._doc()
+        doc["records"].append(self._reseed())
+        doc["sequence"] = 2
+        self._write(doc)
+        ledger = self._ledger()
+        ledger.load()
+        self.assertEqual("epoch-2", ledger.current_epoch_id())
 
     def test_unsupported_schema_version_rejected(self):
         self._write(self._doc(purse_schema_version=2))
@@ -780,41 +987,162 @@ class TestPurseLedgerValidation(unittest.TestCase):
             self._ledger().load()
 
 
+# ==================================================== in-place rollup strictness (CDX-R05)
+
+class TestRollupUpdateStrictness(_LedgerUnitHarness):
+    """CDX-R05: update_fills_rollup mutates the permanent journal in place (the one
+    append-only exception), so every incoming delta must be finite-checked BEFORE any
+    mutation -- a NaN/Infinity delta must raise immediately and leave the document
+    untouched, never serialize into the file and poison the next load."""
+
+    def test_rollup_first_use_rejects_nonfinite(self):
+        self._write(self._doc())
+        ledger = self._ledger()
+        ledger.load()
+        with self.assertRaises(PurseIntegrityError):
+            ledger.update_fills_rollup(epoch_id="epoch-1", d_base=D("0"),
+                                       d_quote=Decimal("NaN"), d_fees=D("0"),
+                                       fills=1, ts=1001.0)
+        self.assertEqual(1, len(ledger.records()))   # no rollup record was created
+
+    def test_rollup_inplace_update_rejects_bad_inputs_and_leaves_doc_unchanged(self):
+        self._write(self._doc())
+        ledger = self._ledger()
+        ledger.load()
+        ledger.update_fills_rollup(epoch_id="epoch-1", d_base=D("1"), d_quote=D("-300.3"),
+                                   d_fees=D("0.3"), fills=1, ts=1001.0)
+        snapshot = ledger.records()
+
+        bad_deltas = [("d_base", Decimal("NaN")), ("d_base", Decimal("Infinity")),
+                      ("d_base", Decimal("-Infinity")),
+                      ("d_quote", Decimal("NaN")), ("d_quote", Decimal("Infinity")),
+                      ("d_quote", Decimal("-Infinity")),
+                      ("d_fees", Decimal("NaN")), ("d_fees", Decimal("Infinity")),
+                      ("d_fees", Decimal("-Infinity")), ("d_fees", Decimal("-1"))]
+        for field, bad in bad_deltas:
+            with self.subTest(field=field, bad=str(bad)):
+                kwargs = {"d_base": D("0.1"), "d_quote": D("-31"), "d_fees": D("0.01")}
+                kwargs[field] = bad
+                with self.assertRaises(PurseIntegrityError):
+                    ledger.update_fills_rollup(epoch_id="epoch-1", fills=1, ts=1002.0,
+                                               **kwargs)
+                self.assertEqual(snapshot, ledger.records(),
+                                 "a rejected update must leave the document untouched")
+        for bad_fills in (-1, True):
+            with self.subTest(bad_fills=bad_fills):
+                with self.assertRaises(PurseIntegrityError):
+                    ledger.update_fills_rollup(epoch_id="epoch-1", d_base=D("0"),
+                                               d_quote=D("0"), d_fees=D("0"),
+                                               fills=bad_fills, ts=1002.0)
+                self.assertEqual(snapshot, ledger.records())
+        with self.subTest(bad_ts="nan"):
+            with self.assertRaises(PurseIntegrityError):
+                ledger.update_fills_rollup(epoch_id="epoch-1", d_base=D("0"), d_quote=D("0"),
+                                           d_fees=D("0"), fills=0, ts=float("nan"))
+            self.assertEqual(snapshot, ledger.records())
+
+        # The untouched document still saves and reloads cleanly -- nothing leaked to disk.
+        ledger.save()
+        fresh = self._ledger()
+        fresh.load()
+        self.assertEqual(snapshot, fresh.records())
+
+
 # ==================================================== custom_info backward compatibility
 
 class TestCustomInfoCompat(_Harness):
 
-    # Every key get_custom_info exposed BEFORE this phase (F9: keys keep their keys; values
-    # keep their meaning; the purse keys are ADDITIVE).
-    PRE_P4_KEYS = [
-        "strategy", "connector", "trading_pair", "reference_price", "managed_quote_total",
-        "managed_base_total", "managed_fund_value_quote", "cap_factor", "seed_value_quote",
-        "deploy_ceiling_quote", "deploy_headroom_quote", "max_fund_value_quote",
-        "event_refresh_enabled", "buy_cooldown_time", "sell_cooldown_time",
-        "buy_cooldown_armed", "sell_cooldown_armed", "buy_cooldown_remaining_s",
-        "sell_cooldown_remaining_s", "buy_side_dirty", "sell_side_dirty", "buy_dirty_reason",
-        "sell_dirty_reason", "last_global_refresh_ts", "global_refresh_remaining_s",
-        "deployable_quote_total", "deployable_base_total", "free_buy_budget_quote",
-        "free_sell_budget_base", "buy_fee_headroom_quote", "ledger_surplus_quote",
-        "refresh_wave_release_buy_quote", "refresh_wave_release_sell_base",
-        "ledger_funded_budgets", "owned_quote_free", "owned_base_free",
-        "available_quote_balance", "available_base_balance", "total_quote_balance",
-        "total_base_balance", "reserve_quote_balance", "reserve_base_balance",
-        "inventory_realized_pnl_quote", "inventory_unrealized_pnl_quote",
-        "inventory_cum_fees_quote", "inventory_global_pnl_quote", "inventory_net_base_amount",
-        "inventory_abs_notional_quote", "initial_fund_value_quote", "fund_growth_quote",
-        "reconciliation_gap_quote", "state_file", "state_schema_version",
-        "state_recovery_reason", "state_migrated_from_version", "accounting_degraded",
-        "state_io_failures", "price_regime", "out_of_range_action", "enable_buys",
-        "enable_sells", "cancel_disabled_side_orders", "config_rebuild_pending",
-        "market_data_ready", "market_data_error", "market_data_unavailable_duration_s",
-        "market_data_hard_pause", "initialization_ready", "initialization_blocked_reason",
-        "session_elapsed_s", "session_expired", "session_expired_reason",
-        "diagnostic_log_enabled", "diagnostic_log_path",
-        "diagnostic_heartbeat_interval_seconds", "buy_prices", "sell_prices",
-        "blocked_level_ids", "active_order_executors", "tracked_positions",
-        "reservation_sources_buy", "reservation_sources_sell", "timestamp_ms",
-    ]
+    # CDX-R07: the FULL pre-P4 custom_info surface for THIS scenario, value by value. The
+    # oracle is the PRE-PHASE build (F9's byte-compat contract IS "what pre-P4 emitted"):
+    # captured by running this exact scenario -- balances XMR (2,2) / USDT (1100,1100),
+    # mid 300 bid 299 ask 301, owned_quote 1000, owned_base 2, seed 1600, default config,
+    # one cycle at t=1000 -- against the merge-base nonkyc (ad5eceee, pre-P4), then
+    # hand-checked against the field semantics. Any pre-existing key whose value drifts from
+    # this dict is a dashboard-breaking regression. Two keys are per-run and asserted with
+    # predicates instead: state_file (tmp path) and diagnostic_log_path (session stamp).
+    PRE_P4_BASELINE = {
+        "accounting_degraded": "False",
+        "active_order_executors": 0,
+        "available_base_balance": "2",
+        "available_quote_balance": "1100",
+        "blocked_level_ids": [],
+        "buy_cooldown_armed": "False",
+        "buy_cooldown_remaining_s": "None",
+        "buy_cooldown_time": "3600",
+        "buy_dirty_reason": "",
+        "buy_fee_headroom_quote": "0",
+        "buy_prices": ["321", "318", "315"],
+        "buy_side_dirty": "False",
+        "cancel_disabled_side_orders": "True",
+        "cap_factor": "1",
+        "config_rebuild_pending": "False",
+        "connector": "nonkyc",
+        "deploy_ceiling_quote": "1600",
+        "deploy_headroom_quote": "1600",
+        "deployable_base_total": "2",
+        "deployable_quote_total": "1000",
+        "diagnostic_heartbeat_interval_seconds": "300",
+        "diagnostic_log_enabled": "True",
+        "enable_buys": "True",
+        "enable_sells": "True",
+        "event_refresh_enabled": "False",
+        "free_buy_budget_quote": "1000",
+        "free_sell_budget_base": "2",
+        "fund_growth_quote": "0",
+        "global_refresh_remaining_s": "0.0",
+        "initial_fund_value_quote": "1600",
+        "initialization_blocked_reason": "",
+        "initialization_ready": "True",
+        "inventory_abs_notional_quote": "0",
+        "inventory_cum_fees_quote": "0",
+        "inventory_global_pnl_quote": "0",
+        "inventory_net_base_amount": "0",
+        "inventory_realized_pnl_quote": "0",
+        "inventory_unrealized_pnl_quote": "0",
+        "last_global_refresh_ts": "0.0",
+        "ledger_funded_budgets": "True",
+        "ledger_surplus_quote": "100",
+        "managed_base_total": "2",
+        "managed_fund_value_quote": "1600",
+        "managed_quote_total": "1000",
+        "market_data_error": "",
+        "market_data_hard_pause": "False",
+        "market_data_ready": "True",
+        "market_data_unavailable_duration_s": "0",
+        "max_fund_value_quote": "100000",
+        "out_of_range_action": "dormant",
+        "owned_base_free": "2",
+        "owned_quote_free": "1000",
+        "price_regime": "below_buy_range",
+        "reconciliation_gap_quote": "0",
+        "reference_price": "300",
+        "refresh_wave_release_buy_quote": "0",
+        "refresh_wave_release_sell_base": "0",
+        "reservation_sources_buy": {},
+        "reservation_sources_sell": {},
+        "reserve_base_balance": "0",
+        "reserve_quote_balance": "0",
+        "seed_value_quote": "1600",
+        "sell_cooldown_armed": "False",
+        "sell_cooldown_remaining_s": "None",
+        "sell_cooldown_time": "3600",
+        "sell_dirty_reason": "",
+        "sell_prices": ["350", "355", "360"],
+        "sell_side_dirty": "False",
+        "session_elapsed_s": "0.0",
+        "session_expired": "False",
+        "session_expired_reason": "",
+        "state_io_failures": 0,
+        "state_migrated_from_version": "",
+        "state_recovery_reason": "",
+        "state_schema_version": "10",
+        "strategy": "range_inventory_ladder",
+        "timestamp_ms": 1000000,
+        "total_base_balance": "2",
+        "total_quote_balance": "1100",
+        "tracked_positions": 0,
+        "trading_pair": "XMR-USDT",
+    }
 
     PURSE_BLOCK_KEYS = [
         "purse_ready", "purse_initialized", "purse_path", "accounting_degraded",
@@ -832,12 +1160,22 @@ class TestCustomInfoCompat(_Harness):
         self._cycle(ctrl, mdp, 1000.0)
         info = ctrl.get_custom_info()
 
-        missing = [key for key in self.PRE_P4_KEYS if key not in info]
-        self.assertEqual([], missing, f"pre-P4 custom_info keys went missing: {missing}")
-        # Spot-check pre-existing values still carry their pre-P4 semantics.
-        self.assertEqual("1000", info["managed_quote_total"])
-        self.assertEqual("2", info["managed_base_total"])
-        self.assertEqual("False", info["accounting_degraded"])
+        # CDX-R07: EVERY pre-P4 key must be present with the pre-P4 VALUE (byte-compatible),
+        # not merely present -- a broken reference_price/budget/PnL value with the key intact
+        # is exactly the dashboard regression F9 forbids.
+        mismatches = {
+            key: (expected, info.get(key, "<MISSING>"))
+            for key, expected in self.PRE_P4_BASELINE.items()
+            if info.get(key, "<MISSING>") != expected
+        }
+        self.assertEqual({}, mismatches,
+                         f"pre-P4 custom_info values drifted from the pre-P4 build: {mismatches}")
+        # The two per-run keys, pinned by predicate instead of literal value.
+        self.assertEqual(str(self._state_path), info["state_file"])
+        self.assertRegex(
+            str(info["diagnostic_log_path"]),
+            r"^data[\\/]range_inventory_ladder_ctrl-hbpurse-p4\.diagnostic_\d{8}-\d{6}\.jsonl$",
+        )
         # F9: the clarified alias mirrors the old key byte-for-byte.
         self.assertEqual(info["fund_growth_quote"], info["fund_growth_since_epoch_mtm"])
 

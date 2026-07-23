@@ -304,8 +304,16 @@ class PurseLedger:
         self._require_loaded()
         if not isinstance(epoch_id, str) or not epoch_id:
             raise PurseIntegrityError("update_fills_rollup requires a non-empty epoch_id")
-        if d_fees < Decimal("0"):
-            raise PurseIntegrityError("fills_rollup fee delta must be non-negative")
+        # CDX-R05: the in-place path bypasses append()'s record validation, so every incoming
+        # value is strict-parsed BEFORE any mutation -- finite-before-persistence is absolute,
+        # and a NaN/Infinity delta must raise here, not poison the journal for the next load.
+        d_base = _parse_decimal(d_base, "fills_rollup d_base")
+        d_quote = _parse_decimal(d_quote, "fills_rollup d_quote")
+        d_fees = _require_nonneg(_parse_decimal(d_fees, "fills_rollup d_fees"),
+                                 "fills_rollup d_fees")
+        if isinstance(fills, bool) or not isinstance(fills, int) or fills < 0:
+            raise PurseIntegrityError("fills_rollup fills must be a non-negative integer")
+        ts = _require_ts(ts, "fills_rollup ts")
         target = None
         for record in self._doc["records"]:
             if record.get("kind") == "fills_rollup" and record.get("epoch_id") == epoch_id:
@@ -319,16 +327,25 @@ class PurseLedger:
                     "base_delta_cum": str(d_base),
                     "quote_delta_cum": str(d_quote),
                     "fees_quote_cum": str(d_fees),
-                    "fills_seen": int(fills),
-                    "last_update_ts": float(ts),
+                    "fills_seen": fills,
+                    "last_update_ts": ts,
                 },
                 ts=ts,
             )
-        target["base_delta_cum"] = str(_parse_decimal(target["base_delta_cum"], "base_delta_cum") + d_base)
-        target["quote_delta_cum"] = str(_parse_decimal(target["quote_delta_cum"], "quote_delta_cum") + d_quote)
-        target["fees_quote_cum"] = str(_parse_decimal(target["fees_quote_cum"], "fees_quote_cum") + d_fees)
-        target["fills_seen"] = int(target["fills_seen"]) + int(fills)
-        target["last_update_ts"] = float(ts)
+        # Compute every cumulative in a local first: the record mutates all-at-once only after
+        # the complete candidate validated, so a bad stored value can never leave it half-updated.
+        new_base = _parse_decimal(target["base_delta_cum"], "base_delta_cum") + d_base
+        new_quote = _parse_decimal(target["quote_delta_cum"], "quote_delta_cum") + d_quote
+        new_fees = _parse_decimal(target["fees_quote_cum"], "fees_quote_cum") + d_fees
+        for name, value in (("base_delta_cum", new_base), ("quote_delta_cum", new_quote),
+                            ("fees_quote_cum", new_fees)):
+            if not value.is_finite():
+                raise PurseIntegrityError(f"fills_rollup {name} update is non-finite")
+        target["base_delta_cum"] = str(new_base)
+        target["quote_delta_cum"] = str(new_quote)
+        target["fees_quote_cum"] = str(new_fees)
+        target["fills_seen"] = int(target["fills_seen"]) + fills
+        target["last_update_ts"] = ts
         self._dirty = True
         return dict(target)
 
@@ -480,19 +497,24 @@ class PurseLedger:
             raise PurseIntegrityError("purse journal 'records' must be a list")
         opened_epochs: set = set()
         rollup_epochs: set = set()
-        expected_seq = 0
+        # Contract (CDX-R06): seq is 1-based and STRICTLY INCREASING -- no contiguity demand
+        # (the sibling API validates against the same pinned text; the engine must not accept
+        # a narrower format than the contract defines). The engine's own appends stay
+        # contiguous, but a gap in a loaded journal is contract-valid and must load.
+        prev_seq = 0
+        index = 0
         for record in records:
-            expected_seq += 1
+            index += 1
             if not isinstance(record, dict):
-                raise PurseIntegrityError(f"purse record #{expected_seq} must be a JSON object")
+                raise PurseIntegrityError(f"purse record #{index} must be a JSON object")
             seq = record.get("seq")
-            if isinstance(seq, bool) or not isinstance(seq, int) or seq != expected_seq:
-                # 1-based, strictly increasing AND contiguous: the journal is append-only, so a
-                # gap or repeat means records were lost, edited or reordered -- refuse it.
+            if isinstance(seq, bool) or not isinstance(seq, int) \
+                    or (index == 1 and seq != 1) or seq <= prev_seq:
                 raise PurseIntegrityError(
-                    f"purse record seq {seq!r} violates the 1-based contiguous order "
-                    f"(expected {expected_seq})"
+                    f"purse record seq {seq!r} violates the 1-based strictly-increasing order "
+                    f"(record #{index}, previous seq {prev_seq})"
                 )
+            prev_seq = seq
             _require_ts(record.get("ts"), f"records[{seq}].ts")
             kind = record.get("kind")
             if kind not in KNOWN_KINDS:
@@ -511,12 +533,15 @@ class PurseLedger:
                     )
                 rollup_epochs.add(epoch_id)
         sequence = raw.get("sequence")
-        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != expected_seq:
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence != prev_seq:
             raise PurseIntegrityError(
                 f"purse journal 'sequence' {sequence!r} does not match the highest record seq "
-                f"({expected_seq})"
+                f"({prev_seq})"
             )
-        if records and records[0].get("kind") != "opening_epoch":
+        if not records or records[0].get("kind") != "opening_epoch":
+            # CDX-R03: an on-disk journal with no opening_epoch (including records: []) IS the
+            # forbidden start-empty fallback -- only create() may hold a transiently empty
+            # document, and only in memory during the one-shot bootstrap.
             raise PurseIntegrityError("purse journal must begin with an opening_epoch record")
         return raw
 
@@ -531,6 +556,14 @@ class PurseLedger:
             _require_str(record.get("epoch_id"), f"records[{seq}].epoch_id")
             _require_enum(record.get("opening_basis_quality"),
                           f"records[{seq}].opening_basis_quality", OPENING_BASIS_QUALITIES)
+            # CDX-R03: `predecessor` and `note` are contract-REQUIRED fields whose VALUES may
+            # be null -- the key must exist, so presence is checked before nullability.
+            for nullable_field in ("predecessor", "note"):
+                if nullable_field not in record:
+                    raise PurseIntegrityError(
+                        f"records[{seq}].{nullable_field} is required (null is allowed, "
+                        "absence is not)"
+                    )
             predecessor = record.get("predecessor")
             if predecessor is not None and not isinstance(predecessor, str):
                 raise PurseIntegrityError(
@@ -556,6 +589,10 @@ class PurseLedger:
             _require_ts(record.get("last_update_ts"), f"records[{seq}].last_update_ts")
         elif kind == "reseed_epoch":
             _require_str(record.get("epoch_id"), f"records[{seq}].epoch_id")
+            if "prev_epoch_id" not in record:
+                raise PurseIntegrityError(
+                    f"records[{seq}].prev_epoch_id is required (null is allowed, absence is not)"
+                )
             prev_epoch = record.get("prev_epoch_id")
             if prev_epoch is not None and not isinstance(prev_epoch, str):
                 raise PurseIntegrityError(

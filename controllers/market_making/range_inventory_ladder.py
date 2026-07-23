@@ -181,6 +181,13 @@ def _safe_decimal(value, field_name: str = "value", default: Optional[str] = Non
     return parsed
 
 
+class _WalletReadError(Exception):
+    """A wallet balance read needed for a PERMANENT purse-journal record failed or produced a
+    non-finite/negative value (hbpurse P4, CDX-R02). Deliberately NOT a PurseError: the journal
+    is fine -- the OBSERVATION is not -- so the caller defers the record and retries next cycle
+    instead of degrading the journal."""
+
+
 class RangeInventoryLadderConfig(ControllerConfigBase):
     """
     Spot-only fixed price inventory ladder with managed-fund accounting.
@@ -1655,6 +1662,9 @@ class RangeInventoryLadderController(ControllerBase):
         self._purse_declaration_ignored_warned: bool = False
         self._purse_last_ref_price: Decimal = Decimal("0")
         self._reseed_deferred_purse_token: Optional[str] = None
+        # CDX-R02: once-latch for the wallet-unreadable adopt/bootstrap deferral (reset on the
+        # next successful adopt/bootstrap so a recurrence logs again).
+        self._purse_wallet_unreadable_logged: bool = False
 
         self._config_rebuild_pending: bool = False
         self._config_rebuild_reason: str = ""
@@ -2002,6 +2012,34 @@ class RangeInventoryLadderController(ControllerBase):
             )
         except Exception:
             return Decimal("0")
+
+    def _strict_get_balance(self, asset: str) -> Decimal:
+        """hbpurse P4 (CDX-R02): a wallet read destined for a PERMANENT journal record must
+        never absorb a failed read as zero (the _safe_* helpers exist for budget clamps, where
+        zero fails closed; in an opening epoch zero is a fabricated observation). Raises
+        _WalletReadError on any exception, unparseable/non-finite value, or negative balance."""
+        try:
+            value = _safe_decimal(
+                self.market_data_provider.get_balance(self.config.connector_name, asset),
+                f"balance_{asset}",
+            )
+        except Exception as exc:
+            raise _WalletReadError(f"balance_{asset}: {exc}") from exc
+        if value < Decimal("0"):
+            raise _WalletReadError(f"balance_{asset} is negative: {value}")
+        return value
+
+    def _strict_get_available_balance(self, asset: str) -> Decimal:
+        try:
+            value = _safe_decimal(
+                self.market_data_provider.get_available_balance(self.config.connector_name, asset),
+                f"available_balance_{asset}",
+            )
+        except Exception as exc:
+            raise _WalletReadError(f"available_balance_{asset}: {exc}") from exc
+        if value < Decimal("0"):
+            raise _WalletReadError(f"available_balance_{asset} is negative: {value}")
+        return value
 
     def _emit_diagnostic_heartbeat_if_due(self):
         if not self.config.diagnostic_log_enabled or not self.processed_data:
@@ -2691,9 +2729,15 @@ class RangeInventoryLadderController(ControllerBase):
     def _finalize_purse_marker(self) -> None:
         """End-of-cycle backstop for the bridge marker: normally it piggybacks on the next
         money commit (no extra write); on a quiet cycle with a due marker, commit it directly.
-        Skipped while degraded -- a degraded cycle must not spend writes on the marker (the
-        piggyback lands it with the first recovered commit)."""
-        if self._accounting_degraded or self._purse_degraded:
+
+        CDX-R04: this backstop must keep retrying while _accounting_degraded is set -- on a
+        QUIET controller the failed marker write is the only commit there is, so gating on
+        the flag it itself raised would deadlock the degradation forever (the flag clears only
+        inside a successful _commit_state). The marker commit IS the recovery probe: it writes
+        the same prior state plus the marker, and success clears the degradation. Only a
+        degraded PURSE skips it -- a marker must never point at a journal that is not clean
+        on disk (_purse_marker_due is False then anyway; the flag check makes it explicit)."""
+        if self._purse_degraded:
             return
         if self._purse_marker_due():
             self._commit_state({"purse_initialized": True}, reason="purse_bootstrap_marker")
@@ -2714,12 +2758,16 @@ class RangeInventoryLadderController(ControllerBase):
                                     note_suffix: Optional[str]) -> Dict[str, Any]:
         """Contract v1 `opening_epoch` fields from the CURRENT state and wallet. The
         unavailable_* fields prefer the P3 init-hold keys (the holds recorded AT init, F11);
-        a pre-P3 state falls back to the current wallet total-minus-available."""
+        a pre-P3 state falls back to the current wallet total-minus-available.
+
+        Wallet reads are STRICT (CDX-R02): an opening epoch is a permanent inception record,
+        so a failed/garbage read raises _WalletReadError (caller defers and retries) instead
+        of journaling a fabricated zero observation. Raises BEFORE any purse mutation."""
         base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
-        total_quote = self._safe_get_balance(quote_asset)
-        total_base = self._safe_get_balance(base_asset)
-        available_quote = self._safe_get_available_balance(quote_asset)
-        available_base = self._safe_get_available_balance(base_asset)
+        total_quote = self._strict_get_balance(quote_asset)
+        total_base = self._strict_get_balance(base_asset)
+        available_quote = self._strict_get_available_balance(quote_asset)
+        available_base = self._strict_get_available_balance(base_asset)
         if self._state.get("init_unavailable_quote") is not None or \
                 self._state.get("init_unavailable_base") is not None:
             unavailable_quote = self._d(self._state.get("init_unavailable_quote"), "0")
@@ -2781,7 +2829,9 @@ class RangeInventoryLadderController(ControllerBase):
             quality = "current_equity_only"
         # F16: an init that followed a quarantine records the recovery reason as predecessor.
         predecessor = self._state_recovery_reason or None
-        purse.create()
+        # CDX-R02: build the fields (strict wallet reads -- may raise _WalletReadError) BEFORE
+        # create(), so a failed read leaves the ledger un-adopted and the bootstrap retries
+        # whole next cycle -- never an adopted-but-empty journal.
         fields = self._build_opening_epoch_fields(
             reference_price=reference_price,
             contributed=contributed,
@@ -2790,6 +2840,7 @@ class RangeInventoryLadderController(ControllerBase):
             predecessor=predecessor,
             note_suffix=self.config.purse_opening_note,
         )
+        purse.create()
         fields["epoch_id"] = purse.next_epoch_id()
         record = purse.append("opening_epoch", fields, ts=self.market_data_provider.time())
         self.logger().info(
@@ -2892,7 +2943,16 @@ class RangeInventoryLadderController(ControllerBase):
                     except PurseError as exc:
                         self._set_purse_degraded("purse_load_failed", str(exc))
                         return
-                    self._on_purse_adopted(reference_price, marker)
+                    try:
+                        self._on_purse_adopted(reference_price, marker)
+                    except _WalletReadError as exc:
+                        # CDX-R02: the adoption may need a re-init opening epoch built from
+                        # wallet truth it cannot read yet. Adoption is all-or-nothing: discard
+                        # the (untouched) loaded document and retry the WHOLE adoption next
+                        # cycle -- the create gate blocks new orders while nothing is adopted.
+                        self._purse = None
+                        self._note_purse_wallet_unreadable("adopt", exc)
+                        return
                 elif marker:
                     # POST-BOOTSTRAP MISSING (contract): the state says a journal exists but
                     # the file is gone. NEVER silently re-bootstrap -- that would fabricate a
@@ -2906,9 +2966,19 @@ class RangeInventoryLadderController(ControllerBase):
                 else:
                     if not self._connector_ready():
                         # Defer the one-shot bootstrap until the connector can serve honest
-                        # wallet totals for the opening epoch. Not degraded -- just not yet.
+                        # wallet totals for the opening epoch. Not degraded -- just not yet;
+                        # the create gate (CDX-R01) blocks new orders until it lands.
                         return
-                    self._bootstrap_purse(reference_price)
+                    try:
+                        self._bootstrap_purse(reference_price)
+                    except _WalletReadError as exc:
+                        # CDX-R02: a wallet read failed or returned garbage. NEVER journal a
+                        # zero in its place -- the purse stays un-created (fields are built
+                        # before create()) and the bootstrap retries next cycle; the create
+                        # gate keeps new orders blocked meanwhile.
+                        self._note_purse_wallet_unreadable("bootstrap", exc)
+                        return
+                self._purse_wallet_unreadable_logged = False
             # Deltas booked while the journal was un-adoptable drain now, before the flush.
             self._drain_purse_pending()
             if purse.dirty:
@@ -3033,6 +3103,25 @@ class RangeInventoryLadderController(ControllerBase):
         if self._purse_degraded:
             self._clear_purse_degraded()
         return True
+
+    def _note_purse_wallet_unreadable(self, phase: str, exc: Exception) -> None:
+        """CDX-R02 deferral visibility: the adopt/bootstrap could not read the wallet for a
+        permanent record. Logged once per outage (latch resets on the next successful adopt/
+        bootstrap); the create gate independently blocks new orders every affected cycle."""
+        if self._purse_wallet_unreadable_logged:
+            return
+        self._purse_wallet_unreadable_logged = True
+        self.logger().warning(
+            f"{self.config.id}: purse {phase} deferred -- wallet unreadable for the opening "
+            f"record ({exc}). Nothing was journaled; new-order proposals stay blocked until "
+            "the journal is adopted. Retrying every cycle."
+        )
+        self._emit_structured(
+            "range_ladder_purse_wallet_unreadable",
+            phase=phase,
+            error=str(exc),
+            purse_file=str(self.purse_path),
+        )
 
     def _set_purse_degraded(self, reason: str, error: str) -> None:
         self._purse_degraded = True
@@ -7718,6 +7807,19 @@ class RangeInventoryLadderController(ControllerBase):
                 state_io_failures=self._state_io_failures,
                 purse_degraded=self._purse_degraded,
                 purse_degraded_reason=self._purse_degraded_reason,
+            )
+            return []
+
+        # hbpurse P4 (CDX-R01): reaching here means the state is initialized
+        # (initialization_ready gated above), so the purse journal MUST be adopted before any
+        # new order is proposed. A deferred bootstrap (connector warming up, wallet unreadable)
+        # is not "degraded", but it is still an un-journaled fund -- fail closed until the
+        # one-shot bootstrap or the on-disk load lands. Existing orders stay untouched.
+        if self._purse is None or not self._purse.loaded:
+            self._emit_structured(
+                "range_ladder_create_blocked_purse_pending",
+                purse_file=str(self.purse_path),
+                connector_ready=self._connector_ready(),
             )
             return []
 
