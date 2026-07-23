@@ -17,7 +17,7 @@ Two production incidents from the 2026-06-30 KRAKEN_LADDER_V1 instance drove the
    near zero. Root cause: the ledger books a fill instantly while Kraken's wallet snapshot
    lags up to one LONG_POLL (120s) — and Kraken has no is_balance_settling flag, so the v14
    settling deferral never engaged. The fix defers over-claim reconciliation within
-   fill_settle_grace_seconds (default 90) of the last BOOKED fill.
+   fill_settle_grace_seconds (default 150, hbpurse P3/F21) of the last BOOKED fill.
 """
 import asyncio
 import sys
@@ -350,7 +350,8 @@ class TestFillSettleGrace(_Harness):
 
     def test_config_default_and_validation(self):
         ctrl = self._build(self._incident_mdp())
-        self.assertEqual(90, ctrl.config.fill_settle_grace_seconds)
+        # hbpurse P3 (F21): default raised 90 -> 150 so the grace exceeds the ~120s poll lag.
+        self.assertEqual(150, ctrl.config.fill_settle_grace_seconds)
         extra = RangeInventoryLadderConfig.model_fields["fill_settle_grace_seconds"].json_schema_extra or {}
         self.assertTrue(extra.get("is_updatable", False))
         with self.assertRaises(Exception):
@@ -366,8 +367,9 @@ class TestFillSettleGrace(_Harness):
         self.assertFalse(ctrl._within_fill_settle_grace(1000.0))  # no fill yet
         ctrl._last_fill_booked_ts = 999.0
         self.assertTrue(ctrl._within_fill_settle_grace(1000.0))   # 1s after fill
-        self.assertTrue(ctrl._within_fill_settle_grace(1088.9))   # 89.9s after fill
-        self.assertFalse(ctrl._within_fill_settle_grace(1089.0))  # grace (90s) expired
+        # hbpurse P3 (F21): default grace is now 150s.
+        self.assertTrue(ctrl._within_fill_settle_grace(1148.9))   # 149.9s after fill
+        self.assertFalse(ctrl._within_fill_settle_grace(1149.0))  # grace (150s) expired
 
     def test_booking_a_fill_stamps_grace_timestamp(self):
         mdp = self._incident_mdp()
@@ -402,7 +404,7 @@ class TestFillSettleGrace(_Harness):
         consecutive evaluations (or >10s), so a single cycle no longer fires it."""
         mdp = self._incident_mdp()
         ctrl = self._incident_controller(mdp)
-        ctrl._last_fill_booked_ts = 905.0  # 95s ago -> grace (90s) expired
+        ctrl._last_fill_booked_ts = 800.0  # 200s ago -> grace (150s, hbpurse P3/F21) expired
         asyncio.run(ctrl.update_processed_data())
         # first evaluation: over-claim observed but not yet persistent -> no warning
         self.assertEqual(0, len(self._events(ctrl, "range_ladder_reconciliation_overclaim")))
