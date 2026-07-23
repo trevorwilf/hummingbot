@@ -388,6 +388,122 @@ class TestReanchorOffsetCredits(_Harness):
         self.assertEqual("0", booked[0].kwargs["offset_base_consumed"])
         self.assertEqual("0", booked[0].kwargs["offset_quote_consumed"])
 
+    def test_base_offset_credit_prevents_double_debit_on_late_sell_fill(self):
+        # CDX-R02: the SELL mirror of the late-BUY test. The wallet already reflects the
+        # SELL (base 1.0 -> 0.8, its 60 proceeds long since arrived); the re-anchor deducts
+        # the 0.2 from owned_base. When the fill then books (d_base=0.2, d_quote=60) the
+        # BASE offset absorbs the base debit: owned_base STAYS 0.8 (not 0.8-0.2=0.6) and
+        # the quote credit books in full (credits are never offset): 60 + 60 = 120.
+        # Would fail with SELL-side offset consumption removed (owned_base would read 0.6).
+        balances = {"XMR": (D("0.8"), D("0.8")), "USDT": (D(120), D(120))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp, ledger_overclaim_reanchor_seconds=10)
+        self._init_state(ctrl, owned_quote=60, owned_base="1.0", seed_value=400)
+
+        self._cycle(ctrl, mdp, 1000.0)  # base over-claim 0.2 (60 quote-valued) observed
+        self._cycle(ctrl, mdp, 1020.0)  # 20s > 10s grace -> base cut 1.0 -> 0.8
+        self.assertEqual(D(ctrl._state["owned_base"]), D("0.8"))
+        self.assertEqual(D(ctrl._state["reanchor_offset_base"]), D("0.2"))
+        self.assertEqual(D(ctrl._state["reanchor_offset_quote"]), D(0))
+
+        ctrl.executors_info = [_filling_executor(
+            "sell_350", TradeType.SELL, 300, "late-sell", filled_base="0.2", filled_quote="60",
+        )]
+        self._cycle(ctrl, mdp, 1030.0)
+
+        self.assertEqual(D(ctrl._state["owned_base"]), D("0.8"))   # NOT double-debited
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(120))    # credit booked in full
+        self.assertEqual(D(ctrl._state["reanchor_offset_base"]), D(0))  # fully consumed
+        booked = self._emit_events(ctrl, "range_ladder_fill_booked")
+        self.assertEqual(1, len(booked))
+        self.assertEqual("0.2", booked[0].kwargs["offset_base_consumed"])
+        self.assertEqual("0", booked[0].kwargs["offset_quote_consumed"])
+        self.assertEqual(D(0), D(self._persisted()["reanchor_offset_base"]))
+
+    def test_later_quote_cut_does_not_renew_older_base_credit(self):
+        # CDX-R01 (cross-asset): each credit ages from its OWN creation time. A base credit
+        # of 0.2 is created at t=1020; a quote-only re-anchor at t=1520 must NOT restart the
+        # base credit's clock. At t=1650 the base credit is 630s old (>= 600 expiry) -> a
+        # genuine SELL debit applies IN FULL (0.8 - 0.2 = 0.6), while the 130s-old quote
+        # credit survives untouched. Would fail if a later re-anchor rejuvenated every
+        # outstanding credit (the shared-timestamp defect: base age would read 130s and the
+        # stale credit would absorb the debit, leaving owned_base fabricated at 0.8).
+        balances = {"XMR": (D("0.8"), D("0.8")), "USDT": (D(100), D(100))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp, ledger_overclaim_reanchor_seconds=10)
+        self._init_state(ctrl, owned_quote=100, owned_base="1.0", seed_value=400)
+
+        self._cycle(ctrl, mdp, 1000.0)  # base over-claim observed
+        self._cycle(ctrl, mdp, 1020.0)  # base cut 1.0 -> 0.8: offset_base=0.2 born t=1020
+        self.assertEqual(D(ctrl._state["reanchor_offset_base"]), D("0.2"))
+
+        balances["USDT"] = (D(70), D(70))  # external quote outflow -30
+        self._cycle(ctrl, mdp, 1500.0)  # quote over-claim observed; base credit 480s old
+        self._cycle(ctrl, mdp, 1520.0)  # quote cut 100 -> 70: offset_quote=30 born t=1520
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(70))
+        self.assertEqual(D(ctrl._state["reanchor_offset_quote"]), D(30))
+        # The surviving base credit was NOT rejuvenated by the quote-side re-anchor.
+        self.assertEqual(D(ctrl._state["reanchor_offset_base"]), D("0.2"))
+        self.assertEqual(1020.0, ctrl._state["reanchor_offset_base_ts"])
+        self.assertEqual(1520.0, ctrl._state["reanchor_offset_quote_ts"])
+
+        # t=1650: base credit age 630 >= 600 -> expired; quote credit age 130 -> alive.
+        balances["XMR"] = (D("0.6"), D("0.6"))   # the sold base already left the wallet
+        balances["USDT"] = (D(130), D(130))      # its proceeds already arrived
+        ctrl.executors_info = [_filling_executor(
+            "sell_350", TradeType.SELL, 300, "late-sell", filled_base="0.2", filled_quote="60",
+        )]
+        self._cycle(ctrl, mdp, 1650.0)
+
+        self.assertEqual(D(ctrl._state["owned_base"]), D("0.6"))  # full debit: no stale absorb
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(130))
+        self.assertEqual(D(ctrl._state["reanchor_offset_base"]), D(0))   # expired, cleared
+        self.assertEqual(D(ctrl._state["reanchor_offset_quote"]), D(30))  # per-asset: alive
+        expired = self._emit_events(ctrl, "range_ladder_reanchor_offset_expired")
+        self.assertEqual(1, len(expired))
+        booked = self._emit_events(ctrl, "range_ladder_fill_booked")
+        self.assertEqual("0", booked[0].kwargs["offset_base_consumed"])
+
+    def test_second_same_asset_cut_does_not_extend_original_credit_expiry(self):
+        # CDX-R01 (same-asset): a second quote cut merged into a surviving quote credit
+        # keeps the ORIGINAL creation time (fail closed: the merged-in 20 dies early with
+        # the old 30, but the old 30 can never be rejuvenated). Credit 30 born t=1020,
+        # +20 merged at t=1420 -> 50 aging from 1020. At t=1650 (630s >= 600) the WHOLE
+        # merged bucket is expired: a late BUY debit of 30 applies in full (150 -> 120).
+        # Would fail if the merge restamped the bucket to t=1420 (age 230 -> absorbs 30).
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(170), D(170))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp, ledger_overclaim_reanchor_seconds=10)
+        self._init_state(ctrl, owned_quote=200, owned_base=0, seed_value=200)
+
+        self._cycle(ctrl, mdp, 1000.0)  # over-claim 30 observed
+        self._cycle(ctrl, mdp, 1020.0)  # cut 200 -> 170: offset_quote=30 born t=1020
+        self.assertEqual(D(ctrl._state["reanchor_offset_quote"]), D(30))
+
+        balances["USDT"] = (D(150), D(150))  # further external outflow -20
+        self._cycle(ctrl, mdp, 1400.0)  # over-claim 20 observed; credit 380s old, alive
+        self._cycle(ctrl, mdp, 1420.0)  # cut 170 -> 150: merged credit 30 + 20 = 50
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(150))
+        self.assertEqual(D(ctrl._state["reanchor_offset_quote"]), D(50))
+        # Merge keeps the OLDEST creation time -- the whole bucket ages from t=1020.
+        self.assertEqual(1020.0, ctrl._state["reanchor_offset_quote_ts"])
+
+        # t=1650: bucket age 630 >= 600 -> the whole 50 is expired (fail closed).
+        balances["USDT"] = (D(120), D(120))  # the late BUY's spend already left the wallet
+        balances["XMR"] = (D("0.1"), D("0.1"))
+        ctrl.executors_info = [_filling_executor(
+            "buy_300", TradeType.BUY, 300, "late-buy", filled_base="0.1", filled_quote="30",
+        )]
+        self._cycle(ctrl, mdp, 1650.0)
+
+        self.assertEqual(D(ctrl._state["owned_quote"]), D(120))  # full debit: 150 - 30
+        self.assertEqual(D(ctrl._state["owned_base"]), D("0.1"))
+        self.assertEqual(D(ctrl._state["reanchor_offset_quote"]), D(0))
+        expired = self._emit_events(ctrl, "range_ladder_reanchor_offset_expired")
+        self.assertEqual(1, len(expired))
+        booked = self._emit_events(ctrl, "range_ladder_fill_booked")
+        self.assertEqual("0", booked[0].kwargs["offset_quote_consumed"])
+
     def test_reseed_clears_outstanding_offset_credits(self):
         # A re-seed re-baselines owned_* from the live wallet and re-primes open-order
         # baselines, so an outstanding credit no longer matches any pending late fill --
@@ -398,7 +514,7 @@ class TestReanchorOffsetCredits(_Harness):
         ctrl = self._build(mdp, reseed_fund_from_wallet_once=True, reseed_generation=1)
         self._init_state(ctrl, owned_quote=100, owned_base=0, seed_value=100,
                          reanchor_offset_quote="30", reanchor_offset_base="0.1",
-                         reanchor_offset_ts=900.0)
+                         reanchor_offset_quote_ts=900.0, reanchor_offset_base_ts=900.0)
         self._cycle(ctrl, mdp, 1000.0)  # flat book -> reseed applies
 
         self.assertEqual(D(ctrl._state["owned_quote"]), D(170))  # min(200, target 170)

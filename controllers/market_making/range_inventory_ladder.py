@@ -2693,8 +2693,18 @@ class RangeInventoryLadderController(ControllerBase):
         exec_fees, alt_fees = self._order_fee_breakdown(order, info, quote_asset, base_asset, exec_quote)
         return exec_base, exec_quote, exec_fees, alt_fees
 
+    # (amount state key, creation-timestamp state key) per asset -- quote first, base second.
+    REANCHOR_OFFSET_KEYS = (
+        ("reanchor_offset_quote", "reanchor_offset_quote_ts"),
+        ("reanchor_offset_base", "reanchor_offset_base_ts"),
+    )
+
     def _load_reanchor_offsets(self, now: float) -> Tuple[Decimal, Decimal, bool]:
-        """hbpurse P1 (F5): current re-anchor offset credits, honoring expiry.
+        """hbpurse P1 (F5): current re-anchor offset credits, honoring PER-ASSET expiry.
+
+        Each credit ages from its OWN creation timestamp (CDX-R01): a later re-anchor on
+        the other asset -- or a later cut merged into this asset's surviving credit -- must
+        never rejuvenate an old credit's expiry clock.
 
         Returns (offset_quote, offset_base, cleared) where cleared=True means a non-zero
         stored credit was expired (older than reanchor_offset_expiry_seconds) or unreadable
@@ -2702,24 +2712,36 @@ class RangeInventoryLadderController(ControllerBase):
         Zero is the fail-closed direction: an offset only ever REDUCES a debit, so dropping
         a doubtful credit means the debit applies in full and equity is never fabricated.
         """
-        try:
-            offset_quote = max(Decimal("0"), _safe_decimal(
-                self._state.get("reanchor_offset_quote"), "reanchor_offset_quote", default="0"))
-            offset_base = max(Decimal("0"), _safe_decimal(
-                self._state.get("reanchor_offset_base"), "reanchor_offset_base", default="0"))
-        except ValueError:
-            return Decimal("0"), Decimal("0"), True
-        if offset_quote <= Decimal("0") and offset_base <= Decimal("0"):
-            return Decimal("0"), Decimal("0"), False
-        try:
-            offset_ts = _safe_decimal(self._state.get("reanchor_offset_ts"), "reanchor_offset_ts")
-        except ValueError:
-            # Unknown age -> treat as stale rather than immortal.
-            return Decimal("0"), Decimal("0"), True
-        age = Decimal(str(now)) - offset_ts
-        if age >= Decimal(self.config.reanchor_offset_expiry_seconds):
-            return Decimal("0"), Decimal("0"), True
-        return offset_quote, offset_base, False
+        expiry = Decimal(self.config.reanchor_offset_expiry_seconds)
+        now_d = None  # converted lazily: with no live credit the clock is never read
+        loaded = []
+        cleared = False
+        for amount_key, ts_key in self.REANCHOR_OFFSET_KEYS:
+            try:
+                amount = max(Decimal("0"), _safe_decimal(
+                    self._state.get(amount_key), amount_key, default="0"))
+            except ValueError:
+                loaded.append(Decimal("0"))
+                cleared = True
+                continue
+            if amount <= Decimal("0"):
+                loaded.append(Decimal("0"))
+                continue
+            try:
+                offset_ts = _safe_decimal(self._state.get(ts_key), ts_key)
+            except ValueError:
+                # Unknown age -> treat as stale rather than immortal.
+                loaded.append(Decimal("0"))
+                cleared = True
+                continue
+            if now_d is None:
+                now_d = Decimal(str(now))
+            if (now_d - offset_ts) >= expiry:
+                loaded.append(Decimal("0"))
+                cleared = True
+                continue
+            loaded.append(amount)
+        return loaded[0], loaded[1], cleared
 
     def _record_reanchor_cut(self, *, now: float, old_owned_quote: Decimal, old_owned_base: Decimal,
                              new_owned_quote: Decimal, new_owned_base: Decimal,
@@ -2769,9 +2791,18 @@ class RangeInventoryLadderController(ControllerBase):
             self._state[key] = str(prior + cut)
 
         prior_offset_quote, prior_offset_base, _cleared = self._load_reanchor_offsets(now)
-        self._state["reanchor_offset_quote"] = str(prior_offset_quote + cut_quote)
-        self._state["reanchor_offset_base"] = str(prior_offset_base + cut_base)
-        self._state["reanchor_offset_ts"] = float(now)
+        for cut, prior, (amount_key, ts_key) in (
+                (cut_quote, prior_offset_quote, self.REANCHOR_OFFSET_KEYS[0]),
+                (cut_base, prior_offset_base, self.REANCHOR_OFFSET_KEYS[1])):
+            self._state[amount_key] = str(prior + cut)
+            if prior > Decimal("0"):
+                # CDX-R01: a cut merged into a surviving credit keeps the credit's ORIGINAL
+                # timestamp (fail closed: the merged-in portion may expire early, but a later
+                # re-anchor can never rejuvenate a stale credit); the other asset's clock is
+                # per-asset state and is not touched at all.
+                continue
+            if cut > Decimal("0"):
+                self._state[ts_key] = float(now)
 
     def _book_fills_from_orders(self):
         """v13 Part A: robust per-order incremental fill booking.
@@ -2808,7 +2839,8 @@ class RangeInventoryLadderController(ControllerBase):
                 "range_ladder_reanchor_offset_expired",
                 offset_quote=str(self._state.get("reanchor_offset_quote")),
                 offset_base=str(self._state.get("reanchor_offset_base")),
-                offset_ts=str(self._state.get("reanchor_offset_ts")),
+                offset_quote_ts=str(self._state.get("reanchor_offset_quote_ts")),
+                offset_base_ts=str(self._state.get("reanchor_offset_base_ts")),
                 expiry_seconds=self.config.reanchor_offset_expiry_seconds,
             )
 
