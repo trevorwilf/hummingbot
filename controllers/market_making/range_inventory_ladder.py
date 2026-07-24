@@ -3713,7 +3713,16 @@ class RangeInventoryLadderController(ControllerBase):
                     f"{self.config.id}: purse derived-metrics computation failed ({exc}); "
                     "reporting zeros this cycle."
                 )
+        # Inception return as a percentage of gross contributions. Presentation-only
+        # (NOT part of the pinned contract-v1 derived set, so it lives here rather than
+        # in PurseLedger.derived_metrics); zero when nothing was contributed yet.
+        contributed = metrics.get("contributed", zero)
+        earned_total_pct = (
+            metrics.get("earned_total", zero) / contributed * Decimal("100")
+            if contributed > zero else zero
+        )
         return {
+            "earned_total_pct": earned_total_pct,
             "purse_ready": ready,
             "purse_initialized": self._state.get("purse_initialized") is True,
             "purse_path": str(self.purse_path),
@@ -9093,6 +9102,7 @@ class RangeInventoryLadderController(ControllerBase):
             f"Reconciliation gap: {p['reconciliation_gap_quote']:.6f} {p['quote_asset']}",
             f"Purse (inception): contributed {pb['contributed']:.6f} / withdrawn {pb['withdrawn']:.6f} "
             f"{p['quote_asset']} | earned {pb['earned_total']:.6f} "
+            f"({pb.get('earned_total_pct', Decimal('0')):+.2f}%) "
             f"(realized {pb['earned_realized']:.6f} / unrealized {pb['unrealized']:.6f}) | "
             f"drift {pb['drift']:.6f}",
             f"Purse epoch: {pb['epoch_id'] or 'n/a'} ({pb['opening_basis_quality'] or 'n/a'}) | "

@@ -1248,6 +1248,7 @@ class TestCustomInfoCompat(_Harness):
         "purse_pending_writes", "epoch_id", "opening_basis_quality", "reanchor_count",
         "last_reseed_token", "reseed_generation", "contributed", "withdrawn",
         "earned_realized", "earned_total", "unrealized", "drift", "equity_quote",
+        "earned_total_pct",
     ]
 
     def test_custom_info_keeps_old_keys_and_adds_purse_block(self):
@@ -1288,7 +1289,41 @@ class TestCustomInfoCompat(_Harness):
         self.assertEqual(D("0"), D(purse["withdrawn"]))
         self.assertEqual(D("0"), D(purse["earned_total"]))
         self.assertEqual(D("1600"), D(purse["equity_quote"]))
+        self.assertEqual(D("0"), D(purse["earned_total_pct"]))  # 0 earned / 1600 contributed
         self.assertEqual(0, purse["reanchor_count"])
+
+    def test_earned_total_pct_is_inception_return_on_contributed(self):
+        """earned_total_pct = earned_total / contributed * 100, hand-derived:
+
+        Declared opening contributed=800, earned_opening=50; owned=(1000 quote, 0 base)
+        at ref 300 -> equity = 1000, earned_total = 1000 - 800 + 0 = 200 -> +25%.
+        """
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp,
+            purse_opening_contributed_quote=Decimal("800"),
+            purse_opening_earned_quote=Decimal("50"),
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)
+
+        pb = ctrl._purse_status_block(D("300"))
+        self.assertEqual(D("200"), D(pb["earned_total"]))
+        self.assertEqual(D("25"), D(pb["earned_total_pct"]))
+        # The status line renders the signed percentage alongside earned.
+        status = "\n".join(ctrl.to_format_status())
+        self.assertIn("earned 200.000000 (+25.00%)", status)
+
+    def test_earned_total_pct_zero_when_nothing_contributed(self):
+        # No journal yet (never cycled) -> metrics are zeros; the pct guard must not divide.
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        pb = ctrl._purse_status_block()
+        self.assertIs(False, pb["purse_ready"])
+        self.assertEqual(D("0"), D(pb["contributed"]))
+        self.assertEqual(D("0"), D(pb["earned_total_pct"]))
 
     def test_status_text_gains_purse_section_and_epoch_label(self):
         balances = {"XMR": (D(0), D(0)), "USDT": (D(500), D(500))}
