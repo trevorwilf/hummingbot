@@ -270,6 +270,33 @@ class PurseLedger:
             return 0
         return sum(1 for record in self._doc["records"] if record.get("kind") == "reanchor")
 
+    def has_flow_token(self, token: str) -> bool:
+        """hbpurse P5 (CDX-R01): True when a `flow` record with this token is already in the
+        journal. The controller uses this to make the terminal `last_flow_token` consumption
+        durably COUPLED to the flow record: the record is (re)appended and only after it is
+        durably on disk is the token marked terminal, so a crash between the state commit and the
+        purse save can never drop the operator-declared flow (it is replayed from the persisted
+        pending intent on the next cycle / restart, idempotently)."""
+        if self._doc is None:
+            return False
+        return any(
+            record.get("kind") == "flow" and record.get("token") == token
+            for record in self._doc["records"]
+        )
+
+    def latest_checkpoint_ts(self) -> Optional[float]:
+        """hbpurse P5 (CDX-R07): the ts of the most recent checkpoint record, or None when the
+        journal has never checkpointed. On adoption the controller seeds its checkpoint clock
+        from this so the reported checkpoint age reflects the persisted history (not a fresh
+        zero) and an overdue interval checkpoint fires immediately after a restart."""
+        if self._doc is None:
+            return None
+        for record in reversed(self._doc["records"]):
+            if record.get("kind") == "checkpoint":
+                ts = record.get("ts")
+                return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
+        return None
+
     # ------------------------------------------------------------------ #
     # Mutation (in-memory; `save()` persists)
     # ------------------------------------------------------------------ #
@@ -405,12 +432,28 @@ class PurseLedger:
             earned_total    = equity - contributed + withdrawn
             unrealized      = earned_total - earned_realized
             drift           = sum over reanchor records of the per-asset cuts valued at ref
-                              (undeclared cuts the records cannot otherwise explain -- ALWAYS
-                              surfaced, never silently absorbed)
+                              PLUS, once the journal is checkpointing (CDX-R02), the LEDGER
+                              reconciliation residual: authoritative owned_* vs the owned the
+                              records imply. A crash after the state commit but before the purse
+                              save advances owned_* without a rollup record; the residual surfaces
+                              that lost delta as drift instead of it vanishing. (Undeclared cuts
+                              the records cannot otherwise explain -- ALWAYS surfaced, never
+                              silently absorbed.)
 
         A post-quarantine re-init opening epoch declares NO new basis (contributed/earned 0),
         so summing across opening epochs keeps inception continuity while every epoch stays
-        an explicit record."""
+        an explicit record.
+
+        CDX-R02 scope note: the reconciliation is OWNED-vs-records, never wallet-vs-owned. owned_*
+        is a DEPOSIT-EXCLUDED SUBSET of the wallet by design (safety rule 6), so the wallet
+        legitimately exceeds owned by reserve / non-strategy funds; treating that gap as drift
+        would fabricate a persistent false residual on every real deployment. The checkpoint's
+        recorded WALLET totals stay in the journal for out-of-band / API reconciliation (which
+        knows the non-strategy portion the engine cannot). The residual here catches exactly the
+        crash the pinned save-ordering note describes: owned_* advanced, the journal record did
+        not. It is robust to the in-place fills_rollup update because it reconciles the AUTHORITATIVE
+        current owned_* (passed in) against the records' final implied owned, not a mid-history
+        snapshot."""
         self._require_loaded()
         ref = reference_price if reference_price is not None else Decimal("0")
         zero = Decimal("0")
@@ -419,11 +462,24 @@ class PurseLedger:
         earned_opening = zero
         realized_flows = zero
         drift = zero
+        # CDX-R02 ledger reconciliation accumulators: the owned_* the records imply for the
+        # CURRENT epoch (opening/reseed reset the epoch baseline; the epoch's fills_rollup carries
+        # its cumulative deltas; only REAL owned cuts -- classification "undeclared_outflow" -- move
+        # the ledger, the phantom "drift"-classified surfacing records leave owned_* untouched).
+        imp_open_q = imp_open_b = zero
+        imp_rollup_q = imp_rollup_b = zero
+        imp_cut_q = imp_cut_b = zero
+        have_opening = False
+        have_checkpoint = False
         for record in self._doc["records"]:
             kind = record.get("kind")
             if kind == "opening_epoch":
                 contributed += _parse_decimal(record["contributed_opening_quote"], "contributed_opening_quote")
                 earned_opening += _parse_decimal(record["earned_opening_quote"], "earned_opening_quote")
+                imp_open_q = _parse_decimal(record["owned_quote"], "owned_quote")
+                imp_open_b = _parse_decimal(record["owned_base"], "owned_base")
+                imp_rollup_q = imp_rollup_b = imp_cut_q = imp_cut_b = zero
+                have_opening = True
             elif kind == "flow":
                 valuation = _parse_decimal(record["quote_valuation"], "quote_valuation")
                 if record.get("flow_kind") == "deposit":
@@ -435,12 +491,29 @@ class PurseLedger:
                     _parse_decimal(record["quote_delta_cum"], "quote_delta_cum")
                     + _parse_decimal(record["base_delta_cum"], "base_delta_cum") * ref
                 )
+                imp_rollup_q = _parse_decimal(record["quote_delta_cum"], "quote_delta_cum")
+                imp_rollup_b = _parse_decimal(record["base_delta_cum"], "base_delta_cum")
+            elif kind == "reseed_epoch":
+                imp_open_q = _parse_decimal(record["new_owned_quote"], "new_owned_quote")
+                imp_open_b = _parse_decimal(record["new_owned_base"], "new_owned_base")
+                imp_rollup_q = imp_rollup_b = imp_cut_q = imp_cut_b = zero
             elif kind == "reanchor":
                 cut_quote = max(zero, _parse_decimal(record["old_owned_quote"], "old_owned_quote")
                                 - _parse_decimal(record["new_owned_quote"], "new_owned_quote"))
                 cut_base = max(zero, _parse_decimal(record["old_owned_base"], "old_owned_base")
                                - _parse_decimal(record["new_owned_base"], "new_owned_base"))
                 drift += cut_quote + cut_base * ref
+                if record.get("classification") == "undeclared_outflow":
+                    imp_cut_q += cut_quote
+                    imp_cut_b += cut_base
+            elif kind == "checkpoint":
+                have_checkpoint = True
+        # The ledger residual is surfaced only once the journal is actively checkpointing (the P5
+        # ledger-snapshot discipline); a pre-P5 journal with no checkpoints keeps the P4 drift.
+        if have_checkpoint and have_opening:
+            implied_q = imp_open_q + imp_rollup_q - imp_cut_q
+            implied_b = imp_open_b + imp_rollup_b - imp_cut_b
+            drift += (owned_quote - implied_q) + (owned_base - implied_b) * ref
         equity = owned_quote + owned_base * ref
         earned_realized = earned_opening + realized_flows
         earned_total = equity - contributed + withdrawn

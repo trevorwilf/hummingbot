@@ -1059,6 +1059,93 @@ class TestRollupUpdateStrictness(_LedgerUnitHarness):
         self.assertEqual(snapshot, fresh.records())
 
 
+# ============================== CDX-R02/R08: checkpoint ledger reconciliation drift
+
+class TestCheckpointLedgerReconciliation(_LedgerUnitHarness):
+    """CDX-R02/R08: a checkpoint's recorded ledger snapshot must participate in derived drift.
+    A crash after the state commit but before the purse rollup save advances owned_* without a
+    rollup record; the next checkpoint records the advanced owned, and derived_metrics reconciles
+    the AUTHORITATIVE current owned against the records-implied owned, surfacing the lost delta as
+    drift. Every expected value is hand-derived from the contract formulas, not from running code.
+    """
+
+    @staticmethod
+    def _checkpoint(seq, epoch, *, owned_quote, owned_base, ref="300",
+                    wallet_quote="100", wallet_base="0"):
+        return {
+            "seq": seq, "ts": 1000.0 + seq, "kind": "checkpoint", "epoch_id": epoch,
+            "owned_quote": str(owned_quote), "owned_base": str(owned_base),
+            "reference_price": str(ref),
+            "equity_quote": str(D(owned_quote) + D(owned_base) * D(ref)),
+            "wallet_quote_total": str(wallet_quote), "wallet_base_total": str(wallet_base),
+            "external_holds_quote": "0", "external_holds_base": "0",
+        }
+
+    def _load_with(self, *records):
+        recs = [self._opening()] + list(records)
+        self._write(self._doc(records=recs, sequence=recs[-1]["seq"]))
+        ledger = self._ledger()
+        ledger.load()
+        return ledger
+
+    def test_checkpoint_surfaces_lost_rollup_as_drift(self):
+        # Opening owned (100, 0). A checkpoint records owned advanced to (100, 1) -- a base credit
+        # whose fills_rollup was lost in a crash. Authoritative current owned is (100, 1); the
+        # records imply (100, 0) (no rollup) -> gap (0, base 1) -> drift = 0 + 1*ref.
+        ledger = self._load_with(
+            self._checkpoint(2, "epoch-1", owned_quote="100", owned_base="1")
+        )
+        metrics = ledger.derived_metrics(reference_price=D("300"),
+                                         owned_quote=D("100"), owned_base=D("1"))
+        # Hand-derived: reanchor drift 0 + checkpoint residual (0 quote + 1 base * 300) = 300.
+        # MUTATION (CDX-R08): filter checkpoints out of the derived_metrics loop -> have_checkpoint
+        # stays False -> the residual term is dropped -> drift collapses to 0 -> this assert FAILS.
+        self.assertEqual(D("300"), metrics["drift"])
+
+    def test_no_checkpoint_means_no_reconciliation_gate(self):
+        # The SAME owned/records mismatch WITHOUT a checkpoint is not reconciled (a pre-P5 journal
+        # keeps P4 drift). This isolates the checkpoint gate: the residual is surfaced only once the
+        # journal is actively checkpointing.
+        ledger = self._load_with()  # opening only, no checkpoint
+        metrics = ledger.derived_metrics(reference_price=D("300"),
+                                         owned_quote=D("100"), owned_base=D("1"))
+        self.assertEqual(D("0"), metrics["drift"])
+
+    def test_consistent_owned_yields_zero_checkpoint_drift(self):
+        # Opening owned (100,0); a fills_rollup books (+base 1, -quote 300); a checkpoint records
+        # the matching owned (base 1, quote 0... i.e. current owned matches the records) -> gap 0.
+        rollup = {
+            "seq": 2, "ts": 1002.0, "kind": "fills_rollup", "epoch_id": "epoch-1",
+            "base_delta_cum": "1", "quote_delta_cum": "-100", "fees_quote_cum": "0",
+            "fills_seen": 1, "last_update_ts": 1002.0,
+        }
+        cp = self._checkpoint(3, "epoch-1", owned_quote="0", owned_base="1")
+        ledger = self._load_with(rollup, cp)
+        # Records imply owned (100-100, 0+1) = (0, 1); authoritative owned matches -> gap 0.
+        metrics = ledger.derived_metrics(reference_price=D("300"),
+                                         owned_quote=D("0"), owned_base=D("1"))
+        self.assertEqual(D("0"), metrics["drift"])
+
+    def test_undeclared_outflow_reanchor_not_double_counted_by_checkpoint(self):
+        # A REAL re-anchor (classification undeclared_outflow) cut owned 100 -> 60 (wallet dropped).
+        # It contributes 40 to reanchor drift; the post-cut checkpoint records owned (60,0) which
+        # MATCHES the records-implied owned (100 - 40 undeclared cut) -> checkpoint residual 0, so
+        # the cut is not counted twice.
+        reanchor = {
+            "seq": 2, "ts": 1002.0, "kind": "reanchor", "epoch_id": "epoch-1",
+            "old_owned_quote": "100", "old_owned_base": "0",
+            "new_owned_quote": "60", "new_owned_base": "0",
+            "overclaim_quote": "40", "classification": "undeclared_outflow",
+            "wallet_quote_total": "60", "wallet_base_total": "0",
+        }
+        cp = self._checkpoint(3, "epoch-1", owned_quote="60", owned_base="0", wallet_quote="60")
+        ledger = self._load_with(reanchor, cp)
+        metrics = ledger.derived_metrics(reference_price=D("300"),
+                                         owned_quote=D("60"), owned_base=D("0"))
+        # reanchor drift 40 + checkpoint residual 0 = 40 (NOT 80).
+        self.assertEqual(D("40"), metrics["drift"])
+
+
 # ==================================================== custom_info backward compatibility
 
 class TestCustomInfoCompat(_Harness):

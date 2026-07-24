@@ -50,6 +50,7 @@ _CTRL_DIR = Path(__file__).resolve().parents[4] / "controllers" / "market_making
 if str(_CTRL_DIR) not in sys.path:
     sys.path.insert(0, str(_CTRL_DIR))
 
+from controllers._shared.purse_ledger import PurseIOError  # noqa: E402
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType  # noqa: E402
 from hummingbot.strategy_v2.models.base import RunnableStatus  # noqa: E402
 
@@ -688,6 +689,313 @@ class TestPurseBlockExposure(_Harness):
         self.assertEqual(1, purse["flow_generation"])
         self.assertIn("checkpoint_age_s", purse)
         self.assertIn("carried_prune_drift_quote", purse)
+
+
+# ============================ CDX-R09: declared WITHDRAWALS (matched / contradicted / base)
+
+class TestDeclaredWithdrawals(_Harness):
+
+    def test_quote_withdrawal_confirms_matched(self):
+        # Declared quote withdrawal of 100: the wallet DROPS by 100 in the declared direction ->
+        # confirmation="wallet_delta_matched", withdrawn metric = 100, owned_* untouched.
+        # (Mutation CDX-R09a: reverse the withdrawal comparison at _maybe_confirm_declared_flow's
+        #  `matched = observed_delta <= -min_move` -> observed -100 no longer matches -> the
+        #  confirmation flips to "drift" -> this assert FAILS.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp, flow_generation=1, flow_kind="withdrawal", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # arm (baseline USDT=1000)
+        balances["USDT"] = (D(900), D(900))         # withdrawal of 100 lands
+        self._cycle(ctrl, mdp, 1001.0)              # confirm
+        flows = self._records_of_kind("flow")
+        self.assertEqual(1, len(flows))
+        self.assertEqual("withdrawal", flows[0]["flow_kind"])
+        self.assertEqual("USDT", flows[0]["asset"])
+        self.assertEqual(D("100"), D(flows[0]["quote_valuation"]))
+        self.assertEqual("wallet_delta_matched", flows[0]["confirmation"])
+        # owned_* is never resized by a flow (deposit/withdrawal-exclusion, safety rule 6).
+        self.assertEqual(D("1000"), D(ctrl._state["owned_quote"]))
+        self.assertEqual(D("0"), D(ctrl._state["owned_base"]))
+        metrics = ctrl._purse.derived_metrics(
+            reference_price=D(300), owned_quote=D(1000), owned_base=D(0)
+        )
+        self.assertEqual(D("100"), metrics["withdrawn"])
+
+    def test_quote_withdrawal_contradiction_records_drift(self):
+        # Declared a withdrawal but the wallet ROSE -> confirmation="drift", never force-matched.
+        # (Also independently fails under the CDX-R09a reversed-comparison mutation.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp, flow_generation=1, flow_kind="withdrawal", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # arm (baseline 1000)
+        balances["USDT"] = (D(1100), D(1100))       # wallet went the WRONG way for a withdrawal
+        self._cycle(ctrl, mdp, 1001.0)              # confirm -> drift
+        flows = self._records_of_kind("flow")
+        self.assertEqual(1, len(flows))
+        self.assertEqual("drift", flows[0]["confirmation"])
+
+    def test_base_withdrawal_valued_at_reference_price(self):
+        # Declared BASE withdrawal of 2 XMR at ref 300 -> quote_valuation = 2*300 = 600, matched
+        # when the base wallet drops by 2.
+        balances = {"XMR": (D(2), D(2)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp, flow_generation=1, flow_kind="withdrawal", flow_asset="base",
+            flow_amount=Decimal("2"), flow_confirm_quiet_cycles=1,
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=2, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # arm (baseline XMR=2)
+        balances["XMR"] = (D(0), D(0))              # withdrawal of 2 XMR lands
+        self._cycle(ctrl, mdp, 1001.0)              # confirm
+        flows = self._records_of_kind("flow")
+        self.assertEqual(1, len(flows))
+        self.assertEqual("XMR", flows[0]["asset"])
+        self.assertEqual(D("2"), D(flows[0]["native_amount"]))
+        self.assertEqual(D("600"), D(flows[0]["quote_valuation"]))
+        self.assertEqual("wallet_delta_matched", flows[0]["confirmation"])
+        metrics = ctrl._purse.derived_metrics(
+            reference_price=D(300), owned_quote=D(1000), owned_base=D(2)
+        )
+        self.assertEqual(D("600"), metrics["withdrawn"])
+
+
+# ==================== CDX-R09/R01: restart idempotency & crash-boundary flow durability
+
+class TestFlowRestartDurability(_Harness):
+
+    def test_same_token_does_not_record_twice_across_restart(self):
+        # A confirmed flow's terminal marker (last_flow_token) is persisted; a RESTARTED controller
+        # loads it and does NOT re-arm or re-record the same declaration. (Mutation CDX-R09b: on
+        # load, `token_val = validated.pop(token_key, None)` drops the token -> the fresh controller
+        # forgets it -> re-arms and records a 2nd flow -> the "exactly one" assert FAILS.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp, flow_generation=1, flow_kind="deposit", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # arm
+        balances["USDT"] = (D(1100), D(1100))
+        self._cycle(ctrl, mdp, 1001.0)              # confirm -> 1 record, last_flow_token set
+        self.assertEqual(1, len(self._records_of_kind("flow")))
+        self.assertEqual("1:deposit:quote:100", self._persisted_state()["last_flow_token"])
+
+        # RESTART: a fresh controller loads state + purse from disk (no _init_state). The persisted
+        # last_flow_token must make it a no-op -- it must NOT re-arm the already-recorded flow.
+        ctrl2 = self._build(
+            mdp, flow_generation=1, flow_kind="deposit", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._cycle(ctrl2, mdp, 1002.0)             # would re-arm under the mutation
+        self._cycle(ctrl2, mdp, 1003.0)
+        self.assertEqual(1, len(self._records_of_kind("flow")))  # still exactly one
+        self.assertEqual("", ctrl2._state.get("flow_arm_token") or "")
+        # The restored token suppresses re-arming entirely. Under the CDX-R09b mutation the fresh
+        # controller forgets last_flow_token and re-arms the declaration -> a flow_armed event fires
+        # -> this assert FAILS (the purse-level has_flow_token guard still blocks the duplicate
+        # RECORD, so the re-arm event is the observable proof the token was lost on load).
+        self.assertEqual(0, len(self._emit_events(ctrl2, "range_ladder_flow_armed")))
+
+    def test_flow_survives_crash_between_state_commit_and_purse_save(self):
+        # CDX-R01: the terminal token must not outlive its purse record. Confirm a flow while the
+        # PURSE save fails -> the flow record is NOT durable and last_flow_token is NOT consumed
+        # (pending_flow_record persists). A restart REPLAYS the record from state -> the operator-
+        # declared flow is recovered, never dropped. (Old behavior consumed the token + buffered
+        # the record in memory -> the crash lost the flow while suppressing all future retries.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp, flow_generation=7, flow_kind="deposit", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # arm + bootstrap purse (opening on disk)
+        balances["USDT"] = (D(1100), D(1100))
+        # Make the purse save fail during the confirm cycle (the state save still succeeds).
+        ctrl._purse.save = MagicMock(side_effect=PurseIOError("simulated purse save failure"))
+        self._cycle(ctrl, mdp, 1001.0)              # confirm -> pending persisted, purse degraded
+        token = "7:deposit:quote:100"
+        self.assertEqual(token, self._persisted_state()["pending_flow_record"]["token"])
+        self.assertNotEqual(token, self._persisted_state().get("last_flow_token"))
+        self.assertEqual([], self._records_of_kind("flow"))   # never reached disk
+        self.assertTrue(ctrl._purse_degraded)
+
+        # RESTART with a healthy purse: reconcile replays the pending record and finalizes it.
+        ctrl2 = self._build(
+            mdp, flow_generation=7, flow_kind="deposit", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._cycle(ctrl2, mdp, 1002.0)
+        flows = self._records_of_kind("flow")
+        self.assertEqual(1, len(flows))                       # RECOVERED, not lost
+        self.assertEqual(token, flows[0]["token"])
+        self.assertEqual(token, self._persisted_state()["last_flow_token"])
+        self.assertIsNone(self._persisted_state().get("pending_flow_record"))
+
+
+# ==================================== CDX-R03: fail-closed flow gate while ledger is degraded
+
+class TestFlowDegradedGate(_Harness):
+
+    def test_flow_does_not_clear_degraded_while_uncommitted_fill_pending(self):
+        # A booking commit fails (accounting degraded + an uncommitted fill pending). In the SAME
+        # cycle the armed flow's confirmation must NOT commit and clear the degradation -- doing so
+        # would re-open new-order proposals with a stale ledger. (Mutation CDX-R03: drop the
+        # `if self._accounting_degraded or self._uncommitted_fill_actuals: return` gate -> the flow
+        # commit succeeds on the second write and clears _accounting_degraded -> assertTrue FAILS.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(
+            mdp, flow_generation=1, flow_kind="deposit", flow_asset="quote",
+            flow_amount=Decimal("100"), flow_confirm_quiet_cycles=1,
+        )
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # arm (no executors -> clean commit)
+
+        # A flaky writer that fails the FIRST write of the next cycle (the booking commit) and
+        # succeeds afterwards (the flow commit the mutation would let through).
+        real_write = ctrl._write_state_to_disk
+        calls = {"n": 0}
+
+        def flaky(state):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("simulated booking commit failure")
+            return real_write(state)
+
+        ctrl._write_state_to_disk = flaky
+        ex = _filling_executor("buy_315", TradeType.BUY, 315, "exec-fail",
+                               filled_base="1", filled_quote="300", fees="0")
+        ctrl.executors_info = [ex]
+        balances["USDT"] = (D(700), D(700))         # BUY spent 300
+        self._cycle(ctrl, mdp, 1010.0)
+        self.assertTrue(ctrl._accounting_degraded)              # booking failure stands
+        self.assertIn("exec-fail", ctrl._uncommitted_fill_actuals)
+        self.assertEqual([], self._records_of_kind("flow"))     # flow gated -> not recorded
+
+
+# ==================================== CDX-R04: strict wallet reads for permanent records
+
+class TestStrictWalletReads(_Harness):
+
+    def test_checkpoint_defers_on_unreadable_wallet_no_fabricated_zero(self):
+        # An interval checkpoint is due but the wallet read FAILS -> the checkpoint DEFERS (no
+        # record, a structured deferral event) rather than journaling a fabricated wallet_total=0,
+        # which would corrupt the ledger-reconciliation drift. (Mutation CDX-R04: read via
+        # _safe_get_balance -> a checkpoint with wallet_quote_total="0" is written -> the "no
+        # checkpoint" assert FAILS.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp, purse_checkpoint_interval_seconds=100)
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        self._cycle(ctrl, mdp, 1000.0)              # bootstrap; checkpoint clock starts
+
+        def _raise(_conn, _asset):
+            raise RuntimeError("wallet momentarily unreadable")
+
+        mdp.get_balance.side_effect = _raise
+        self._cycle(ctrl, mdp, 1101.0)              # interval due, but wallet unreadable -> defer
+        self.assertEqual([], self._records_of_kind("checkpoint"))   # no fabricated-zero checkpoint
+        self.assertGreaterEqual(
+            len(self._emit_events(ctrl, "range_ladder_checkpoint_wallet_unreadable")), 1)
+
+
+# ==================================== CDX-R06: fee-only uncommitted loss surfaces as drift
+
+class TestFeeOnlyUncommittedDrift(_Harness):
+
+    def test_fee_only_uncommitted_loss_surfaces_drift(self):
+        # A durable fill (base 1, quote 300, fees 0), then a FEE-ONLY update (fees +1, base/quote
+        # flat) whose commit FAILS; the executor then vanishes. The unbooked fee is a quote debit
+        # and must be surfaced as drift, not dropped. (Mutation CDX-R06: retention condition
+        # `lost_base>0 or lost_quote>0` (no lost_fees term) -> the fee-only loss is discarded ->
+        # no drift record -> FAILS.)
+        balances = {"XMR": (D(0), D(0)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        ex = _filling_executor("buy_315", TradeType.BUY, 315, "exec-fee",
+                               filled_base="1", filled_quote="300", fees="0")
+        ctrl.executors_info = [ex]
+        balances["USDT"] = (D(700), D(700))
+        self._cycle(ctrl, mdp, 1000.0)              # books base 1, quote 300, fees 0 (durable)
+        self.assertEqual(D("700"), D(ctrl._state["owned_quote"]))
+
+        # A fee-only update whose booking commit fails.
+        real_write = ctrl._write_state_to_disk
+        gate = {"fail": True}
+
+        def flaky(state):
+            if gate["fail"]:
+                raise OSError("simulated fee booking commit failure")
+            return real_write(state)
+
+        ctrl._write_state_to_disk = flaky
+        ex.custom_info = {"filled_amount_base": D("1"), "filled_amount_quote": D("300"),
+                          "cum_fees_quote": D("1")}
+        self._cycle(ctrl, mdp, 1010.0)
+        self.assertTrue(ctrl._accounting_degraded)
+        self.assertIn("exec-fee", ctrl._uncommitted_fill_actuals)
+
+        # Recover the writer, executor vanishes -> the lost fee (1 quote) surfaces as drift.
+        gate["fail"] = False
+        ctrl.executors_info = []
+        self._cycle(ctrl, mdp, 1020.0)
+        drifts = [r for r in self._records_of_kind("reanchor") if r["classification"] == "drift"]
+        self.assertEqual(1, len(drifts))
+        self.assertEqual(D("1"), D(drifts[0]["old_owned_quote"]))   # the unbooked fee (folded)
+        self.assertEqual(D("0"), D(drifts[0]["old_owned_base"]))
+        self.assertEqual(D("1"), D(drifts[0]["overclaim_quote"]))   # 1 quote at ref
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_uncommitted_fill_drift")))
+
+
+# ==================================== CDX-R07/R10: restart-accurate reporting markers
+
+class TestRestartMarkers(_Harness):
+
+    def test_checkpoint_age_and_carried_prune_drift_exact_and_survive_restart(self):
+        # checkpoint_age_s reflects the ACTUAL last checkpoint ts and carried_prune_drift_quote the
+        # ACTUAL surfaced total -- both exact, and both survive a restart. (Mutations CDX-R10:
+        # force checkpoint_age to None / carried total to Decimal("0") -> the exact asserts FAIL.
+        # Mutation CDX-R07: reset the markers from constants on restart -> the post-restart asserts
+        # FAIL.)
+        balances = {"XMR": (D("0.5"), D("0.5")), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        self._init_state(
+            ctrl, owned_quote=1000, owned_base="0.5", seed_value=1000,
+            booked_fill_progress={"old-exec-1": {"base": "0.4", "quote": "120", "fees": "0.12"}},
+        )
+        ctrl.executors_info = []
+        self._cycle(ctrl, mdp, 1000.0)              # carried prune -> drift 240 + a checkpoint @1000
+        self.assertEqual(1, len(self._records_of_kind("checkpoint")))
+
+        # Exact markers at a later time in the SAME session (the purse block rides processed_data,
+        # so re-run a cycle at t=1500 to recompute it -- no new checkpoint: interval 3600 not due).
+        self._cycle(ctrl, mdp, 1500.0)
+        self.assertEqual(1, len(self._records_of_kind("checkpoint")))   # still just the event one
+        purse = ctrl.get_custom_info()["purse"]
+        self.assertEqual(500.0, purse["checkpoint_age_s"])          # 1500 - 1000
+        self.assertEqual(D("240"), D(str(purse["carried_prune_drift_quote"])))
+        self.assertEqual(D("240"),
+                         D(self._persisted_state()["carried_prune_drift_quote_cum"]))
+
+        # RESTART: a fresh controller loads the persisted state + purse; the markers are seeded
+        # from history, not reset to constants.
+        ctrl2 = self._build(mdp)
+        self._cycle(ctrl2, mdp, 2000.0)             # adopt purse (seed checkpoint ts + carried cum)
+        purse2 = ctrl2.get_custom_info()["purse"]
+        self.assertEqual(1000.0, purse2["checkpoint_age_s"])       # 2000 - persisted 1000
+        self.assertEqual(D("240"), D(str(purse2["carried_prune_drift_quote"])))
 
 
 if __name__ == "__main__":
