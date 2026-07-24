@@ -935,6 +935,88 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
         },
     )
 
+    # hbpurse P5 (F15/CLA-M04/A6): OPERATOR-DECLARED FLOWS via a generation token. A deposit or
+    # withdrawal is not an order, so the fills-only trading ledger (owned_*) never sees it
+    # (deposit-exclusion invariant, safety rule 6); the purse JOURNAL records the flow so the
+    # inception contributed/withdrawn metrics stay correct. The declaration is a token
+    # (flow_generation:flow_kind:flow_asset:flow_amount); bump flow_generation to arm a new flow.
+    # Idempotent per token (state key last_flow_token). Confirmation happens only in a QUIET
+    # booking window (no booked fills for flow_confirm_quiet_cycles consecutive cycles AND
+    # balances settled) and sanity-checks that the wallet moved in the declared direction; a
+    # contradicting/absent move is recorded confirmation="drift", never force-matched. Defaults
+    # (flow_kind="none") reproduce current behavior for every deployed yml -- no flow, no record.
+    flow_generation: int = Field(
+        default=0,
+        json_schema_extra={
+            "prompt": (
+                "Declared-flow generation counter -- bump this integer to arm a new declared "
+                "deposit/withdrawal (default 0): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    flow_kind: str = Field(
+        default="none",
+        description=(
+            "Declared-flow kind: 'none' (no flow, default), 'deposit', or 'withdrawal'. Only "
+            "recorded in the purse journal (the trading ledger is never resized by a flow)."
+        ),
+        json_schema_extra={
+            "prompt": "Declared-flow kind (none / deposit / withdrawal): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    flow_asset: str = Field(
+        default="quote",
+        description="Which asset the declared flow moved: 'base' or 'quote' (default 'quote').",
+        json_schema_extra={
+            "prompt": "Declared-flow asset (base / quote): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    flow_amount: Decimal = Field(
+        default=Decimal("0"),
+        description=(
+            "Native amount of the declared flow (in flow_asset units). A base flow is valued at "
+            "the current reference price for the purse record's quote_valuation."
+        ),
+        json_schema_extra={
+            "prompt": "Declared-flow native amount (default 0): ",
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    flow_confirm_quiet_cycles: int = Field(
+        default=3,
+        json_schema_extra={
+            "prompt": (
+                "Consecutive quiet (no booked fill, balances settled) cycles required before a "
+                "declared flow is confirmed and journaled (default 3): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+    # hbpurse P5: wallet-observation checkpoints. A checkpoint {owned_*, ref, equity, wallet
+    # totals, external holds} is appended every purse_checkpoint_interval_seconds and once after
+    # every flow/reseed_epoch/reanchor append, so stopped-window ambiguity and ledger-vs-wallet
+    # gaps land as surfaced drift on the next resume instead of vanishing. 0 = interval-driven
+    # checkpoints disabled (event-driven checkpoints still fire).
+    purse_checkpoint_interval_seconds: int = Field(
+        default=3600,
+        json_schema_extra={
+            "prompt": (
+                "Seconds between wallet-observation purse checkpoints (default 3600; 0 = only "
+                "after flow/reseed/re-anchor events): "
+            ),
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
+
     @field_validator("buy_prices", "sell_prices", mode="before")
     @classmethod
     def parse_price_lists(cls, value, validation_info: ValidationInfo):
@@ -1022,6 +1104,38 @@ class RangeInventoryLadderConfig(ControllerConfigBase):
             if value == "":
                 return None
         return str(value)
+
+    @field_validator("flow_kind", mode="before")
+    @classmethod
+    def validate_flow_kind(cls, value):
+        # Blank / unset -> "none" (no declared flow -> no journal record; current behavior).
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            return "none"
+        value = str(value).strip().lower()
+        if value not in ("none", "deposit", "withdrawal"):
+            raise ValueError("flow_kind must be 'none', 'deposit', or 'withdrawal'")
+        return value
+
+    @field_validator("flow_asset", mode="before")
+    @classmethod
+    def validate_flow_asset(cls, value):
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            return "quote"
+        value = str(value).strip().lower()
+        if value not in ("base", "quote"):
+            raise ValueError("flow_asset must be 'base' or 'quote'")
+        return value
+
+    @field_validator("flow_amount", mode="before")
+    @classmethod
+    def parse_flow_amount(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+        parsed = _safe_decimal(value, "flow_amount", default="0")
+        # A declared flow amount is a magnitude (the direction is flow_kind) -- never negative.
+        if parsed < Decimal("0"):
+            raise ValueError("flow_amount cannot be negative")
+        return parsed
 
     @field_validator("understatement_growth_threshold_quote", mode="before")
     @classmethod
@@ -1614,6 +1728,15 @@ class RangeInventoryLadderController(ControllerBase):
     # refresh request the under-deployment condition must STILL hold before the re-center
     # actually fires (gives the async REST refresh a moment to land in the cached balances).
     _UNDERDEPLOYED_FRESH_BALANCE_GRACE_S = 5.0
+    # hbpurse P5 (F15/A6): a declared flow confirms only after a QUIET booking window (mirrors
+    # the reseed flat-book deferral); at confirmation the wallet must have moved in the declared
+    # direction by at least this fraction of the declared amount to be recorded
+    # "wallet_delta_matched" -- otherwise it is recorded "drift" (surfaced, never force-matched,
+    # never silently dropped).
+    _FLOW_MATCH_FRACTION = Decimal("0.5")
+    # Throttle for the "flow armed but cannot confirm on a busy ladder" deferral event so a
+    # starved flow stays observable without per-cycle spam.
+    _FLOW_CONFIRM_DEFER_LOG_INTERVAL_S = 300.0
 
 
     def __init__(self, config: RangeInventoryLadderConfig, *args, **kwargs):
@@ -1665,6 +1788,37 @@ class RangeInventoryLadderController(ControllerBase):
         # CDX-R02: once-latch for the wallet-unreadable adopt/bootstrap deferral (reset on the
         # next successful adopt/bootstrap so a recurrence logs again).
         self._purse_wallet_unreadable_logged: bool = False
+
+        # hbpurse P5 (F15/F18/CLA-M04): declared-flow confirmation, wallet checkpoints, and
+        # carried-prune drift surfacing.
+        # - _flow_quiet_cycles: consecutive quiet (no booked fill, balances settled) cycles the
+        #   currently-armed flow has waited; reset on any booked fill or while settling. In-memory
+        #   only (a restart just re-accrues the window -- never a double-fire, since the token
+        #   idempotency lives in the persisted last_flow_token).
+        # - _flow_confirm_deferred_last_ts: throttle for the "armed flow starving on a busy
+        #   ladder" deferral event.
+        self._flow_quiet_cycles: int = 0
+        self._flow_confirm_deferred_last_ts: float = 0.0
+        # Wallet-observation checkpoints. _last_checkpoint_ts is None until the first checkpoint
+        # opportunity (then the interval counts from there); _purse_checkpoint_due is set by
+        # every flow/reseed_epoch/reanchor append and drained by the end-of-cycle checkpoint.
+        self._last_checkpoint_ts: Optional[float] = None
+        self._purse_checkpoint_due: bool = False
+        # Carried-prune drift (F15/CLA-M04): the booked_fill_progress ids LOADED from disk this
+        # session (a prior session's executors) and the subset OBSERVED live in executors_info.
+        # A loaded-but-never-observed id that the prune would delete is the post-resume last-window
+        # loss -- journaled as a drift reanchor record instead of vanishing silently.
+        self._loaded_progress_ids: Optional[Set[str]] = None
+        self._observed_progress_ids: Set[str] = set()
+        self._carried_prune_drift_quote_cum: Decimal = Decimal("0")
+        # hbpurse P5 (CDX-R02, DEFERRED from P2 -> folded into the P5 drift surfacing per the
+        # P2 adjudication): booking retry is recompute-based (from executors_info), so a fill whose
+        # commit FAILED and whose executor then LEAVES executors_info before a successful retry
+        # loses its exact delta silently. Capture the last-known ACTUAL cumulative of any executor
+        # booked in a FAILED-commit cycle here; if that executor then vanishes before the delta
+        # commits, the loss (actual - last durable progress) is surfaced as drift, never dropped.
+        # Cleared entirely on any successful commit (every pending delta is then durable).
+        self._uncommitted_fill_actuals: Dict[str, Dict[str, str]] = {}
 
         self._config_rebuild_pending: bool = False
         self._config_rebuild_reason: str = ""
@@ -2504,6 +2658,28 @@ class RangeInventoryLadderController(ControllerBase):
                     f"State field '{offset_ts_key}' {parsed_ts} is unreasonably far in the future"
                 )
 
+        # hbpurse P5 (F15): the OPTIONAL declared-flow state keys follow the SAME discipline as
+        # the P1/P3 optional keys -- MISSING is a valid absence (a pre-P5 file loads untouched),
+        # a PRESENT but corrupt value quarantines. The flow token strings must be strings; the
+        # armed wallet baseline must be finite non-negative decimals; the arm ts is bounded to
+        # the same future-skew window (a far-future arm ts would keep a stale baseline forever).
+        for token_key in ("last_flow_token", "flow_arm_token"):
+            token_val = validated.get(token_key)
+            if token_val is not None and not isinstance(token_val, str):
+                raise ValueError(f"State field '{token_key}' must be a string")
+        for flow_amount_key in ("flow_arm_wallet_quote", "flow_arm_wallet_base"):
+            if validated.get(flow_amount_key) is None:
+                continue
+            parsed = _safe_decimal(validated.get(flow_amount_key), f"state field '{flow_amount_key}'", default="0")
+            if parsed < Decimal("0"):
+                raise ValueError(f"State field '{flow_amount_key}' must be non-negative")
+        if validated.get("flow_arm_ts") is not None:
+            parsed_flow_ts = _safe_decimal(validated.get("flow_arm_ts"), "state field 'flow_arm_ts'")
+            if parsed_flow_ts < Decimal("0"):
+                raise ValueError("State field 'flow_arm_ts' must be non-negative")
+            if parsed_flow_ts > (offsets_now_ts + self.STATE_MAX_FUTURE_SKEW_SECONDS):
+                raise ValueError("State field 'flow_arm_ts' is unreasonably far in the future")
+
         # hbpurse P4: the OPTIONAL v10 bridge marker `purse_initialized` (no schema bump).
         # MISSING is a valid absence (pre-purse file loads untouched); a PRESENT value must be a
         # strict bool -- anything else is corruption and trips the quarantine like the money
@@ -2925,6 +3101,11 @@ class RangeInventoryLadderController(ControllerBase):
         deltas buffered during a degraded window, flush unsaved content, and clear/raise the
         purse-degraded flag. Exception-safe: every failure degrades (fail closed -- new orders
         halt via create_actions_proposal) instead of raising into the control loop."""
+        # hbpurse P5: keep the last good reference price current so the booking-loop carried-prune
+        # drift valuation and the stop-path booking (neither has a reference_price of its own)
+        # mark base at a real price rather than zero.
+        if reference_price is not None and reference_price > Decimal("0"):
+            self._purse_last_ref_price = reference_price
         try:
             if self._purse is None:
                 self._purse = PurseLedger(
@@ -3029,9 +3210,15 @@ class RangeInventoryLadderController(ControllerBase):
 
     def _purse_append_record(self, kind: str, fields: Dict[str, Any], *,
                              opens_epoch: bool = False) -> None:
-        """Guarded journal append + save from the money sites (reseed epoch, re-anchor).
+        """Guarded journal append + save from the money sites (reseed epoch, re-anchor, flow).
         Un-adoptable journal -> the record is BUFFERED (retained in memory, drained on
         recovery); append/save failures degrade. Never raises into the control loop."""
+        # hbpurse P5: a flow / reseed_epoch / reanchor append must be followed by a wallet
+        # checkpoint (contract: one checkpoint immediately after every such append). Arm the
+        # end-of-cycle checkpoint here so the observation lands even when the append is buffered
+        # while degraded (the drift-on-mismatch reconciliation depends on the checkpoint stream).
+        if kind in ("flow", "reseed_epoch", "reanchor"):
+            self._purse_checkpoint_due = True
         entry = (kind, dict(fields), opens_epoch)
         purse = self._purse
         if purse is None or not purse.loaded:
@@ -3160,6 +3347,228 @@ class RangeInventoryLadderController(ControllerBase):
             purse_io_failures=self._purse.io_failures if self._purse is not None else 0,
         )
 
+    # ------------------------------------------------------------------ #
+    # hbpurse P5 -- declared flows + wallet checkpoints (contract v1)
+    # ------------------------------------------------------------------ #
+
+    def _flow_token(self) -> str:
+        """The generation token for the CURRENT declared flow (A6): idempotency key persisted in
+        state as last_flow_token so the same declaration never records twice."""
+        return (
+            f"{int(self.config.flow_generation)}:{self.config.flow_kind}:"
+            f"{self.config.flow_asset}:{self._d(self.config.flow_amount, '0')}"
+        )
+
+    def _maybe_confirm_declared_flow(self, reference_price: Decimal, total_quote: Decimal,
+                                     total_base: Decimal, balance_settling: bool) -> None:
+        """hbpurse P5 (F15/CLA-M04/A6): confirm and journal an operator-declared flow.
+
+        A deposit/withdrawal is NOT an order, so the fills-only trading ledger (owned_*) is never
+        resized by this path (deposit-exclusion invariant, safety rule 6) -- only the purse
+        journal records the flow. The declaration is idempotent per token (last_flow_token).
+        Confirmation happens ONLY in a QUIET booking window (no booked fills for
+        flow_confirm_quiet_cycles consecutive cycles AND balances settled -- mirrors the reseed
+        flat-book deferral) so a mid-trade wallet swing is not mistaken for the flow. At
+        confirmation the wallet must have moved in the DECLARED direction (by >= half the declared
+        amount) to record confirmation="wallet_delta_matched"; a contradicting/absent move records
+        confirmation="drift" with a warning -- the flow is ALWAYS recorded, never force-matched,
+        never silently dropped."""
+        kind = str(self.config.flow_kind or "none")
+        amount = self._d(self.config.flow_amount, "0")
+        if kind not in ("deposit", "withdrawal") or amount <= Decimal("0"):
+            return  # no flow declared -> nothing to confirm (default behavior)
+        token = self._flow_token()
+        if self._state.get("last_flow_token") == token:
+            return  # this exact declaration already recorded -> idempotent no-op
+        # The flow record and its idempotency token must stay coupled, so confirm only against an
+        # adopted, healthy journal (mirrors the reseed purse-unavailable deferral). While the
+        # journal is un-adoptable or degraded the create gate already halts new orders.
+        if self._purse is None or not self._purse.loaded or self._purse_degraded:
+            return
+
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        now = self.market_data_provider.time()
+
+        # ARM a newly-declared token: capture the PRE-flow wallet baseline, persisted (commit-
+        # coupled) so a restart mid-confirmation cannot re-baseline against the post-flow wallet
+        # and manufacture a false drift. Reset the quiet-cycle counter.
+        if self._state.get("flow_arm_token") != token:
+            if not self._commit_state(
+                {
+                    "flow_arm_token": token,
+                    "flow_arm_wallet_quote": str(total_quote),
+                    "flow_arm_wallet_base": str(total_base),
+                    "flow_arm_ts": now,
+                },
+                reason="flow_arm",
+            ):
+                return  # save failed -> not armed; retry next cycle
+            self._flow_quiet_cycles = 0
+            self.logger().info(
+                f"{self.config.id}: declared flow armed (token={token}); will confirm after "
+                f"{max(1, int(self.config.flow_confirm_quiet_cycles))} quiet cycles with a wallet "
+                f"move in the declared direction. Baseline wallet quote={total_quote} "
+                f"base={total_base}."
+            )
+            self._emit_structured(
+                "range_ladder_flow_armed",
+                token=token,
+                flow_kind=kind,
+                flow_asset=str(self.config.flow_asset),
+                flow_amount=str(amount),
+                baseline_wallet_quote=str(total_quote),
+                baseline_wallet_base=str(total_base),
+            )
+            return
+
+        # Already armed for THIS token: gate on the quiet window. A booked fill this cycle or a
+        # settling wallet resets the counter (and surfaces the deferral, throttled) so a starving
+        # flow on a busy ladder stays observable.
+        booked_this_cycle = self._booked_buy_fill_this_cycle or self._booked_sell_fill_this_cycle
+        if balance_settling or booked_this_cycle:
+            self._flow_quiet_cycles = 0
+            if (now - self._flow_confirm_deferred_last_ts) >= self._FLOW_CONFIRM_DEFER_LOG_INTERVAL_S:
+                self._flow_confirm_deferred_last_ts = now
+                self.logger().info(
+                    f"{self.config.id}: declared flow (token={token}) confirmation deferred -- the "
+                    f"booking window is not quiet (balance_settling={balance_settling}, "
+                    f"booked_this_cycle={booked_this_cycle}). Will confirm once the ladder is quiet."
+                )
+                self._emit_structured(
+                    "range_ladder_flow_confirm_deferred",
+                    token=token,
+                    balance_settling=balance_settling,
+                    booked_this_cycle=booked_this_cycle,
+                )
+            return
+        self._flow_quiet_cycles += 1
+        if self._flow_quiet_cycles < max(1, int(self.config.flow_confirm_quiet_cycles)):
+            return
+
+        # QUIET WINDOW satisfied -> CONFIRM. Compare the current wallet against the armed baseline
+        # in the declared direction; value a base flow at the current reference price.
+        baseline_quote = self._d(self._state.get("flow_arm_wallet_quote"), str(total_quote))
+        baseline_base = self._d(self._state.get("flow_arm_wallet_base"), str(total_base))
+        valuation_price = reference_price if (reference_price is not None
+                                              and reference_price > Decimal("0")) else Decimal("0")
+        if str(self.config.flow_asset) == "base":
+            asset_symbol = base_asset
+            observed_delta = total_base - baseline_base
+            quote_valuation = amount * valuation_price
+        else:
+            asset_symbol = quote_asset
+            observed_delta = total_quote - baseline_quote
+            quote_valuation = amount
+        min_move = amount * self._FLOW_MATCH_FRACTION
+        if kind == "deposit":
+            matched = observed_delta >= min_move
+        else:  # withdrawal
+            matched = observed_delta <= -min_move
+        confirmation = "wallet_delta_matched" if matched else "drift"
+
+        # Consume the token + clear the arm state FIRST (save ordering: state, then purse); the
+        # coupled flow record is appended (and retried while degraded) only after the token lands,
+        # so a crash between the two re-confirms nothing (token already consumed) and the buffered
+        # record is drained on recovery.
+        if not self._commit_state(
+            {
+                "last_flow_token": token,
+                "flow_arm_token": None,
+                "flow_arm_wallet_quote": None,
+                "flow_arm_wallet_base": None,
+                "flow_arm_ts": None,
+            },
+            reason="flow_confirm",
+        ):
+            return  # save failed -> token NOT consumed, arm state intact; retry next cycle
+        self._flow_quiet_cycles = 0
+        self._purse_append_record(
+            "flow",
+            {
+                "token": token,
+                "flow_kind": kind,
+                "asset": asset_symbol,
+                "native_amount": str(amount),
+                "quote_valuation": str(quote_valuation),
+                "valuation_price": str(valuation_price),
+                "valuation_ts": now,
+                "confirmation": confirmation,
+            },
+        )
+        log = self.logger().info if matched else self.logger().warning
+        log(
+            f"{self.config.id}: declared {kind} of {amount} {asset_symbol} recorded "
+            f"(token={token}, confirmation={confirmation}, quote_valuation={quote_valuation}). "
+            f"Observed wallet delta {observed_delta} vs required move {min_move} in the declared "
+            f"direction. The trading ledger (owned_*) is unchanged -- flows are deposit-excluded."
+        )
+        self._emit_structured(
+            "range_ladder_flow_recorded",
+            token=token,
+            flow_kind=kind,
+            asset=asset_symbol,
+            native_amount=str(amount),
+            quote_valuation=str(quote_valuation),
+            valuation_price=str(valuation_price),
+            confirmation=confirmation,
+            observed_delta=str(observed_delta),
+            required_move=str(min_move),
+        )
+
+    def _maybe_append_checkpoint(self, reference_price: Decimal, total_quote: Decimal,
+                                 total_base: Decimal, now: float) -> None:
+        """hbpurse P5: append a wallet-observation checkpoint every
+        purse_checkpoint_interval_seconds and once after every flow/reseed_epoch/reanchor append
+        (the _purse_checkpoint_due flag). Checkpoints capture the contract fields (owned_*,
+        reference_price, equity, wallet totals via the safe getters, external holds); they ride
+        the normal purse save path (degraded rules apply) and are SKIPPED while the journal is
+        un-adoptable or degraded so a degraded checkpoint can never spin (the next healthy cycle
+        captures a fresh observation)."""
+        purse = self._purse
+        if purse is None or not purse.loaded or self._purse_degraded:
+            return
+        interval = int(self.config.purse_checkpoint_interval_seconds)
+        if self._last_checkpoint_ts is None:
+            # First opportunity: start the interval clock without an immediate checkpoint unless an
+            # event already armed one (a fresh bootstrap already has the opening epoch as its
+            # observation).
+            self._last_checkpoint_ts = now
+            if not self._purse_checkpoint_due:
+                return
+        interval_due = interval > 0 and (now - self._last_checkpoint_ts) >= interval
+        if not (self._purse_checkpoint_due or interval_due):
+            return
+
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        owned_quote = self._d(self._state.get("owned_quote"), "0")
+        owned_base = self._d(self._state.get("owned_base"), "0")
+        ref = reference_price if (reference_price is not None
+                                  and reference_price > Decimal("0")) else self._purse_last_ref_price
+        equity = owned_quote + owned_base * ref
+        wallet_quote = self._safe_get_balance(quote_asset)
+        wallet_base = self._safe_get_balance(base_asset)
+        external_quote_hold, external_base_hold = self._external_order_holds()
+        self._purse_append_record(
+            "checkpoint",
+            {
+                "owned_quote": str(owned_quote),
+                "owned_base": str(owned_base),
+                "reference_price": str(ref),
+                "equity_quote": str(equity),
+                "wallet_quote_total": str(wallet_quote),
+                "wallet_base_total": str(wallet_base),
+                "external_holds_quote": str(external_quote_hold),
+                "external_holds_base": str(external_base_hold),
+            },
+        )
+        # The observation is taken -- clear the due flag and advance the interval clock. Even if
+        # the SAVE just failed (degraded), the checkpoint record is already in the in-memory
+        # document and _ensure_purse retries it every cycle, so re-appending next cycle would only
+        # duplicate the same wallet snapshot. checkpoint is not in the due-arming kind set, so this
+        # append never re-arms itself.
+        self._purse_checkpoint_due = False
+        self._last_checkpoint_ts = now
+
     def _purse_status_block(self, reference_price: Optional[Decimal] = None) -> Dict[str, Any]:
         """The `purse` reporting block (F13/F9/F1): inception metrics per the contract
         formulas plus epoch markers, exposed through processed_data/custom_info/status so
@@ -3204,6 +3613,15 @@ class RangeInventoryLadderController(ControllerBase):
             "reanchor_count": purse.reanchor_count() if ready else 0,
             "last_reseed_token": self._state.get("last_reseed_token") or "",
             "reseed_generation": int(self.config.reseed_generation),
+            # hbpurse P5: declared-flow + checkpoint markers.
+            "last_flow_token": self._state.get("last_flow_token") or "",
+            "armed_flow_token": self._state.get("flow_arm_token") or "",
+            "flow_generation": int(self.config.flow_generation),
+            "checkpoint_age_s": (
+                max(0.0, self.market_data_provider.time() - self._last_checkpoint_ts)
+                if self._last_checkpoint_ts is not None else None
+            ),
+            "carried_prune_drift_quote": self._carried_prune_drift_quote_cum,
             **metrics,
         }
 
@@ -3837,6 +4255,14 @@ class RangeInventoryLadderController(ControllerBase):
         progress_raw = self._state.get("booked_fill_progress")
         progress: Dict[str, Dict[str, str]] = dict(progress_raw) if isinstance(progress_raw, dict) else {}
 
+        # hbpurse P5 (F15/CLA-M04): the FIRST booking pass of the session snapshots the
+        # booked_fill_progress ids loaded from disk -- a prior session's executors. On resume
+        # executors_info does not re-attach them, so they get pruned below before any final
+        # sampling. A loaded-but-never-observed pruned entry is the last-window loss F15/CLA-M04
+        # describe; it is journaled as a drift reanchor record rather than deleted silently.
+        if self._loaded_progress_ids is None:
+            self._loaded_progress_ids = set(progress.keys())
+
         # hbpurse P1 (F5): re-anchor offset credits. A re-anchor may already have deducted
         # the money a late-booking fill is about to debit (the wallet reflected the fill
         # before booking observed it); the matching offset absorbs that debit exactly once.
@@ -3869,6 +4295,9 @@ class RangeInventoryLadderController(ControllerBase):
 
         changed = False
         current_ids = set()
+        # hbpurse P5 (CDX-R02): ids that booked a NON-ZERO delta this cycle -- captured into
+        # _uncommitted_fill_actuals if this cycle's commit fails, so a later vanish surfaces as drift.
+        cycle_booked_ids: Set[str] = set()
 
         # hbpurse P4: per-cycle signed fill deltas for the purse journal's per-epoch
         # fills_rollup -- "the same signed deltas" the booking derives: BUY base +d_base /
@@ -3888,6 +4317,9 @@ class RangeInventoryLadderController(ControllerBase):
                 continue  # not ours
             eid = executor.id
             current_ids.add(eid)
+            # hbpurse P5: an id seen live this session is NOT a carried orphan -- a routine
+            # prune of it later (its executor completed after a final capture pass) stays silent.
+            self._observed_progress_ids.add(eid)
             side = getattr(executor.config, "side", None)
 
             exec_base, exec_quote, exec_fees, alt_fees = self._sample_order_execution(
@@ -3984,6 +4416,7 @@ class RangeInventoryLadderController(ControllerBase):
                     )
             progress[eid] = {"base": str(exec_base), "quote": str(exec_quote), "fees": str(exec_fees)}
             changed = True
+            cycle_booked_ids.add(eid)
 
             self._emit_structured(
                 "range_ladder_fill_booked",
@@ -4003,10 +4436,42 @@ class RangeInventoryLadderController(ControllerBase):
         # Prune progress entries for executors that have left executors_info (after the final
         # capture pass above), so the map does not grow without bound.
         pruned_ids = [eid for eid in progress if eid not in current_ids]
+        # hbpurse P5 (F15/CLA-M04): split the prune into ROUTINE (an executor observed live this
+        # session that completed after its final capture -- silent, as today) and CARRIED (an
+        # entry loaded from disk that this session NEVER saw in executors_info -- the post-resume
+        # last-window loss). Capture the carried entries' cumulative values BEFORE deletion; they
+        # are journaled as a drift reanchor record AFTER the state commit (save ordering).
+        carried_pruned = {
+            eid: dict(progress[eid])
+            for eid in pruned_ids
+            if self._loaded_progress_ids is not None
+            and eid in self._loaded_progress_ids
+            and eid not in self._observed_progress_ids
+        }
+        # hbpurse P5 (CDX-R02): a within-session executor whose booking commit FAILED and that has
+        # now LEFT executors_info -- its delta (last-known actual minus the last durable progress)
+        # never booked and cannot be recomputed. Compute the lost delta BEFORE the prune deletes
+        # the durable baseline; journal it as drift after the commit succeeds. Detected off the
+        # _uncommitted_fill_actuals tracker, so it also covers a never-committed first fill (no
+        # progress entry at all -> pruned_ids would miss it).
+        uncommitted_lost: Dict[str, Dict[str, Decimal]] = {}
+        for eid, actual in self._uncommitted_fill_actuals.items():
+            if eid in current_ids:
+                continue  # still live -> the recompute-based retry will re-book it
+            baseline = progress.get(eid, {})
+            lost_base = self._d(actual.get("base"), "0") - self._d(baseline.get("base"), "0")
+            lost_quote = self._d(actual.get("quote"), "0") - self._d(baseline.get("quote"), "0")
+            lost_fees = self._d(actual.get("fees"), "0") - self._d(baseline.get("fees"), "0")
+            if lost_base > Decimal("0") or lost_quote > Decimal("0"):
+                uncommitted_lost[eid] = {
+                    "base": max(Decimal("0"), lost_base),
+                    "quote": max(Decimal("0"), lost_quote),
+                    "fees": max(Decimal("0"), lost_fees),
+                }
         for eid in pruned_ids:
             del progress[eid]
 
-        if changed or pruned_ids or reseed_priming or offset_dirty:
+        if changed or pruned_ids or reseed_priming or offset_dirty or uncommitted_lost:
             # hbpurse P2 (CDX-M01): commit the booked ledger to disk BEFORE advancing the
             # in-memory owned_*/progress/offsets. `owned_quote`, `owned_base` and `progress` are
             # LOCALS up to here -- self._state still holds the PRIOR values -- so a failed save
@@ -4030,10 +4495,25 @@ class RangeInventoryLadderController(ControllerBase):
                 # while degraded). Retry next cycle.
                 self._booked_buy_fill_this_cycle = False
                 self._booked_sell_fill_this_cycle = False
+                # hbpurse P5 (CDX-R02): remember this cycle's ACTUAL cumulatives for the ids that
+                # booked, so if one of them vanishes before a successful retry its lost delta is
+                # still quantifiable and surfaced as drift.
+                for eid in cycle_booked_ids:
+                    self._uncommitted_fill_actuals[eid] = dict(progress[eid])
                 return
             # The baseline (priming) or the booked deltas are now durable.
             if reseed_priming:
                 self._reseed_just_applied = False
+            # hbpurse P5 (F15/CLA-M04): the prune of the carried entries is now durable in state;
+            # surface the loss as a drift reanchor record (never silent). Routine prunes remain
+            # silent. Carried ids also drop out of _loaded_progress_ids so they are journaled once.
+            if carried_pruned:
+                self._journal_carried_prune_drift(carried_pruned)
+            # hbpurse P5 (CDX-R02): surface any within-session vanished-before-commit lost deltas.
+            if uncommitted_lost:
+                self._journal_uncommitted_fill_drift(uncommitted_lost)
+            # Every pending delta is now durable in state -> the uncommitted tracker is spent.
+            self._uncommitted_fill_actuals.clear()
             if changed:
                 # hbpurse P4 (contract save ordering): the STATE committed first; only now does
                 # the purse journal take the same signed deltas into the current epoch's
@@ -4060,6 +4540,135 @@ class RangeInventoryLadderController(ControllerBase):
                     owned_base=str(owned_base),
                     booked_orders=len(progress),
                 )
+
+    def _journal_carried_prune_drift(self, carried_pruned: Dict[str, dict]) -> None:
+        """hbpurse P5 (F15/CLA-M04): journal ONE drift reanchor record embedding the pruned
+        carried entries' cumulative values, and emit a structured event -- so a last-window fill
+        loss (a prior session's executor whose progress could not be reconciled from the
+        controller; engine-Postgres is framework territory per A5) is SURFACED as drift rather
+        than deleted silently. The trading ledger (owned_*) is NOT resized here (safety rule 6);
+        the record is a pure observation. The pruned cumulative base/quote sit in old_owned_* cut
+        to new_owned_*=0, so the derived-metrics `drift` reflects the unreconciled magnitude."""
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        pruned_base = sum((self._d(entry.get("base"), "0") for entry in carried_pruned.values()),
+                          Decimal("0"))
+        pruned_quote = sum((self._d(entry.get("quote"), "0") for entry in carried_pruned.values()),
+                           Decimal("0"))
+        pruned_fees = sum((self._d(entry.get("fees"), "0") for entry in carried_pruned.values()),
+                          Decimal("0"))
+        ref = self._purse_last_ref_price
+        drift_quote = pruned_quote + pruned_base * ref
+        self._carried_prune_drift_quote_cum += drift_quote
+        wallet_quote = self._safe_get_balance(quote_asset)
+        wallet_base = self._safe_get_balance(base_asset)
+        self.logger().warning(
+            f"{self.config.id}: pruned {len(carried_pruned)} carried booked_fill_progress "
+            f"entry(ies) never observed live this session ({sorted(carried_pruned)}); their "
+            f"last-window fills cannot be reconciled from the controller. Surfacing base="
+            f"{pruned_base} quote={pruned_quote} (drift {drift_quote} at ref {ref}) as a drift "
+            "reanchor record -- the trading ledger is unchanged."
+        )
+        self._emit_structured(
+            "range_ladder_carried_prune_drift",
+            pruned_ids=sorted(carried_pruned),
+            pruned_base=str(pruned_base),
+            pruned_quote=str(pruned_quote),
+            pruned_fees=str(pruned_fees),
+            drift_quote=str(drift_quote),
+            reference_price=str(ref),
+        )
+        self._purse_append_record(
+            "reanchor",
+            {
+                "old_owned_quote": str(pruned_quote),
+                "old_owned_base": str(pruned_base),
+                "new_owned_quote": "0",
+                "new_owned_base": "0",
+                "overclaim_quote": str(drift_quote),
+                "classification": "drift",
+                "wallet_quote_total": str(wallet_quote),
+                "wallet_base_total": str(wallet_base),
+            },
+        )
+
+    def _journal_uncommitted_fill_drift(self, uncommitted_lost: Dict[str, Dict[str, Decimal]]) -> None:
+        """hbpurse P5 (CDX-R02): journal ONE drift reanchor record for within-session fill deltas
+        that could not be booked -- an executor whose booking commit FAILED and that then left
+        executors_info before a successful recompute-based retry. The lost delta (last-known
+        actual minus the last durable progress) cannot be recomputed from the controller, so it is
+        surfaced as drift (never silent). owned_* is NOT resized (safety rule 6)."""
+        ref = self._purse_last_ref_price
+        base_asset, quote_asset = split_hb_trading_pair(self.config.trading_pair)
+        lost_base = sum((v["base"] for v in uncommitted_lost.values()), Decimal("0"))
+        lost_quote = sum((v["quote"] for v in uncommitted_lost.values()), Decimal("0"))
+        lost_fees = sum((v["fees"] for v in uncommitted_lost.values()), Decimal("0"))
+        drift_quote = lost_quote + lost_base * ref
+        self._carried_prune_drift_quote_cum += drift_quote
+        wallet_quote = self._safe_get_balance(quote_asset)
+        wallet_base = self._safe_get_balance(base_asset)
+        self.logger().warning(
+            f"{self.config.id}: {len(uncommitted_lost)} fill delta(s) failed to commit and their "
+            f"executor(s) left before retry ({sorted(uncommitted_lost)}); the unbooked delta "
+            f"base={lost_base} quote={lost_quote} cannot be recomputed. Surfacing drift "
+            f"{drift_quote} at ref {ref} -- the trading ledger is unchanged."
+        )
+        self._emit_structured(
+            "range_ladder_uncommitted_fill_drift",
+            executor_ids=sorted(uncommitted_lost),
+            lost_base=str(lost_base),
+            lost_quote=str(lost_quote),
+            lost_fees=str(lost_fees),
+            drift_quote=str(drift_quote),
+            reference_price=str(ref),
+        )
+        self._purse_append_record(
+            "reanchor",
+            {
+                "old_owned_quote": str(lost_quote),
+                "old_owned_base": str(lost_base),
+                "new_owned_quote": "0",
+                "new_owned_base": "0",
+                "overclaim_quote": str(drift_quote),
+                "classification": "drift",
+                "wallet_quote_total": str(wallet_quote),
+                "wallet_base_total": str(wallet_base),
+            },
+        )
+
+    def on_stop(self):
+        """hbpurse P5 (F15/CLA-M04): a FINAL booking + save pass on the controller stop path.
+
+        The framework calls on_stop after the control loop terminates (RunnableBase.control_loop),
+        so a fill that arrived after the last update_processed_data would otherwise never book.
+        This pass books trailing fills from the last-known executors_info and flushes the purse --
+        it ONLY books (state commit + purse rollup); it proposes NO executor actions (the loop is
+        already gone). Fail-safe: it never raises out of the stop hook, so a booking/IO error can
+        never wedge shutdown; an unbooked trailing fill is caught on resume by checkpoint drift."""
+        try:
+            super().on_stop()
+        except Exception:
+            self.logger().error(f"{self.config.id}: base on_stop failed", exc_info=True)
+        try:
+            if not self._state.get("initialized"):
+                return
+            self._emit_structured("range_ladder_stop_book_pass_started")
+            self._book_fills_from_orders()
+            # Flush any purse content the booking produced but could not persist (the state
+            # committed inside booking; the purse rollup may still be dirty). A degraded purse
+            # retains the delta in memory for the next resume's drift reconciliation.
+            if self._purse is not None and self._purse.loaded and self._purse.dirty \
+                    and not self._purse_degraded:
+                self._purse_try_save()
+            self._emit_structured(
+                "range_ladder_stop_book_pass_complete",
+                owned_quote=str(self._d(self._state.get("owned_quote"), "0")),
+                owned_base=str(self._d(self._state.get("owned_base"), "0")),
+                purse_degraded=self._purse_degraded,
+            )
+        except Exception:
+            self.logger().error(
+                f"{self.config.id}: stop-path final booking pass failed", exc_info=True
+            )
 
     def _update_ledger_from_completed_executors(self):
         """Deprecated v12 name; thin alias for the v13 per-order booking. Kept so any external
@@ -6268,6 +6877,26 @@ class RangeInventoryLadderController(ControllerBase):
 
         self._cycles_seen += 1
 
+        # hbpurse P5: declared-flow confirmation (quiet-window gated) then the wallet-observation
+        # checkpoint. Runs AFTER booking (so the quiet-window sees this cycle's fill flags) and
+        # AFTER the re-anchor/reseed sites (so a same-cycle event arms the checkpoint via the due
+        # flag). The flow appends may arm the checkpoint, so confirm the flow FIRST. Both are
+        # exception-safe (a purse failure degrades; it never crashes the cycle).
+        try:
+            self._maybe_confirm_declared_flow(
+                reference_price, total_quote_balance, total_base_balance, balance_settling
+            )
+        except Exception as e:
+            self.logger().exception(f"{self.config.id}: declared-flow confirmation failed")
+            self._emit_structured("range_ladder_flow_error", error=str(e))
+        try:
+            self._maybe_append_checkpoint(
+                reference_price, total_quote_balance, total_base_balance, now
+            )
+        except Exception as e:
+            self.logger().exception(f"{self.config.id}: purse checkpoint append failed")
+            self._emit_structured("range_ladder_checkpoint_error", error=str(e))
+
         # Refresh-wave bookkeeping (TTL + resolution only; re-propose runs in
         # determine_executor_actions where it may re-mark a side dirty in time for the
         # stop/create pass of the same tick).
@@ -8300,6 +8929,11 @@ class RangeInventoryLadderController(ControllerBase):
             f"Purse epoch: {pb['epoch_id'] or 'n/a'} ({pb['opening_basis_quality'] or 'n/a'}) | "
             f"reanchors: {pb['reanchor_count']} | degraded: {pb['accounting_degraded']} | "
             f"journal: {pb['purse_path']}",
+            # hbpurse P5: declared-flow + checkpoint + carried-prune drift markers.
+            f"Purse flows: last {pb.get('last_flow_token') or 'none'} | "
+            f"armed {pb.get('armed_flow_token') or 'none'} | "
+            f"checkpoint age {('n/a' if pb.get('checkpoint_age_s') is None else '%.0fs' % pb['checkpoint_age_s'])} | "
+            f"carried-prune drift {pb.get('carried_prune_drift_quote', Decimal('0')):.6f} {p['quote_asset']}",
             f"Reserved wallet balances: {p['reserve_quote_balance']:.6f} {p['quote_asset']} / {p['reserve_base_balance']:.6f} {p['base_asset']}",
             f"State file: {self.state_path} | Schema: {self.STATE_SCHEMA_VERSION}",
             f"Diagnostic log: {self.diagnostic_log_path if self.config.diagnostic_log_enabled else 'disabled'}",

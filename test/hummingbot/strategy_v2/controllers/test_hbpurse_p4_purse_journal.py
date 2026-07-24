@@ -437,7 +437,10 @@ class TestScriptedSequenceDerivedMetrics(_Harness):
         self._cycle(ctrl, mdp, 1210.0)   # over-claim observed, grace arms
         self._cycle(ctrl, mdp, 1225.0)   # 15s > 10s grace -> cut + journal record
         self.assertEqual(D("600"), D(ctrl._state["owned_quote"]))
-        reanchor = self._persisted_purse()["records"][3]
+        # hbpurse P5: a checkpoint is appended immediately after every reseed/re-anchor event, so
+        # the reanchor is no longer at a fixed index -- locate it by kind (its VALUE assertions are
+        # unchanged). The checkpoint interposition is asserted explicitly below.
+        reanchor = next(r for r in self._persisted_purse()["records"] if r["kind"] == "reanchor")
         self.assertEqual("reanchor", reanchor["kind"])
         self.assertEqual("epoch-3", reanchor["epoch_id"])
         self.assertEqual(D("650"), D(reanchor["old_owned_quote"]))
@@ -458,12 +461,18 @@ class TestScriptedSequenceDerivedMetrics(_Harness):
         self.assertEqual(D("661.938"), D(ctrl._state["owned_quote"]))
         self.assertEqual(D("0.3"), D(ctrl._state["owned_base"]))
         doc = self._persisted_purse()
-        self.assertEqual(5, doc["sequence"])
+        # hbpurse P5: the money/epoch records the P4 contract produces are unchanged, but a
+        # wallet checkpoint now follows each reseed_epoch and reanchor append (contract: one
+        # checkpoint immediately after every flow/reseed_epoch/reanchor). The interval-driven
+        # checkpoints stay silent here (default 3600s; cycles are seconds apart), so exactly two
+        # event-driven checkpoints appear -- after the reseed and after the reanchor.
+        self.assertEqual(7, doc["sequence"])
         self.assertEqual(
-            ["opening_epoch", "fills_rollup", "reseed_epoch", "reanchor", "fills_rollup"],
+            ["opening_epoch", "fills_rollup", "reseed_epoch", "checkpoint", "reanchor",
+             "checkpoint", "fills_rollup"],
             [r["kind"] for r in doc["records"]],
         )
-        rollup3 = doc["records"][4]
+        rollup3 = [r for r in doc["records"] if r["kind"] == "fills_rollup"][-1]
         self.assertEqual("epoch-3", rollup3["epoch_id"])
         self.assertEqual(D("-0.2"), D(rollup3["base_delta_cum"]))
         self.assertEqual(D("61.938"), D(rollup3["quote_delta_cum"]))
@@ -672,7 +681,9 @@ class TestFailClosed(_Harness):
         self.assertEqual("1:170", ctrl._state["last_reseed_token"])
         self.assertEqual(D("170"), D(ctrl._state["owned_quote"]))
         kinds = [r["kind"] for r in self._persisted_purse()["records"]]
-        self.assertEqual(["opening_epoch", "reseed_epoch"], kinds)
+        # hbpurse P5: a wallet checkpoint follows the reseed_epoch append (contract: one
+        # checkpoint immediately after every flow/reseed/re-anchor event).
+        self.assertEqual(["opening_epoch", "reseed_epoch", "checkpoint"], kinds)
         self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_purse_recovered")))
 
 
