@@ -3721,6 +3721,27 @@ class RangeInventoryLadderController(ControllerBase):
             metrics.get("earned_total", zero) / contributed * Decimal("100")
             if contributed > zero else zero
         )
+        # hbdash P1 (findings CLA-2A-01 / CDX-007): additive, read-only activity read-out.
+        # These are BOOKED FILL EVENTS -- one per executor per cycle with any positive
+        # base/quote/fee delta (incl. fee-only) -- NOT exchange trades; the panel/API label them
+        # and derive a per-week rate from the span. Fail-safe (safety invariant 3): a SEPARATE
+        # guard defaulting to 0 / None, so the activity read can never raise into the status path
+        # and never widens the money-metrics except above. The accessors are themselves defensive
+        # (a malformed fills_seen is skipped, not raised); this guard is the belt-and-suspenders.
+        fills_seen_total = 0
+        fills_first_ts = None
+        fills_last_ts = None
+        if ready:
+            try:
+                fills_seen_total = int(purse.fills_seen_total())
+                fills_first_ts, fills_last_ts = purse.activity_span()
+            except Exception as exc:
+                self.logger().warning(
+                    f"{self.config.id}: purse activity read-out failed ({exc}); "
+                    "reporting 0/None this cycle."
+                )
+                fills_seen_total = 0
+                fills_first_ts = fills_last_ts = None
         return {
             "earned_total_pct": earned_total_pct,
             "purse_ready": ready,
@@ -3738,6 +3759,12 @@ class RangeInventoryLadderController(ControllerBase):
             "epoch_id": (purse.current_epoch_id() if ready else None) or "",
             "opening_basis_quality": (purse.opening_basis_quality() if ready else None) or "",
             "reanchor_count": purse.reanchor_count() if ready else 0,
+            # booked fill events (once per executor per cycle w/ any positive base/quote/fee
+            # delta, incl. fee-only) -- NOT exchange trades; fills_first_ts/fills_last_ts let a
+            # consumer derive a since-inception per-week rate without a new stored field (hbdash P1).
+            "fills_seen_total": fills_seen_total,
+            "fills_first_ts": fills_first_ts,
+            "fills_last_ts": fills_last_ts,
             "last_reseed_token": self._state.get("last_reseed_token") or "",
             "reseed_generation": int(self.config.reseed_generation),
             # hbpurse P5: declared-flow + checkpoint markers.
