@@ -24,7 +24,7 @@ import os
 import tempfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 PURSE_SCHEMA_VERSION = 1
 
@@ -269,6 +269,53 @@ class PurseLedger:
         if self._doc is None:
             return 0
         return sum(1 for record in self._doc["records"] if record.get("kind") == "reanchor")
+
+    def fills_seen_total(self) -> int:
+        """hbdash P1 (findings CLA-2A-01 / CDX-007): the since-inception activity read-out --
+        the SUM of `fills_seen` across every `fills_rollup` record. This counts BOOKED FILL
+        EVENTS (one per executor per cycle with any positive base/quote/fee delta, INCLUDING
+        fee-only deltas), NOT exchange trades. Read-only, and defensive/fail-safe for the status
+        path: a record whose `fills_seen` is missing / non-int / negative is SKIPPED rather than
+        raised, so one malformed record can never crash the reporting block. Empty / no-rollup
+        journal -> 0. No write or mutation -- a pure read over `self._doc['records']`."""
+        if self._doc is None:
+            return 0
+        total = 0
+        for record in self._doc["records"]:
+            if record.get("kind") != "fills_rollup":
+                continue
+            value = record.get("fills_seen")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+            total += int(value)
+        return total
+
+    def activity_span(self) -> Tuple[Optional[float], Optional[float]]:
+        """hbdash P1: the (earliest, latest) activity timestamps a consumer needs to derive a
+        since-inception per-week rate WITHOUT a new stored field. `earliest` is the FIRST
+        opening_epoch record's `ts` (inception); `latest` is the MAX `last_update_ts` across all
+        `fills_rollup` records. Each side is None independently -- earliest when the journal has
+        no opening epoch, latest when it has no rollups. Read-only and defensive: a record with a
+        missing / non-numeric ts is skipped rather than raised. No write or mutation."""
+        if self._doc is None:
+            return (None, None)
+        first_ts: Optional[float] = None
+        seen_opening = False
+        last_ts: Optional[float] = None
+        for record in self._doc["records"]:
+            kind = record.get("kind")
+            if kind == "opening_epoch" and not seen_opening:
+                seen_opening = True
+                ts = record.get("ts")
+                if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                    first_ts = float(ts)
+            elif kind == "fills_rollup":
+                ts = record.get("last_update_ts")
+                if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                    ts = float(ts)
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+        return (first_ts, last_ts)
 
     def has_flow_token(self, token: str) -> bool:
         """hbpurse P5 (CDX-R01): True when a `flow` record with this token is already in the
