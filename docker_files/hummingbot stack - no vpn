@@ -12,7 +12,7 @@
 #
 # Runs ALONGSIDE the anon stack. Namespaced: bind root hummingbot_us,
 # container names hummingbot-us-*, network hbnet-us, project hummingbot-us,
-# host ports 8502 / 18084 / 8001.
+# host ports 8502 / 18084 / 8001 / 8504 (purse panel).
 # =============================================================================
 
 name: hummingbot-us     # compose project name (matches the Portainer stack name)
@@ -434,6 +434,63 @@ services:
           "python",
           "-c",
           "import socket; s=socket.create_connection(('127.0.0.1',8501),2); s.close()"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Purse panel — US mirror. Fully independent of the anon stack: reads ONLY
+  # this stack's API (hummingbot-us-api over hbnet-us) and therefore shows ONLY
+  # the Kraken/US purses. Host :8504 (anon stack's panel owns host :8503, this
+  # stack's dashboard owns host :8502). Same app file as the anon panel — it is
+  # entirely env-configured, so each copy only ever sees its own stack's API.
+  # App file lives on the share:
+  #   apps/hummingbot_us/purse_panel/purse_panel.py
+  # ---------------------------------------------------------------------------
+  purse-panel:
+    image: hummingbot/dashboard:latest   # ON :latest — pin to new digest AFTER you pull
+    container_name: hummingbot-us-purse-panel
+    networks:
+      - hbnet-us
+    depends_on:
+      hummingbot-api:
+        condition: service_healthy
+    environment:
+      - TZ=America/Boise
+      - BACKEND_API_HOST=hummingbot-api
+      - BACKEND_API_PORT=8000
+      - BACKEND_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - BACKEND_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot_us/purse_panel/purse_panel.py:/home/panel/purse_panel.py:ro
+    ports:
+      - "8504:8503"     # purse panel on host 8504 (8503 in-container; anon stack owns host 8503)
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - >
+        if command -v streamlit >/dev/null 2>&1; then
+        exec streamlit run /home/panel/purse_panel.py
+        --server.port 8503 --server.address 0.0.0.0
+        --server.headless true --browser.gatherUsageStats false;
+        else
+        source activate dashboard 2>/dev/null || conda activate dashboard;
+        exec streamlit run /home/panel/purse_panel.py
+        --server.port 8503 --server.address 0.0.0.0
+        --server.headless true --browser.gatherUsageStats false;
+        fi
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8503),2); s.close()"
         ]
       interval: 20s
       timeout: 5s

@@ -115,7 +115,8 @@ test_logs/
 
 /batch_logs/*
 /batch_reviews/*
-HBSTRAT_FINDINGS.md
-hbstrat_fix_batch_prompt.md
-hbstrat_fixes_batch_prompt.md
-run_hbstrat_fix_batch.ps1
+
+# Completed-batch artifacts (runners/prompts) and operator findings/reports — local only.
+# (Supersedes the old per-file hbstrat entries — those files now live in these folders.)
+/batch_runners_old/
+/reports/

@@ -95,7 +95,7 @@ services:
       - BLOCK_IPV6=on
       - FIREWALL=on
       - FIREWALL_OUTBOUND_SUBNETS=172.16.1.0/24,192.168.1.0/24
-      - FIREWALL_INPUT_PORTS=8501,8080,15888,18083,27017,28081,8100,8888,5432,9443
+      - FIREWALL_INPUT_PORTS=8501,8080,15888,18083,27017,28081,8100,8888,5432,9443,8503
 
       - UPDATER_PERIOD=24h
 
@@ -121,6 +121,7 @@ services:
       - "8888:8888"
       - "5432:5432"  # postgresql
       - "9443:9443"  # side caddy for mpc
+      - "8503:8503"  # purse panel (streamlit; host 8502 is taken by the US stack's dashboard)
       
 
     healthcheck:
@@ -758,6 +759,64 @@ services:
           "python",
           "-c",
           "import socket; s=socket.create_connection(('127.0.0.1',8501),2); s.close()"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Purse panel — inception accounting (contributed / earned / % / drift) for
+  # range-inventory-ladder controllers. Standalone Streamlit page on host :8503
+  # (host 8502 is taken by the US stack's dashboard on this box). Reuses the
+  # dashboard image (streamlit preinstalled). Reads THIS stack's API only:
+  # live custom_info.purse via /bot-orchestration/status + the harvested /purse
+  # read-model. App file lives on the share:
+  #   apps/hummingbot/purse_panel/purse_panel.py
+  # ---------------------------------------------------------------------------
+  purse-panel:
+    image: hummingbot/dashboard:latest   # ON :latest — pin to new digest AFTER you pull
+    container_name: hummingbot-purse-panel
+    network_mode: "service:gluetun"
+    depends_on:
+      wait-for-vpn:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+      hummingbot-api:
+        condition: service_healthy
+    environment:
+      - TZ=Europe/Tirane
+      - BACKEND_API_HOST=127.0.0.1
+      - BACKEND_API_PORT=8000
+      - BACKEND_API_USERNAME=${HBOT_API_USERNAME:-admin}
+      - BACKEND_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+    volumes:
+      - /mnt/sharedrive/apps/hummingbot/purse_panel/purse_panel.py:/home/panel/purse_panel.py:ro
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - >
+        if command -v streamlit >/dev/null 2>&1; then
+        exec streamlit run /home/panel/purse_panel.py
+        --server.port 8503 --server.address 0.0.0.0
+        --server.headless true --browser.gatherUsageStats false;
+        else
+        source activate dashboard 2>/dev/null || conda activate dashboard;
+        exec streamlit run /home/panel/purse_panel.py
+        --server.port 8503 --server.address 0.0.0.0
+        --server.headless true --browser.gatherUsageStats false;
+        fi
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',8503),2); s.close()"
         ]
       interval: 20s
       timeout: 5s
