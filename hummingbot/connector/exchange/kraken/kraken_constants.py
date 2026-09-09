@@ -72,6 +72,10 @@ QUERY_TRADES_PATH_URL = "/0/private/QueryTrades"
 
 # QueryTrades accepts a comma-delimited list of trade txids, capped at 20 per request.
 QUERY_TRADES_MAX_IDS_PER_REQUEST = 20
+# QueryOrders accepts a comma-separated txid list. Keep batches conservative and aligned
+# with QueryTrades so a full ladder costs a handful of private requests, not one request
+# per tracked order (twice) on every status cycle.
+QUERY_ORDERS_MAX_IDS_PER_REQUEST = 20
 
 
 # KRK-8 — UNVERIFIED: Kraken's exact matching-engine penalty weights are not read-only probeable

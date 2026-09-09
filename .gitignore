@@ -120,3 +120,6 @@ test_logs/
 # (Supersedes the old per-file hbstrat entries — those files now live in these folders.)
 /batch_runners_old/
 /reports/
+
+# Local recovery snapshots, account-specific configs, and operational reports.
+/.recovery/

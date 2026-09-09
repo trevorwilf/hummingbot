@@ -1,0 +1,17 @@
+ARG BASE_IMAGE=hummingbot/hummingbot:nonkyc-recovery-pre-20260908T193854-0700
+ARG PATCH_SHA256=unknown
+ARG RECOVERY_BUILD_DATE=unknown
+FROM ${BASE_IMAGE}
+ARG PATCH_SHA256
+ARG RECOVERY_BUILD_DATE
+
+COPY hummingbot/connector/exchange/nonkyc/nonkyc_exchange.py \
+    /home/hummingbot/hummingbot/connector/exchange/nonkyc/nonkyc_exchange.py
+
+RUN /opt/conda/envs/hummingbot/bin/python -m py_compile \
+    /home/hummingbot/hummingbot/connector/exchange/nonkyc/nonkyc_exchange.py
+
+LABEL nonkyc.recovery.issue="incomplete-balance-snapshot-quarantine" \
+      nonkyc.recovery.base="hummingbot/hummingbot:nonkyc-recovery-pre-20260908T193854-0700" \
+      nonkyc.recovery.patch_sha256="${PATCH_SHA256}" \
+      nonkyc.recovery.date="${RECOVERY_BUILD_DATE}"

@@ -1868,6 +1868,28 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.assertEqual(1, api_mock.call_count)
         self.assertEqual(CONSTANTS.QUERY_ORDERS_PATH_URL, api_mock.call_args.kwargs["path_url"])
 
+    async def test_query_orders_snapshot_batches_and_serves_fill_and_status_passes(self):
+        self.exchange._set_current_timestamp(1640780000)
+        first = self._track_simple_order("OID-B1", "OTXID-B1")
+        second = self._track_simple_order("OID-B2", "OTXID-B2")
+        api_mock = AsyncMock(return_value={
+            "OTXID-B1": {"status": "open", "trades": []},
+            "OTXID-B2": {"status": "open", "trades": []},
+        })
+
+        with patch.object(self.exchange, "_api_request_with_retry", new=api_mock):
+            self.assertEqual([], await self.exchange._all_trade_updates_for_order(first))
+            self.assertEqual([], await self.exchange._all_trade_updates_for_order(second))
+            first_update = await self.exchange._request_order_status(first)
+            second_update = await self.exchange._request_order_status(second)
+
+        self.assertEqual(OrderState.OPEN, first_update.new_state)
+        self.assertEqual(OrderState.OPEN, second_update.new_state)
+        self.assertEqual(1, api_mock.call_count)
+        request_data = api_mock.call_args.kwargs["data"]
+        self.assertEqual({"OTXID-B1", "OTXID-B2"}, set(request_data["txid"].split(",")))
+        self.assertEqual("true", request_data["trades"])
+
     def test_is_order_not_found_during_status_update_error_classification(self):
         # KRK-6: the empty-result signature (ORDER_NOT_EXIST_ERROR_CODE raised by
         # _request_order_status) and the explicit EOrder strings classify as not-found;

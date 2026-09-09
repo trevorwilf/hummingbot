@@ -13,6 +13,11 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 
 class KrakenAuth(AuthBase):
     _last_tracking_nonce: int = 0
+    # Persistent epoch used after this API key observed a nanosecond-scale nonce. Keeping the
+    # clock portion at microsecond precision preserves Kraken's tolerance for requests that arrive
+    # slightly out of order, while the epoch keeps every post-restart nonce above the old high-water
+    # mark. All clients sharing the key must use this same epoch.
+    _nonce_epoch_offset: int = 1_800_000_000_000_000_000
 
     def __init__(self, api_key: str, secret_key: str, time_provider: TimeSynchronizer):
         self.api_key = api_key
@@ -21,11 +26,12 @@ class KrakenAuth(AuthBase):
 
     @classmethod
     def get_tracking_nonce(cls) -> str:
-        # Microsecond granularity (matching the connector's NonceCreator.for_microseconds() used for client
-        # order ids) gives ~1,000,000x headroom over wall-clock so realistic request bursts never drift the
-        # nonce ahead of real time, and a post-restart nonce (int(time.time() * 1e6)) stays far above any
-        # value Kraken last saw — avoiding the EAPI:Invalid nonce lockout that seconds-granularity caused.
-        nonce = int(time.time() * 1_000_000)
+        # Kraken remembers the greatest nonce used by an API key across every client sharing that key.
+        # Microsecond spacing is intentional: nanosecond spacing makes ordinary concurrent requests
+        # land farther outside Kraken's nonce window when the network reorders them. The fixed epoch
+        # raises this sequence above the previously-observed nanosecond high-water mark without losing
+        # that useful microsecond spacing.
+        nonce = cls._nonce_epoch_offset + int(time.time() * 1_000_000)
         cls._last_tracking_nonce = nonce if nonce > cls._last_tracking_nonce else cls._last_tracking_nonce + 1
         return str(cls._last_tracking_nonce)
 

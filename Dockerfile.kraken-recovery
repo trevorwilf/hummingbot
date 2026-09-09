@@ -1,0 +1,29 @@
+ARG BASE_IMAGE=hummingbot/hummingbot:nonkyc-balancefix-20260908
+ARG PATCH_SHA256=unknown
+ARG RECOVERY_BUILD_DATE=unknown
+FROM ${BASE_IMAGE}
+ARG PATCH_SHA256
+ARG RECOVERY_BUILD_DATE
+
+COPY hummingbot/connector/exchange_py_base.py \
+    /home/hummingbot/hummingbot/connector/exchange_py_base.py
+COPY hummingbot/strategy_v2/executors/executor_base.py \
+    /home/hummingbot/hummingbot/strategy_v2/executors/executor_base.py
+COPY hummingbot/connector/exchange/kraken/kraken_constants.py \
+    /home/hummingbot/hummingbot/connector/exchange/kraken/kraken_constants.py
+COPY hummingbot/connector/exchange/kraken/kraken_exchange.py \
+    /home/hummingbot/hummingbot/connector/exchange/kraken/kraken_exchange.py
+COPY controllers/market_making/range_inventory_ladder.py \
+    /home/hummingbot/controllers/market_making/range_inventory_ladder.py
+
+RUN /opt/conda/envs/hummingbot/bin/python -m py_compile \
+    /home/hummingbot/hummingbot/connector/exchange_py_base.py \
+    /home/hummingbot/hummingbot/strategy_v2/executors/executor_base.py \
+    /home/hummingbot/hummingbot/connector/exchange/kraken/kraken_constants.py \
+    /home/hummingbot/hummingbot/connector/exchange/kraken/kraken_exchange.py \
+    /home/hummingbot/controllers/market_making/range_inventory_ladder.py
+
+LABEL kraken.recovery.issue="cross-run-order-ownership-provenance-queryorders-coalescing" \
+      kraken.recovery.base="hummingbot/hummingbot:nonkyc-balancefix-20260908" \
+      kraken.recovery.patch_sha256="${PATCH_SHA256}" \
+      kraken.recovery.date="${RECOVERY_BUILD_DATE}"

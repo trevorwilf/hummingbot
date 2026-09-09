@@ -290,21 +290,26 @@ class ExecutorBase(RunnableBase):
             order_id = self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
         else:
             order_id = self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
-        # Tag in-flight order with controller/executor/level IDs for provenance propagation
+        # Stage provenance synchronously. Connector order creation is asynchronous, so a
+        # direct tracker lookup here usually runs before the InFlightOrder exists and loses
+        # the metadata. ExchangePyBase consumes this hand-off when it starts tracking.
         try:
-            tracked = self.connectors[connector_name]._order_tracker.all_orders.get(order_id)
-            if tracked:
-                tracked.controller_id = getattr(self.config, 'controller_id', None)
-                tracked.executor_id = getattr(self.config, 'id', None)
-                tracked.level_id = getattr(self.config, 'level_id', None) or getattr(self, 'level_id', None)
-                # Get bot_run_id from MarketsRecorder singleton or structured logger
-                try:
-                    from hummingbot.connector.markets_recorder import MarketsRecorder
-                    recorder = MarketsRecorder._shared_instance
-                    if recorder:
-                        tracked.bot_run_id = recorder._bot_run_id
-                except Exception:
-                    pass
+            bot_run_id = None
+            try:
+                from hummingbot.connector.markets_recorder import MarketsRecorder
+                recorder = MarketsRecorder._shared_instance
+                if recorder:
+                    bot_run_id = recorder._bot_run_id
+            except Exception:
+                pass
+            connector = self.connectors[connector_name]
+            connector.set_order_provenance(
+                order_id=order_id,
+                controller_id=getattr(self.config, 'controller_id', None),
+                executor_id=getattr(self.config, 'id', None),
+                level_id=getattr(self.config, 'level_id', None) or getattr(self, 'level_id', None),
+                bot_run_id=bot_run_id,
+            )
         except Exception:
             pass
         return order_id

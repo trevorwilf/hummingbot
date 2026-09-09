@@ -133,6 +133,10 @@ class TestExecutorBase(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             amount=Decimal("1.0"),
         )
         self.assertEqual(buy_order_id, "OID-BUY-1")
+        provenance_call = self.strategy.connectors["connector1"].set_order_provenance.call_args.kwargs
+        self.assertEqual("OID-BUY-1", provenance_call["order_id"])
+        self.assertEqual("main", provenance_call["controller_id"])
+        self.assertEqual("test", provenance_call["executor_id"])
 
     def test_place_sell_order(self):
         sell_order_id = self.component.place_order(

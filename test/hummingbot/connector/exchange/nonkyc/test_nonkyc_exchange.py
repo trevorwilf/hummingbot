@@ -176,6 +176,40 @@ class NonkycExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
             {"asset": self.base_asset, "available": "10.0", "held": "5.0"},
         ]
 
+    @aioresponses()
+    async def test_update_balances(self, mock_api):
+        """NonKYC may return HTTP-successful partial snapshots; omitted non-zero rows are retained."""
+        self._configure_balance_response(
+            response=self.balance_request_mock_response_for_base_and_quote,
+            mock_api=mock_api,
+        )
+        await self.exchange._update_balances()
+
+        # The first partial response omits a known non-zero quote balance. The connector must
+        # preserve it and immediately request a confirmation snapshot rather than treating it as
+        # zero. The following complete response resolves the quarantine.
+        self._configure_balance_response(
+            response=self.balance_request_mock_response_only_base,
+            mock_api=mock_api,
+        )
+        self._configure_balance_response(
+            response=self.balance_request_mock_response_for_base_and_quote,
+            mock_api=mock_api,
+        )
+        with patch(
+            "hummingbot.connector.exchange.nonkyc.nonkyc_exchange.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            await self.exchange._update_balances()
+
+        available_balances = self.exchange.available_balances
+        total_balances = self.exchange.get_all_balances()
+        self.assertEqual(Decimal("10"), available_balances[self.base_asset])
+        self.assertEqual(Decimal("2000"), available_balances[self.quote_asset])
+        self.assertEqual(Decimal("15"), total_balances[self.base_asset])
+        self.assertEqual(Decimal("2000"), total_balances[self.quote_asset])
+        self.assertFalse(self.exchange._balance_snapshot_incomplete)
+
     @property
     def balance_event_websocket_update(self):
         return {

@@ -467,6 +467,9 @@ services:
       - BACKEND_API_PORT=8000
       - BACKEND_API_USERNAME=${HBOT_API_USERNAME:-admin}
       - BACKEND_API_PASSWORD=${HBOT_API_PASSWORD:-admin}
+      - PURSE_ENV_LABEL=US / KRAKEN
+      - PURSE_ENV_ACCENT=#38bdf8
+      - PURSE_REFRESH_SECONDS=60
     volumes:
       - /mnt/sharedrive/apps/hummingbot_us/purse_panel/purse_panel.py:/home/panel/purse_panel.py:ro
     ports:

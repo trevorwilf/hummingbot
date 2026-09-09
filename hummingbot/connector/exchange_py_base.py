@@ -81,6 +81,12 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._user_stream_tracker = self._create_user_stream_tracker()
 
         self._order_tracker: ClientOrderTracker = self._create_order_tracker()
+        # Executor provenance is known synchronously when StrategyV2 receives the client
+        # order id, while the connector creates its InFlightOrder asynchronously. Keep the
+        # metadata here until start_tracking_order() constructs that object. Without this
+        # hand-off the recorder's OrderCreated listener runs with controller/executor/level
+        # all unset, making live orders impossible to associate with their owning executor.
+        self._pending_order_provenance: Dict[str, Dict[str, Optional[str]]] = {}
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -641,8 +647,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param amount: the amount for the order
         :param order_type: type of execution for the order (MARKET, LIMIT, LIMIT_MAKER)
         """
-        self._order_tracker.start_tracking_order(
-            InFlightOrder(
+        order = InFlightOrder(
                 client_order_id=order_id,
                 exchange_order_id=exchange_order_id,
                 trading_pair=trading_pair,
@@ -652,7 +657,42 @@ class ExchangePyBase(ExchangeBase, ABC):
                 price=price,
                 creation_timestamp=self.current_timestamp
             )
-        )
+        provenance = self._pending_order_provenance.pop(order_id, None)
+        if provenance is not None:
+            order.controller_id = provenance.get("controller_id")
+            order.executor_id = provenance.get("executor_id")
+            order.level_id = provenance.get("level_id")
+            order.bot_run_id = provenance.get("bot_run_id")
+        self._order_tracker.start_tracking_order(order)
+
+    def set_order_provenance(
+        self,
+        order_id: str,
+        controller_id: Optional[str] = None,
+        executor_id: Optional[str] = None,
+        level_id: Optional[str] = None,
+        bot_run_id: Optional[str] = None,
+    ) -> None:
+        """Attach StrategyV2 ownership before the asynchronous submit can emit OrderCreated.
+
+        Normally the connector's create task has not run yet, so the metadata is staged and
+        consumed by start_tracking_order(). The tracked-order branch makes the operation safe
+        for connectors that create their InFlightOrder synchronously.
+        """
+        provenance = {
+            "controller_id": controller_id,
+            "executor_id": executor_id,
+            "level_id": level_id,
+            "bot_run_id": bot_run_id,
+        }
+        tracked_order = self._order_tracker.all_orders.get(order_id)
+        if tracked_order is None:
+            self._pending_order_provenance[order_id] = provenance
+            return
+        tracked_order.controller_id = controller_id
+        tracked_order.executor_id = executor_id
+        tracked_order.level_id = level_id
+        tracked_order.bot_run_id = bot_run_id
 
     def stop_tracking_order(self, order_id: str):
         """

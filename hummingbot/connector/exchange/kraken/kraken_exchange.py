@@ -67,6 +67,14 @@ class KrakenExchange(ExchangePyBase):
         # runs only every LONG_POLL_INTERVAL (120s). A fill therefore leaves cached balances
         # stale for up to 2 minutes. A WS fill triggers a debounced REST refresh instead.
         self._fill_balance_refresh_task: Optional[asyncio.Task] = None
+        # One QueryOrders snapshot serves both fill discovery and status reconciliation for
+        # every tracked order. The base connector asks those questions order-by-order; without
+        # this coalescing a 17-order ladder consumed 34 private calls in one poll and repeatedly
+        # reached Kraken's account rate limit.
+        self._query_orders_snapshot_cache: Dict[str, Any] = {}
+        self._query_orders_snapshot_ids = frozenset()
+        self._query_orders_snapshot_timestamp: float = 0.0
+        self._query_orders_snapshot_ttl: float = 5.0
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -759,11 +767,7 @@ class KrakenExchange(ExchangePyBase):
                           "- waiting for exchange order id.")
 
         try:
-            orders_response = await self._api_request_with_retry(
-                method=RESTMethod.POST,
-                path_url=CONSTANTS.QUERY_ORDERS_PATH_URL,
-                data={"txid": exchange_order_id, "trades": "true"},
-                is_auth_required=True)
+            orders_response = await self._query_orders_snapshot(required_order=order)
             order_data = orders_response.get(exchange_order_id) or {}
             trade_ids: List[str] = list(order_data.get("trades") or [])
         except asyncio.CancelledError:
@@ -793,13 +797,65 @@ class KrakenExchange(ExchangePyBase):
                 trade_updates.append(trade_update)
         return trade_updates
 
+    async def _query_orders_snapshot(self, required_order: Optional[InFlightOrder] = None) -> Dict[str, Any]:
+        """Return one short-lived QueryOrders snapshot for all locally known orders.
+
+        ExchangePyBase first discovers fills for every order and then asks for every order's
+        status. Kraken supports multiple comma-separated txids, so coalesce both passes into
+        batched requests and include ``trades=true`` once. A five-second cache is deliberately
+        shorter than the connector's minimum status interval and only bridges calls belonging
+        to the same polling cycle.
+        """
+        orders: List[InFlightOrder] = []
+        seen_client_ids = set()
+        tracker_groups = (
+            self._order_tracker.all_fillable_orders,
+            self._order_tracker.all_updatable_orders,
+        )
+        for group in tracker_groups:
+            for tracked_order in group.values():
+                if tracked_order.client_order_id not in seen_client_ids:
+                    seen_client_ids.add(tracked_order.client_order_id)
+                    orders.append(tracked_order)
+        if required_order is not None and required_order.client_order_id not in seen_client_ids:
+            orders.append(required_order)
+
+        exchange_order_ids: List[str] = []
+        for tracked_order in orders:
+            exchange_order_id = tracked_order.exchange_order_id
+            if exchange_order_id is None and tracked_order is required_order:
+                exchange_order_id = await tracked_order.get_exchange_order_id()
+            if exchange_order_id is not None:
+                exchange_order_ids.append(str(exchange_order_id))
+
+        id_signature = frozenset(exchange_order_ids)
+        now = self._time()
+        cache_is_fresh = (
+            id_signature == self._query_orders_snapshot_ids
+            and (now - self._query_orders_snapshot_timestamp) <= self._query_orders_snapshot_ttl
+        )
+        if cache_is_fresh:
+            return self._query_orders_snapshot_cache
+
+        snapshot: Dict[str, Any] = {}
+        for start in range(0, len(exchange_order_ids), CONSTANTS.QUERY_ORDERS_MAX_IDS_PER_REQUEST):
+            batch = exchange_order_ids[start:start + CONSTANTS.QUERY_ORDERS_MAX_IDS_PER_REQUEST]
+            response = await self._api_request_with_retry(
+                method=RESTMethod.POST,
+                path_url=CONSTANTS.QUERY_ORDERS_PATH_URL,
+                data={"txid": ",".join(batch), "trades": "true"},
+                is_auth_required=True,
+            )
+            snapshot.update(response or {})
+
+        self._query_orders_snapshot_cache = snapshot
+        self._query_orders_snapshot_ids = id_signature
+        self._query_orders_snapshot_timestamp = now
+        return snapshot
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         exchange_order_id = await tracked_order.get_exchange_order_id()
-        updated_order_data = await self._api_request_with_retry(
-            method=RESTMethod.POST,
-            path_url=CONSTANTS.QUERY_ORDERS_PATH_URL,
-            data={"txid": exchange_order_id},
-            is_auth_required=True)
+        updated_order_data = await self._query_orders_snapshot(required_order=tracked_order)
 
         update = updated_order_data.get(exchange_order_id)
         if update is None:

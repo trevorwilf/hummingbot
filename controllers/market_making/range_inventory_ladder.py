@@ -1768,6 +1768,20 @@ class RangeInventoryLadderController(ControllerBase):
         self._accounting_degraded: bool = False
         self._state_io_failures: int = 0
 
+        # Same-pair orders present in the connector but absent from this controller's live
+        # executors are an ownership break, not spare wallet inventory. This is the exact
+        # cross-run failure that can duplicate a ladder after a restart. The create path
+        # fails closed while any such order exists and publishes a compact operator summary.
+        self._unowned_order_signature: Optional[tuple] = None
+        self._unowned_order_last_warning_ts: float = 0.0
+        self._unowned_order_summary: Dict[str, Any] = {
+            "count": 0,
+            "buy_quote": Decimal("0"),
+            "sell_base": Decimal("0"),
+            "client_order_ids": [],
+            "exchange_order_ids": [],
+        }
+
         # hbpurse P4: the append-only purse journal (contract v1). The journal is adopted or
         # bootstrapped by _ensure_purse each cycle; ANY load/save failure fails CLOSED via
         # _purse_degraded (its own flag -- a successful STATE commit must not clear a purse
@@ -5482,6 +5496,104 @@ class RangeInventoryLadderController(ControllerBase):
         except Exception:
             return None
 
+    def _same_pair_unowned_connector_orders(self) -> List[Any]:
+        """Return open same-pair connector orders not claimed by a live executor.
+
+        Orders explicitly tagged to another controller are left alone; that supports accounts
+        intentionally sharing a connector. Untagged orders fail closed because they cannot be
+        distinguished from a prior-run orphan and therefore must never be treated as available
+        capital for a replacement ladder.
+        """
+        try:
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            in_flight_orders = getattr(connector, "in_flight_orders", {}) or {}
+        except Exception:
+            return []
+
+        owned_client_ids = {
+            order_id
+            for executor in self._order_executors_active_or_shutting_down()
+            for order_id in [self._executor_order_id(executor)]
+            if order_id
+        }
+        unowned = []
+        for order in in_flight_orders.values():
+            if getattr(order, "trading_pair", None) != self.config.trading_pair:
+                continue
+            if getattr(order, "is_done", False):
+                continue
+            client_order_id = getattr(order, "client_order_id", None)
+            if client_order_id in owned_client_ids:
+                continue
+            tagged_controller = getattr(order, "controller_id", None)
+            if tagged_controller and tagged_controller != self.config.id:
+                continue
+            unowned.append(order)
+        return unowned
+
+    def _refresh_unowned_order_guard(self) -> bool:
+        """Refresh ownership diagnostics and return True when creates must be blocked."""
+        orders = self._same_pair_unowned_connector_orders()
+        buy_quote = Decimal("0")
+        sell_base = Decimal("0")
+        client_order_ids = []
+        exchange_order_ids = []
+        for order in orders:
+            client_order_id = str(getattr(order, "client_order_id", "") or "")
+            exchange_order_id = str(getattr(order, "exchange_order_id", "") or "")
+            if client_order_id:
+                client_order_ids.append(client_order_id)
+            if exchange_order_id:
+                exchange_order_ids.append(exchange_order_id)
+            try:
+                amount = max(Decimal("0"), self._d(getattr(order, "amount", "0"), "0"))
+                executed = max(Decimal("0"), self._d(getattr(order, "executed_amount_base", "0"), "0"))
+                remaining = max(Decimal("0"), amount - executed)
+                if getattr(order, "trade_type", None) == TradeType.BUY:
+                    price = max(Decimal("0"), self._d(getattr(order, "price", "0"), "0"))
+                    buy_quote += remaining * price
+                elif getattr(order, "trade_type", None) == TradeType.SELL:
+                    sell_base += remaining
+            except Exception:
+                # The count/id guard remains authoritative even if a malformed restored
+                # order prevents a notional estimate.
+                pass
+
+        client_order_ids.sort()
+        exchange_order_ids.sort()
+        self._unowned_order_summary = {
+            "count": len(orders),
+            "buy_quote": buy_quote,
+            "sell_base": sell_base,
+            "client_order_ids": client_order_ids,
+            "exchange_order_ids": exchange_order_ids,
+        }
+        signature = tuple(client_order_ids)
+        now = self.market_data_provider.time()
+        if signature:
+            if signature != self._unowned_order_signature or (now - self._unowned_order_last_warning_ts) >= 300.0:
+                self.logger().error(
+                    f"{self.config.id}: BLOCKING NEW ORDERS: found {len(orders)} open "
+                    f"{self.config.trading_pair} connector order(s) with no live executor ownership "
+                    f"(buy_quote={buy_quote}, sell_base={sell_base}, ids={client_order_ids})."
+                )
+                self._emit_structured(
+                    "range_ladder_create_blocked_unowned_connector_orders",
+                    count=len(orders),
+                    buy_quote=str(buy_quote),
+                    sell_base=str(sell_base),
+                    client_order_ids=client_order_ids,
+                    exchange_order_ids=exchange_order_ids,
+                )
+                self._unowned_order_last_warning_ts = now
+        elif self._unowned_order_signature:
+            self.logger().info(
+                f"{self.config.id}: connector order ownership recovered; new-order proposals may resume."
+            )
+            self._emit_structured("range_ladder_unowned_connector_orders_cleared")
+        self._unowned_order_signature = signature or None
+        return bool(signature)
+
     def _remaining_open_order_amounts(self, executor: ExecutorInfo):
         configured_price = self._d(getattr(executor.config, "price", "0") or "0")
         configured_amount = self._d(getattr(executor.config, "amount", "0") or "0")
@@ -8630,6 +8742,13 @@ class RangeInventoryLadderController(ControllerBase):
         if self._market_data_hard_pause or self._session_expired:
             return []
 
+        # Cross-run ownership invariant: never build a replacement ladder while this
+        # connector still tracks same-pair orders that no live executor owns. This check is
+        # intentionally independent from wallet-budget arithmetic because an orphan may be
+        # far from market yet still fill later and corrupt both exposure and ledger history.
+        if self._refresh_unowned_order_guard() is True:
+            return []
+
         # hbpurse P2 (CDX-M01) + P4 (purse contract): fail closed while accounting is degraded
         # -- a STATE commit failed (in-memory ledger unpersisted) OR the PURSE journal failed
         # to load/save (permanent record not current). Propose NO new orders until the next
@@ -9172,6 +9291,12 @@ class RangeInventoryLadderController(ControllerBase):
         lines.append(
             f"Tracked held positions: {len(self.positions_held or [])} | Active executors: {len(self._active_order_executors())}"
         )
+        ownership = self._unowned_order_summary
+        lines.append(
+            f"Order ownership: {'DEGRADED / creates blocked' if ownership.get('count', 0) else 'healthy'} | "
+            f"unowned={ownership.get('count', 0)} | buy quote={ownership.get('buy_quote', Decimal('0'))} | "
+            f"sell base={ownership.get('sell_base', Decimal('0'))}"
+        )
         lines.append(f"Reservation sources buy: {self._buy_reservation_sources} | sell: {self._sell_reservation_sources}")
         if blocked:
             lines.append(f"Blocked/cooldown levels: {', '.join(blocked)}")
@@ -9275,6 +9400,8 @@ class RangeInventoryLadderController(ControllerBase):
             # the next durable save (the create gate blocks on exactly this disjunction).
             "accounting_degraded": str(self._accounting_degraded or self._purse_degraded),
             "state_io_failures": self._state_io_failures,
+            "order_ownership_degraded": str(self._unowned_order_summary.get("count", 0) > 0),
+            "unowned_connector_orders": self._json_safe(self._unowned_order_summary),
             # hbpurse P4 (F13/F1): the inception purse block -- contributed / withdrawn /
             # earned / drift per the contract formulas, plus the epoch markers that make
             # controller_performance_snapshots retroactively segmentable.

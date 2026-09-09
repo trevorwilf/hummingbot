@@ -99,6 +99,15 @@ class NonkycExchange(ExchangePyBase):
         self._balance_settling: bool = False
         self._balance_settle_start: float = 0.0
         self._BALANCE_SETTLE_TIMEOUT: float = 15.0
+        # NonKYC has returned successful but incomplete /balances snapshots in production
+        # (for example, omitting a non-zero USDT row for one poll). Treating an omitted row as
+        # zero can make shared-account controllers permanently write down their ledgers. Keep
+        # an incomplete snapshot quarantined until REST explicitly reports every previously
+        # non-zero omitted asset again. Unlike ordinary reconnect settling, this condition must
+        # never fail open merely because the short reconnect timeout elapsed.
+        self._balance_snapshot_incomplete: bool = False
+        self._missing_nonzero_balance_assets: set = set()
+        self._last_incomplete_balance_warn: float = 0.0
         self._orders_reconciled_after_reconnect: bool = True
         # Orphan exchange-order ids already warned about: a persistent orphan (e.g. an order
         # left by a previous session) otherwise re-warns at EVERY reconnect reconciliation.
@@ -165,6 +174,11 @@ class NonkycExchange(ExchangePyBase):
 
     def _exit_balance_settling(self):
         if self._balance_settling:
+            if getattr(self, "_balance_snapshot_incomplete", False):
+                self.logger().debug(
+                    "Balance settling: REST snapshot is still incomplete; keeping order creation paused"
+                )
+                return
             # Wait for both balances AND active orders reconciliation
             if not self._orders_reconciled_after_reconnect:
                 self.logger().debug("Balance settling: balances refreshed but orders not yet reconciled")
@@ -690,7 +704,13 @@ class NonkycExchange(ExchangePyBase):
             )
         if self._balance_settling:
             elapsed = time.time() - self._balance_settle_start
-            if elapsed > self._BALANCE_SETTLE_TIMEOUT:
+            if getattr(self, "_balance_snapshot_incomplete", False):
+                missing_assets = sorted(getattr(self, "_missing_nonzero_balance_assets", set()))
+                raise Exception(
+                    f"Order creation blocked: incomplete REST balance snapshot omitted previously "
+                    f"non-zero asset(s) {missing_assets}. Waiting for a complete REST balance sync."
+                )
+            elif elapsed > self._BALANCE_SETTLE_TIMEOUT:
                 self.logger().warning(
                     f"Balance settling: TIMEOUT after {elapsed:.1f}s — allowing order creation")
                 self._balance_settling = False
@@ -1985,6 +2005,59 @@ class NonkycExchange(ExchangePyBase):
             self._account_available_balances[asset_name] = available_balance
             self._account_balances[asset_name] = total_balance
 
+        # A successful HTTP response is not necessarily a complete account snapshot. NonKYC has
+        # been observed returning hundreds of assets while omitting a non-zero USDT row for one
+        # poll. Preserve omitted non-zero balances and fail closed until a later REST response
+        # explicitly includes them. Zero-valued omitted rows may still be pruned normally.
+        missing_asset_names = local_asset_names.difference(remote_asset_names)
+        missing_nonzero_assets = {
+            asset_name
+            for asset_name in missing_asset_names
+            if (
+                self._account_balances.get(asset_name, Decimal("0")) != Decimal("0")
+                or self._account_available_balances.get(asset_name, Decimal("0")) != Decimal("0")
+            )
+        }
+        if missing_nonzero_assets:
+            previous_missing = set(getattr(self, "_missing_nonzero_balance_assets", set()))
+            self._balance_snapshot_incomplete = True
+            self._missing_nonzero_balance_assets = set(missing_nonzero_assets)
+            if not self._balance_settling:
+                self._balance_settling = True
+                self._balance_settle_start = time.time()
+
+            now = time.time()
+            missing_changed = previous_missing != missing_nonzero_assets
+            if missing_changed or now - self._last_incomplete_balance_warn >= 60.0:
+                self._last_incomplete_balance_warn = now
+                preserved = {
+                    asset_name: {
+                        "available": str(self._account_available_balances.get(asset_name, Decimal("0"))),
+                        "total": str(self._account_balances.get(asset_name, Decimal("0"))),
+                    }
+                    for asset_name in sorted(missing_nonzero_assets)
+                }
+                self.logger().warning(
+                    "Incomplete REST balance snapshot omitted previously non-zero asset(s) "
+                    f"{sorted(missing_nonzero_assets)}; preserving cached values and pausing order creation "
+                    "until REST confirms them."
+                )
+                self._emit_structured_event("balance_snapshot_incomplete", {
+                    "missing_assets": sorted(missing_nonzero_assets),
+                    "preserved_balances": preserved,
+                })
+        else:
+            if getattr(self, "_balance_snapshot_incomplete", False):
+                recovered_assets = sorted(getattr(self, "_missing_nonzero_balance_assets", set()))
+                self.logger().info(
+                    f"REST balance snapshot complete again; recovered omitted asset(s) {recovered_assets}."
+                )
+                self._emit_structured_event("balance_snapshot_complete", {
+                    "recovered_assets": recovered_assets,
+                })
+            self._balance_snapshot_incomplete = False
+            self._missing_nonzero_balance_assets.clear()
+
         if reconciliation_diffs:
             self.logger().info(
                 f"Balance reconciliation (REST overwrote WS): "
@@ -2020,12 +2093,27 @@ class NonkycExchange(ExchangePyBase):
                     self._balance_recheck_in_progress = False
                 return
 
-        self._exit_balance_settling()
+        # An omitted non-zero asset is an incomplete-snapshot signal, not a zero balance. Trigger
+        # one prompt confirmation pass while retaining the quarantine if the omission persists.
+        if missing_nonzero_assets and not self._balance_recheck_in_progress:
+            self.logger().warning(
+                "Scheduling confirmation balance poll for incomplete REST snapshot."
+            )
+            self._balance_recheck_in_progress = True
+            try:
+                await asyncio.sleep(2.0)
+                await self._update_balances()
+            finally:
+                self._balance_recheck_in_progress = False
+            return
 
-        asset_names_to_remove = local_asset_names.difference(remote_asset_names)
+        if not missing_nonzero_assets:
+            self._exit_balance_settling()
+
+        asset_names_to_remove = missing_asset_names.difference(missing_nonzero_assets)
         for asset_name in asset_names_to_remove:
-            del self._account_available_balances[asset_name]
-            del self._account_balances[asset_name]
+            self._account_available_balances.pop(asset_name, None)
+            self._account_balances.pop(asset_name, None)
 
         # Periodic balance health snapshot (throttled to once per 60s)
         now = time.time()
