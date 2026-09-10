@@ -8108,7 +8108,9 @@ class RangeInventoryLadderController(ControllerBase):
         the side's resting orders are cancelled. `free` is already fee-haircut by
         _compute_deploy_budgets; the reserved add-back gets the same haircut, because once the
         resting notional (and its fee hold) returns to the wallet it is re-haircut before
-        redeployment -- keeping the planner and the live rebuild sized identically."""
+        redeployment. Reapply the shared-account quota to the combined budget, with the
+        same fee headroom as placement: the free-budget cap alone does not constrain
+        the reservations added back here."""
         p = self.processed_data or {}
         free = self._d(p.get("free_buy_budget_quote", "0"), "0")
         reserved = self._d(p.get("active_buy_reserved_quote", "0"), "0")
@@ -8117,7 +8119,12 @@ class RangeInventoryLadderController(ControllerBase):
         # rebuild never counts the same reservation twice.
         reserved = max(Decimal("0"), reserved - self._wave_ledger_credit_quote)
         fee_rate = max(Decimal("0"), Decimal(self.config.fee_rate))
-        return max(Decimal("0"), free + reserved / (Decimal("1") + fee_rate))
+        fee_factor = Decimal("1") + fee_rate
+        budget = max(Decimal("0"), free + reserved / fee_factor)
+        if self.config.shared_account_quote_quota is not None:
+            quota = max(Decimal("0"), Decimal(self.config.shared_account_quote_quota))
+            budget = min(budget, quota / fee_factor)
+        return budget
 
     def _side_rebuild_budget_base(self) -> Decimal:
         """Base a fresh SELL rebuild would deploy (free + this side's own resting reservation)."""
