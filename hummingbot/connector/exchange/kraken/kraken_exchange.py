@@ -724,13 +724,15 @@ class KrakenExchange(ExchangePyBase):
             self._fill_balance_refresh_task = None
         await super().stop_network()
 
-    def _create_order_update_with_order_status_data(self, order_status: Dict[str, Any], order: InFlightOrder):
+    def _create_order_update_with_order_status_data(
+        self, order_status: Dict[str, Any], order: InFlightOrder, exchange_order_id: Optional[str] = None
+    ):
         order_update = OrderUpdate(
             trading_pair=order.trading_pair,
             update_timestamp=self.current_timestamp,
             new_state=CONSTANTS.ORDER_STATE[order_status["status"]],
             client_order_id=order.client_order_id,
-            exchange_order_id=order.exchange_order_id,
+            exchange_order_id=exchange_order_id or order.exchange_order_id,
         )
         return order_update
 
@@ -748,8 +750,10 @@ class KrakenExchange(ExchangePyBase):
                     # entry and keep processing the rest of the batch instead of returning early.
                     continue
                 if "status" in order_msg:
-                    order_update = self._create_order_update_with_order_status_data(order_status=order_msg,
-                                                                                    order=tracked_order)
+                    # openOrders can arrive before the AddOrder REST response. Its
+                    # dictionary key must reach the tracker before Created is emitted.
+                    order_update = self._create_order_update_with_order_status_data(
+                        order_status=order_msg, order=tracked_order, exchange_order_id=exchange_order_id)
                     self._order_tracker.process_order_update(order_update=order_update)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:

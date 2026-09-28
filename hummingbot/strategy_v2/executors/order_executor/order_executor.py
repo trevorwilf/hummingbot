@@ -26,8 +26,7 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 class OrderExecutor(ExecutorBase):
     _logger = None
 
-    # Watchdog for a shutdown that never completes (lost cancel confirmation, or an
-    # order stuck in a pending state that matches no shutdown branch).
+    # Warn about delayed shutdowns without abandoning possibly-live exchange orders.
     _SHUTDOWN_TIMEOUT_S = 30.0
 
     @classmethod
@@ -58,6 +57,7 @@ class OrderExecutor(ExecutorBase):
         self._current_retries = 0
         self._max_retries = max_retries
         self._shutdown_start_timestamp: Optional[float] = None
+        self._shutdown_last_warning_timestamp: Optional[float] = None
 
     @property
     def current_market_price(self) -> Decimal:
@@ -74,7 +74,11 @@ class OrderExecutor(ExecutorBase):
         Control the order execution process based on the execution strategy.
         """
         if self.status == RunnableStatus.RUNNING:
-            self.control_order()
+            # Check before placing a retry; stopping after placement can abandon
+            # the newly submitted order before it receives its creation event.
+            self.evaluate_max_retries()
+            if self.status == RunnableStatus.RUNNING:
+                self.control_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
         self.evaluate_max_retries()
@@ -118,8 +122,16 @@ class OrderExecutor(ExecutorBase):
         """
         Control the shutdown process of the executor.
         """
+        if self.status != RunnableStatus.SHUTTING_DOWN:
+            return
         if self._shutdown_start_timestamp is None:
             self._shutdown_start_timestamp = self._strategy.current_timestamp
+        # A creation event may have been missed. Reattach from the connector, but
+        # never interpret an absent tracker entry as proof of cancellation.
+        if self._order and self._order.order is None:
+            self.update_tracked_order_with_order_id(self._order.order_id)
+        if self._order and self._order.order is not None and self._order.order.is_cancelled:
+            self._record_cancelled_order()
         if self._order:
             if self._order.is_open:
                 self.cancel_order()
@@ -137,32 +149,22 @@ class OrderExecutor(ExecutorBase):
             self.stop()
         if self.status == RunnableStatus.SHUTTING_DOWN and \
                 self._strategy.current_timestamp - self._shutdown_start_timestamp > self._SHUTDOWN_TIMEOUT_S:
-            self._force_terminate_shutdown()
+            self._warn_shutdown_pending()
         await self._sleep(5.0)
 
-    def _force_terminate_shutdown(self):
-        """
-        Terminate a shutdown that did not complete within _SHUTDOWN_TIMEOUT_S: the cancel
-        confirmation was lost, or the order is wedged in a pending state. Filled inventory
-        is recorded as POSITION_HOLD; otherwise the executor terminates FAILED. The order
-        may still be live on the exchange either way.
-        """
+    def _warn_shutdown_pending(self):
+        """Keep ownership and event listeners until the connector confirms closure."""
+        now = self._strategy.current_timestamp
+        if self._shutdown_last_warning_timestamp is not None and \
+                now - self._shutdown_last_warning_timestamp < self._SHUTDOWN_TIMEOUT_S:
+            return
+        self._shutdown_last_warning_timestamp = now
         order_id = self._order.order_id if self._order else None
-        order_has_fills = self._order is not None and \
-            (self._order.is_filled or self._order.executed_amount_base > Decimal("0"))
-        if order_has_fills or self._partial_filled_orders:
-            self.close_type = CloseType.POSITION_HOLD
-            if order_has_fills:
-                self._held_position_orders.append(self._order_json_safe(self._order))
-            self._held_position_orders.extend([self._order_json_safe(order) for order in self._partial_filled_orders])
-        else:
-            self.close_type = CloseType.FAILED
         self.logger().warning(
             f"Executor {self.config.id} ({self.config.trading_pair} on {self.config.connector_name}): shutdown did "
             f"not complete within {self._SHUTDOWN_TIMEOUT_S:.0f}s — order {order_id} may still be live on the "
-            f"exchange. Force-terminating as {self.close_type.name}."
+            f"exchange. Retaining ownership and retrying cancellation until closure is confirmed."
         )
-        self.stop()
 
     def _order_json_safe(self, tracked: TrackedOrder) -> Dict:
         """
@@ -189,7 +191,8 @@ class OrderExecutor(ExecutorBase):
         """
         Evaluate if the maximum number of retries has been reached.
         """
-        if self._current_retries > self._max_retries:
+        if self._current_retries > self._max_retries and self._order is None \
+                and self.status == RunnableStatus.RUNNING:
             self.stop()
 
     def place_open_order(self):
@@ -282,7 +285,7 @@ class OrderExecutor(ExecutorBase):
         :param order_id: The order ID to update.
         """
         in_flight_order = self.get_in_flight_order(self.config.connector_name, order_id)
-        if self._order and self._order.order_id == order_id:
+        if self._order and self._order.order_id == order_id and in_flight_order is not None:
             self._order.order = in_flight_order
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
@@ -301,6 +304,8 @@ class OrderExecutor(ExecutorBase):
         """
         Process the order completed event.
         """
+        if self.is_closed:
+            return
         self.update_tracked_order_with_order_id(event.order_id)
         if self._order and self._order.order_id == event.order_id:
             self._held_position_orders.append(self._order_json_safe(self._order))
@@ -312,11 +317,15 @@ class OrderExecutor(ExecutorBase):
         Process the order canceled event.
         """
         if self._order and event.order_id == self._order.order_id:
-            if self._order.executed_amount_base > Decimal("0"):
-                self._partial_filled_orders.append(self._order)
-            else:
-                self._canceled_orders.append(self._order)
-            self._order = None
+            self.update_tracked_order_with_order_id(event.order_id)
+            self._record_cancelled_order()
+
+    def _record_cancelled_order(self):
+        if self._order.executed_amount_base > Decimal("0"):
+            self._partial_filled_orders.append(self._order)
+        else:
+            self._canceled_orders.append(self._order)
+        self._order = None
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         """

@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from hummingbot.strategy_v2.models.base import RunnableStatus
+
 _CONTROLLER_DIR = Path(__file__).resolve().parents[4] / "controllers" / "market_making"
 if str(_CONTROLLER_DIR) not in sys.path:
     sys.path.insert(0, str(_CONTROLLER_DIR))
@@ -68,6 +70,19 @@ class TestConnectorOrderOwnershipGuard(unittest.TestCase):
 
         self.assertFalse(controller._refresh_unowned_order_guard())
         self.assertEqual(0, controller._unowned_order_summary["count"])
+
+    def test_shutting_down_executor_retains_order_ownership(self):
+        order = self._order("delayed-cancel", controller_id="xmr-ladder")
+        controller = self._controller([order])
+        # Use the real status filter, not the default harness mock.
+        del controller._order_executors_active_or_shutting_down
+        executor = SimpleNamespace(status=RunnableStatus.SHUTTING_DOWN,
+                                   config=SimpleNamespace(type="order_executor"),
+                                   custom_info={"order_id": order.client_order_id})
+        controller.executors_info = [executor]
+        self.assertFalse(controller._refresh_unowned_order_guard())
+        executor.status = RunnableStatus.TERMINATED
+        self.assertTrue(controller._refresh_unowned_order_guard())
 
 
 if __name__ == "__main__":

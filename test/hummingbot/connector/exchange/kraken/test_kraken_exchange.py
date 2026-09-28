@@ -15,7 +15,7 @@ from hummingbot.connector.exchange.kraken.kraken_exchange import KrakenExchange
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.core.network_iterator import NetworkStatus
@@ -1419,6 +1419,33 @@ class KrakenExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         # process_order_update schedules the state change via safe_ensure_future; let it run.
         await asyncio.sleep(0.1)
         self.assertEqual(OrderState.OPEN, tracked.current_state)
+
+    async def test_created_event_has_exchange_id_regardless_of_ws_rest_ordering(self):
+        for ws_first in (True, False):
+            with self.subTest(ws_first=ws_first):
+                client_id = "12345" if ws_first else "12346"
+                exchange_id = f"EX-{client_id}"
+                tracked = self._track_simple_order(client_id, None)
+                rest_update = OrderUpdate(trading_pair=self.trading_pair,
+                                          update_timestamp=self.exchange.current_timestamp,
+                                          new_state=OrderState.OPEN, client_order_id=client_id,
+                                          exchange_order_id=exchange_id)
+                message = [[{exchange_id: {"userref": int(client_id), "status": "open"}}],
+                           "openOrders", {"sequence": 1}]
+                if not ws_first:
+                    await self.exchange._order_tracker._process_order_update(rest_update)
+                self.exchange._process_order_message(message)
+                await asyncio.sleep(0)
+                if ws_first:
+                    await self.exchange._order_tracker._process_order_update(rest_update)
+                # A repeated snapshot must not duplicate the creation event.
+                self.exchange._process_order_message(message)
+                await asyncio.sleep(0)
+                events = [event for event in self.buy_order_created_logger.event_log if event.order_id == client_id]
+                self.assertEqual(1, len(events))
+                self.assertEqual(exchange_id, events[0].exchange_order_id)
+                self.assertEqual(exchange_id, tracked.exchange_order_id)
+                self.assertEqual(OrderState.OPEN, tracked.current_state)
 
     def test_process_trade_message_ws_fill_timestamp_is_float(self):
         # ORDERS-2: WS ownTrades 'time' arrives as a string; it must be cast to float so downstream

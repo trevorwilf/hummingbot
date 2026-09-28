@@ -948,6 +948,8 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         new_market.display_name = "integration_test_market"
         new_market.trading_pairs = ["BTC-USDT"]
         new_market.tracking_states = {}  # Empty dict is JSON serializable
+        new_market._order_tracker.all_orders = {}
+        new_market._order_tracker._lost_orders = {}
         new_market.add_trade_fills_from_market_recorder = MagicMock()
         new_market.add_exchange_order_ids_from_market_recorder = MagicMock()
         new_market.add_listener = MagicMock()

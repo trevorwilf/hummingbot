@@ -56,6 +56,12 @@ class TestRebuildQuoteQuota(_Harness):
                    for a in ctrl._create_buy_actions()}
         self.assertEqual(planned, created)
 
+    def test_kraken_incident_rebuild_budget_is_capped_after_reservation_addback(self):
+        ctrl, _, _ = self._quota_setup(shared_account_quote_quota=D("465"), fee_rate=D("0.0025"))
+        ctrl.processed_data["free_buy_budget_quote"] = D("112.618979690773")
+        ctrl.processed_data["active_buy_reserved_quote"] = D("463.840394590")
+        self.assertEqual(D("465") / D("1.0025"), ctrl._side_rebuild_budget_quote())
+
     def test_quota_saturated_book_stays_quiet_across_watchdog_windows(self):
         ctrl, mdp, _ = self._quota_setup()
         self.assertTrue(ctrl._side_free_budget_funds_a_level("buy"))

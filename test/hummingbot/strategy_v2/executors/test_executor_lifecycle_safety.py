@@ -1,10 +1,8 @@
 """Executor lifecycle safety tests (V2 strategy fixes phase 1 — findings A1, A4, B6-position, A2).
 
 Under test:
-- OrderExecutor shutdown watchdog: a lost cancel confirmation or an order wedged in a
-  pending state can no longer pin the executor in SHUTTING_DOWN forever — after
-  _SHUTDOWN_TIMEOUT_S it force-terminates (POSITION_HOLD when there are fills,
-  FAILED otherwise) with a loud warning.
+- OrderExecutor shutdown watchdog retains ownership and listeners during delayed
+  cancellation, then finishes when the connector confirms closure.
 - OrderExecutor completed-event handling when the connector already evicted the
   InFlightOrder (TrackedOrder.order is None): no AttributeError, held inventory recorded.
 - PositionExecutor enforces the retry ceiling in SHUTTING_DOWN, so a close order that
@@ -24,7 +22,7 @@ from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.event.events import BuyOrderCompletedEvent
+from hummingbot.core.event.events import BuyOrderCompletedEvent, OrderCancelledEvent
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator, PositionHold
@@ -93,10 +91,11 @@ class TestOrderExecutorShutdownWatchdog(IsolatedAsyncioWrapperTestCase, LoggerMi
         executor = OrderExecutor(self.strategy, config, update_interval=0.5)
         self.set_loggers(loggers=[executor.logger()])
         executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.get_in_flight_order = MagicMock(return_value=None)
         return executor
 
     @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
-    async def test_lost_cancel_confirmation_force_fails_after_timeout(self, _):
+    async def test_lost_cancel_confirmation_keeps_ownership_after_timeout(self, _):
         executor = self.build_executor()
         executor._order = TrackedOrder("OID-OPEN")
         executor._order.order = make_in_flight_order("OID-OPEN", OrderState.OPEN)
@@ -109,12 +108,28 @@ class TestOrderExecutorShutdownWatchdog(IsolatedAsyncioWrapperTestCase, LoggerMi
         # The cancel confirmation never arrives; past the timeout the watchdog fires.
         self.strategy.current_timestamp = 1000.0 + OrderExecutor._SHUTDOWN_TIMEOUT_S + 1
         await executor.control_shutdown_process()
-        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
-        self.assertEqual(CloseType.FAILED, executor.close_type)
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
+        self.assertIsNone(executor.close_type)
+        self.assertEqual("OID-OPEN", executor.executor_info.custom_info["order_id"])
+        self.strategy.connectors["binance"].remove_listener.assert_not_called()
         self.assertTrue(self.is_partially_logged("WARNING", "may still be live on the exchange"))
+        # Several watchdog windows and an exhausted placement retry counter cannot
+        # release ownership or start a replacement while the cancel is unresolved.
+        executor._current_retries = executor._max_retries + 1
+        self.strategy.current_timestamp += 1000
+        await executor.control_task()
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
+        self.assertEqual(3, self.strategy.cancel.call_count)
+        self.strategy.buy.assert_not_called()
+
+        executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+            timestamp=self.strategy.current_timestamp, order_id="OID-OPEN"))
+        await executor.control_task()
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual(CloseType.EARLY_STOP, executor.close_type)
 
     @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
-    async def test_lost_cancel_with_partial_fill_holds_inventory(self, _):
+    async def test_late_cancel_with_partial_fill_holds_inventory_once_confirmed(self, _):
         executor = self.build_executor()
         order = make_in_flight_order("OID-PART", OrderState.PARTIALLY_FILLED)
         order.executed_amount_base = Decimal("0.4")
@@ -127,16 +142,25 @@ class TestOrderExecutorShutdownWatchdog(IsolatedAsyncioWrapperTestCase, LoggerMi
 
         self.strategy.current_timestamp = 1000.0 + OrderExecutor._SHUTDOWN_TIMEOUT_S + 1
         await executor.control_shutdown_process()
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
+        self.assertEqual([], executor._held_position_orders)
+        self.assertIsNone(executor.close_type)
+        # Additional fills arriving while cancellation is delayed must be included.
+        order.executed_amount_base = Decimal("0.6")
+        order.executed_amount_quote = Decimal("60")
+        event = OrderCancelledEvent(timestamp=self.strategy.current_timestamp, order_id="OID-PART")
+        executor.process_order_canceled_event(None, None, event)
+        executor.process_order_canceled_event(None, None, event)
+        await executor.control_shutdown_process()
+        await executor.control_shutdown_process()
         self.assertEqual(RunnableStatus.TERMINATED, executor.status)
         self.assertEqual(CloseType.POSITION_HOLD, executor.close_type)
         self.assertEqual(1, len(executor._held_position_orders))
-        self.assertEqual("0.4", executor._held_position_orders[0]["executed_amount_base"])
+        self.assertEqual("0.6", executor._held_position_orders[0]["executed_amount_base"])
         self.assertTrue(self.is_partially_logged("WARNING", "may still be live on the exchange"))
 
     @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
-    async def test_pending_state_fall_through_terminates(self, _):
-        # A TrackedOrder that never got its InFlightOrder attached is neither is_open nor
-        # is_filled: before the watchdog it matched NO shutdown branch and spun forever.
+    async def test_missing_tracker_entry_retains_ownership_and_reattaches_after_recovery(self, _):
         executor = self.build_executor()
         executor._order = TrackedOrder("OID-PENDING")
 
@@ -145,8 +169,79 @@ class TestOrderExecutorShutdownWatchdog(IsolatedAsyncioWrapperTestCase, LoggerMi
 
         self.strategy.current_timestamp = 1000.0 + OrderExecutor._SHUTDOWN_TIMEOUT_S + 1
         await executor.control_shutdown_process()
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
+        self.assertEqual("OID-PENDING", executor.executor_info.custom_info["order_id"])
+        self.strategy.connectors["binance"].remove_listener.assert_not_called()
+        order = make_in_flight_order("OID-PENDING", OrderState.OPEN)
+        executor.get_in_flight_order.return_value = order
+        await executor.control_shutdown_process()
+        self.strategy.cancel.assert_called_once()
+        # Terminal state polling also completes shutdown if the cancel callback was missed.
+        order.current_state = OrderState.CANCELED
+        await executor.control_shutdown_process()
         self.assertEqual(RunnableStatus.TERMINATED, executor.status)
-        self.assertEqual(CloseType.FAILED, executor.close_type)
+        self.assertEqual(CloseType.EARLY_STOP, executor.close_type)
+
+    @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
+    async def test_late_full_fill_after_timeout_is_preserved_once(self, _):
+        executor = self.build_executor()
+        order = make_in_flight_order("OID-FILL", OrderState.OPEN)
+        executor._order = TrackedOrder(order.client_order_id)
+        executor._order.order = order
+        await executor.control_shutdown_process()
+        self.strategy.current_timestamp += 100
+        await executor.control_shutdown_process()
+        order.executed_amount_base = Decimal("1")
+        order.executed_amount_quote = Decimal("100")
+        order.current_state = OrderState.FILLED
+        # The connector has already evicted the order; keep the attached fill data.
+        event = BuyOrderCompletedEvent(timestamp=1100, order_id=order.client_order_id,
+                                       base_asset="ETH", quote_asset="USDT",
+                                       base_asset_amount=Decimal("1"), quote_asset_amount=Decimal("100"),
+                                       order_type=OrderType.LIMIT)
+        executor.process_order_completed_event(None, None, event)
+        executor.process_order_completed_event(None, None, event)
+        await executor.control_shutdown_process()
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual(CloseType.POSITION_HOLD, executor.close_type)
+        self.assertEqual(1, len(executor._held_position_orders))
+        self.assertEqual("100", executor._held_position_orders[0]["executed_amount_quote"])
+
+    @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
+    async def test_cancel_reattaches_partial_fills_before_next_shutdown_poll(self, _):
+        executor = self.build_executor()
+        executor._order = TrackedOrder("OID-LATE")
+        await executor.control_shutdown_process()
+        self.strategy.current_timestamp += 100
+        await executor.control_shutdown_process()
+        order = make_in_flight_order("OID-LATE", OrderState.CANCELED)
+        order.executed_amount_base = Decimal("0.4")
+        order.executed_amount_quote = Decimal("40")
+        executor.get_in_flight_order.return_value = order
+        executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+            timestamp=self.strategy.current_timestamp, order_id=order.client_order_id))
+        await executor.control_shutdown_process()
+        self.assertEqual(CloseType.POSITION_HOLD, executor.close_type)
+        self.assertEqual("0.4", executor._held_position_orders[0]["executed_amount_base"])
+
+    @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
+    async def test_shutdown_warning_is_throttled(self, _):
+        executor = self.build_executor()
+        executor._order = TrackedOrder("OID-PENDING")
+        with patch.object(executor.logger(), "warning") as warning:
+            for now in (1000, 1031, 1037, 1062):
+                self.strategy.current_timestamp = now
+                await executor.control_shutdown_process()
+            self.assertEqual(2, warning.call_count)
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
+
+    async def test_exhausted_placement_retries_stop_before_submitting_another_order(self):
+        executor = self.build_executor()
+        executor._status = RunnableStatus.RUNNING
+        executor._current_retries = executor._max_retries + 1
+        await executor.control_task()
+        self.strategy.buy.assert_not_called()
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
 
     @patch.object(OrderExecutor, "_sleep", new_callable=AsyncMock)
     async def test_no_force_stop_within_timeout(self, _):

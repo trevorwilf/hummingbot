@@ -1171,9 +1171,8 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertNotIn(key, self.orchestrator._shutdown_in_flight_keys)
 
     @patch.object(MarketsRecorder, "get_instance")
-    def test_safety_valve_cleanup(self, markets_recorder_mock):
-        """Shutdown-in-flight key older than 30 seconds is cleaned up.
-        Creates are NOT deferred even if the key existed."""
+    def test_completed_shutdown_tracking_cleanup(self, markets_recorder_mock):
+        """An old key with no shutting-down executor no longer defers creates."""
         markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
 
         self.orchestrator.cached_performance["test"] = PerformanceReport()
@@ -1197,6 +1196,31 @@ class TestExecutorOrchestrator(unittest.TestCase):
 
         # The create must proceed since the key was cleaned up
         self.orchestrator.create_executor.assert_called_once()
+
+    def test_delayed_shutdown_defers_creates_without_expiry_or_seeded_key(self):
+        for connector in ("kraken", "nonkyc"):
+            for seed_key in (True, False):
+                with self.subTest(connector=connector, seed_key=seed_key):
+                    config = PositionExecutorConfig(
+                        timestamp=1234, connector_name=connector, trading_pair="ETH-USDT",
+                        side=TradeType.BUY, entry_price=Decimal(100), amount=Decimal(1))
+                    executor = MagicMock(spec=PositionExecutor)
+                    executor.config = config
+                    executor.status = RunnableStatus.SHUTTING_DOWN
+                    self.orchestrator.active_executors = {"test": [executor]}
+                    key = (connector, "ETH-USDT", TradeType.BUY)
+                    self.orchestrator._shutdown_in_flight_keys = (
+                        {key: time.time() - 1000} if seed_key else {})
+                    self.orchestrator.create_executor = MagicMock()
+                    action = CreateExecutorAction(executor_config=config, controller_id="test")
+                    with patch.object(self.orchestrator, "_preflight_budget_check", side_effect=lambda actions: actions):
+                        self.orchestrator.execute_actions([action])
+                        self.orchestrator.execute_actions([action])
+                        self.orchestrator.create_executor.assert_not_called()
+                        self.assertIn(key, self.orchestrator._shutdown_in_flight_keys)
+                        executor.status = RunnableStatus.TERMINATED
+                        self.orchestrator.execute_actions([action])
+                        self.orchestrator.create_executor.assert_called_once_with(action)
 
     @patch.object(MarketsRecorder, "get_instance")
     def test_no_false_deferral(self, markets_recorder_mock):

@@ -461,6 +461,22 @@ class MarketsRecorder:
         market_states: Optional[MarketState] = query.one_or_none()
         return market_states
 
+    @staticmethod
+    def _exchange_order_id_for_event(market: ConnectorBase, evt) -> Optional[str]:
+        """Resolve identity from this event or its exact client order, never by pair."""
+        exchange_order_id = getattr(evt, "exchange_order_id", None)
+        if isinstance(exchange_order_id, str) and exchange_order_id:
+            return exchange_order_id
+        try:
+            tracker = market._order_tracker
+            tracked = tracker.all_orders.get(evt.order_id)
+            if tracked is None:
+                tracked = tracker._lost_orders.get(evt.order_id)
+            exchange_order_id = tracked.exchange_order_id if tracked is not None else None
+        except AttributeError:
+            return None
+        return exchange_order_id if isinstance(exchange_order_id, str) and exchange_order_id else None
+
     def _did_create_order(self,
                           event_tag: int,
                           market: ConnectorBase,
@@ -473,6 +489,7 @@ class MarketsRecorder:
         timestamp = int(evt.creation_timestamp * 1e3)
         event_type: MarketEvent = self.market_event_tag_map[event_tag]
         trade_type_str = "BUY" if event_type == MarketEvent.BuyOrderCreated else "SELL"
+        exchange_order_id = self._exchange_order_id_for_event(market, evt)
 
         event_data = {}
         with self._sql_manager.get_new_session() as session:
@@ -492,12 +509,13 @@ class MarketsRecorder:
                                             position=evt.position if evt.position else PositionAction.NIL.value,
                                             last_status=event_type.name,
                                             last_update_timestamp=timestamp,
-                                            exchange_order_id=evt.exchange_order_id,
+                                            exchange_order_id=exchange_order_id,
                                             trade_type=trade_type_str,
                                             bot_run_id=self._bot_run_id)
                 order_status: OrderStatus = OrderStatus(order=order_record,
                                                         timestamp=timestamp,
                                                         status=event_type.name,
+                                                        exchange_order_id=exchange_order_id,
                                                         received_timestamp_ms=int(time.time() * 1e3),
                                                         bot_run_id=self._bot_run_id)
                 # Propagate controller/executor/level IDs from in-flight order
@@ -508,18 +526,18 @@ class MarketsRecorder:
                         order_record.executor_id = getattr(tracked, 'executor_id', None)
                         order_record.level_id = getattr(tracked, 'level_id', None)
                         order_status.level_id = getattr(tracked, 'level_id', None)
-                        order_status.exchange_order_id = evt.exchange_order_id
                 except Exception:
                     pass
 
                 session.add(order_record)
                 session.add(order_status)
-                market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
+                if exchange_order_id:
+                    market.add_exchange_order_ids_from_market_recorder({exchange_order_id: evt.order_id})
                 self.save_market_states(self._config_file_path, market, session=session)
 
                 event_data = {
                     "order_id": evt.order_id,
-                    "exchange_order_id": getattr(evt, 'exchange_order_id', None),
+                    "exchange_order_id": exchange_order_id,
                     "trading_pair": evt.trading_pair,
                     "order_type": evt.type.name,
                     "trade_type": trade_type_str,
@@ -544,7 +562,7 @@ class MarketsRecorder:
                     connector=market.display_name,
                     trading_pair=evt.trading_pair,
                     client_order_id=evt.order_id,
-                    exchange_order_id=getattr(evt, 'exchange_order_id', None),
+                    exchange_order_id=exchange_order_id,
                     trade_type=trade_type_str,
                     order_type=evt.type.name,
                     price=str(evt.price),
@@ -571,6 +589,7 @@ class MarketsRecorder:
         timestamp: int = int(evt.timestamp * 1e3) if evt.timestamp is not None else self.db_timestamp
         event_type: MarketEvent = self.market_event_tag_map[event_tag]
         order_id: str = evt.order_id
+        exchange_order_id = self._exchange_order_id_for_event(market, evt)
 
         event_data = {}
         try:
@@ -581,12 +600,16 @@ class MarketsRecorder:
                     if order_record is not None:
                         order_record.last_status = event_type.name
                         order_record.last_update_timestamp = timestamp
+                        if not order_record.exchange_order_id and exchange_order_id:
+                            order_record.exchange_order_id = exchange_order_id
+                            market.add_exchange_order_ids_from_market_recorder({exchange_order_id: order_id})
 
                     # Order status and trade fill record should be added even if the order record is not found, because it's
                     # possible for fill event to come in before the order created event for market orders.
                     order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                             timestamp=timestamp,
                                                             status=event_type.name,
+                                                            exchange_order_id=exchange_order_id,
                                                             bot_run_id=self._bot_run_id)
                     try:
                         fee_in_quote = evt.trade_fee.fee_amount_in_token(
@@ -617,7 +640,7 @@ class MarketsRecorder:
                         trade_fee_in_quote=fee_in_quote,
                         exchange_trade_id=evt.exchange_trade_id,
                         position=evt.position if evt.position else PositionAction.NIL.value,
-                        exchange_order_id=getattr(evt, 'exchange_order_id', None),
+                        exchange_order_id=exchange_order_id,
                         bot_run_id=self._bot_run_id,
                     )
                     # Enrich with provenance data from the in-flight order tracker
@@ -642,7 +665,6 @@ class MarketsRecorder:
                             trade_fill_record.executor_id = tracked_order.executor_id
                             trade_fill_record.level_id = getattr(tracked_order, 'level_id', None)
                             order_status.level_id = getattr(tracked_order, 'level_id', None)
-                            order_status.exchange_order_id = getattr(evt, 'exchange_order_id', None)
                     except Exception:
                         pass  # Never let provenance enrichment break fill recording
 
@@ -810,6 +832,7 @@ class MarketsRecorder:
         timestamp: int = self.db_timestamp
         event_type: MarketEvent = self.market_event_tag_map[event_tag]
         order_id: str = evt.order_id
+        exchange_order_id = self._exchange_order_id_for_event(market, evt)
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
@@ -818,9 +841,13 @@ class MarketsRecorder:
                 if order_record is not None:
                     order_record.last_status = event_type.name
                     order_record.last_update_timestamp = timestamp
+                    if not order_record.exchange_order_id and exchange_order_id:
+                        order_record.exchange_order_id = exchange_order_id
+                        market.add_exchange_order_ids_from_market_recorder({exchange_order_id: order_id})
                     order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                             timestamp=timestamp,
                                                             status=event_type.name,
+                                                            exchange_order_id=exchange_order_id,
                                                             received_timestamp_ms=int(time.time() * 1e3),
                                                             bot_run_id=self._bot_run_id)
                     # Enrich with tracked order data if available
@@ -829,7 +856,6 @@ class MarketsRecorder:
                         if tracked is None:
                             tracked = market._order_tracker._lost_orders.get(order_id)
                         if tracked is not None:
-                            order_status.exchange_order_id = tracked.exchange_order_id
                             order_status.level_id = getattr(tracked, 'level_id', None)
                     except Exception:
                         pass

@@ -532,15 +532,21 @@ class ExecutorOrchestrator:
         for action in store_actions:
             self.execute_action(action)
 
-        # Update shutdown-in-flight tracking for cross-cycle deferral
-        for key in stopped_keys:
-            self._shutdown_in_flight_keys[key] = time.time()
-
-        # Clean up stale shutdown tracking entries (safety valve: 30 seconds max)
-        stale_cutoff = time.time() - 30.0
+        # Derive deferral from executor state, including shutdowns initiated outside
+        # this batch. Elapsed time does not prove exchange collateral was released.
+        shutting_down_keys = set()
+        for executors in self.active_executors.values():
+            for executor in executors:
+                if executor.status == RunnableStatus.SHUTTING_DOWN:
+                    try:
+                        shutting_down_keys.add((executor.config.connector_name,
+                                                executor.config.trading_pair,
+                                                executor.config.side))
+                    except AttributeError:
+                        continue
         self._shutdown_in_flight_keys = {
-            k: v for k, v in self._shutdown_in_flight_keys.items()
-            if v > stale_cutoff
+            key: self._shutdown_in_flight_keys.get(key, time.time())
+            for key in stopped_keys | shutting_down_keys
         }
 
         # Separate creates into immediate vs deferred
@@ -559,30 +565,9 @@ class ExecutorOrchestrator:
                     continue
 
                 # Cross-cycle: check if any executor for this key is still SHUTTING_DOWN
-                if key in self._shutdown_in_flight_keys:
-                    still_shutting_down = False
-                    for controller_id, executors in self.active_executors.items():
-                        for executor in executors:
-                            try:
-                                exec_key = (
-                                    executor.config.connector_name,
-                                    executor.config.trading_pair,
-                                    executor.config.side
-                                )
-                                if exec_key == key and executor.status == RunnableStatus.SHUTTING_DOWN:
-                                    still_shutting_down = True
-                                    break
-                            except AttributeError:
-                                continue
-                        if still_shutting_down:
-                            break
-
-                    if still_shutting_down:
-                        deferred_creates.append(action)
-                        continue
-                    else:
-                        # Shutdown completed, remove from tracking
-                        self._shutdown_in_flight_keys.pop(key, None)
+                if key in shutting_down_keys:
+                    deferred_creates.append(action)
+                    continue
 
                 immediate_creates.append(action)
             except AttributeError:
