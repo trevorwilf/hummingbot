@@ -14,6 +14,7 @@ import datetime
 import http.server
 import json
 import re
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -1690,6 +1691,62 @@ class TestControllersSyncWritesManifest(unittest.TestCase):
                         1, len(backups), f"replaced manifest must be backed up; found {backups}"
                     )
                     self.assertEqual("stale manifest\n", backups[0].read_text(encoding="utf-8"))
+
+
+@unittest.skipUnless(BASH, "requires a working bash")
+class TestApiOverlayDependencies(unittest.TestCase):
+    """Exercise the real Dockerfile heredoc without running a build or pip."""
+
+    def _run_dependency_steps(self, check_status=0):
+        source = read_text(API_BUILD_SCRIPT)
+        heredoc = re.search(
+            r'^cat > "\$WRAP_DOCKERFILE" <<EOF\n.*?^EOF$', source, re.M | re.S
+        )
+        self.assertIsNotNone(heredoc)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "Dockerfile"
+            setup = (
+                "set -eu\n"
+                f"WRAP_DOCKERFILE={shlex.quote(target.as_posix())}\n"
+                "BASE_TAG=api-base:test\nCONDA_PIP=fake_pip\nCONDA_PYTHON=python\n"
+                "HB_REPO=https://example.invalid/hummingbot.git\nHB_BRANCH=nonkyc\n"
+            )
+            rendered = subprocess.run(
+                [BASH, "-c", setup + heredoc.group(0)], capture_output=True, text=True
+            )
+            self.assertEqual(0, rendered.returncode, rendered.stderr)
+            dockerfile = target.read_text(encoding="utf-8").replace("\\\n", "")
+        # Execute only pip-install/check RUN instructions with a recording stub.
+        # Preserve their actual && and set-e semantics, including check failure.
+        steps = re.findall(r"^RUN (fake_pip .*)$", dockerfile, re.M)
+        self.assertTrue(steps)
+        stub = (
+            "set -e\nfake_pip() {\n"
+            "  printf 'pip'; printf '\\t%s' \"$@\"; printf '\\n'\n"
+            f'  if [ "$1" = check ]; then return {check_status}; fi\n'
+            "  return 0\n}\n"
+        )
+        return subprocess.run(
+            [BASH, "-c", stub + "\n".join(steps) + "\necho DEPENDENCIES_OK\n"],
+            capture_output=True, text=True,
+        )
+
+    def test_fork_replacement_preserves_base_dependencies_and_checks_compatibility(self):
+        result = self._run_dependency_steps()
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = [line.split("\t")[1:] for line in result.stdout.splitlines() if line.startswith("pip\t")]
+        fork_calls = [args for args in calls if any(a.startswith("hummingbot @ git+") for a in args)]
+        self.assertEqual(1, len(fork_calls))
+        self.assertIn("--force-reinstall", fork_calls[0])
+        self.assertIn("--no-deps", fork_calls[0])
+        self.assertTrue(any("xrpl-py==4.5.0" in args for args in calls))
+        self.assertEqual(["check"], calls[-1])
+        self.assertIn("DEPENDENCIES_OK", result.stdout)
+
+    def test_incompatible_dependencies_fail_the_generated_build_step(self):
+        result = self._run_dependency_steps(check_status=17)
+        self.assertEqual(17, result.returncode, result.stderr)
+        self.assertNotIn("DEPENDENCIES_OK", result.stdout)
 
 
 if __name__ == "__main__":

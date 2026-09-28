@@ -638,10 +638,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends git g++ gcc mak
 # Replace the stock hummingbot pip package with the NonKYC fork.
 # Uses the conda env's pip so it installs into the right site-packages.
 # --force-reinstall ensures it fully replaces the existing install.
+# --no-deps preserves the API base's resolved dependency set. Re-resolving the
+# entire fork tree can select legacy pysha3, which cannot build on Python 3.12.
 RUN ${CONDA_PIP} install --no-cache-dir --upgrade pip && \\
-    ${CONDA_PIP} install --no-cache-dir --force-reinstall \\
+    ${CONDA_PIP} install --no-cache-dir --force-reinstall --no-deps \\
       "hummingbot @ git+${HB_REPO}@${HB_BRANCH}" && \\
     ${CONDA_PIP} install --no-cache-dir --upgrade "paho-mqtt>=2.0"
+
+# The fork requires xrpl-py <5; use the version validated in both deployed APIs.
+# --no-deps must not hide missing/incompatible requirements: fail the build here.
+RUN ${CONDA_PIP} install --no-cache-dir "xrpl-py==4.5.0" && \\
+    ${CONDA_PIP} check
 
 # Verify paho-mqtt v2 is intact (aiomqtt requires paho.mqtt.enums from v2+)
 RUN ${CONDA_PYTHON} -c "from paho.mqtt.enums import CallbackAPIVersion; print('paho-mqtt v2 OK')"
