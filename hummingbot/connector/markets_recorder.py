@@ -598,8 +598,12 @@ class MarketsRecorder:
                     # Try to find the order record, and update it if necessary.
                     order_record: Optional[Order] = session.query(Order).filter(Order.id == order_id).one_or_none()
                     if order_record is not None:
-                        order_record.last_status = event_type.name
-                        order_record.last_update_timestamp = timestamp
+                        # A delayed fill is still accounting evidence, but does not reopen an
+                        # order whose terminal lifecycle event was already recorded.
+                        terminal_statuses = {event.name for event in self._LIFECYCLE_EVENT_MAP}
+                        if order_record.last_status not in terminal_statuses:
+                            order_record.last_status = event_type.name
+                        order_record.last_update_timestamp = max(order_record.last_update_timestamp, timestamp)
                         if not order_record.exchange_order_id and exchange_order_id:
                             order_record.exchange_order_id = exchange_order_id
                             market.add_exchange_order_ids_from_market_recorder({exchange_order_id: order_id})

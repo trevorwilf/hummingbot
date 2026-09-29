@@ -37,6 +37,11 @@ class ExitCommand:
         if self.trading_core._is_running:
             await self.trading_core.stop_clock()
 
+        # Keep recorder listeners through cancellation, then close this run before exit.
+        if self.trading_core.markets_recorder:
+            self.trading_core.markets_recorder.stop()
+            self.trading_core.markets_recorder = None
+
         if self.trading_core.gateway_monitor is not None:
             self.trading_core.gateway_monitor.stop_monitor()
 

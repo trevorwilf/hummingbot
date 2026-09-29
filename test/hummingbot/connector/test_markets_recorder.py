@@ -289,6 +289,41 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.config_file_path, trade_fills[0].config_file_path)
         self.assertEqual(fill_event.order_id, trade_fills[0].order_id)
 
+    def test_late_fill_preserves_terminal_status_and_records_trade(self):
+        recorder = MarketsRecorder(
+            sql=self.manager, markets=[self], config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False),
+        )
+        for terminal in recorder._LIFECYCLE_EVENT_MAP:
+            with self.subTest(terminal=terminal.name):
+                oid = f"late-{terminal.name}"
+                created = BuyOrderCreatedEvent(
+                    timestamp=1642010000, type=OrderType.LIMIT, trading_pair=self.trading_pair,
+                    amount=Decimal("1"), price=Decimal("1000"), order_id=oid,
+                    creation_timestamp=1642010000, exchange_order_id="exchange-" + oid,
+                )
+                recorder._did_create_order(MarketEvent.BuyOrderCreated.value, self, created)
+                # Exercise the real terminal-event persistence path before the delayed fill.
+                recorder._update_order_status(terminal.value, self, created)
+                with self.manager.get_new_session() as session:
+                    terminal_time = session.query(Order).filter(Order.id == oid).one().last_update_timestamp
+                filled = OrderFilledEvent(
+                    timestamp=1642020000, order_id=oid, trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("1000"),
+                    amount=Decimal("0.4"), trade_fee=AddedToCostTradeFee(percent=Decimal("0.001")),
+                    exchange_trade_id="trade-" + oid,
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, filled)
+                with self.manager.get_new_session() as session:
+                    order = session.query(Order).filter(Order.id == oid).one()
+                    self.assertEqual(terminal.name, order.last_status)
+                    self.assertEqual(terminal_time, order.last_update_timestamp)
+                    self.assertEqual(1, len(order.trade_fills))
+                    self.assertEqual(Decimal("0.4"), order.trade_fills[0].amount)
+                    self.assertEqual(Decimal("0.4"), order.trade_fills[0].trade_fee_in_quote)
+                    self.assertEqual(1, sum(s.status == MarketEvent.OrderFilled.name for s in order.status))
+
     def test_trade_fee_in_quote_not_available(self):
         recorder = MarketsRecorder(
             sql=self.manager,

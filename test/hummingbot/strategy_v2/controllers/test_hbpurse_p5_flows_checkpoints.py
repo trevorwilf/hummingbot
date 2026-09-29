@@ -1,7 +1,6 @@
 """hbpurse Phase 5 behavior-contract tests: declared flows (generation-token, quiet-window
 confirmation, drift on contradiction), wallet-observation checkpoints (interval + after every
-flow/reseed/re-anchor event), the stop-path final booking pass, and carried-prune drift
-surfacing.
+flow/reseed/re-anchor event), the stop-path final booking pass, and carried-progress retirement.
 
 Every test drives the REAL controller (`RangeInventoryLadderController`) with mocked balances,
 prices, time() and executors_info, exactly like the P1-P4 suites. Purse IO is real (a temp dir);
@@ -26,9 +25,8 @@ Discriminating assertions (named for the reviewer's TEST INTEGRITY AUDIT):
   _purse_append_record for kind "flow" -> no checkpoint that cycle -> FAILS.
 - Checkpoint on interval: test_checkpoint_appended_on_interval asserts a checkpoint appears once
   the interval elapses with no events. Disabling the interval branch (interval_due) -> FAILS.
-- Carried-prune drift: test_carried_prune_produces_drift_record asserts a drift reanchor record
-  carrying the pruned entry's cumulative base/quote. Reverting to today's silent delete (removing
-  the _journal_carried_prune_drift call) -> no such record -> FAILS.
+- Carried progress: retirement reports already-booked amounts without fabricating a loss or
+  modifying financial history; genuinely uncommitted deltas still surface as drift.
 - Routine prune silent: test_same_session_completed_prune_is_silent asserts NO drift record and NO
   carried-prune event when a live-observed executor's entry is pruned. Misclassifying it as
   carried (dropping the `eid not in self._observed_progress_ids` guard) -> a spurious drift record
@@ -432,13 +430,13 @@ class TestCheckpoints(_Harness):
         self.assertEqual(1, len(self._records_of_kind("checkpoint")))
 
 
-# ==================================================== carried-prune drift
+# ==================================================== carried-progress retirement
 
-class TestCarriedPruneDrift(_Harness):
+class TestCarriedProgressRetirement(_Harness):
 
-    def test_carried_prune_produces_drift_record(self):
+    def test_carried_prune_reports_unknown_final_delta_without_fabricating_drift(self):
         # A booked_fill_progress entry loaded from disk, never seen live this session, is pruned on
-        # the first post-resume booking cycle -> ONE drift reanchor record with its values.
+        # the first post-resume booking cycle. Its known booked cumulative is NOT a lost delta.
         balances = {"XMR": (D("0.5"), D("0.5")), "USDT": (D(1000), D(1000))}
         mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
         ctrl = self._build(mdp)
@@ -450,26 +448,65 @@ class TestCarriedPruneDrift(_Harness):
         self._cycle(ctrl, mdp, 1000.0)
 
         drifts = [r for r in self._records_of_kind("reanchor") if r["classification"] == "drift"]
-        self.assertEqual(1, len(drifts))
-        rec = drifts[0]
-        self.assertEqual(D("120"), D(rec["old_owned_quote"]))   # pruned entry's cumulative quote
-        self.assertEqual(D("0.4"), D(rec["old_owned_base"]))    # pruned entry's cumulative base
-        self.assertEqual(D("0"), D(rec["new_owned_quote"]))
-        self.assertEqual(D("0"), D(rec["new_owned_base"]))
-        # drift magnitude = quote + base * ref = 120 + 0.4 * 300 = 240.
-        self.assertEqual(D("240"), D(rec["overclaim_quote"]))
+        self.assertEqual([], drifts)
         # The progress entry is gone from state (pruned) but owned_* is UNCHANGED (never resized).
         self.assertNotIn("old-exec-1", ctrl._state.get("booked_fill_progress", {}))
         self.assertEqual(D("1000"), D(ctrl._state["owned_quote"]))
         self.assertEqual(D("0.5"), D(ctrl._state["owned_base"]))
-        evts = self._emit_events(ctrl, "range_ladder_carried_prune_drift")
+        evts = self._emit_events(ctrl, "range_ladder_carried_progress_retired")
         self.assertEqual(1, len(evts))
         self.assertEqual(["old-exec-1"], evts[0].kwargs["pruned_ids"])
-        # Derived drift reflects the surfaced loss.
+        self.assertEqual("0.4", evts[0].kwargs["booked_base"])
+        self.assertEqual("120", evts[0].kwargs["booked_quote"])
+        self.assertEqual("0.12", evts[0].kwargs["booked_fees"])
+        self.assertIs(False, evts[0].kwargs["final_execution_verified"])
+        self.assertIs(False, evts[0].kwargs["accounting_adjustment"])
+        self.assertNotIn("drift_quote", evts[0].kwargs)
         metrics = ctrl._purse.derived_metrics(
             reference_price=D(300), owned_quote=D(1000), owned_base=D("0.5")
         )
-        self.assertEqual(D("240"), metrics["drift"])
+        self.assertEqual(D("0"), metrics["drift"])
+        self.assertEqual(D("0"), ctrl._carried_prune_drift_quote_cum)
+        self._cycle(ctrl, mdp, 1001.0)
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_carried_progress_retired")))
+
+    def test_booked_fill_restart_preserves_money_and_journal_without_reanchor(self):
+        balances = {"XMR": (D(2), D(2)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        self._init_state(ctrl, owned_quote=1000, owned_base=0, seed_value=1000)
+        ctrl.executors_info = [_filling_executor(
+            "buy_315", TradeType.BUY, 315, "booked-exec",
+            filled_base="0.4", filled_quote="120", fees="0.12",
+        )]
+        self._cycle(ctrl, mdp, 1000.0)
+        self.assertEqual("879.88", ctrl._state["owned_quote"])
+        self.assertEqual("0.4", ctrl._state["owned_base"])
+        before = self._persisted_purse()
+        self.assertEqual(1, len(self._records_of_kind("fills_rollup")))
+
+        restarted = self._build(mdp)
+        self._cycle(restarted, mdp, 1001.0)
+        self.assertEqual("879.88", restarted._state["owned_quote"])
+        self.assertEqual("0.4", restarted._state["owned_base"])
+        self.assertEqual({}, restarted._state["booked_fill_progress"])
+        self.assertEqual(before, self._persisted_purse())
+        self.assertEqual(1, len(self._emit_events(restarted, "range_ladder_carried_progress_retired")))
+
+    def test_failed_retirement_commit_keeps_progress_and_reports_only_after_retry(self):
+        balances = {"XMR": (D(1), D(1)), "USDT": (D(1000), D(1000))}
+        mdp = _make_mdp(balances=balances, mid=300, bid=299, ask=301)
+        ctrl = self._build(mdp)
+        progress = {"old": {"base": "0.4", "quote": "120", "fees": "0.12"}}
+        self._init_state(ctrl, booked_fill_progress=progress)
+        before = dict(ctrl._state)
+        with patch.object(ctrl, "_commit_state", return_value=False):
+            ctrl._book_fills_from_orders()
+        self.assertEqual(before, ctrl._state)
+        self.assertEqual([], self._emit_events(ctrl, "range_ladder_carried_progress_retired"))
+        ctrl._book_fills_from_orders()
+        self.assertEqual({}, self._persisted_state()["booked_fill_progress"])
+        self.assertEqual(1, len(self._emit_events(ctrl, "range_ladder_carried_progress_retired")))
 
     def test_same_session_completed_prune_is_silent(self):
         # An executor OBSERVED live this session, whose entry is pruned after it completes, is a
@@ -492,7 +529,7 @@ class TestCarriedPruneDrift(_Harness):
         self.assertNotIn("new-exec-1", ctrl._state.get("booked_fill_progress", {}))
         self.assertEqual([], [r for r in self._records_of_kind("reanchor")
                               if r["classification"] == "drift"])
-        self.assertEqual(0, len(self._emit_events(ctrl, "range_ladder_carried_prune_drift")))
+        self.assertEqual(0, len(self._emit_events(ctrl, "range_ladder_carried_progress_retired")))
 
     def test_carried_entry_reobserved_live_then_pruned_is_silent(self):
         # A carried entry (LOADED from disk) that IS re-attached into executors_info this session
@@ -523,7 +560,7 @@ class TestCarriedPruneDrift(_Harness):
         self.assertNotIn("reattached-exec", ctrl._state.get("booked_fill_progress", {}))
         self.assertEqual([], [r for r in self._records_of_kind("reanchor")
                               if r["classification"] == "drift"])
-        self.assertEqual(0, len(self._emit_events(ctrl, "range_ladder_carried_prune_drift")))
+        self.assertEqual(0, len(self._emit_events(ctrl, "range_ladder_carried_progress_retired")))
 
 
 # ==================================================== CDX-R02: within-session uncommitted fill
@@ -962,7 +999,7 @@ class TestFeeOnlyUncommittedDrift(_Harness):
 
 class TestRestartMarkers(_Harness):
 
-    def test_checkpoint_age_and_carried_prune_drift_exact_and_survive_restart(self):
+    def test_checkpoint_age_and_legacy_drift_counter_survive_restart_without_increment(self):
         # checkpoint_age_s reflects the ACTUAL last checkpoint ts and carried_prune_drift_quote the
         # ACTUAL surfaced total -- both exact, and both survive a restart. (Mutations CDX-R10:
         # force checkpoint_age to None / carried total to Decimal("0") -> the exact asserts FAIL.
@@ -974,10 +1011,23 @@ class TestRestartMarkers(_Harness):
         self._init_state(
             ctrl, owned_quote=1000, owned_base="0.5", seed_value=1000,
             booked_fill_progress={"old-exec-1": {"base": "0.4", "quote": "120", "fees": "0.12"}},
+            carried_prune_drift_quote_cum="240",
         )
+        # Exercise real schema-10 loading, including the legacy reporting marker.
+        self._state_path.write_text(json.dumps(ctrl._state), encoding="utf-8")
+        ctrl._state_loaded = False
         ctrl.executors_info = []
-        self._cycle(ctrl, mdp, 1000.0)              # carried prune -> drift 240 + a checkpoint @1000
+        self._cycle(ctrl, mdp, 1000.0)              # retirement preserves the legacy counter
+        # Model an existing pre-fix diagnostic record. New code must not silently rewrite it.
+        ctrl._purse_append_record("reanchor", {
+            "old_owned_quote": "120", "old_owned_base": "0.4",
+            "new_owned_quote": "0", "new_owned_base": "0",
+            "overclaim_quote": "240", "classification": "drift",
+            "wallet_quote_total": "1000", "wallet_base_total": "0.5",
+        })
+        self._cycle(ctrl, mdp, 1000.0)
         self.assertEqual(1, len(self._records_of_kind("checkpoint")))
+        legacy_records = self._persisted_purse()["records"]
 
         # Exact markers at a later time in the SAME session (the purse block rides processed_data,
         # so re-run a cycle at t=1500 to recompute it -- no new checkpoint: interval 3600 not due).
@@ -996,6 +1046,8 @@ class TestRestartMarkers(_Harness):
         purse2 = ctrl2.get_custom_info()["purse"]
         self.assertEqual(1000.0, purse2["checkpoint_age_s"])       # 2000 - persisted 1000
         self.assertEqual(D("240"), D(str(purse2["carried_prune_drift_quote"])))
+        self.assertEqual(legacy_records, self._persisted_purse()["records"])
+        self.assertEqual(10, ctrl2._state["schema_version"])
 
 
 if __name__ == "__main__":

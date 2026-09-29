@@ -1818,10 +1818,10 @@ class RangeInventoryLadderController(ControllerBase):
         # every flow/reseed_epoch/reanchor append and drained by the end-of-cycle checkpoint.
         self._last_checkpoint_ts: Optional[float] = None
         self._purse_checkpoint_due: bool = False
-        # Carried-prune drift (F15/CLA-M04): the booked_fill_progress ids LOADED from disk this
+        # Carried progress: the booked_fill_progress ids LOADED from disk this
         # session (a prior session's executors) and the subset OBSERVED live in executors_info.
-        # A loaded-but-never-observed id that the prune would delete is the post-resume last-window
-        # loss -- journaled as a drift reanchor record instead of vanishing silently.
+        # A loaded-but-never-observed id contains already committed amounts, not a lost delta.
+        # Retirement is observable, but cannot establish whether any later fill was missed.
         self._loaded_progress_ids: Optional[Set[str]] = None
         self._observed_progress_ids: Set[str] = set()
         self._carried_prune_drift_quote_cum: Decimal = Decimal("0")
@@ -4426,8 +4426,8 @@ class RangeInventoryLadderController(ControllerBase):
         # hbpurse P5 (F15/CLA-M04): the FIRST booking pass of the session snapshots the
         # booked_fill_progress ids loaded from disk -- a prior session's executors. On resume
         # executors_info does not re-attach them, so they get pruned below before any final
-        # sampling. A loaded-but-never-observed pruned entry is the last-window loss F15/CLA-M04
-        # describe; it is journaled as a drift reanchor record rather than deleted silently.
+        # sampling. These cumulative amounts have already been committed to owned_*; their
+        # retirement alone is not evidence of lost money or of a successful final sampling.
         if self._loaded_progress_ids is None:
             self._loaded_progress_ids = set(progress.keys())
 
@@ -4606,9 +4606,9 @@ class RangeInventoryLadderController(ControllerBase):
         pruned_ids = [eid for eid in progress if eid not in current_ids]
         # hbpurse P5 (F15/CLA-M04): split the prune into ROUTINE (an executor observed live this
         # session that completed after its final capture -- silent, as today) and CARRIED (an
-        # entry loaded from disk that this session NEVER saw in executors_info -- the post-resume
-        # last-window loss). Capture the carried entries' cumulative values BEFORE deletion; they
-        # are journaled as a drift reanchor record AFTER the state commit (save ordering).
+        # entry loaded from disk that this session NEVER saw in executors_info). Capture the
+        # already-booked cumulative values BEFORE deletion for an informational event AFTER the
+        # state commit. A missing final sample is unknown, not the entire booked cumulative.
         carried_pruned = {
             eid: dict(progress[eid])
             for eid in pruned_ids
@@ -4643,16 +4643,13 @@ class RangeInventoryLadderController(ControllerBase):
             del progress[eid]
 
         if changed or pruned_ids or reseed_priming or offset_dirty or uncommitted_lost:
-            # hbpurse P5 (CDX-R07): the carried-prune / uncommitted-fill drift running total is a
-            # reporting marker that must survive restart. Compute this cycle's addition BEFORE the
-            # commit and fold the new cumulative into the SAME commit that makes the prune durable,
-            # so a restart re-seeds it from state (the derived `drift` is authoritative regardless).
-            carried_drift = self._carried_prune_drift_quote(carried_pruned) if carried_pruned \
-                else Decimal("0")
+            # Keep the legacy cumulative marker unchanged for retirement of durable progress.
+            # Only an observed, uncommitted delta establishes a quantifiable loss. Persist that
+            # addition in the same commit as the prune so it survives restart exactly once.
             uncommitted_drift = self._uncommitted_fill_drift_quote(uncommitted_lost) \
                 if uncommitted_lost else Decimal("0")
             new_carried_cum = (self._d(self._state.get("carried_prune_drift_quote_cum"), "0")
-                               + carried_drift + uncommitted_drift)
+                               + uncommitted_drift)
             # hbpurse P2 (CDX-M01): commit the booked ledger to disk BEFORE advancing the
             # in-memory owned_*/progress/offsets. `owned_quote`, `owned_base` and `progress` are
             # LOCALS up to here -- self._state still holds the PRIOR values -- so a failed save
@@ -4665,7 +4662,7 @@ class RangeInventoryLadderController(ControllerBase):
                 "reanchor_offset_quote": str(offset_quote),
                 "reanchor_offset_base": str(offset_base),
             }
-            if carried_pruned or uncommitted_lost:
+            if uncommitted_lost:
                 booking_mutations["carried_prune_drift_quote_cum"] = str(new_carried_cum)
             committed = self._commit_state(booking_mutations, reason="fill_booking")
             if not committed:
@@ -4687,13 +4684,12 @@ class RangeInventoryLadderController(ControllerBase):
                 self._reseed_just_applied = False
             # hbpurse P5 (CDX-R07): the drift running total is now durable in state -> mirror it
             # in the live counter (kept in sync with the persisted value; seeded from state on load).
-            if carried_pruned or uncommitted_lost:
+            if uncommitted_lost:
                 self._carried_prune_drift_quote_cum = new_carried_cum
-            # hbpurse P5 (F15/CLA-M04): the prune of the carried entries is now durable in state;
-            # surface the loss as a drift reanchor record (never silent). Routine prunes remain
-            # silent. Carried ids also drop out of _loaded_progress_ids so they are journaled once.
+            # The carried entries are now durably retired. Report their known booked amounts
+            # without inventing a loss, resizing ownership, or adding a financial journal record.
             if carried_pruned:
-                self._journal_carried_prune_drift(carried_pruned)
+                self._report_carried_progress_retired(carried_pruned)
             # hbpurse P5 (CDX-R02): surface any within-session vanished-before-commit lost deltas.
             if uncommitted_lost:
                 self._journal_uncommitted_fill_drift(uncommitted_lost)
@@ -4726,15 +4722,6 @@ class RangeInventoryLadderController(ControllerBase):
                     booked_orders=len(progress),
                 )
 
-    def _carried_prune_drift_quote(self, carried_pruned: Dict[str, dict]) -> Decimal:
-        """Quote-valued magnitude of a carried-prune loss (pruned quote + pruned base at the last
-        good reference price). Single source of truth shared by the persisted running total and
-        the journaled record so the two never diverge."""
-        ref = self._purse_last_ref_price
-        pruned_base = sum((self._d(e.get("base"), "0") for e in carried_pruned.values()), Decimal("0"))
-        pruned_quote = sum((self._d(e.get("quote"), "0") for e in carried_pruned.values()), Decimal("0"))
-        return pruned_quote + pruned_base * ref
-
     def _uncommitted_fill_drift_quote(self, uncommitted_lost: Dict[str, Dict[str, Decimal]]) -> Decimal:
         """Quote-valued magnitude of an uncommitted-fill loss. CDX-R06: the lost FEE is an unbooked
         quote debit, so it is folded into the quote side of the surfaced drift."""
@@ -4755,53 +4742,34 @@ class RangeInventoryLadderController(ControllerBase):
         except _WalletReadError:
             return Decimal("0"), Decimal("0"), False
 
-    def _journal_carried_prune_drift(self, carried_pruned: Dict[str, dict]) -> None:
-        """hbpurse P5 (F15/CLA-M04): journal ONE drift reanchor record embedding the pruned
-        carried entries' cumulative values, and emit a structured event -- so a last-window fill
-        loss (a prior session's executor whose progress could not be reconciled from the
-        controller; engine-Postgres is framework territory per A5) is SURFACED as drift rather
-        than deleted silently. The trading ledger (owned_*) is NOT resized here (safety rule 6);
-        the record is a pure observation. The pruned cumulative base/quote sit in old_owned_* cut
-        to new_owned_*=0, so the derived-metrics `drift` reflects the unreconciled magnitude. The
-        running total is persisted commit-coupled in _book_fills_from_orders (CDX-R07)."""
+    def _report_carried_progress_retired(self, carried_pruned: Dict[str, dict]) -> None:
+        """Report retirement of durable booking baselines, not an accounting adjustment.
+
+        The baseline proves what was booked, not the final exchange cumulative. Any delta after
+        it is unknown without external reconciliation; neither zero loss nor a loss equal to the
+        baseline can be inferred. Actual failed-commit deltas and wallet discrepancies retain
+        their separate error/drift paths. Existing journal records and counters are untouched.
+        """
         pruned_base = sum((self._d(entry.get("base"), "0") for entry in carried_pruned.values()),
                           Decimal("0"))
         pruned_quote = sum((self._d(entry.get("quote"), "0") for entry in carried_pruned.values()),
                            Decimal("0"))
         pruned_fees = sum((self._d(entry.get("fees"), "0") for entry in carried_pruned.values()),
                           Decimal("0"))
-        ref = self._purse_last_ref_price
-        drift_quote = self._carried_prune_drift_quote(carried_pruned)
-        wallet_quote, wallet_base, wallet_read_ok = self._drift_record_wallet_totals()
-        self.logger().warning(
-            f"{self.config.id}: pruned {len(carried_pruned)} carried booked_fill_progress "
-            f"entry(ies) never observed live this session ({sorted(carried_pruned)}); their "
-            f"last-window fills cannot be reconciled from the controller. Surfacing base="
-            f"{pruned_base} quote={pruned_quote} (drift {drift_quote} at ref {ref}) as a drift "
-            "reanchor record -- the trading ledger is unchanged."
+        self.logger().info(
+            f"{self.config.id}: retired {len(carried_pruned)} prior-session booked progress "
+            f"entry(ies) ({sorted(carried_pruned)}). Their cumulative amounts were already "
+            "committed; final exchange deltas are unverified by this controller. "
+            "No accounting adjustment was made."
         )
         self._emit_structured(
-            "range_ladder_carried_prune_drift",
+            "range_ladder_carried_progress_retired",
             pruned_ids=sorted(carried_pruned),
-            pruned_base=str(pruned_base),
-            pruned_quote=str(pruned_quote),
-            pruned_fees=str(pruned_fees),
-            drift_quote=str(drift_quote),
-            reference_price=str(ref),
-            wallet_read_ok=wallet_read_ok,
-        )
-        self._purse_append_record(
-            "reanchor",
-            {
-                "old_owned_quote": str(pruned_quote),
-                "old_owned_base": str(pruned_base),
-                "new_owned_quote": "0",
-                "new_owned_base": "0",
-                "overclaim_quote": str(drift_quote),
-                "classification": "drift",
-                "wallet_quote_total": str(wallet_quote),
-                "wallet_base_total": str(wallet_base),
-            },
+            booked_base=str(pruned_base),
+            booked_quote=str(pruned_quote),
+            booked_fees=str(pruned_fees),
+            final_execution_verified=False,
+            accounting_adjustment=False,
         )
 
     def _journal_uncommitted_fill_drift(self, uncommitted_lost: Dict[str, Dict[str, Decimal]]) -> None:
